@@ -1,0 +1,21 @@
+[service]
+database_path = "/var/lib/fixer/fixer.sqlite3"
+state_dir = "/var/lib/fixer"
+poll_interval_seconds = 300
+collect_processes = true
+collect_crashes = true
+collect_warnings = true
+collect_perf = false
+collect_bpftrace = false
+perf_duration_seconds = 3
+coredump_limit = 10
+journal_lines = 50
+watched_repos = []
+warning_logs = []
+
+[patch]
+codex_command = "codex"
+codex_args = []
+sandbox = "workspace-write"
+approval_policy = "never"
+extra_instructions = "Keep the change narrowly scoped and summarize validation clearly."

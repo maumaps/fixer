@@ -1,0 +1,25 @@
+Fixer installs a systemd service and a CLI.
+
+For the simplest install path, prefer:
+
+  sudo apt install ./fixer_<version>_<arch>.deb
+
+That allows APT to install recommended helper tools such as perf,
+bpftrace, cargo, nodejs, npm, python3-pip, and postgresql-client alongside the
+main package.
+
+Optional integrations are still detected at runtime. Missing helper
+tools reduce capability surface but do not block startup or package
+installation.
+
+For Debian-backed opportunities without an attached repo, Fixer now
+tries to hydrate a workspace automatically. It prefers `apt-get source`
+when `deb-src` is configured and otherwise falls back to cloning the
+package homepage if it points at a real upstream repository.
+
+`pip-audit` is not currently available as a native Debian package in the
+environment used for this project, so Python dependency auditing is not
+yet pulled in automatically by the `.deb`.
+
+Codex itself is not packaged here; install it separately if you want the
+`fixer propose-fix --engine codex` workflow.

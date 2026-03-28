@@ -1,0 +1,35 @@
+[package]
+name = "fixer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "fixer"
+
+[lib]
+name = "fixer"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "fixer"
+path = "src/bin/fixer.rs"
+
+[[bin]]
+name = "fixerd"
+path = "src/bin/fixerd.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

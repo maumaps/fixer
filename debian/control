@@ -1,0 +1,36 @@
+Source: fixer
+Section: utils
+Priority: optional
+Maintainer: Maumap Fixer Maintainers <fixer@example.invalid>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc,
+ pkg-config,
+ libsqlite3-dev
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+Homepage: https://github.com/maumaps/fixer
+
+Package: fixer
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ systemd
+Recommends:
+ linux-perf,
+ bpftrace,
+ cargo,
+ nodejs,
+ npm,
+ python3-pip,
+ postgresql-client
+Description: local evidence engine for Linux maintenance opportunities
+ Fixer inventories what is actually running on a Linux machine, watches
+ configured repositories, ingests crashes and warnings, ranks fix
+ opportunities, and can hand bounded evidence bundles to Codex for
+ patch proposals.
+ .
+ The package installs both the command-line client and the systemd
+ service, along with a default configuration file under /etc/fixer.

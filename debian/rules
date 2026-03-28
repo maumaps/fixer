@@ -1,0 +1,20 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export CARGO_HOME = $(CURDIR)/.cargo-home
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+
+override_dh_auto_build:
+	cargo build --release --locked -p fixer --bins
+
+override_dh_auto_test:
+	cargo test --locked -p fixer
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/fixer $(CURDIR)/debian/fixer/usr/bin/fixer
+	install -D -m 0755 target/release/fixerd $(CURDIR)/debian/fixer/usr/bin/fixerd
+	install -D -m 0644 debian/fixer.toml $(CURDIR)/debian/fixer/etc/fixer/fixer.toml

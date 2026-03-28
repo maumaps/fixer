@@ -1,0 +1,20 @@
+[Unit]
+Description=Maumap Fixer evidence daemon
+After=network-online.target systemd-journald.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/fixerd run --config /etc/fixer/fixer.toml
+Restart=on-failure
+RestartSec=10
+WorkingDirectory=/var/lib/fixer
+StateDirectory=fixer
+LogsDirectory=fixer
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

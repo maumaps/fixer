@@ -1,0 +1,21 @@
+[service]
+database_path = "./state/fixer.sqlite3"
+state_dir = "./state"
+poll_interval_seconds = 300
+collect_processes = true
+collect_crashes = true
+collect_warnings = true
+collect_perf = false
+collect_bpftrace = false
+perf_duration_seconds = 3
+coredump_limit = 10
+journal_lines = 20
+watched_repos = ["."]
+warning_logs = []
+
+[patch]
+codex_command = "codex"
+codex_args = []
+sandbox = "workspace-write"
+approval_policy = "never"
+extra_instructions = "Keep the change narrowly scoped and leave a concise summary in the final message."
