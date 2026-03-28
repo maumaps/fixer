@@ -1,13 +1,16 @@
 use crate::models::{
-    Capability, FindingInput, FindingRecord, OpportunityRecord, ProposalRecord, StatusSnapshot,
-    TopEntry, ValidationRecord,
+    Capability, FindingInput, FindingRecord, InstallIdentity, OpportunityRecord,
+    ParticipationState, ProposalRecord, SharedOpportunity, StatusSnapshot, TopEntry,
+    ValidationRecord,
 };
 use crate::util::now_rfc3339;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 pub struct Store {
     conn: Connection,
@@ -101,6 +104,12 @@ impl Store {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS local_state (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             ",
         )?;
         Ok(())
@@ -157,13 +166,12 @@ impl Store {
                 name: row.get(0)?,
                 binary: row.get(1)?,
                 available: row.get::<_, i64>(2)? != 0,
-                path: row
-                    .get::<_, Option<String>>(3)?
-                    .map(PathBuf::from),
+                path: row.get::<_, Option<String>>(3)?.map(PathBuf::from),
                 notes: row.get(4)?,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn prune_stackless_crash_findings(&self) -> Result<()> {
@@ -278,6 +286,86 @@ impl Store {
               );
             ",
         )?;
+        Ok(())
+    }
+
+    pub fn prune_low_signal_kernel_warning_findings(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            DELETE FROM proposals
+            WHERE opportunity_id IN (
+                SELECT o.id
+                FROM opportunities o
+                JOIN findings f ON f.id = o.finding_id
+                WHERE f.kind = 'warning'
+                  AND (
+                    f.summary LIKE '%kauditd_printk_skb:%callbacks suppressed%'
+                    OR f.details_json LIKE '%kauditd_printk_skb:%callbacks suppressed%'
+                  )
+            );
+
+            DELETE FROM validation_runs
+            WHERE opportunity_id IN (
+                SELECT o.id
+                FROM opportunities o
+                JOIN findings f ON f.id = o.finding_id
+                WHERE f.kind = 'warning'
+                  AND (
+                    f.summary LIKE '%kauditd_printk_skb:%callbacks suppressed%'
+                    OR f.details_json LIKE '%kauditd_printk_skb:%callbacks suppressed%'
+                  )
+            );
+
+            DELETE FROM opportunities
+            WHERE finding_id IN (
+                SELECT f.id
+                FROM findings f
+                WHERE f.kind = 'warning'
+                  AND (
+                    f.summary LIKE '%kauditd_printk_skb:%callbacks suppressed%'
+                    OR f.details_json LIKE '%kauditd_printk_skb:%callbacks suppressed%'
+                  )
+            );
+
+            DELETE FROM findings
+            WHERE kind = 'warning'
+              AND (
+                summary LIKE '%kauditd_printk_skb:%callbacks suppressed%'
+                OR details_json LIKE '%kauditd_printk_skb:%callbacks suppressed%'
+              );
+            ",
+        )?;
+        Ok(())
+    }
+
+    pub fn prune_postgres_collation_findings(
+        &self,
+        assessed_clusters: &[(String, String)],
+        current_fingerprints: &[String],
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, fingerprint
+            FROM findings
+            WHERE kind = 'warning'
+              AND json_extract(details_json, '$.subsystem') = 'postgres-collation'
+              AND CAST(COALESCE(json_extract(details_json, '$.cluster_version'), '') AS TEXT) = ?1
+              AND COALESCE(json_extract(details_json, '$.cluster_name'), '') = ?2
+            ",
+        )?;
+
+        for (cluster_version, cluster_name) in assessed_clusters {
+            let rows = stmt.query_map(params![cluster_version, cluster_name], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let findings = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            for (finding_id, fingerprint) in findings {
+                if current_fingerprints.iter().any(|item| item == &fingerprint) {
+                    continue;
+                }
+                self.delete_finding_cascade(finding_id)?;
+            }
+        }
         Ok(())
     }
 
@@ -452,7 +540,18 @@ impl Store {
             WHERE f.id = ?1
             ",
         )?;
-        let (kind, title, severity, summary, details_json, repo_root, ecosystem, artifact_name, artifact_path, package_name): (
+        let (
+            kind,
+            title,
+            severity,
+            summary,
+            details_json,
+            repo_root,
+            ecosystem,
+            artifact_name,
+            artifact_path,
+            package_name,
+        ): (
             String,
             String,
             String,
@@ -548,6 +647,34 @@ impl Store {
         Ok(())
     }
 
+    fn delete_finding_cascade(&self, finding_id: i64) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM opportunities WHERE finding_id = ?1")?;
+        let opportunity_ids = stmt
+            .query_map([finding_id], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        for opportunity_id in opportunity_ids {
+            self.conn.execute(
+                "DELETE FROM proposals WHERE opportunity_id = ?1",
+                [opportunity_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM validation_runs WHERE opportunity_id = ?1",
+                [opportunity_id],
+            )?;
+        }
+
+        self.conn.execute(
+            "DELETE FROM opportunities WHERE finding_id = ?1",
+            [finding_id],
+        )?;
+        self.conn
+            .execute("DELETE FROM findings WHERE id = ?1", [finding_id])?;
+        Ok(())
+    }
+
     pub fn status(&self) -> Result<StatusSnapshot> {
         Ok(StatusSnapshot {
             capabilities: self.count("capabilities")?,
@@ -590,7 +717,8 @@ impl Store {
                 severity: row.get(3)?,
                 fingerprint: row.get(4)?,
                 summary: row.get(5)?,
-                details: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_else(|_| json!({})),
+                details: serde_json::from_str(&row.get::<_, String>(6)?)
+                    .unwrap_or_else(|_| json!({})),
                 artifact_name: row.get(7)?,
                 artifact_path: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
                 package_name: row.get(9)?,
@@ -600,7 +728,8 @@ impl Store {
                 last_seen: row.get(13)?,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn list_opportunities(&self, state: Option<&str>) -> Result<Vec<OpportunityRecord>> {
@@ -621,7 +750,8 @@ impl Store {
                 score: row.get(4)?,
                 state: row.get(5)?,
                 summary: row.get(6)?,
-                evidence: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_else(|_| json!({})),
+                evidence: serde_json::from_str(&row.get::<_, String>(7)?)
+                    .unwrap_or_else(|_| json!({})),
                 repo_root: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
                 ecosystem: row.get(9)?,
                 created_at: row.get(10)?,
@@ -633,7 +763,8 @@ impl Store {
         } else {
             stmt.query_map([], mapper)?
         };
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn get_opportunity(&self, id: i64) -> Result<OpportunityRecord> {
@@ -679,7 +810,8 @@ impl Store {
                 count: row.get(1)?,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn list_repo_owners(&self) -> Result<Vec<(String, String, String)>> {
@@ -693,7 +825,8 @@ impl Store {
         )?;
         let rows = stmt.query_map([], |row| {
             let metadata_json: String = row.get(2)?;
-            let metadata: Value = serde_json::from_str(&metadata_json).unwrap_or_else(|_| json!({}));
+            let metadata: Value =
+                serde_json::from_str(&metadata_json).unwrap_or_else(|_| json!({}));
             let owners = metadata
                 .get("owners")
                 .and_then(Value::as_array)
@@ -707,7 +840,8 @@ impl Store {
                 .unwrap_or_default();
             Ok((row.get(0)?, row.get(1)?, owners))
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn record_validation(
@@ -747,7 +881,8 @@ impl Store {
                 created_at: row.get(5)?,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn create_proposal(
@@ -808,9 +943,144 @@ impl Store {
         ).map_err(Into::into)
     }
 
+    pub fn set_local_state<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        let updated_at = now_rfc3339();
+        let value_json = serde_json::to_string(value)?;
+        self.conn.execute(
+            "
+            INSERT INTO local_state (key, value_json, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at
+            ",
+            params![key, value_json, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_local_state<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT value_json FROM local_state WHERE key = ?1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        raw.map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn clear_local_state(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM local_state WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    pub fn ensure_install_identity(&self) -> Result<InstallIdentity> {
+        if let Some(existing) = self.get_local_state::<InstallIdentity>("install_identity")? {
+            return Ok(existing);
+        }
+        let identity = InstallIdentity {
+            install_id: Uuid::new_v4().to_string(),
+            created_at: now_rfc3339(),
+        };
+        self.set_local_state("install_identity", &identity)?;
+        Ok(identity)
+    }
+
+    pub fn load_participation_state(&self) -> Result<Option<ParticipationState>> {
+        self.get_local_state("participation_state")
+    }
+
+    pub fn save_participation_state(&self, state: &ParticipationState) -> Result<()> {
+        self.set_local_state("participation_state", state)
+    }
+
+    pub fn list_submission_candidates(&self, limit: usize) -> Result<Vec<SharedOpportunity>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT
+                o.id,
+                o.finding_id,
+                o.kind,
+                o.title,
+                o.score,
+                o.state,
+                o.summary,
+                o.evidence_json,
+                o.repo_root,
+                o.ecosystem,
+                o.created_at,
+                o.updated_at,
+                f.kind,
+                f.title,
+                f.severity,
+                f.fingerprint,
+                f.summary,
+                f.details_json,
+                a.name,
+                a.path,
+                a.package_name,
+                COALESCE(f.repo_root, a.repo_root),
+                COALESCE(f.ecosystem, a.ecosystem),
+                f.first_seen,
+                f.last_seen
+            FROM opportunities o
+            JOIN findings f ON f.id = o.finding_id
+            LEFT JOIN artifacts a ON a.id = f.artifact_id
+            WHERE o.state IN ('open', 'validated', 'proposed')
+            ORDER BY o.score DESC, o.updated_at DESC
+            LIMIT ?1
+            ",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok(SharedOpportunity {
+                local_opportunity_id: row.get(0)?,
+                opportunity: OpportunityRecord {
+                    id: row.get(0)?,
+                    finding_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    title: row.get(3)?,
+                    score: row.get(4)?,
+                    state: row.get(5)?,
+                    summary: row.get(6)?,
+                    evidence: serde_json::from_str(&row.get::<_, String>(7)?)
+                        .unwrap_or_else(|_| json!({})),
+                    repo_root: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
+                    ecosystem: row.get(9)?,
+                    created_at: row.get(10)?,
+                    updated_at: row.get(11)?,
+                },
+                finding: FindingRecord {
+                    id: row.get(1)?,
+                    kind: row.get(12)?,
+                    title: row.get(13)?,
+                    severity: row.get(14)?,
+                    fingerprint: row.get(15)?,
+                    summary: row.get(16)?,
+                    details: serde_json::from_str(&row.get::<_, String>(17)?)
+                        .unwrap_or_else(|_| json!({})),
+                    artifact_name: row.get(18)?,
+                    artifact_path: row.get::<_, Option<String>>(19)?.map(PathBuf::from),
+                    package_name: row.get(20)?,
+                    repo_root: row.get::<_, Option<String>>(21)?.map(PathBuf::from),
+                    ecosystem: row.get(22)?,
+                    first_seen: row.get(23)?,
+                    last_seen: row.get(24)?,
+                },
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     fn count(&self, table: &str) -> Result<i64> {
         self.conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
             .map_err(Into::into)
     }
 }
@@ -860,5 +1130,89 @@ mod tests {
         let status = store.status().unwrap();
         assert_eq!(status.findings, 1);
         assert_eq!(status.opportunities, 1);
+    }
+
+    #[test]
+    fn persists_install_identity_and_participation_state() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        let identity = store.ensure_install_identity().unwrap();
+        let again = store.ensure_install_identity().unwrap();
+        assert_eq!(identity.install_id, again.install_id);
+
+        let state = crate::models::ParticipationState {
+            mode: crate::models::ParticipationMode::SubmitterWorker,
+            consented_at: Some("2026-03-28T00:00:00Z".to_string()),
+            consent_policy_version: Some("2026-03-28".to_string()),
+            consent_policy_digest: Some("digest".to_string()),
+            opt_out_at: None,
+            richer_evidence_allowed: true,
+        };
+        store.save_participation_state(&state).unwrap();
+        let loaded = store.load_participation_state().unwrap().unwrap();
+        assert_eq!(
+            loaded.mode,
+            crate::models::ParticipationMode::SubmitterWorker
+        );
+        assert!(loaded.richer_evidence_allowed);
+    }
+
+    #[test]
+    fn prunes_resolved_postgres_collation_findings_for_assessed_clusters() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+
+        store
+            .record_finding(&FindingInput {
+                kind: "warning".to_string(),
+                title: "PostgreSQL collation mismatch in app on 18/main".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "keep-me".to_string(),
+                summary: "app mismatch".to_string(),
+                details: json!({
+                    "subsystem": "postgres-collation",
+                    "cluster_version": "18",
+                    "cluster_name": "main",
+                    "database_name": "app",
+                }),
+                artifact: None,
+                repo_root: None,
+                ecosystem: Some("postgres".to_string()),
+            })
+            .unwrap();
+
+        store
+            .record_finding(&FindingInput {
+                kind: "warning".to_string(),
+                title: "PostgreSQL collation mismatch in olddb on 18/main".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "drop-me".to_string(),
+                summary: "olddb mismatch".to_string(),
+                details: json!({
+                    "subsystem": "postgres-collation",
+                    "cluster_version": "18",
+                    "cluster_name": "main",
+                    "database_name": "olddb",
+                }),
+                artifact: None,
+                repo_root: None,
+                ecosystem: Some("postgres".to_string()),
+            })
+            .unwrap();
+
+        store
+            .prune_postgres_collation_findings(
+                &[("18".to_string(), "main".to_string())],
+                &["keep-me".to_string()],
+            )
+            .unwrap();
+
+        let findings = store.list_findings("warning").unwrap();
+        let fingerprints = findings
+            .iter()
+            .map(|finding| finding.fingerprint.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(fingerprints, vec!["keep-me"]);
+        assert_eq!(store.status().unwrap().opportunities, 1);
     }
 }

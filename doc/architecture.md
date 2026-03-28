@@ -4,7 +4,7 @@ This document describes the architecture of the current MVP implementation in th
 
 ## System shape
 
-Fixer is split into three layers:
+Fixer is now split into four layers:
 
 1. Collection and normalization
    - `fixerd` runs collection cycles.
@@ -12,9 +12,14 @@ Fixer is split into three layers:
 2. Persistence and ranking
    - SQLite stores capabilities, artifacts, findings, opportunities, validation runs, and patch proposals.
    - A simple scoring function turns findings into ranked opportunities.
-3. Operator workflows
+3. Federation and aggregation
+   - Opted-in clients can upload structured finding bundles to a Fixer server.
+   - `fixer-server` stores anonymous submissions in Postgres, clusters repeated findings into issues, keeps new installs and new issues quarantined by default, and leases promoted issues to trusted workers.
+   - Basic anti-spam and anti-abuse controls are proof-of-work, per-install and per-IP rate limits, duplicate-content suppression, quarantine, and install trust scores.
+4. Operator and worker workflows
    - `fixer` exposes commands for collection, inspection, validation, and proposal generation.
-   - Codex is only used at the proposal stage and only on a bounded evidence bundle.
+   - It also exposes explicit participation commands: `opt-in`, `opt-out`, `sync`, `worker run`, and `participation`.
+   - Codex is only used at the proposal stage and only on a bounded evidence bundle, whether that proposal is local-only or comes from a leased server issue.
 
 ## Main binaries
 
@@ -24,6 +29,9 @@ Fixer is split into three layers:
 - `fixerd`
   - Long-running daemon wrapper around the same collection pipeline.
   - Reads config, performs a collection cycle, sleeps, and repeats.
+- `fixer-server`
+  - Aggregation server for opted-in clients.
+  - Stores submissions in Postgres, clusters issues, exposes promoted issues, and accepts worker results.
 
 ## Module layout
 
@@ -33,7 +41,7 @@ The shared application logic lives in `crates/fixer/src/`.
   - Top-level orchestration for loading config, opening the store, running collection, validating, and preparing proposals.
 - `config.rs`
   - TOML-backed runtime configuration.
-  - Holds service settings, watched repos, log paths, sampling toggles, and Codex settings.
+  - Holds service settings, watched repos, log paths, sampling toggles, Codex settings, client network defaults, privacy policy versioning, participation defaults, and server settings.
 - `capabilities.rs`
   - Detects optional helper tools at runtime.
   - This lets the package stay installable even when optional integrations are absent.
@@ -51,7 +59,15 @@ The shared application logic lives in `crates/fixer/src/`.
   - Resolves a patchable workspace for an opportunity.
   - Uses an attached repo when one exists, then tries `apt-get source` for Debian packages, then falls back to cloning a package homepage when it looks like a real upstream repository.
 - `models.rs`
-  - Shared record types for capabilities, findings, opportunities, validation runs, proposals, and repo insights.
+  - Shared record types for local findings and proposals plus the wire format for client/server federation.
+- `privacy.rs`
+  - Participation policy text plus best-effort secret redaction for outbound bundles.
+- `pow.rs`
+  - Hashcash-style proof-of-work helpers used by submissions and worker pulls.
+- `network.rs`
+  - Client-side participation state, submission bundle building, sync, and worker execution.
+- `server.rs`
+  - Axum HTTP server plus Postgres-backed clustering, quarantine, leasing, and worker result handling.
 
 ## Data model
 
@@ -74,6 +90,14 @@ The current pipeline uses these record types:
 - Proposals
   - Output bundles for deterministic or Codex-backed patch proposals.
   - Proposal bundles now also record the prepared workspace that Fixer resolved for patching.
+- Participation state
+  - Local opt-in state, consent policy version/digest, richer-evidence opt-in, and anonymous install identity.
+- Submission bundles
+  - Structured uploads containing capabilities, status, redactions, and a set of ranked opportunities plus their underlying findings.
+- Issue clusters
+  - Server-side aggregation records keyed by normalized finding fingerprints and stack/module signatures.
+- Worker leases and patch attempts
+  - Server-side records for volunteer workers that try to patch promoted issues or explain why a safe patch is not currently possible.
 
 ## Collection flow
 
@@ -100,6 +124,8 @@ When an operator later validates or proposes a fix for an opportunity, Fixer res
 3. clone the package homepage if it points at a cloneable upstream repo
 
 If none of those work and the operator asks for a deterministic proposal, Fixer falls back to an external bug-report bundle instead of failing outright. That bundle includes installed and candidate package versions, upgrade guidance, host details, crash metadata, the locally symbolized stack, a redacted command line suitable for sharing with a vendor, and any vendor/support URL discoverable from package metadata.
+
+If the host is opted in as a submitter, the same local opportunity graph can also be serialized into a submission bundle. Before upload, Fixer applies best-effort secret redaction to known high-risk string classes such as passwords, query tokens, and bearer headers. The explicit participation policy warns that redaction is not perfect and that private data may still be present unintentionally.
 
 ## Scoring model
 
@@ -152,12 +178,24 @@ Proposal generation is intentionally bounded:
 
 The system does not auto-submit patches upstream. `prepare-submit` creates a handoff artifact for manual review and publication.
 
+In the federated flow:
+
+1. A submitter uploads a redacted finding bundle after explicit opt-in.
+2. The server stores the raw bundle, normalizes issue clusters, and keeps them quarantined until corroborated or trusted.
+3. A trusted worker host with Codex can pull a promoted issue lease.
+4. The worker reuses the normal workspace-acquisition and proposal pipeline locally.
+5. The worker sends back either:
+   - a patch attempt with local bundle/output paths and a “review and submit upstream” summary
+   - an impossibility reason explaining why a safe patch could not be produced
+   - an optional request for richer evidence
+
 ## Packaging and runtime layout
 
 The Debian package installs:
 
 - `/usr/bin/fixer`
 - `/usr/bin/fixerd`
+- `/usr/bin/fixer-server`
 - `/etc/fixer/fixer.toml`
 - `/usr/lib/systemd/system/fixer.service`
 - `/usr/lib/tmpfiles.d/fixer.conf`
@@ -166,6 +204,7 @@ Default runtime paths:
 
 - database: `/var/lib/fixer/fixer.sqlite3`
 - state directory: `/var/lib/fixer`
+- default public server URL: `https://fixer.maumaps.org`
 
 The service runs as root in the current package because the MVP needs broad visibility into system telemetry. This is a practical choice, not the desired end state.
 
@@ -174,13 +213,14 @@ The service runs as root in the current package because the MVP needs broad visi
 The MVP intentionally stops short of the full product vision:
 
 - no TUI or web UI yet
-- no background job queue beyond the daemon loop
+- no admin UI for siloed server promotion or moderation yet
 - no source package graph beyond basic package/path mapping
 - no automatic `deb-src` enablement or build-dependency installation yet
 - no upstream issue search or maintainer routing beyond local metadata and `git shortlog`
 - no raw eBPF integration library yet; optional eBPF support shells out to `bpftrace`
 - no automatic branch creation, PR creation, or issue submission
 - no privilege separation between collection and proposal execution
+- no richer-evidence approval path implemented yet beyond the policy/config shape
 
 ## Near-term extensions
 

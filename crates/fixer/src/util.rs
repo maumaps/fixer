@@ -3,6 +3,7 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -77,4 +78,26 @@ pub fn read_text(path: &Path) -> Option<String> {
 
 pub fn command_exists(binary: &str) -> bool {
     find_in_path(binary).is_some()
+}
+
+pub fn find_postgres_binary(binary: &str) -> Option<PathBuf> {
+    if let Some(path) = find_in_path(binary) {
+        return Some(path);
+    }
+    let base = Path::new("/usr/lib/postgresql");
+    let mut versions = fs::read_dir(base)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| {
+            let version = path.file_name()?.to_str()?.parse::<i64>().ok()?;
+            Some((version, path))
+        })
+        .collect::<Vec<_>>();
+    versions.sort_by(|left, right| right.0.cmp(&left.0));
+    versions
+        .into_iter()
+        .map(|(_, path)| path.join("bin").join(binary))
+        .find(|candidate| candidate.is_file())
 }

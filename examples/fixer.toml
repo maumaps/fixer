@@ -19,3 +19,35 @@ codex_args = []
 sandbox = "workspace-write"
 approval_policy = "never"
 extra_instructions = "Keep the change narrowly scoped and leave a concise summary in the final message."
+
+[network]
+server_url = "http://127.0.0.1:8080/"
+sync_interval_seconds = 900
+connect_timeout_seconds = 20
+submission_pow_difficulty = 3
+worker_pow_difficulty = 4
+max_submission_items = 25
+
+[participation]
+mode = "local-only"
+richer_evidence_allowed = false
+
+[privacy]
+policy_version = "2026-03-28"
+redact_known_secrets = true
+require_opt_in_for_upload = true
+require_secondary_opt_in_for_richer_evidence = true
+
+[server]
+listen = "127.0.0.1:8080"
+postgres_url = "postgres://fixer@localhost/fixer"
+submission_pow_difficulty = 3
+worker_pow_difficulty = 4
+max_payload_bytes = 524288
+max_bundle_items = 25
+quarantine_corroboration_threshold = 2
+lease_seconds = 900
+worker_trust_minimum = 1
+max_submissions_per_hour = 60
+max_work_pulls_per_hour = 60
+max_abuse_events_before_ban = 8

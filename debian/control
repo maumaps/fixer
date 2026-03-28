@@ -1,7 +1,7 @@
 Source: fixer
 Section: utils
 Priority: optional
-Maintainer: Maumap Fixer Maintainers <fixer@example.invalid>
+Maintainer: Darafei Praliaskouski <me@komzpa.net>
 Build-Depends:
  debhelper-compat (= 13),
  cargo,

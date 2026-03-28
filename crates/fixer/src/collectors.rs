@@ -4,10 +4,11 @@ use crate::config::FixerConfig;
 use crate::models::{FindingInput, ObservedArtifact};
 use crate::storage::Store;
 use crate::util::{
-    command_exists, command_output, command_output_os, hash_text, maybe_canonicalize, now_rfc3339,
+    command_exists, command_output, command_output_os, find_postgres_binary, hash_text,
+    maybe_canonicalize, now_rfc3339,
 };
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -41,6 +42,7 @@ pub fn collect_once(config: &FixerConfig, store: &Store) -> Result<CollectReport
     if config.service.collect_warnings {
         report.findings_seen += collect_warning_logs(config, store)?;
         report.findings_seen += collect_kernel_warnings(config, store)?;
+        report.findings_seen += collect_postgres_collation_mismatches(store)?;
     }
     if config.service.collect_perf {
         report.findings_seen += collect_perf_hotspots(config, store)?;
@@ -145,7 +147,8 @@ fn collect_repos(repo_paths: &[PathBuf], store: &Store) -> Result<usize> {
                     title: format!("Repo `{}` is missing upstream metadata", artifact.name),
                     severity: "low".to_string(),
                     fingerprint: hash_text(format!("repo-metadata-missing:{}", root.display())),
-                    summary: "The watched repository does not expose an obvious upstream URL.".to_string(),
+                    summary: "The watched repository does not expose an obvious upstream URL."
+                        .to_string(),
                     details: json!({
                         "repo_root": root,
                         "ecosystem": insight.ecosystem,
@@ -196,11 +199,11 @@ fn collect_crashes(config: &FixerConfig, store: &Store) -> Result<usize> {
             continue;
         }
 
-        let exe = parsed.executable.as_ref().map(PathBuf::from).or_else(|| {
-            event.get("exe")
-                .and_then(Value::as_str)
-                .map(PathBuf::from)
-        });
+        let exe = parsed
+            .executable
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| event.get("exe").and_then(Value::as_str).map(PathBuf::from));
         let artifact = exe.as_ref().map(|path| ObservedArtifact {
             kind: "binary".to_string(),
             name: path
@@ -324,31 +327,65 @@ fn collect_kernel_warnings(config: &FixerConfig, store: &Store) -> Result<usize>
     if !store.capability_available("journalctl")? {
         return Ok(0);
     }
-    let output = command_output(
+    store.prune_low_signal_kernel_warning_findings()?;
+    let journal_lines = config.service.journal_lines.to_string();
+    let mut lines = Vec::new();
+    let mut seen = BTreeSet::new();
+    let warning_output = command_output(
         "journalctl",
         &[
             "-k",
+            "-b",
             "-p",
             "warning",
             "-n",
-            &config.service.journal_lines.to_string(),
+            journal_lines.as_str(),
             "--no-pager",
         ],
     )
     .unwrap_or_default();
+    extend_unique_log_lines(&mut lines, &mut seen, &warning_output);
+
+    let apparmor_output = command_output(
+        "journalctl",
+        &[
+            "-k",
+            "-b",
+            "-g",
+            "apparmor=\"DENIED\"",
+            "-n",
+            journal_lines.as_str(),
+            "--no-pager",
+        ],
+    )
+    .unwrap_or_default();
+    extend_unique_log_lines(&mut lines, &mut seen, &apparmor_output);
+
     let mut count = 0;
-    for line in output.lines() {
-        if line.trim().is_empty() {
+    for line in lines {
+        if let Some(finding) = apparmor_finding_from_kernel_line(&line) {
+            let _ = store.record_finding(&finding)?;
+            count += 1;
             continue;
+        }
+        if is_low_signal_kernel_warning(&line) {
+            continue;
+        }
+        let artifact = kernel_warning_artifact_from_line(&line);
+        let mut details = serde_json::Map::new();
+        details.insert("line".to_string(), json!(line));
+        if let Some(artifact) = &artifact {
+            details.insert("kernel_module".to_string(), json!(artifact.name));
+            details.insert("kernel_module_path".to_string(), json!(artifact.path));
         }
         let finding = FindingInput {
             kind: "warning".to_string(),
             title: "Kernel warning".to_string(),
             severity: "medium".to_string(),
             fingerprint: hash_text(format!("kernel-warning:{line}")),
-            summary: line.trim().to_string(),
-            details: json!({ "line": line.trim() }),
-            artifact: None,
+            summary: line.clone(),
+            details: Value::Object(details),
+            artifact,
             repo_root: None,
             ecosystem: None,
         };
@@ -356,6 +393,807 @@ fn collect_kernel_warnings(config: &FixerConfig, store: &Store) -> Result<usize>
         count += 1;
     }
     Ok(count)
+}
+
+fn collect_postgres_collation_mismatches(store: &Store) -> Result<usize> {
+    if !store.capability_available("psql")? || !store.capability_available("pg_lsclusters")? {
+        return Ok(0);
+    }
+    let output = command_output("pg_lsclusters", &["--json"]).unwrap_or_default();
+    if output.trim().is_empty() {
+        return Ok(0);
+    }
+    let clusters: Vec<PostgresClusterEntry> = serde_json::from_str(&output).unwrap_or_default();
+    let mut count = 0;
+    let mut assessed_clusters = Vec::new();
+    let mut current_fingerprints = Vec::new();
+    for cluster in clusters.into_iter().filter(|cluster| cluster.running != 0) {
+        let Some((mismatches, warning_excerpt)) = postgres_collation_mismatches(&cluster) else {
+            continue;
+        };
+        assessed_clusters.push((cluster.version.to_string(), cluster.cluster.clone()));
+        for mismatch in mismatches {
+            let (affected_index_candidates, candidate_warning_excerpt) =
+                postgres_collation_index_candidates(&cluster, &mismatch.database_name);
+            let package_name = Some(format!("postgresql-{}", cluster.version));
+            let artifact = ObservedArtifact {
+                kind: "postgres-cluster".to_string(),
+                name: format!("{}/{}", cluster.version, cluster.cluster),
+                path: cluster.configdir.as_ref().map(PathBuf::from),
+                package_name,
+                repo_root: None,
+                ecosystem: Some("postgres".to_string()),
+                metadata: json!({
+                    "source": "postgres-collation-check",
+                    "cluster": cluster.cluster,
+                    "version": cluster.version,
+                    "port": cluster.port,
+                    "socketdir": cluster.socketdir,
+                    "configdir": cluster.configdir,
+                    "logfile": cluster.logfile,
+                }),
+            };
+            let summary = format!(
+                "Database `{}` on PostgreSQL cluster {}/{} stores collation version `{}` but the system now reports `{}`.",
+                mismatch.database_name,
+                cluster.version,
+                cluster.cluster,
+                mismatch.stored_collation_version,
+                mismatch.actual_collation_version,
+            );
+            let fingerprint = hash_text(format!(
+                "postgres-collation:{}:{}:{}:{}:{}",
+                cluster.version,
+                cluster.cluster,
+                mismatch.database_name,
+                mismatch.stored_collation_version,
+                mismatch.actual_collation_version
+            ));
+            current_fingerprints.push(fingerprint.clone());
+            let finding = FindingInput {
+                kind: "warning".to_string(),
+                title: format!(
+                    "PostgreSQL collation mismatch in {} on {}/{}",
+                    mismatch.database_name, cluster.version, cluster.cluster
+                ),
+                severity: "high".to_string(),
+                fingerprint,
+                summary,
+                details: json!({
+                    "subsystem": "postgres-collation",
+                    "cluster_name": cluster.cluster,
+                    "cluster_version": cluster.version,
+                    "port": cluster.port,
+                    "socketdir": cluster.socketdir,
+                    "configdir": cluster.configdir,
+                    "logfile": cluster.logfile,
+                    "database_name": mismatch.database_name,
+                    "stored_collation_version": mismatch.stored_collation_version,
+                    "actual_collation_version": mismatch.actual_collation_version,
+                    "affected_index_candidates": affected_index_candidates,
+                    "pg_amcheck_path": find_postgres_binary("pg_amcheck")
+                        .map(|path| path.display().to_string()),
+                    "detection_warning_excerpt": candidate_warning_excerpt.or_else(|| warning_excerpt.clone()),
+                    "detection_query": POSTGRES_COLLATION_QUERY,
+                    "psql_connect_command": format!("psql -p {} -U postgres -d {}", cluster.port, mismatch.database_name),
+                    "affected_indexes_query": POSTGRES_AFFECTED_INDEXES_QUERY,
+                    "refresh_collation_command": format!("ALTER DATABASE {} REFRESH COLLATION VERSION;", sql_ident(&mismatch.database_name)),
+                    "recommended_order": [
+                        "List collation-dependent btree indexes in the affected database.",
+                        "Run pg_amcheck first if it is available to catch obvious index failures.",
+                        "Reindex the affected indexes instead of the whole database.",
+                        "Refresh the recorded collation version with ALTER DATABASE ... REFRESH COLLATION VERSION.",
+                        "Retest application queries that depend on locale-sensitive ordering."
+                    ],
+                }),
+                artifact: Some(artifact),
+                repo_root: None,
+                ecosystem: Some("postgres".to_string()),
+            };
+            let _ = store.record_finding(&finding)?;
+            count += 1;
+        }
+    }
+    if !assessed_clusters.is_empty() {
+        store.prune_postgres_collation_findings(&assessed_clusters, &current_fingerprints)?;
+    }
+    Ok(count)
+}
+
+const POSTGRES_COLLATION_QUERY: &str = "SELECT datname, COALESCE(datcollversion, ''), COALESCE(pg_database_collation_actual_version(oid), '') FROM pg_database WHERE datallowconn AND datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid) ORDER BY datname";
+
+const POSTGRES_AFFECTED_INDEXES_QUERY: &str = "SELECT DISTINCT indrelid::regclass::text, indexrelid::regclass::text, collname, pg_get_indexdef(indexrelid) FROM (SELECT indexrelid, indrelid, indcollation[i] coll FROM pg_index, generate_subscripts(indcollation, 1) g(i)) s JOIN pg_class index_class ON index_class.oid = indexrelid JOIN pg_am am ON am.oid = index_class.relam JOIN pg_collation c ON coll = c.oid WHERE am.amname = 'btree' AND collprovider IN ('d', 'c') AND collname NOT IN ('C', 'POSIX') ORDER BY 1, 2";
+
+fn postgres_collation_mismatches(
+    cluster: &PostgresClusterEntry,
+) -> Option<(Vec<PostgresCollationMismatch>, Option<String>)> {
+    if command_exists("runuser") {
+        if let Some((stdout, stderr)) =
+            postgres_query_via_runuser(cluster.port.as_str(), POSTGRES_COLLATION_QUERY)
+        {
+            return Some((
+                parse_postgres_collation_mismatch_rows(&stdout),
+                trimmed_nonempty(stderr),
+            ));
+        }
+    }
+    if let Some((stdout, stderr)) =
+        postgres_query_direct(cluster.port.as_str(), POSTGRES_COLLATION_QUERY)
+    {
+        return Some((
+            parse_postgres_collation_mismatch_rows(&stdout),
+            trimmed_nonempty(stderr),
+        ));
+    }
+    None
+}
+
+fn postgres_collation_index_candidates(
+    cluster: &PostgresClusterEntry,
+    database_name: &str,
+) -> (Vec<PostgresIndexCandidate>, Option<String>) {
+    if command_exists("runuser") {
+        if let Some((stdout, stderr)) = postgres_query_via_runuser_for_db(
+            cluster.port.as_str(),
+            database_name,
+            POSTGRES_AFFECTED_INDEXES_QUERY,
+        ) {
+            return (
+                parse_postgres_index_candidate_rows(&stdout),
+                trimmed_nonempty(stderr),
+            );
+        }
+    }
+    if let Some((stdout, stderr)) = postgres_query_direct_for_db(
+        cluster.port.as_str(),
+        database_name,
+        POSTGRES_AFFECTED_INDEXES_QUERY,
+    ) {
+        return (
+            parse_postgres_index_candidate_rows(&stdout),
+            trimmed_nonempty(stderr),
+        );
+    }
+    (Vec::new(), None)
+}
+
+fn postgres_query_via_runuser(port: &str, query: &str) -> Option<(String, String)> {
+    postgres_query_via_runuser_for_db(port, "postgres", query)
+}
+
+fn postgres_query_via_runuser_for_db(
+    port: &str,
+    database_name: &str,
+    query: &str,
+) -> Option<(String, String)> {
+    let output = Command::new("runuser")
+        .args([
+            "-u",
+            "postgres",
+            "--",
+            "psql",
+            "-p",
+            port,
+            "-d",
+            database_name,
+            "-A",
+            "-t",
+            "-F",
+            "\t",
+            "-c",
+            query,
+        ])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some((
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn postgres_query_direct(port: &str, query: &str) -> Option<(String, String)> {
+    postgres_query_direct_for_db(port, "postgres", query)
+}
+
+fn postgres_query_direct_for_db(
+    port: &str,
+    database_name: &str,
+    query: &str,
+) -> Option<(String, String)> {
+    let output = Command::new("psql")
+        .args([
+            "-p",
+            port,
+            "-U",
+            "postgres",
+            "-d",
+            database_name,
+            "-A",
+            "-t",
+            "-F",
+            "\t",
+            "-c",
+            query,
+        ])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some((
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn parse_postgres_collation_mismatch_rows(output: &str) -> Vec<PostgresCollationMismatch> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let database_name = parts.next()?.trim();
+            let stored_collation_version = parts.next()?.trim();
+            let actual_collation_version = parts.next()?.trim();
+            if database_name.is_empty()
+                || stored_collation_version.is_empty()
+                || actual_collation_version.is_empty()
+                || stored_collation_version == actual_collation_version
+            {
+                return None;
+            }
+            Some(PostgresCollationMismatch {
+                database_name: database_name.to_string(),
+                stored_collation_version: stored_collation_version.to_string(),
+                actual_collation_version: actual_collation_version.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_postgres_index_candidate_rows(output: &str) -> Vec<PostgresIndexCandidate> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            Some(PostgresIndexCandidate {
+                table_name: parts.next()?.trim().to_string(),
+                index_name: parts.next()?.trim().to_string(),
+                collation_name: parts.next()?.trim().to_string(),
+                index_definition: parts.next()?.trim().to_string(),
+            })
+        })
+        .filter(|candidate| {
+            !candidate.table_name.is_empty()
+                && !candidate.index_name.is_empty()
+                && !candidate.index_definition.is_empty()
+        })
+        .collect()
+}
+
+fn trimmed_nonempty(raw: String) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn sql_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn extend_unique_log_lines(lines: &mut Vec<String>, seen: &mut BTreeSet<String>, output: &str) {
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if seen.insert(line.to_string()) {
+            lines.push(line.to_string());
+        }
+    }
+}
+
+fn kernel_warning_artifact_from_line(line: &str) -> Option<ObservedArtifact> {
+    if !command_exists("modinfo") {
+        return None;
+    }
+    for module in kernel_warning_module_candidates(line) {
+        for lookup_name in kernel_module_lookup_names(&module) {
+            let Ok(output) = command_output("modinfo", &["-n", &lookup_name]) else {
+                continue;
+            };
+            let Some(path_line) = output.lines().next().map(str::trim) else {
+                continue;
+            };
+            let module_path = PathBuf::from(path_line);
+            if !module_path.exists() {
+                continue;
+            }
+            return Some(ObservedArtifact {
+                kind: "kernel-module".to_string(),
+                name: module.clone(),
+                path: Some(module_path.clone()),
+                package_name: map_kernel_module_to_package(&module_path, &module),
+                repo_root: None,
+                ecosystem: None,
+                metadata: json!({
+                    "source": "kernel-warning",
+                    "module": module,
+                    "lookup_name": lookup_name,
+                }),
+            });
+        }
+    }
+    None
+}
+
+fn map_kernel_module_to_package(module_path: &Path, module: &str) -> Option<String> {
+    map_path_to_package(module_path)
+        .or_else(|| dkms_module_package(module_path, module))
+        .or_else(|| kernel_module_package_hint(module_path, module))
+}
+
+fn dkms_module_package(module_path: &Path, module: &str) -> Option<String> {
+    let path_text = module_path.to_string_lossy();
+    if !path_text.contains("/updates/dkms/") {
+        return None;
+    }
+    let release = kernel_module_release(module_path)?;
+    let module_names = dkms_module_names(module_path, module);
+    if let Some((module_name, version)) = dkms_status_version(&module_names, &release) {
+        if let Some(package_name) = map_dkms_source_to_package(&module_name, &version) {
+            return Some(package_name);
+        }
+    }
+    let version = command_output_os(
+        "modinfo",
+        &[
+            OsStr::new("-F"),
+            OsStr::new("version"),
+            module_path.as_os_str(),
+        ],
+    )
+    .ok()?;
+    for module_name in module_names {
+        if let Some(package_name) = map_dkms_source_to_package(&module_name, version.trim()) {
+            return Some(package_name);
+        }
+    }
+    None
+}
+
+fn dkms_status_version(module_names: &[String], release: &str) -> Option<(String, String)> {
+    if !command_exists("dkms") {
+        return None;
+    }
+    let output = command_output("dkms", &["status"]).ok()?;
+    output
+        .lines()
+        .filter_map(parse_dkms_status_line)
+        .find(|entry| {
+            entry.kernel_release == release
+                && module_names
+                    .iter()
+                    .any(|module_name| module_name == &entry.module_name)
+        })
+        .map(|entry| (entry.module_name, entry.version))
+}
+
+fn parse_dkms_status_line(line: &str) -> Option<DkmsStatusEntry> {
+    let (prefix, rest) = line.split_once(',')?;
+    let (module_name, version) = prefix.trim().split_once('/')?;
+    let (kernel_release, status_section) = rest.trim().split_once(',')?;
+    let status = status_section
+        .split_once(':')
+        .map(|(_, status)| status.trim())
+        .unwrap_or_else(|| status_section.trim());
+    Some(DkmsStatusEntry {
+        module_name: module_name.trim().to_string(),
+        version: version.trim().to_string(),
+        kernel_release: kernel_release.trim().to_string(),
+        status: status.to_string(),
+    })
+}
+
+fn map_dkms_source_to_package(module_name: &str, version: &str) -> Option<String> {
+    let source_tree = Path::new("/usr/src").join(format!("{module_name}-{version}"));
+    if !source_tree.exists() {
+        return None;
+    }
+    map_path_to_package(&source_tree)
+}
+
+fn dkms_module_names(module_path: &Path, module: &str) -> Vec<String> {
+    let mut names = kernel_module_lookup_names(module);
+    if let Some(file_hint) = stripped_module_file_name(module_path) {
+        names.push(file_hint);
+    }
+    dedupe_preserve_order(names)
+}
+
+fn stripped_module_file_name(module_path: &Path) -> Option<String> {
+    let file_name = module_path.file_name()?.to_str()?;
+    let uncompressed = file_name
+        .strip_suffix(".xz")
+        .or_else(|| file_name.strip_suffix(".zst"))
+        .unwrap_or(file_name);
+    let module_name = uncompressed.strip_suffix(".ko").unwrap_or(uncompressed);
+    if module_name.is_empty() {
+        None
+    } else {
+        Some(module_name.to_string())
+    }
+}
+
+fn kernel_module_package_hint(module_path: &Path, module: &str) -> Option<String> {
+    let path_text = module_path.to_string_lossy();
+    if path_text.contains("/updates/dkms/") {
+        if module.starts_with("nvidia") || path_text.contains("/nvidia-current") {
+            return Some("nvidia-kernel-dkms".to_string());
+        }
+        return None;
+    }
+    if module.starts_with("nvidia") || path_text.contains("/nvidia-current") {
+        return Some("nvidia-driver".to_string());
+    }
+    let release = kernel_module_release(module_path);
+    release.map(|release| format!("linux-image-{release}"))
+}
+
+fn kernel_module_release(module_path: &Path) -> Option<String> {
+    module_path
+        .components()
+        .collect::<Vec<_>>()
+        .windows(3)
+        .find_map(|window| match window {
+            [a, b, c]
+                if a.as_os_str() == OsStr::new("lib") && b.as_os_str() == OsStr::new("modules") =>
+            {
+                c.as_os_str().to_str().map(ToString::to_string)
+            }
+            _ => None,
+        })
+}
+
+fn kernel_warning_module_candidates(line: &str) -> Vec<String> {
+    let message = line
+        .split_once(" kernel: ")
+        .map(|(_, message)| message)
+        .unwrap_or(line)
+        .trim();
+    let mut candidates = Vec::new();
+    if message.starts_with("NVRM:") {
+        candidates.push("nvidia".to_string());
+    }
+    if let Some(module) = bracketed_kernel_module_name(message) {
+        candidates.push(module);
+    }
+    if let Some(first_token) = message.split_whitespace().next() {
+        let candidate = first_token.trim_end_matches(':');
+        if is_plausible_kernel_module_name(candidate) {
+            candidates.push(candidate.to_string());
+        }
+    }
+    dedupe_preserve_order(candidates)
+}
+
+fn kernel_module_lookup_names(module: &str) -> Vec<String> {
+    let mut names = vec![module.to_string()];
+    if module == "nvidia" {
+        names.push("nvidia-current".to_string());
+    } else if let Some(suffix) = module.strip_prefix("nvidia_") {
+        names.push(format!("nvidia-current-{suffix}"));
+    }
+    dedupe_preserve_order(names)
+}
+
+fn bracketed_kernel_module_name(message: &str) -> Option<String> {
+    let start = message.rfind('[')?;
+    let end = message.rfind(']')?;
+    if end <= start + 1 {
+        return None;
+    }
+    let candidate = &message[start + 1..end];
+    if is_plausible_kernel_module_name(candidate) {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+fn is_plausible_kernel_module_name(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && candidate
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+}
+
+fn dedupe_preserve_order(values: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            result.push(value);
+        }
+    }
+    result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DkmsStatusEntry {
+    module_name: String,
+    version: String,
+    kernel_release: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PostgresClusterEntry {
+    cluster: String,
+    version: i64,
+    port: String,
+    running: i64,
+    socketdir: Option<String>,
+    configdir: Option<String>,
+    logfile: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostgresCollationMismatch {
+    database_name: String,
+    stored_collation_version: String,
+    actual_collation_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PostgresIndexCandidate {
+    table_name: String,
+    index_name: String,
+    collation_name: String,
+    index_definition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedAppArmorDenial {
+    profile: String,
+    comm: Option<String>,
+    operation: Option<String>,
+    class: Option<String>,
+    info: Option<String>,
+    name: Option<String>,
+    family: Option<String>,
+    sock_type: Option<String>,
+    requested: Option<String>,
+    denied: Option<String>,
+    pid: Option<i64>,
+}
+
+impl ParsedAppArmorDenial {
+    fn actor_display_name(&self) -> String {
+        profile_display_name(&self.profile)
+            .or_else(|| self.comm.clone())
+            .unwrap_or_else(|| self.profile.clone())
+    }
+
+    fn mediated_actor_display_name(&self) -> String {
+        let actor = self.actor_display_name();
+        match self.comm.as_deref() {
+            Some(comm) if !comm.trim().is_empty() && comm != actor => format!("{actor} via {comm}"),
+            _ => actor,
+        }
+    }
+
+    fn executable_path(&self) -> Option<PathBuf> {
+        resolve_profile_or_command_path(&self.profile, self.comm.as_deref())
+    }
+
+    fn summary(&self) -> String {
+        let actor = self.mediated_actor_display_name();
+        let operation = self.operation.as_deref().unwrap_or("access");
+        if let Some(name) = &self.name {
+            return format!("AppArmor denied {actor}: {operation} {name}");
+        }
+        if let Some(class) = &self.class {
+            let mut summary = format!("AppArmor denied {actor}: {operation} {class}");
+            if let Some(family) = &self.family {
+                summary.push(' ');
+                summary.push_str(family);
+            }
+            if let Some(sock_type) = &self.sock_type {
+                summary.push('/');
+                summary.push_str(sock_type);
+            }
+            return summary;
+        }
+        if let Some(info) = &self.info {
+            return format!("AppArmor denied {actor}: {operation} ({info})");
+        }
+        format!("AppArmor denied {actor}: {operation}")
+    }
+}
+
+fn apparmor_finding_from_kernel_line(line: &str) -> Option<FindingInput> {
+    let denial = parse_apparmor_denial(line)?;
+    let executable_path = denial.executable_path();
+    let artifact = executable_path.as_ref().map(|path| ObservedArtifact {
+        kind: "binary".to_string(),
+        name: denial.actor_display_name(),
+        path: Some(path.clone()),
+        package_name: map_path_to_package(path),
+        repo_root: None,
+        ecosystem: None,
+        metadata: json!({
+            "source": "journalctl",
+            "profile": denial.profile,
+            "comm": denial.comm,
+        }),
+    });
+    let fingerprint = hash_text(format!(
+        "apparmor-warning:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        denial.profile,
+        denial.comm.as_deref().unwrap_or(""),
+        denial.operation.as_deref().unwrap_or(""),
+        denial.class.as_deref().unwrap_or(""),
+        denial.name.as_deref().unwrap_or(""),
+        denial.family.as_deref().unwrap_or(""),
+        denial.sock_type.as_deref().unwrap_or(""),
+        denial.requested.as_deref().unwrap_or(""),
+        denial.denied.as_deref().unwrap_or(""),
+    ));
+    Some(FindingInput {
+        kind: "warning".to_string(),
+        title: format!("AppArmor denial in {}", denial.actor_display_name()),
+        severity: "medium".to_string(),
+        fingerprint,
+        summary: denial.summary(),
+        details: json!({
+            "line": line,
+            "subsystem": "apparmor",
+            "profile": denial.profile,
+            "comm": denial.comm,
+            "operation": denial.operation,
+            "class": denial.class,
+            "info": denial.info,
+            "name": denial.name,
+            "family": denial.family,
+            "sock_type": denial.sock_type,
+            "requested": denial.requested,
+            "denied": denial.denied,
+            "pid": denial.pid,
+        }),
+        artifact,
+        repo_root: None,
+        ecosystem: None,
+    })
+}
+
+fn parse_apparmor_denial(line: &str) -> Option<ParsedAppArmorDenial> {
+    if !line.contains("apparmor=\"DENIED\"") {
+        return None;
+    }
+    let kernel_message = line
+        .split_once(" kernel: ")
+        .map(|(_, message)| message)
+        .unwrap_or(line);
+    let fields = parse_key_value_fields(kernel_message);
+    if fields.get("apparmor").map(String::as_str) != Some("DENIED") {
+        return None;
+    }
+    let profile = fields.get("profile")?.to_string();
+    Some(ParsedAppArmorDenial {
+        profile,
+        comm: fields.get("comm").cloned(),
+        operation: fields.get("operation").cloned(),
+        class: fields.get("class").cloned(),
+        info: fields.get("info").cloned(),
+        name: fields.get("name").cloned(),
+        family: fields.get("family").cloned(),
+        sock_type: fields.get("sock_type").cloned(),
+        requested: fields
+            .get("requested")
+            .or_else(|| fields.get("requested_mask"))
+            .cloned(),
+        denied: fields
+            .get("denied")
+            .or_else(|| fields.get("denied_mask"))
+            .cloned(),
+        pid: fields
+            .get("pid")
+            .and_then(|value| value.parse::<i64>().ok()),
+    })
+}
+
+fn parse_key_value_fields(raw: &str) -> HashMap<String, String> {
+    let mut fields = HashMap::new();
+    let bytes = raw.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        let key_start = index;
+        while index < bytes.len() && bytes[index] != b'=' && !bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || bytes[index] != b'=' {
+            while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            continue;
+        }
+        let key = raw[key_start..index].trim();
+        index += 1;
+        if index >= bytes.len() {
+            break;
+        }
+        let value = if bytes[index] == b'"' {
+            index += 1;
+            let value_start = index;
+            while index < bytes.len() && bytes[index] != b'"' {
+                index += 1;
+            }
+            let value = raw[value_start..index].to_string();
+            if index < bytes.len() {
+                index += 1;
+            }
+            value
+        } else {
+            let value_start = index;
+            while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            raw[value_start..index].to_string()
+        };
+        if !key.is_empty() {
+            fields.insert(key.to_string(), value);
+        }
+    }
+    fields
+}
+
+fn is_low_signal_kernel_warning(line: &str) -> bool {
+    line.contains("kauditd_printk_skb:") && line.contains("callbacks suppressed")
+}
+
+fn profile_display_name(profile: &str) -> Option<String> {
+    let path = Path::new(profile);
+    if path.is_absolute() {
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .map(ToString::to_string)
+    } else if !profile.trim().is_empty() {
+        Some(profile.to_string())
+    } else {
+        None
+    }
+}
+
+fn resolve_profile_or_command_path(profile: &str, comm: Option<&str>) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if Path::new(profile).is_absolute() {
+        candidates.push(PathBuf::from(profile));
+    }
+    if let Some(name) = profile_display_name(profile) {
+        candidates.push(Path::new("/usr/sbin").join(&name));
+        candidates.push(Path::new("/usr/bin").join(&name));
+        candidates.push(Path::new("/sbin").join(&name));
+        candidates.push(Path::new("/bin").join(&name));
+        candidates.push(Path::new("/usr/libexec").join(&name));
+    }
+    if let Some(comm) = comm.filter(|value| !value.trim().is_empty()) {
+        candidates.push(Path::new("/usr/sbin").join(comm));
+        candidates.push(Path::new("/usr/bin").join(comm));
+        candidates.push(Path::new("/sbin").join(comm));
+        candidates.push(Path::new("/bin").join(comm));
+        candidates.push(Path::new("/usr/libexec").join(comm));
+    }
+    candidates.into_iter().find(|candidate| candidate.exists())
 }
 
 fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
@@ -406,7 +1244,10 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
         }
         let finding = FindingInput {
             kind: "hotspot".to_string(),
-            title: format!("Perf hotspot: {}", parts.get(1).copied().unwrap_or("unknown")),
+            title: format!(
+                "Perf hotspot: {}",
+                parts.get(1).copied().unwrap_or("unknown")
+            ),
             severity: "medium".to_string(),
             fingerprint: hash_text(format!("hotspot:{trimmed}")),
             summary: trimmed.to_string(),
@@ -665,9 +1506,7 @@ fn parse_stack_frame(frame: &str) -> ParsedStackFrame {
     let mut offset = None;
     if let Some(paren_start) = rest.rfind(" (") {
         symbol = rest[..paren_start].trim().to_string();
-        let raw_object = rest[paren_start + 2..]
-            .trim_end_matches(')')
-            .to_string();
+        let raw_object = rest[paren_start + 2..].trim_end_matches(')').to_string();
         if let Some((candidate_object, candidate_offset)) = raw_object.split_once(" + ") {
             object = Some(candidate_object.trim().to_string());
             offset = candidate_offset
@@ -675,14 +1514,17 @@ fn parse_stack_frame(frame: &str) -> ParsedStackFrame {
                 .trim_start_matches("0x")
                 .parse::<u64>()
                 .ok()
-                .or_else(|| u64::from_str_radix(candidate_offset.trim().trim_start_matches("0x"), 16).ok());
+                .or_else(|| {
+                    u64::from_str_radix(candidate_offset.trim().trim_start_matches("0x"), 16).ok()
+                });
         } else if !raw_object.trim().is_empty() {
             object = Some(raw_object.trim().to_string());
         }
     }
     ParsedStackFrame {
         raw: trimmed.to_string(),
-        normalized: format_stack_frame(&symbol, object.as_deref()).unwrap_or_else(|| rest.to_string()),
+        normalized: format_stack_frame(&symbol, object.as_deref())
+            .unwrap_or_else(|| rest.to_string()),
         symbol,
         object,
         offset,
@@ -823,21 +1665,11 @@ fn symbol_from_addr2line(object: &Path, offset: u64) -> Option<String> {
         return None;
     }
     let rendered = String::from_utf8_lossy(&output.stdout);
-    let line = rendered
-        .lines()
-        .next()
-        .map(str::trim)
-        .unwrap_or("");
+    let line = rendered.lines().next().map(str::trim).unwrap_or("");
     if line.is_empty() || line.starts_with("??") {
         return None;
     }
-    Some(
-        line.split(" at ")
-            .next()
-            .unwrap_or(line)
-            .trim()
-            .to_string(),
-    )
+    Some(line.split(" at ").next().unwrap_or(line).trim().to_string())
 }
 
 fn nearest_dynamic_symbol(
@@ -863,10 +1695,7 @@ fn nearest_dynamic_symbol(
 }
 
 fn load_dynamic_symbols(object: &Path) -> Vec<(u64, String)> {
-    let output = Command::new("nm")
-        .args(["-D", "-n"])
-        .arg(object)
-        .output();
+    let output = Command::new("nm").args(["-D", "-n"]).arg(object).output();
     let Ok(output) = output else {
         return Vec::new();
     };
@@ -906,13 +1735,16 @@ fn available_debug_packages_for(object: &str) -> Vec<String> {
     candidate_debug_packages(&package_name)
         .into_iter()
         .filter(|candidate| {
-            command_output("apt-cache", &["search", "--names-only", &format!("^{candidate}$")])
-                .map(|output| {
-                    output
-                        .lines()
-                        .any(|line| line.split_whitespace().next() == Some(candidate.as_str()))
-                })
-                .unwrap_or(false)
+            command_output(
+                "apt-cache",
+                &["search", "--names-only", &format!("^{candidate}$")],
+            )
+            .map(|output| {
+                output
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(candidate.as_str()))
+            })
+            .unwrap_or(false)
         })
         .collect()
 }
@@ -938,13 +1770,150 @@ fn frame_is_useful(frame: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{looks_like_warning, parse_coredump_info};
+    use super::{
+        apparmor_finding_from_kernel_line, extend_unique_log_lines, is_low_signal_kernel_warning,
+        kernel_module_lookup_names, kernel_module_package_hint, kernel_warning_module_candidates,
+        looks_like_warning, parse_apparmor_denial, parse_coredump_info, parse_dkms_status_line,
+        parse_postgres_collation_mismatch_rows,
+    };
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+    use std::path::Path;
 
     #[test]
     fn warning_detection_handles_common_keywords() {
         assert!(looks_like_warning("warning: something happened"));
         assert!(looks_like_warning("ERROR: boom"));
         assert!(!looks_like_warning("all good"));
+    }
+
+    #[test]
+    fn parses_apparmor_denial_lines() {
+        let line = "Mar 28 18:59:23 smallcat kernel: audit: type=1400 audit(1774709963.724:166286): apparmor=\"DENIED\" operation=\"open\" class=\"file\" profile=\"/usr/sbin/cupsd\" name=\"/etc/paperspecs\" pid=934836 comm=\"cupsd\" requested_mask=\"r\" denied_mask=\"r\" fsuid=0 ouid=0";
+        let parsed = parse_apparmor_denial(line).expect("AppArmor line should parse");
+        assert_eq!(parsed.profile, "/usr/sbin/cupsd");
+        assert_eq!(parsed.comm.as_deref(), Some("cupsd"));
+        assert_eq!(parsed.operation.as_deref(), Some("open"));
+        assert_eq!(parsed.class.as_deref(), Some("file"));
+        assert_eq!(parsed.name.as_deref(), Some("/etc/paperspecs"));
+    }
+
+    #[test]
+    fn apparmor_denials_become_structured_warning_findings() {
+        let line = "Mar 28 18:58:46 smallcat kernel: audit: type=1400 audit(1774709926.444:166268): apparmor=\"DENIED\" operation=\"create\" class=\"net\" info=\"failed protocol match\" error=-13 profile=\"rsyslogd\" pid=928892 comm=\"rsyslogd\" family=\"unix\" sock_type=\"dgram\" protocol=0 requested=\"create\" denied=\"create\" addr=none";
+        let finding =
+            apparmor_finding_from_kernel_line(line).expect("AppArmor finding should be created");
+        assert_eq!(finding.title, "AppArmor denial in rsyslogd");
+        assert_eq!(
+            finding.summary,
+            "AppArmor denied rsyslogd: create net unix/dgram"
+        );
+        assert_eq!(
+            finding.details.get("subsystem").and_then(Value::as_str),
+            Some("apparmor")
+        );
+    }
+
+    #[test]
+    fn ignores_low_signal_kernel_suppression_lines() {
+        let line = "Mar 28 18:59:23 smallcat kernel: kauditd_printk_skb: 4 callbacks suppressed";
+        assert!(is_low_signal_kernel_warning(line));
+        assert!(apparmor_finding_from_kernel_line(line).is_none());
+    }
+
+    #[test]
+    fn apparmor_summary_surfaces_mediating_command_when_it_differs() {
+        let line = "Mar 28 18:59:23 smallcat kernel: audit: type=1400 audit(1774709963.724:166286): apparmor=\"DENIED\" operation=\"create\" class=\"net\" info=\"failed protocol match\" error=-13 profile=\"/usr/sbin/cupsd\" pid=934836 comm=\"dbus\" family=\"unix\" sock_type=\"stream\" protocol=0 requested=\"create\" denied=\"create\" addr=none";
+        let finding =
+            apparmor_finding_from_kernel_line(line).expect("AppArmor finding should be created");
+        assert_eq!(
+            finding.summary,
+            "AppArmor denied cupsd via dbus: create net unix/stream"
+        );
+    }
+
+    #[test]
+    fn merged_kernel_log_streams_dedupe_and_preserve_order() {
+        let mut lines = Vec::new();
+        let mut seen = BTreeSet::new();
+        extend_unique_log_lines(&mut lines, &mut seen, "a\nb\n");
+        extend_unique_log_lines(&mut lines, &mut seen, "b\nc\n");
+        assert_eq!(lines, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn kernel_warning_candidates_extract_module_from_device_warning() {
+        let line = "Mar 28 18:47:22 nucat kernel: iwlwifi 0000:04:00.0: missed_beacons:21, missed_beacons_since_rx:3";
+        assert_eq!(kernel_warning_module_candidates(line), vec!["iwlwifi"]);
+    }
+
+    #[test]
+    fn kernel_warning_candidates_map_nvrm_to_nvidia() {
+        let line =
+            "Mar 28 19:30:47 geocint kernel: NVRM: GPU 0000:3b:00.0 is already bound to nouveau.";
+        assert_eq!(kernel_warning_module_candidates(line), vec!["nvidia"]);
+    }
+
+    #[test]
+    fn kernel_warning_candidates_extract_bracketed_module_names() {
+        let line = "Mar 28 19:17:57 geocint kernel: RIP: 0010:nvkm_gr_units+0x9/0x30 [nouveau]";
+        assert_eq!(kernel_warning_module_candidates(line), vec!["nouveau"]);
+    }
+
+    #[test]
+    fn kernel_module_lookup_names_include_debian_nvidia_aliases() {
+        assert_eq!(
+            kernel_module_lookup_names("nvidia_uvm"),
+            vec!["nvidia_uvm", "nvidia-current-uvm"]
+        );
+        assert_eq!(
+            kernel_module_lookup_names("nvidia"),
+            vec!["nvidia", "nvidia-current"]
+        );
+    }
+
+    #[test]
+    fn kernel_module_package_hint_uses_running_kernel_image_for_in_tree_modules() {
+        let path = Path::new(
+            "/lib/modules/6.19.8+deb14-amd64/kernel/drivers/net/wireless/intel/iwlwifi/iwlwifi.ko.xz",
+        );
+        assert_eq!(
+            kernel_module_package_hint(path, "iwlwifi"),
+            Some("linux-image-6.19.8+deb14-amd64".to_string())
+        );
+    }
+
+    #[test]
+    fn kernel_module_package_hint_maps_nvidia_dkms_modules_to_nvidia_kernel_dkms() {
+        let path = Path::new("/lib/modules/6.17.10+deb14-amd64/updates/dkms/nvidia-current.ko.xz");
+        assert_eq!(
+            kernel_module_package_hint(path, "nvidia"),
+            Some("nvidia-kernel-dkms".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_dkms_status_entries() {
+        let entry = parse_dkms_status_line(
+            "nvidia-current/550.163.01, 6.17.10+deb14-amd64, x86_64: installed",
+        )
+        .expect("dkms status line should parse");
+        assert_eq!(entry.module_name, "nvidia-current");
+        assert_eq!(entry.version, "550.163.01");
+        assert_eq!(entry.kernel_release, "6.17.10+deb14-amd64");
+        assert_eq!(entry.status, "installed");
+    }
+
+    #[test]
+    fn parses_postgres_collation_mismatch_rows_from_tsv() {
+        let rows = parse_postgres_collation_mismatch_rows(
+            "batumarket\t2.42\t2.43\npostgres\t2.42\t2.43\nfixer\t2.43\t2.43\n",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].database_name, "batumarket");
+        assert_eq!(rows[0].stored_collation_version, "2.42");
+        assert_eq!(rows[0].actual_collation_version, "2.43");
+        assert_eq!(rows[1].database_name, "postgres");
     }
 
     #[test]

@@ -1,5 +1,11 @@
+fixer (0.2.0-1) unstable; urgency=medium
+
+  * Federated collection, PostgreSQL collation handling, and remote aggregation improvements.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 00:10:00 +0400
+
 fixer (0.1.0-1) unstable; urgency=medium
 
   * Initial release.
 
- -- Maumap Fixer Maintainers <fixer@example.invalid>  Sat, 28 Mar 2026 10:30:00 +0400
+ -- Darafei Praliaskouski <me@komzpa.net>  Sat, 28 Mar 2026 10:30:00 +0400

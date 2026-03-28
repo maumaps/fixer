@@ -9,6 +9,14 @@ pub struct FixerConfig {
     pub service: ServiceConfig,
     #[serde(default)]
     pub patch: PatchConfig,
+    #[serde(default)]
+    pub network: NetworkConfig,
+    #[serde(default)]
+    pub participation: ParticipationConfig,
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
+    #[serde(default)]
+    pub server: ServerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,11 +69,79 @@ pub struct PatchConfig {
     pub extra_instructions: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    #[serde(default = "default_server_url")]
+    pub server_url: String,
+    #[serde(default = "default_sync_interval")]
+    pub sync_interval_seconds: u64,
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_seconds: u64,
+    #[serde(default = "default_submission_pow_difficulty")]
+    pub submission_pow_difficulty: u32,
+    #[serde(default = "default_worker_pow_difficulty")]
+    pub worker_pow_difficulty: u32,
+    #[serde(default = "default_max_submission_items")]
+    pub max_submission_items: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParticipationConfig {
+    #[serde(default)]
+    pub mode: crate::models::ParticipationMode,
+    #[serde(default)]
+    pub richer_evidence_allowed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyConfig {
+    #[serde(default = "default_policy_version")]
+    pub policy_version: String,
+    #[serde(default = "default_true")]
+    pub redact_known_secrets: bool,
+    #[serde(default = "default_true")]
+    pub require_opt_in_for_upload: bool,
+    #[serde(default = "default_true")]
+    pub require_secondary_opt_in_for_richer_evidence: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_listen_addr")]
+    pub listen: String,
+    #[serde(default = "default_postgres_url")]
+    pub postgres_url: String,
+    #[serde(default = "default_submission_pow_difficulty")]
+    pub submission_pow_difficulty: u32,
+    #[serde(default = "default_worker_pow_difficulty")]
+    pub worker_pow_difficulty: u32,
+    #[serde(default = "default_max_payload_bytes")]
+    pub max_payload_bytes: usize,
+    #[serde(default = "default_max_submission_items")]
+    pub max_bundle_items: usize,
+    #[serde(default = "default_quarantine_threshold")]
+    pub quarantine_corroboration_threshold: i64,
+    #[serde(default = "default_lease_seconds")]
+    pub lease_seconds: u64,
+    #[serde(default = "default_worker_trust_minimum")]
+    pub worker_trust_minimum: i64,
+    #[serde(default = "default_rate_limit_per_hour")]
+    pub max_submissions_per_hour: i64,
+    #[serde(default = "default_rate_limit_per_hour")]
+    pub max_work_pulls_per_hour: i64,
+    #[serde(default = "default_abuse_threshold")]
+    pub max_abuse_events_before_ban: i64,
+}
+
 impl Default for FixerConfig {
     fn default() -> Self {
         Self {
             service: ServiceConfig::default(),
             patch: PatchConfig::default(),
+            network: NetworkConfig::default(),
+            participation: ParticipationConfig::default(),
+            privacy: PrivacyConfig::default(),
+            server: ServerConfig::default(),
         }
     }
 }
@@ -101,6 +177,58 @@ impl Default for PatchConfig {
             sandbox: Some("workspace-write".to_string()),
             approval_policy: Some("never".to_string()),
             extra_instructions: None,
+        }
+    }
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            server_url: default_server_url(),
+            sync_interval_seconds: default_sync_interval(),
+            connect_timeout_seconds: default_connect_timeout(),
+            submission_pow_difficulty: default_submission_pow_difficulty(),
+            worker_pow_difficulty: default_worker_pow_difficulty(),
+            max_submission_items: default_max_submission_items(),
+        }
+    }
+}
+
+impl Default for ParticipationConfig {
+    fn default() -> Self {
+        Self {
+            mode: crate::models::ParticipationMode::LocalOnly,
+            richer_evidence_allowed: false,
+        }
+    }
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            policy_version: default_policy_version(),
+            redact_known_secrets: true,
+            require_opt_in_for_upload: true,
+            require_secondary_opt_in_for_richer_evidence: true,
+        }
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_listen_addr(),
+            postgres_url: default_postgres_url(),
+            submission_pow_difficulty: default_submission_pow_difficulty(),
+            worker_pow_difficulty: default_worker_pow_difficulty(),
+            max_payload_bytes: default_max_payload_bytes(),
+            max_bundle_items: default_max_submission_items(),
+            quarantine_corroboration_threshold: default_quarantine_threshold(),
+            lease_seconds: default_lease_seconds(),
+            worker_trust_minimum: default_worker_trust_minimum(),
+            max_submissions_per_hour: default_rate_limit_per_hour(),
+            max_work_pulls_per_hour: default_rate_limit_per_hour(),
+            max_abuse_events_before_ban: default_abuse_threshold(),
         }
     }
 }
@@ -157,6 +285,66 @@ fn default_bpftrace_timeout() -> u64 {
 
 fn default_codex_command() -> String {
     "codex".to_string()
+}
+
+fn default_server_url() -> String {
+    "https://fixer.maumaps.org".to_string()
+}
+
+fn default_sync_interval() -> u64 {
+    900
+}
+
+fn default_connect_timeout() -> u64 {
+    20
+}
+
+fn default_submission_pow_difficulty() -> u32 {
+    4
+}
+
+fn default_worker_pow_difficulty() -> u32 {
+    5
+}
+
+fn default_max_submission_items() -> usize {
+    50
+}
+
+fn default_policy_version() -> String {
+    "2026-03-28".to_string()
+}
+
+fn default_listen_addr() -> String {
+    "0.0.0.0:8080".to_string()
+}
+
+fn default_postgres_url() -> String {
+    "postgres://fixer@localhost/fixer".to_string()
+}
+
+fn default_max_payload_bytes() -> usize {
+    512 * 1024
+}
+
+fn default_quarantine_threshold() -> i64 {
+    2
+}
+
+fn default_lease_seconds() -> u64 {
+    900
+}
+
+fn default_worker_trust_minimum() -> i64 {
+    2
+}
+
+fn default_rate_limit_per_hour() -> i64 {
+    60
+}
+
+fn default_abuse_threshold() -> i64 {
+    8
 }
 
 fn default_true() -> bool {

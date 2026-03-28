@@ -163,3 +163,196 @@ pub struct InstalledPackageMetadata {
     pub update_command: Option<String>,
     pub cloneable_homepage: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ParticipationMode {
+    #[default]
+    LocalOnly,
+    Submitter,
+    SubmitterWorker,
+}
+
+impl ParticipationMode {
+    pub fn can_submit(&self) -> bool {
+        !matches!(self, Self::LocalOnly)
+    }
+
+    pub fn can_work(&self) -> bool {
+        matches!(self, Self::SubmitterWorker)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParticipationState {
+    pub mode: ParticipationMode,
+    pub consented_at: Option<String>,
+    pub consent_policy_version: Option<String>,
+    pub consent_policy_digest: Option<String>,
+    pub opt_out_at: Option<String>,
+    pub richer_evidence_allowed: bool,
+}
+
+impl Default for ParticipationState {
+    fn default() -> Self {
+        Self {
+            mode: ParticipationMode::LocalOnly,
+            consented_at: None,
+            consent_policy_version: None,
+            consent_policy_digest: None,
+            opt_out_at: None,
+            richer_evidence_allowed: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallIdentity {
+    pub install_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedOpportunity {
+    pub local_opportunity_id: i64,
+    pub opportunity: OpportunityRecord,
+    pub finding: FindingRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientHello {
+    pub install_id: String,
+    pub version: String,
+    pub mode: ParticipationMode,
+    pub hostname: Option<String>,
+    pub capabilities: Vec<String>,
+    pub has_codex: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofOfWork {
+    pub algorithm: String,
+    pub difficulty: u32,
+    pub issued_at: String,
+    pub nonce: u64,
+    pub payload_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindingBundle {
+    pub captured_at: String,
+    pub policy_version: String,
+    pub status: StatusSnapshot,
+    pub capabilities: Vec<Capability>,
+    pub items: Vec<SharedOpportunity>,
+    pub redactions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionEnvelope {
+    pub client: ClientHello,
+    pub content_hash: String,
+    pub proof_of_work: ProofOfWork,
+    pub bundle: FindingBundle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerHello {
+    pub policy_version: String,
+    pub submission_pow_difficulty: u32,
+    pub worker_pow_difficulty: u32,
+    pub install_trust_score: i64,
+    pub quarantined: bool,
+    pub worker_allowed: bool,
+    pub message: String,
+    pub server_time: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionReceipt {
+    pub submission_id: i64,
+    pub accepted: bool,
+    pub duplicate: bool,
+    pub quarantined: bool,
+    pub promoted_clusters: usize,
+    pub issue_ids: Vec<i64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueCluster {
+    pub id: i64,
+    pub cluster_key: String,
+    pub kind: String,
+    pub title: String,
+    pub summary: String,
+    pub package_name: Option<String>,
+    pub source_package: Option<String>,
+    pub ecosystem: Option<String>,
+    pub severity: Option<String>,
+    pub score: i64,
+    pub corroboration_count: i64,
+    pub quarantined: bool,
+    pub promoted: bool,
+    pub representative: SharedOpportunity,
+    pub best_patch: Option<PatchAttempt>,
+    pub last_seen: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkPullRequest {
+    pub client: ClientHello,
+    pub proof_of_work: ProofOfWork,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkOffer {
+    pub message: String,
+    pub lease: Option<WorkLease>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkLease {
+    pub lease_id: String,
+    pub issued_at: String,
+    pub expires_at: String,
+    pub issue: IssueCluster,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchAttempt {
+    pub cluster_id: i64,
+    pub install_id: String,
+    pub outcome: String,
+    pub state: String,
+    pub summary: String,
+    pub bundle_path: Option<String>,
+    pub output_path: Option<String>,
+    pub validation_status: Option<String>,
+    pub details: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpossibleReason {
+    pub category: String,
+    pub summary: String,
+    pub details: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceUpgradeRequest {
+    pub issue_id: i64,
+    pub requested_by_install_id: Option<String>,
+    pub reason: String,
+    pub requested_fields: Vec<String>,
+    pub requested_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerResultEnvelope {
+    pub lease_id: String,
+    pub attempt: PatchAttempt,
+    pub impossible_reason: Option<ImpossibleReason>,
+    pub evidence_request: Option<EvidenceUpgradeRequest>,
+}

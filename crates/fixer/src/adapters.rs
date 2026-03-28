@@ -90,26 +90,23 @@ impl EcosystemAdapter for NpmAdapter {
         let display_name = value
             .get("name")
             .and_then(Value::as_str)
-            .unwrap_or_else(|| repo_root.file_name().and_then(|x| x.to_str()).unwrap_or("npm-repo"))
+            .unwrap_or_else(|| {
+                repo_root
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or("npm-repo")
+            })
             .to_string();
         let upstream = parse_package_json_url(value.get("repository"));
         let bug_tracker = parse_package_json_url(value.get("bugs"));
         let mut validation = Vec::new();
-        if value
-            .get("scripts")
-            .and_then(|x| x.get("test"))
-            .is_some()
-        {
+        if value.get("scripts").and_then(|x| x.get("test")).is_some() {
             validation.push(ValidationCommand {
                 program: "npm".to_string(),
                 args: vec!["test".to_string()],
             });
         }
-        if value
-            .get("scripts")
-            .and_then(|x| x.get("lint"))
-            .is_some()
-        {
+        if value.get("scripts").and_then(|x| x.get("lint")).is_some() {
             validation.push(ValidationCommand {
                 program: "npm".to_string(),
                 args: vec!["run".to_string(), "lint".to_string()],
@@ -194,8 +191,8 @@ impl EcosystemAdapter for PythonAdapter {
 
     fn inspect_repo(&self, repo_root: &Path) -> Option<RepoInsight> {
         let pyproject = repo_root.join("pyproject.toml");
-        let pyproject_value = read_text(&pyproject)
-            .and_then(|x| toml::from_str::<toml::Value>(&x).ok());
+        let pyproject_value =
+            read_text(&pyproject).and_then(|x| toml::from_str::<toml::Value>(&x).ok());
         let display_name = pyproject_value
             .as_ref()
             .and_then(|x| x.get("project"))
@@ -270,7 +267,12 @@ impl EcosystemAdapter for PgxnAdapter {
         let display_name = value
             .get("name")
             .and_then(Value::as_str)
-            .unwrap_or_else(|| repo_root.file_name().and_then(|x| x.to_str()).unwrap_or("pgxn"))
+            .unwrap_or_else(|| {
+                repo_root
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or("pgxn")
+            })
             .to_string();
         let validation = if repo_root.join("t").exists() {
             vec![ValidationCommand {
@@ -364,7 +366,10 @@ mod tests {
     #[test]
     fn parses_debian_fields() {
         let control = "Source: fixer\nHomepage: https://example.test\n";
-        assert_eq!(parse_debian_field(control, "Source").as_deref(), Some("fixer"));
+        assert_eq!(
+            parse_debian_field(control, "Source").as_deref(),
+            Some("fixer")
+        );
         assert_eq!(
             parse_debian_field(control, "Homepage").as_deref(),
             Some("https://example.test")

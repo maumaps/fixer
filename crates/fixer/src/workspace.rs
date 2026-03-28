@@ -27,8 +27,12 @@ pub fn ensure_workspace_for_opportunity(
         });
     }
 
-    let package_name = package_name_from_opportunity(opportunity)
-        .ok_or_else(|| anyhow!("opportunity {} has no repo root or package name", opportunity.id))?;
+    let package_name = package_name_from_opportunity(opportunity).ok_or_else(|| {
+        anyhow!(
+            "opportunity {} has no repo root or package name",
+            opportunity.id
+        )
+    })?;
     let metadata = resolve_installed_package_metadata(&package_name)?;
 
     if deb_src_enabled() {
@@ -156,9 +160,8 @@ pub fn resolve_installed_package_metadata(package_name: &str) -> Result<Installe
         .zip(candidate_version.as_deref())
         .map(|(installed, candidate)| version_is_newer(candidate, installed))
         .unwrap_or(false);
-    let update_command = upgrade_available.then(|| {
-        format!("sudo apt-get install --only-upgrade {}", package_name)
-    });
+    let update_command =
+        upgrade_available.then(|| format!("sudo apt-get install --only-upgrade {}", package_name));
     let cloneable_homepage = homepage
         .as_deref()
         .map(is_cloneable_repo_url)
@@ -257,7 +260,13 @@ fn ensure_upstream_clone(config: &FixerConfig, source_package: &str, url: &str) 
             .with_context(|| format!("failed to replace stale workspace {}", dest.display()))?;
     }
     let status = Command::new("git")
-        .args(["clone", "--depth", "1", url, dest.to_string_lossy().as_ref()])
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            url,
+            dest.to_string_lossy().as_ref(),
+        ])
         .status()
         .with_context(|| format!("failed to clone upstream repository {}", url))?;
     if !status.success() {
@@ -316,7 +325,10 @@ fn deb_src_enabled() -> bool {
     if let Ok(entries) = fs::read_dir(apt_dir.join("sources.list.d")) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if matches!(path.extension().and_then(|x| x.to_str()), Some("list" | "sources")) {
+            if matches!(
+                path.extension().and_then(|x| x.to_str()),
+                Some("list" | "sources")
+            ) {
                 paths.push(path);
             }
         }
@@ -347,13 +359,17 @@ fn deb_src_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_cloneable_repo_url, parse_apt_origins, parse_maintainer_url, sanitize_dir_name};
+    use super::{
+        is_cloneable_repo_url, parse_apt_origins, parse_maintainer_url, sanitize_dir_name,
+    };
 
     #[test]
     fn detects_cloneable_urls() {
         assert!(is_cloneable_repo_url("https://github.com/uutils/coreutils"));
         assert!(is_cloneable_repo_url("https://example.test/repo.git"));
-        assert!(!is_cloneable_repo_url("https://example.test/project-homepage"));
+        assert!(!is_cloneable_repo_url(
+            "https://example.test/project-homepage"
+        ));
     }
 
     #[test]
@@ -378,7 +394,8 @@ zoom:\n\
     #[test]
     fn parses_url_from_maintainer_field() {
         assert_eq!(
-            parse_maintainer_url("Zoom Communications, Inc. <https://support.zoom.com/hc>").as_deref(),
+            parse_maintainer_url("Zoom Communications, Inc. <https://support.zoom.com/hc>")
+                .as_deref(),
             Some("https://support.zoom.com/hc")
         );
         assert_eq!(
