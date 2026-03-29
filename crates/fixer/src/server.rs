@@ -108,7 +108,8 @@ code, pre {
     flex-wrap: wrap;
 }
 
-.nav-links a {
+.nav-links a,
+.nav-status {
     padding: 0.55rem 0.9rem;
     border-radius: 999px;
     border: 1px solid transparent;
@@ -118,6 +119,12 @@ code, pre {
 .nav-links a:hover {
     border-color: var(--line);
     background: rgba(255, 255, 255, 0.5);
+}
+
+.nav-status {
+    cursor: default;
+    border-color: var(--line);
+    background: rgba(255, 255, 255, 0.4);
 }
 
 .hero,
@@ -335,6 +342,49 @@ code, pre {
         flex-direction: column;
     }
 }
+"#;
+
+const HEALTH_INDICATOR_SCRIPT: &str = r#"
+<script>
+(() => {
+    const indicator = document.getElementById("health-indicator");
+    if (!indicator) {
+        return;
+    }
+
+    const render = (emoji, title) => {
+        indicator.textContent = `${emoji} Health`;
+        indicator.setAttribute("aria-label", title);
+        indicator.title = title;
+    };
+
+    const update = async () => {
+        try {
+            const response = await fetch("/healthz", {
+                headers: { accept: "application/json" },
+                cache: "no-store",
+            });
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            const payload = await response.json();
+            const healthy = payload.status === "ok" && payload.database === "ok";
+            if (healthy) {
+                render("🟢", "Health: server and database are ok");
+                return;
+            }
+            render(
+                "🔴",
+                `Health: server=${payload.status ?? "unknown"}, database=${payload.database ?? "unknown"}`
+            );
+        } catch (_error) {
+            render("🔴", "Health: request failed");
+        }
+    };
+
+    update();
+})();
+</script>
 "#;
 
 #[derive(Clone)]
@@ -4339,7 +4389,7 @@ fn render_page(
             <div class="nav-links">
                 <a class="{}" href="/">Overview</a>
                 <a class="{}" href="/issues">Issues</a>
-                <a href="/healthz">Health</a>
+                <span class="nav-status" id="health-indicator" aria-live="polite" title="Health: checking">⚪ Health</span>
                 <a href="https://github.com/maumaps/fixer">GitHub</a>
                 <a href="/apt/">APT</a>
             </div>
@@ -4347,6 +4397,7 @@ fn render_page(
         {}
         <p class="footer">{}</p>
     </div>
+    {}
 </body>
 </html>"#,
         html_escape(title),
@@ -4354,7 +4405,8 @@ fn render_page(
         home_class,
         issues_class,
         body,
-        html_escape(&footer_note)
+        html_escape(&footer_note),
+        HEALTH_INDICATOR_SCRIPT
     )
 }
 
@@ -4627,6 +4679,22 @@ mod tests {
         assert!(markup.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
         assert!(markup.contains("/v1/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
         assert!(!markup.contains("representative_json"));
+    }
+
+    #[test]
+    fn render_page_uses_live_health_indicator_in_nav() {
+        let markup = render_page(
+            "Fixer",
+            "Public Fixer issue federation",
+            NavPage::Home,
+            "<section>body</section>".to_string(),
+            0,
+        );
+
+        assert!(markup.contains("id=\"health-indicator\""));
+        assert!(markup.contains("⚪ Health"));
+        assert!(markup.contains("fetch(\"/healthz\""));
+        assert!(!markup.contains("href=\"/healthz\""));
     }
 
     #[test]

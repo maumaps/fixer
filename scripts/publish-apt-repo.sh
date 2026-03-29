@@ -23,6 +23,128 @@ DESCRIPTION=${APT_REPO_DESCRIPTION:-Fixer package repository}
 COMPONENT=${APT_REPO_COMPONENT:-main}
 ARCHITECTURES=${APT_REPO_ARCHITECTURES:-"amd64 arm64 source"}
 SUITES=${APT_REPO_SUITES:-}
+PUBLIC_URL=${APT_REPO_PUBLIC_URL:-https://fixer.maumap.com/apt}
+DEFAULT_SUITE=${APT_REPO_DEFAULT_SUITE:-stable}
+
+write_repo_index() {
+    public_url=${PUBLIC_URL%/}
+    key_url="$public_url/fixer-archive-keyring.gpg"
+    source_line="deb [signed-by=/usr/share/keyrings/fixer-archive-keyring.gpg] $public_url $DEFAULT_SUITE $COMPONENT"
+    cat >"$PUBLIC_DIR/index.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fixer APT Repository</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6efe4;
+      --panel: rgba(255, 251, 244, 0.92);
+      --line: rgba(94, 70, 34, 0.18);
+      --text: #2a2012;
+      --muted: #6e5a3c;
+      --accent: #095955;
+      --code-bg: #211a12;
+      --code-fg: #fef3db;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(11, 122, 117, 0.16), transparent 34%),
+        linear-gradient(180deg, #faf6ef 0%, var(--bg) 100%);
+    }
+    main {
+      width: min(980px, calc(100% - 2rem));
+      margin: 0 auto;
+      padding: 2rem 0 3rem;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 1.35rem;
+      box-shadow: 0 18px 40px rgba(66, 45, 15, 0.12);
+      margin-top: 1rem;
+    }
+    h1, h2 { margin-top: 0; }
+    p, li { color: var(--muted); }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      padding: 1rem;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: var(--code-bg);
+      color: var(--code-fg);
+      font-family: "Iosevka Term", "JetBrains Mono", "SFMono-Regular", monospace;
+      font-size: 0.95rem;
+    }
+    code {
+      font-family: "Iosevka Term", "JetBrains Mono", "SFMono-Regular", monospace;
+    }
+    ul {
+      padding-left: 1.1rem;
+    }
+    a {
+      color: var(--accent);
+    }
+    .topline {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      align-items: center;
+    }
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      padding: 0.35rem 0.7rem;
+      background: rgba(255, 255, 255, 0.55);
+      color: var(--accent);
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="panel">
+      <div class="topline">
+        <span class="tag">Fixer APT repository</span>
+        <a class="tag" href="/">Main site</a>
+        <a class="tag" href="./dists/">Browse dists/</a>
+        <a class="tag" href="./pool/">Browse pool/</a>
+      </div>
+      <h1>Install Fixer from APT</h1>
+      <p>Add the public keyring, register the repository, then install <code>fixer</code> with normal APT tooling.</p>
+      <pre><code>sudo install -d -m 0755 /usr/share/keyrings /etc/apt/sources.list.d
+curl -fsSL $key_url -o /usr/share/keyrings/fixer-archive-keyring.gpg
+echo "$source_line" | sudo tee /etc/apt/sources.list.d/fixer.list >/dev/null
+sudo apt update
+sudo apt install fixer</code></pre>
+      <p>The default published suite is <code>$DEFAULT_SUITE</code> with component <code>$COMPONENT</code>.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Useful files</h2>
+      <ul>
+        <li>Binary keyring: <a href="./fixer-archive-keyring.gpg">fixer-archive-keyring.gpg</a></li>
+        <li>ASCII armored key: <a href="./KEY.gpg.asc">KEY.gpg.asc</a></li>
+        <li>Suite metadata: <a href="./dists/$DEFAULT_SUITE/Release">dists/$DEFAULT_SUITE/Release</a></li>
+        <li>Raw package pool: <a href="./pool/">pool/</a></li>
+      </ul>
+      <p>If you are enrolling another host remotely, the repo URL is <code>$public_url</code>.</p>
+    </section>
+  </main>
+</body>
+</html>
+EOF
+}
 
 derive_suites() {
     suites=""
@@ -114,6 +236,7 @@ fi
 
 gpg --batch --yes --export "$SIGNING_KEY" >"$PUBLIC_DIR/fixer-archive-keyring.gpg"
 gpg --batch --yes --armor --export "$SIGNING_KEY" >"$PUBLIC_DIR/KEY.gpg.asc"
+write_repo_index
 find "$PUBLIC_DIR" -type d -exec chmod 755 {} +
 find "$PUBLIC_DIR" -type f -exec chmod 644 {} +
 
