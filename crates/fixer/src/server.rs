@@ -20,7 +20,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -365,6 +365,40 @@ struct PublicIssue {
     last_seen: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PublishedAttemptSession {
+    prompt: String,
+    response: Option<String>,
+    diff: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicAttempt {
+    outcome: String,
+    state: String,
+    summary: String,
+    validation_status: Option<String>,
+    created_at: String,
+    published_session: Option<PublishedAttemptSession>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicIssueDetail {
+    id: String,
+    kind: String,
+    title: String,
+    summary: String,
+    package_name: Option<String>,
+    source_package: Option<String>,
+    ecosystem: Option<String>,
+    severity: Option<String>,
+    score: i64,
+    corroboration_count: i64,
+    best_patch_available: bool,
+    last_seen: String,
+    attempts: Vec<PublicAttempt>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct Healthz {
     status: &'static str,
@@ -448,6 +482,7 @@ pub async fn serve(config: FixerConfig) -> Result<()> {
     let app = Router::new()
         .route("/", get(landing_page))
         .route("/issues", get(public_issues_page))
+        .route("/issues/{id}", get(public_issue_detail_page))
         .route("/healthz", get(healthz))
         .route("/assets/app.css", get(stylesheet))
         .route("/v1/install/hello", post(install_hello))
@@ -486,6 +521,15 @@ async fn public_issues_page(
 ) -> Result<Html<String>, ApiError> {
     let issues = load_public_issues(&state.db, 100).await?;
     Ok(Html(render_issues_page(&issues)))
+}
+
+async fn public_issue_detail_page(
+    State(state): State<Arc<ServerState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Html<String>, ApiError> {
+    validate_uuid_param(&id, "issue id")?;
+    let issue = load_public_issue_detail(&state.db, id).await?;
+    Ok(Html(render_issue_detail_page(&issue)))
 }
 
 async fn healthz(State(state): State<Arc<ServerState>>) -> Result<Json<Healthz>, ApiError> {
@@ -875,9 +919,9 @@ async fn list_issues(
 async fn get_issue(
     State(state): State<Arc<ServerState>>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<PublicIssue>, ApiError> {
+) -> Result<Json<PublicIssueDetail>, ApiError> {
     validate_uuid_param(&id, "issue id")?;
-    let issue = load_public_issue(&state.db, id).await?;
+    let issue = load_public_issue_detail(&state.db, id).await?;
     Ok(Json(issue))
 }
 
@@ -3677,6 +3721,73 @@ async fn load_public_issue(db: &ServerDb, id: String) -> Result<PublicIssue, Api
     }
 }
 
+async fn load_public_issue_detail(
+    db: &ServerDb,
+    id: String,
+) -> Result<PublicIssueDetail, ApiError> {
+    let issue = load_public_issue(db, id.clone()).await?;
+    let attempts = load_public_attempts(db, &id, 10).await?;
+    Ok(PublicIssueDetail {
+        id: issue.id,
+        kind: issue.kind,
+        title: issue.title,
+        summary: issue.summary,
+        package_name: issue.package_name,
+        source_package: issue.source_package,
+        ecosystem: issue.ecosystem,
+        severity: issue.severity,
+        score: issue.score,
+        corroboration_count: issue.corroboration_count,
+        best_patch_available: issue.best_patch_available,
+        last_seen: issue.last_seen,
+        attempts,
+    })
+}
+
+async fn load_public_attempts(
+    db: &ServerDb,
+    cluster_id: &str,
+    limit: i64,
+) -> Result<Vec<PublicAttempt>, ApiError> {
+    match db {
+        ServerDb::Postgres(db) => {
+            let rows = db
+                .query(
+                    "
+            SELECT bundle_json
+            FROM patch_attempts
+            WHERE cluster_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            ",
+                    &[&cluster_id, &limit],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            rows.into_iter().map(public_attempt_from_row).collect()
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            let mut stmt = connection
+                .prepare(
+                    "
+            SELECT bundle_json
+            FROM patch_attempts
+            WHERE cluster_id = ?1
+            ORDER BY created_at DESC
+            LIMIT ?2
+            ",
+                )
+                .map_err(ApiError::internal)?;
+            let rows = stmt
+                .query_map(params![cluster_id, limit], public_attempt_from_sqlite_row)
+                .map_err(ApiError::internal)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(ApiError::internal)
+        }
+    }
+}
+
 fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
     let last_seen: DateTime<Utc> = row.get(11);
     Ok(PublicIssue {
@@ -3695,6 +3806,13 @@ fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
     })
 }
 
+fn public_attempt_from_row(row: Row) -> Result<PublicAttempt, ApiError> {
+    let bundle_json: Value = row.get(0);
+    let envelope =
+        serde_json::from_value::<WorkerResultEnvelope>(bundle_json).map_err(ApiError::internal)?;
+    Ok(public_attempt_from_patch_attempt(envelope.attempt))
+}
+
 fn public_issue_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicIssue> {
     Ok(PublicIssue {
         id: row.get(0)?,
@@ -3710,6 +3828,30 @@ fn public_issue_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pub
         best_patch_available: row.get::<_, i64>(10)? != 0,
         last_seen: row.get(11)?,
     })
+}
+
+fn public_attempt_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicAttempt> {
+    let raw: String = row.get(0)?;
+    let envelope = serde_json::from_str::<WorkerResultEnvelope>(&raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(public_attempt_from_patch_attempt(envelope.attempt))
+}
+
+fn public_attempt_from_patch_attempt(attempt: PatchAttempt) -> PublicAttempt {
+    let published_session = attempt
+        .details
+        .get("published_session")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<PublishedAttemptSession>(value).ok());
+    PublicAttempt {
+        outcome: attempt.outcome,
+        state: attempt.state,
+        summary: attempt.summary,
+        validation_status: attempt.validation_status,
+        created_at: attempt.created_at,
+        published_session,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4102,6 +4244,59 @@ fn render_issues_page(issues: &[PublicIssue]) -> String {
     )
 }
 
+fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
+    let attempts_markup = if issue.attempts.is_empty() {
+        "<p class=\"fine-print\">No public attempts have been published for this issue yet.</p>"
+            .to_string()
+    } else {
+        issue
+            .attempts
+            .iter()
+            .map(render_public_attempt_card)
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let body = format!(
+        r#"
+        <section class="hero">
+            <p class="tag">Public issue detail</p>
+            <h1>{}</h1>
+            <p class="lede">{}</p>
+            <div class="meta">{}</div>
+            <p class="fine-print">Last seen: {}. Public JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
+        </section>
+
+        <section class="panel section">
+            <h2>Published attempts</h2>
+            <div class="issue-list">{}</div>
+        </section>
+        "#,
+        html_escape(&issue.title),
+        html_escape(&issue.summary),
+        render_issue_tags(
+            issue.kind.as_str(),
+            issue.package_name.as_deref(),
+            issue.source_package.as_deref(),
+            issue.ecosystem.as_deref(),
+            issue.severity.as_deref(),
+            issue.score,
+            issue.corroboration_count,
+            issue.best_patch_available,
+        ),
+        html_escape(&format_timestamp(&issue.last_seen)),
+        issue.id,
+        issue.id,
+        attempts_markup,
+    );
+    render_page(
+        &format!("Fixer Issue {}", issue.id),
+        &issue.title,
+        NavPage::Issues,
+        body,
+        0,
+    )
+}
+
 fn render_page(
     title: &str,
     description: &str,
@@ -4164,49 +4359,65 @@ fn render_page(
 }
 
 fn render_issue_card(issue: &PublicIssue) -> String {
-    let mut tags = Vec::new();
-    if let Some(severity) = issue.severity.as_deref() {
-        tags.push(format!(
-            "<span class=\"tag severity-{}\">{}</span>",
-            html_escape(&severity_class(severity)),
-            html_escape(severity)
-        ));
-    }
-    if let Some(package_name) = issue.package_name.as_deref() {
-        tags.push(format!(
-            "<span class=\"tag\">package: {}</span>",
-            html_escape(package_name)
-        ));
-    }
-    if let Some(source_package) = issue.source_package.as_deref() {
-        tags.push(format!(
-            "<span class=\"tag\">source: {}</span>",
-            html_escape(source_package)
-        ));
-    }
-    if let Some(ecosystem) = issue.ecosystem.as_deref() {
-        tags.push(format!(
-            "<span class=\"tag\">ecosystem: {}</span>",
-            html_escape(ecosystem)
-        ));
-    }
-    tags.push(format!("<span class=\"tag\">score: {}</span>", issue.score));
-    tags.push(format!(
-        "<span class=\"tag\">reports: {}</span>",
-        issue.corroboration_count
-    ));
-    if issue.best_patch_available {
-        tags.push("<span class=\"tag patch\">patch attempt ready</span>".to_string());
-    }
-
     let mut extra = String::new();
     let _ = write!(
         extra,
-        "<p class=\"fine-print\">Last seen: {}. Public JSON: <a href=\"/v1/issues/{}\">/v1/issues/{}</a></p>",
+        "<p class=\"fine-print\">Last seen: {}. Public page: <a href=\"/issues/{}\">/issues/{}</a>. Public JSON: <a href=\"/v1/issues/{}\">/v1/issues/{}</a></p>",
         html_escape(&format_timestamp(&issue.last_seen)),
+        issue.id,
+        issue.id,
         issue.id,
         issue.id
     );
+
+    format!(
+        r#"<article class="issue-card">
+            <div class="issue-topline">
+                <h3><a href="/issues/{}">{}</a></h3>
+                <span class="tag">{}</span>
+            </div>
+            <p class="issue-summary">{}</p>
+            <div class="meta">{}</div>
+            {}
+        </article>"#,
+        issue.id,
+        html_escape(&issue.title),
+        html_escape(&issue.kind),
+        html_escape(&issue.summary),
+        render_issue_tags(
+            issue.kind.as_str(),
+            issue.package_name.as_deref(),
+            issue.source_package.as_deref(),
+            issue.ecosystem.as_deref(),
+            issue.severity.as_deref(),
+            issue.score,
+            issue.corroboration_count,
+            issue.best_patch_available,
+        ),
+        extra
+    )
+}
+
+fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
+    let mut sections = Vec::new();
+    if let Some(session) = &attempt.published_session {
+        sections.push(format!(
+            "<h4>Prompt</h4><pre class=\"code-block\"><code>{}</code></pre>",
+            html_escape(&session.prompt)
+        ));
+        if let Some(response) = session.response.as_deref() {
+            sections.push(format!(
+                "<h4>Response</h4><pre class=\"code-block\"><code>{}</code></pre>",
+                html_escape(response)
+            ));
+        }
+        if let Some(diff) = session.diff.as_deref() {
+            sections.push(format!(
+                "<h4>Diff</h4><pre class=\"code-block\"><code>{}</code></pre>",
+                html_escape(diff)
+            ));
+        }
+    }
 
     format!(
         r#"<article class="issue-card">
@@ -4215,15 +4426,71 @@ fn render_issue_card(issue: &PublicIssue) -> String {
                 <span class="tag">{}</span>
             </div>
             <p class="issue-summary">{}</p>
-            <div class="meta">{}</div>
+            <div class="meta"><span class="tag">state: {}</span><span class="tag">created: {}</span>{}</div>
             {}
         </article>"#,
-        html_escape(&issue.title),
-        html_escape(&issue.kind),
-        html_escape(&issue.summary),
-        tags.join(""),
-        extra
+        html_escape(&format!("{} attempt", attempt.outcome)),
+        html_escape(&attempt.outcome),
+        html_escape(&attempt.summary),
+        html_escape(&attempt.state),
+        html_escape(&format_timestamp(&attempt.created_at)),
+        attempt
+            .validation_status
+            .as_deref()
+            .map(|status| format!(
+                "<span class=\"tag\">validation: {}</span>",
+                html_escape(status)
+            ))
+            .unwrap_or_default(),
+        sections.join("")
     )
+}
+
+fn render_issue_tags(
+    _kind: &str,
+    package_name: Option<&str>,
+    source_package: Option<&str>,
+    ecosystem: Option<&str>,
+    severity: Option<&str>,
+    score: i64,
+    corroboration_count: i64,
+    best_patch_available: bool,
+) -> String {
+    let mut tags = Vec::new();
+    if let Some(severity) = severity {
+        tags.push(format!(
+            "<span class=\"tag severity-{}\">{}</span>",
+            html_escape(&severity_class(severity)),
+            html_escape(severity)
+        ));
+    }
+    if let Some(package_name) = package_name {
+        tags.push(format!(
+            "<span class=\"tag\">package: {}</span>",
+            html_escape(package_name)
+        ));
+    }
+    if let Some(source_package) = source_package {
+        tags.push(format!(
+            "<span class=\"tag\">source: {}</span>",
+            html_escape(source_package)
+        ));
+    }
+    if let Some(ecosystem) = ecosystem {
+        tags.push(format!(
+            "<span class=\"tag\">ecosystem: {}</span>",
+            html_escape(ecosystem)
+        ));
+    }
+    tags.push(format!("<span class=\"tag\">score: {}</span>", score));
+    tags.push(format!(
+        "<span class=\"tag\">reports: {}</span>",
+        corroboration_count
+    ));
+    if best_patch_available {
+        tags.push("<span class=\"tag patch\">patch attempt ready</span>".to_string());
+    }
+    tags.join("")
 }
 
 fn severity_class(value: &str) -> String {
@@ -4357,8 +4624,44 @@ mod tests {
 
         let markup = render_issue_card(&issue);
         assert!(markup.contains("patch attempt ready"));
+        assert!(markup.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
         assert!(markup.contains("/v1/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
         assert!(!markup.contains("representative_json"));
+    }
+
+    #[test]
+    fn public_attempt_uses_published_session_only() {
+        let public_attempt = public_attempt_from_patch_attempt(PatchAttempt {
+            cluster_id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Patch proposal created locally.".to_string(),
+            bundle_path: Some("/var/lib/fixer/proposals/example".to_string()),
+            output_path: Some("/var/lib/fixer/proposals/example/codex-output.txt".to_string()),
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "diagnosis": {
+                    "command_line": "/usr/bin/postgres --bad",
+                },
+                "published_session": {
+                    "prompt": "Read ./evidence.json",
+                    "response": "Patched ./workspace/src/file.c",
+                    "diff": "--- ./source/src/file.c\n+++ ./workspace/src/file.c\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        });
+
+        assert_eq!(public_attempt.outcome, "patch");
+        assert!(public_attempt.summary.contains("Patch proposal"));
+        assert_eq!(
+            public_attempt
+                .published_session
+                .as_ref()
+                .and_then(|session| session.response.as_deref()),
+            Some("Patched ./workspace/src/file.c")
+        );
     }
 
     #[test]

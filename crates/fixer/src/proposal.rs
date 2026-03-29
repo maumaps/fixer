@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub fn create_proposal(
@@ -141,6 +141,62 @@ pub fn load_codex_job(job_dir: &std::path::Path) -> Result<CodexJobSpec> {
     let raw =
         fs::read(&job_path).with_context(|| format!("failed to read {}", job_path.display()))?;
     serde_json::from_slice(&raw).with_context(|| format!("failed to parse {}", job_path.display()))
+}
+
+pub fn load_published_codex_session(bundle_dir: &Path) -> Result<Value> {
+    let evidence_path = bundle_dir.join("evidence.json");
+    let prompt_path = bundle_dir.join("prompt.md");
+    let output_path = bundle_dir.join("codex-output.txt");
+    let evidence_raw = fs::read(&evidence_path)
+        .with_context(|| format!("failed to read {}", evidence_path.display()))?;
+    let evidence: Value = serde_json::from_slice(&evidence_raw)
+        .with_context(|| format!("failed to parse {}", evidence_path.display()))?;
+    let workspace_root = evidence
+        .get("workspace")
+        .and_then(|value| value.get("repo_root"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    let source_workspace_root = evidence
+        .get("source_workspace")
+        .and_then(|value| value.get("repo_root"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    let prompt = truncate_public_session_text(
+        &sanitize_public_session_text(
+            &read_text(&prompt_path)
+                .with_context(|| format!("failed to read {}", prompt_path.display()))?,
+            bundle_dir,
+            workspace_root.as_deref(),
+            source_workspace_root.as_deref(),
+        ),
+        16 * 1024,
+    );
+    let response = output_path
+        .exists()
+        .then(|| {
+            let raw = read_text(&output_path)
+                .with_context(|| format!("failed to read {}", output_path.display()))?;
+            Ok::<String, anyhow::Error>(truncate_public_session_text(
+                &sanitize_public_session_text(
+                    &raw,
+                    bundle_dir,
+                    workspace_root.as_deref(),
+                    source_workspace_root.as_deref(),
+                ),
+                64 * 1024,
+            ))
+        })
+        .transpose()?;
+    let diff = render_public_session_diff(
+        source_workspace_root.as_deref(),
+        workspace_root.as_deref(),
+        bundle_dir,
+    )?;
+    Ok(json!({
+        "prompt": prompt,
+        "response": response,
+        "diff": diff,
+    }))
 }
 
 pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<CodexJobStatus> {
@@ -498,6 +554,106 @@ fn copy_directory_recursively(
         ));
     }
     Ok(())
+}
+
+fn render_public_session_diff(
+    source_workspace_root: Option<&Path>,
+    workspace_root: Option<&Path>,
+    bundle_dir: &Path,
+) -> Result<Option<String>> {
+    let (Some(source_workspace_root), Some(workspace_root)) =
+        (source_workspace_root, workspace_root)
+    else {
+        return Ok(None);
+    };
+    if !source_workspace_root.exists() || !workspace_root.exists() {
+        return Ok(None);
+    }
+
+    let output = Command::new("diff")
+        .args([
+            "-urN",
+            "--exclude=.git",
+            "--exclude=.pc",
+            "--exclude=build",
+            "--exclude=autom4te.cache",
+            "--exclude=config.log",
+        ])
+        .arg(source_workspace_root)
+        .arg(workspace_root)
+        .output()
+        .context("failed to generate a public diff for the Codex session")?;
+    match output.status.code() {
+        Some(0) => Ok(None),
+        Some(1) => {
+            let diff = String::from_utf8_lossy(&output.stdout).to_string();
+            Ok(Some(truncate_public_session_text(
+                &sanitize_public_session_text(
+                    &diff,
+                    bundle_dir,
+                    Some(workspace_root),
+                    Some(source_workspace_root),
+                ),
+                128 * 1024,
+            )))
+        }
+        _ => Err(anyhow!(
+            "failed to generate a public diff for the Codex session: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+fn sanitize_public_session_text(
+    text: &str,
+    bundle_dir: &Path,
+    workspace_root: Option<&Path>,
+    source_workspace_root: Option<&Path>,
+) -> String {
+    let mut replacements = vec![
+        (
+            bundle_dir.join("evidence.json"),
+            "./evidence.json".to_string(),
+        ),
+        (bundle_dir.join("workspace"), "./workspace".to_string()),
+        (bundle_dir.to_path_buf(), ".".to_string()),
+    ];
+    if let Some(workspace_root) = workspace_root {
+        replacements.push((workspace_root.to_path_buf(), "./workspace".to_string()));
+    }
+    if let Some(source_workspace_root) = source_workspace_root {
+        replacements.push((source_workspace_root.to_path_buf(), "./source".to_string()));
+    }
+    replacements.sort_by(|(left, _), (right, _)| {
+        right
+            .to_string_lossy()
+            .len()
+            .cmp(&left.to_string_lossy().len())
+    });
+
+    let mut sanitized = text.to_string();
+    for (from, to) in replacements {
+        let from = from.to_string_lossy();
+        if !from.is_empty() {
+            sanitized = sanitized.replace(from.as_ref(), &to);
+        }
+    }
+    sanitized
+}
+
+fn truncate_public_session_text(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        return text.to_string();
+    }
+    let mut boundary = max_len;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!(
+        "{}\n\n[truncated {} bytes]",
+        &text[..boundary],
+        text.len() - boundary
+    )
 }
 
 struct CodexProcessOutcome {
@@ -1669,12 +1825,13 @@ fn pg_amcheck_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        pg_amcheck_command, render_external_bug_report, render_local_remediation_report,
-        render_local_remediation_sql, render_process_investigation_report,
-        sanitize_command_line_for_report, suggested_report_destination,
+        load_published_codex_session, pg_amcheck_command, render_external_bug_report,
+        render_local_remediation_report, render_local_remediation_sql,
+        render_process_investigation_report, sanitize_command_line_for_report,
+        suggested_report_destination,
     };
     use crate::models::{InstalledPackageMetadata, OpportunityRecord};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::path::Path;
 
     #[test]
@@ -2030,5 +2187,59 @@ mod tests {
         assert!(rendered.contains("fuse_wait_answer"));
         assert!(rendered.contains("/mnt/problematic-tree"));
         assert!(rendered.contains("kernel, mount, or storage investigation"));
+    }
+
+    #[test]
+    fn published_codex_session_sanitizes_local_bundle_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_dir = dir.path().join("proposal");
+        let source_dir = dir.path().join("source");
+        let workspace_dir = bundle_dir.join("workspace");
+        std::fs::create_dir_all(source_dir.join("src")).unwrap();
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::write(
+            bundle_dir.join("prompt.md"),
+            format!(
+                "Read the evidence bundle at `{}` and patch `{}`.",
+                bundle_dir.join("evidence.json").display(),
+                workspace_dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_dir.join("codex-output.txt"),
+            format!(
+                "Patched [src/file.c]({}) after reading `{}`.",
+                workspace_dir.join("src/file.c").display(),
+                source_dir.join("src/file.c").display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(source_dir.join("src/file.c"), "old\n").unwrap();
+        std::fs::create_dir_all(workspace_dir.join("src")).unwrap();
+        std::fs::write(workspace_dir.join("src/file.c"), "new\n").unwrap();
+        std::fs::write(
+            bundle_dir.join("evidence.json"),
+            serde_json::to_vec_pretty(&json!({
+                "workspace": { "repo_root": workspace_dir },
+                "source_workspace": { "repo_root": source_dir },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let published = load_published_codex_session(&bundle_dir).unwrap();
+        let prompt = published.get("prompt").and_then(Value::as_str).unwrap();
+        let response = published.get("response").and_then(Value::as_str).unwrap();
+        let diff = published.get("diff").and_then(Value::as_str).unwrap();
+
+        assert!(prompt.contains("./evidence.json"));
+        assert!(prompt.contains("./workspace"));
+        assert!(!prompt.contains(bundle_dir.to_string_lossy().as_ref()));
+        assert!(response.contains("./workspace/src/file.c"));
+        assert!(response.contains("./source/src/file.c"));
+        assert!(!response.contains(source_dir.to_string_lossy().as_ref()));
+        assert!(diff.contains("./source/src/file.c"));
+        assert!(diff.contains("./workspace/src/file.c"));
     }
 }

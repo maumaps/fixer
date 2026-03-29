@@ -824,6 +824,40 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                     let diagnosis_bundle = investigation_report
                         .as_ref()
                         .and_then(|report| proposal::prepare_submission(store, report.id).ok());
+                    let mut details = serde_json::Map::from_iter([
+                        ("local_proposal_id".to_string(), json!(local_proposal.id)),
+                        (
+                            "local_submission_bundle".to_string(),
+                            json!(submission_bundle.map(|path| path.display().to_string())),
+                        ),
+                        (
+                            "diagnosis_proposal_id".to_string(),
+                            json!(investigation_report.as_ref().map(|report| report.id)),
+                        ),
+                        (
+                            "diagnosis_submission_bundle".to_string(),
+                            json!(diagnosis_bundle.map(|path| path.display().to_string())),
+                        ),
+                        (
+                            "diagnosis_bundle_path".to_string(),
+                            json!(
+                                investigation_report
+                                    .as_ref()
+                                    .map(|report| report.bundle_path.display().to_string())
+                            ),
+                        ),
+                        ("local_opportunity_id".to_string(), json!(opportunity.id)),
+                        (
+                            "diagnosis".to_string(),
+                            process_investigation_worker_diagnosis(&opportunity),
+                        ),
+                        ("workspace".to_string(), json!(workspace)),
+                    ]);
+                    if let Ok(public_session) =
+                        proposal::load_published_codex_session(&local_proposal.bundle_path)
+                    {
+                        details.insert("published_session".to_string(), public_session);
+                    }
                     WorkerResultEnvelope {
                         lease_id: lease.lease_id.clone(),
                         attempt: PatchAttempt {
@@ -858,16 +892,7 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                                 .as_ref()
                                 .map(|path| path.display().to_string()),
                             validation_status: Some(local_proposal.state.clone()),
-                            details: json!({
-                                "local_proposal_id": local_proposal.id,
-                                "local_submission_bundle": submission_bundle.map(|path| path.display().to_string()),
-                                "diagnosis_proposal_id": investigation_report.as_ref().map(|report| report.id),
-                                "diagnosis_submission_bundle": diagnosis_bundle.map(|path| path.display().to_string()),
-                                "diagnosis_bundle_path": investigation_report.as_ref().map(|report| report.bundle_path.display().to_string()),
-                                "local_opportunity_id": opportunity.id,
-                                "diagnosis": process_investigation_worker_diagnosis(&opportunity),
-                                "workspace": workspace,
-                            }),
+                            details: Value::Object(details),
                             created_at: now_rfc3339(),
                         },
                         impossible_reason: None,

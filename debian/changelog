@@ -1,3 +1,11 @@
+fixer (0.16.0-1) unstable; urgency=medium
+
+  * Publish sanitized prompt, response, and diff excerpts with public patch attempts.
+  * Add public issue detail pages that show the published attempt session when present.
+  * Keep raw internal diagnosis blobs private while exposing public-safe attempt context.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 20:35:00 +0400
+
 fixer (0.15.0-1) unstable; urgency=medium
 
   * Lease Codex worker auth from an explicit user session instead of root.
