@@ -508,12 +508,6 @@ fn sanitize_unit_name(raw: &str) -> String {
         .collect()
 }
 
-fn read_codex_job_status(bundle_dir: &Path) -> Result<CodexJobStatus> {
-    let path = bundle_dir.join("status.json");
-    let raw = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_slice(&raw).with_context(|| format!("failed to parse {}", path.display()))
-}
-
 fn render_command_failure(output: &std::process::Output) -> String {
     let combined = format!(
         "{}{}",
@@ -619,7 +613,7 @@ fn run_codex_job_as_user(
                 render_command_failure(&output)
             ));
         }
-        read_codex_job_status(&job.bundle_dir)
+        proposal::load_codex_job_status(&job.bundle_dir)
     })();
 
     match result {
@@ -929,6 +923,20 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                             json!(current_binary_version()),
                         ),
                     ]);
+                    if let Ok(job_status) =
+                        proposal::load_codex_job_status(&local_proposal.bundle_path)
+                    {
+                        details
+                            .insert("worker_model".to_string(), json!(job_status.selected_model));
+                        details.insert(
+                            "worker_models_used".to_string(),
+                            json!(job_status.models_used),
+                        );
+                        details.insert(
+                            "worker_rate_limit_fallback_used".to_string(),
+                            json!(job_status.rate_limit_fallback_used),
+                        );
+                    }
                     if let Some(best_patch) = lease.issue.best_patch.as_ref() {
                         details.insert(
                             "supersedes_patch_created_at".to_string(),
@@ -1436,6 +1444,28 @@ fn process_investigation_worker_summary(opportunity: &crate::models::Opportunity
         Some("stuck-process") => {
             format!("{target} likely remains stuck in a {classification} wait.")
         }
+        Some("desktop-resume") => {
+            let crashed = details
+                .get("crashed_processes")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "the desktop session".to_string());
+            let display_manager = details
+                .get("display_manager")
+                .and_then(Value::as_str)
+                .unwrap_or("the display manager");
+            format!(
+                "{target} disappeared after resume when {crashed} crashed and {display_manager} restarted the display stack."
+            )
+        }
         Some("oom-kill") => format!("{target} was killed by the kernel OOM killer."),
         _ => format!("{target} likely remains stuck in a {classification} loop."),
     }
@@ -1481,7 +1511,7 @@ fn prior_patch_review_rejected_for_refresh(
     if prior_best_patch.is_none() || local_proposal.state == "ready" {
         return None;
     }
-    let status = read_codex_job_status(&local_proposal.bundle_path).ok()?;
+    let status = proposal::load_codex_job_status(&local_proposal.bundle_path).ok()?;
     (status.failure_kind.as_deref() == Some("review")).then_some(status)
 }
 

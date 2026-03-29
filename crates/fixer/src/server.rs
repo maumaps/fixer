@@ -669,6 +669,12 @@ struct PublishedAttemptSession {
     prompt: String,
     response: Option<String>,
     diff: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    models_used: Vec<String>,
+    #[serde(default)]
+    rate_limit_fallback_used: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -6479,6 +6485,32 @@ fn duplicate_primary_signature(item: &SharedOpportunity) -> Option<String> {
                             .map(normalize_duplicate_field)
                             .filter(|value| !value.is_empty())
                     }),
+                "desktop-resume" => item
+                    .finding
+                    .details
+                    .get("gpu_error_lines")
+                    .and_then(Value::as_array)
+                    .and_then(|lines| lines.first())
+                    .and_then(Value::as_str)
+                    .map(normalize_duplicate_field)
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| {
+                        item.finding
+                            .details
+                            .get("crashed_processes")
+                            .and_then(Value::as_array)
+                            .map(|processes| {
+                                let mut normalized = processes
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(normalize_duplicate_field)
+                                    .filter(|value| !value.is_empty())
+                                    .collect::<Vec<_>>();
+                                normalized.sort();
+                                normalized.join("|")
+                            })
+                            .filter(|value| !value.is_empty())
+                    }),
                 _ => None,
             }
         }
@@ -7712,6 +7744,31 @@ fn normalized_investigation_cluster_key(item: &SharedOpportunity) -> String {
                 constraint,
             ))
         }
+        "desktop-resume" => {
+            let target = normalized_investigation_target_name(item);
+            let driver = item
+                .finding
+                .details
+                .get("driver")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let session_type = item
+                .finding
+                .details
+                .get("session_type")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let display_manager = item
+                .finding
+                .details
+                .get("display_manager")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            hash_text(format!(
+                "investigation|desktop-resume|{}|{}|{}|{}",
+                target, driver, session_type, display_manager,
+            ))
+        }
         _ => hash_text(format!(
             "investigation|{}|{}|{}|{}",
             subsystem,
@@ -7806,6 +7863,37 @@ fn investigation_public_issue_fields(item: &SharedOpportunity) -> Option<PublicI
                 summary: format!(
                     "{target} was killed by the kernel OOM killer after reaching about {:.0} MiB anonymous RSS{}.",
                     anon_rss_mib, scope
+                ),
+                visible: is_publicly_visible(item),
+            })
+        }
+        "desktop-resume" => {
+            let target = normalized_investigation_target_name(item);
+            let display_manager = item
+                .finding
+                .details
+                .get("display_manager")
+                .and_then(Value::as_str)
+                .unwrap_or("the display manager");
+            let crashed = item
+                .finding
+                .details
+                .get("crashed_processes")
+                .and_then(Value::as_array)
+                .map(|processes| {
+                    processes
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "desktop processes".to_string());
+            Some(PublicIssueFields {
+                title: format!("Desktop resume failure investigation for {target}"),
+                summary: format!(
+                    "After suspend/resume, {target} failed: {crashed} crashed after GPU/display errors, and {display_manager} restarted the display stack."
                 ),
                 visible: is_publicly_visible(item),
             })
@@ -9209,6 +9297,64 @@ mod tests {
         }
     }
 
+    fn sample_desktop_resume_investigation(
+        target: &str,
+        crashed_processes: &[&str],
+        last_seen: &str,
+    ) -> SharedOpportunity {
+        SharedOpportunity {
+            local_opportunity_id: 1,
+            opportunity: OpportunityRecord {
+                id: 1,
+                finding_id: 1,
+                kind: "investigation".to_string(),
+                title: format!("Desktop resume failure investigation for {target}"),
+                score: 109,
+                state: "open".to_string(),
+                summary: format!(
+                    "After suspend/resume, {target} failed: {} crashed after GPU/display errors, and sddm restarted the display stack.",
+                    crashed_processes.join(", ")
+                ),
+                evidence: json!({}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: last_seen.to_string(),
+                updated_at: last_seen.to_string(),
+            },
+            finding: FindingRecord {
+                id: 1,
+                kind: "investigation".to_string(),
+                title: format!("Desktop resume failure investigation for {target}"),
+                severity: "high".to_string(),
+                fingerprint: format!("desktop-resume-{target}"),
+                summary: format!(
+                    "After suspend/resume, {target} failed: {} crashed after GPU/display errors, and sddm restarted the display stack.",
+                    crashed_processes.join(", ")
+                ),
+                details: json!({
+                    "subsystem": "desktop-resume",
+                    "profile_target": { "name": target },
+                    "loop_classification": "resume-display-failure",
+                    "driver": "radeon",
+                    "session_type": "x11",
+                    "display_manager": "sddm",
+                    "crashed_processes": crashed_processes,
+                    "gpu_error_lines": [
+                        "Mar 30 01:38:57 tinycat kernel: radeon 0000:01:05.0: ring 0 stalled for more than 10240msec",
+                        "Mar 30 01:38:57 tinycat kernel: [drm:radeon_resume_kms [radeon]] *ERROR* ib ring test failed (-35)."
+                    ],
+                }),
+                artifact_name: Some(target.to_string()),
+                artifact_path: None,
+                package_name: Some("linux-image-6.19.8+deb14-amd64".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: last_seen.to_string(),
+                last_seen: last_seen.to_string(),
+            },
+        }
+    }
+
     fn public_issue_for_test(id: &str, opportunity: &SharedOpportunity) -> PublicIssue {
         let public = build_public_issue_fields(opportunity);
         PublicIssue {
@@ -9562,6 +9708,9 @@ mod tests {
                         "--- a/src/file.c\n+++ b/src/file.c\n@@\n+/* Avoid the retry loop on missing files. */\n"
                             .to_string(),
                     ),
+                    model: Some("gpt-5.4".to_string()),
+                    models_used: vec!["gpt-5.4".to_string()],
+                    rate_limit_fallback_used: false,
                 }),
                 handoff: None,
             },
@@ -9608,6 +9757,9 @@ mod tests {
                         "--- a/src/file.c\n+++ b/src/file.c\n@@\n+/* Avoid the retry loop on missing files. */\n"
                             .to_string(),
                     ),
+                    model: Some("gpt-5.4".to_string()),
+                    models_used: vec!["gpt-5.4".to_string()],
+                    rate_limit_fallback_used: false,
                 }),
                 handoff: None,
             }),
@@ -9731,6 +9883,9 @@ mod tests {
                         "--- a/src/backend/utils/fmgr/dfmgr.c\t2026-02-24 01:56:43.000000000 +0400\n+++ b/src/backend/utils/fmgr/dfmgr.c\t2026-03-29 20:11:53.195108902 +0400\n@@\n+/* Prefer the suffixed shared library name first to avoid a guaranteed failed probe. */\n"
                             .to_string(),
                     ),
+                    model: Some("gpt-5.4".to_string()),
+                    models_used: vec!["gpt-5.4".to_string()],
+                    rate_limit_fallback_used: false,
                 }),
                 handoff: None,
             }),
@@ -10227,6 +10382,30 @@ mod tests {
         assert_eq!(public.title, "OOM kill investigation for chrome");
         assert!(public.summary.contains("kernel OOM killer"));
         assert!(public.summary.contains("google-chrome"));
+    }
+
+    #[test]
+    fn desktop_resume_cluster_key_prefers_graphics_stack_family() {
+        let a = sample_desktop_resume_investigation(
+            "radeon X11 desktop",
+            &["Xorg", "kwin_x11"],
+            "2026-03-30T01:38:58Z",
+        );
+        let b = sample_desktop_resume_investigation(
+            "radeon X11 desktop",
+            &["kwin_x11", "Xorg"],
+            "2026-03-30T01:39:03Z",
+        );
+
+        assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
+
+        let public = build_public_issue_fields(&a);
+        assert_eq!(
+            public.title,
+            "Desktop resume failure investigation for radeon X11 desktop"
+        );
+        assert!(public.summary.contains("suspend/resume"));
+        assert!(public.summary.contains("Xorg, kwin_x11"));
     }
 
     #[test]

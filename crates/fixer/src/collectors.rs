@@ -28,6 +28,7 @@ const PERF_TOP_HOTSPOTS_PER_TARGET: usize = 3;
 const PERF_REPORT_LIMIT: usize = 12;
 const RUNAWAY_INVESTIGATION_SUBSYSTEM: &str = "runaway-process";
 const STUCK_PROCESS_INVESTIGATION_SUBSYSTEM: &str = "stuck-process";
+const DESKTOP_RESUME_INVESTIGATION_SUBSYSTEM: &str = "desktop-resume";
 const RUNAWAY_STRACE_EXCERPT_LIMIT: usize = 24;
 const RUNAWAY_TOP_SYSCALL_LIMIT: usize = 6;
 const RUNAWAY_SEQUENCE_WINDOW: usize = 3;
@@ -60,6 +61,7 @@ pub fn collect_once(config: &FixerConfig, store: &Store) -> Result<CollectReport
     if config.service.collect_warnings {
         report.findings_seen += collect_warning_logs(config, store)?;
         report.findings_seen += collect_kernel_oom_kill_investigations(config, store)?;
+        report.findings_seen += collect_desktop_resume_investigations(config, store)?;
         report.findings_seen += collect_kernel_warnings(config, store)?;
         report.findings_seen += collect_postgres_collation_mismatches(store)?;
     }
@@ -196,6 +198,19 @@ struct KernelOomKillEvent {
     killed_line: String,
     oom_kill_line: Option<String>,
     invoker_line: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DesktopResumeFailureEvent {
+    driver: String,
+    session_type: String,
+    display_manager: String,
+    crashed_processes: Vec<String>,
+    gpu_error_lines: Vec<String>,
+    session_error_lines: Vec<String>,
+    suspend_line: Option<String>,
+    resume_line: String,
+    display_restart_line: Option<String>,
 }
 
 fn collect_stuck_process_investigations(config: &FixerConfig, store: &Store) -> Result<usize> {
@@ -795,6 +810,90 @@ fn collect_kernel_oom_kill_investigations(config: &FixerConfig, store: &Store) -
         count += 1;
     }
     Ok(count)
+}
+
+fn collect_desktop_resume_investigations(config: &FixerConfig, store: &Store) -> Result<usize> {
+    if !store.capability_available("journalctl")? {
+        return Ok(0);
+    }
+    let journal_lines = config.service.journal_lines.saturating_mul(8).to_string();
+    let output = command_output(
+        "journalctl",
+        &[
+            "-b",
+            "-g",
+            "suspend|resume|radeon|amdgpu|drm|Xorg|kwin_x11|sddm|display server|kernel rejected CS|could not connect to display",
+            "-n",
+            journal_lines.as_str(),
+            "--no-pager",
+        ],
+    )
+    .unwrap_or_default();
+    let Some(event) = parse_latest_desktop_resume_failure(&output) else {
+        return Ok(0);
+    };
+    let package_name = event.package_name();
+    let likely_external_root_cause = true;
+    let finding = FindingInput {
+        kind: "investigation".to_string(),
+        title: format!(
+            "Desktop resume failure investigation for {}",
+            event.display_target()
+        ),
+        severity: "high".to_string(),
+        fingerprint: hash_text(format!(
+            "desktop-resume:{}:{}:{}:{}",
+            event.driver,
+            event.session_type,
+            event.display_manager,
+            event.crashed_processes.join("|"),
+        )),
+        summary: event.public_summary(),
+        details: json!({
+            "subsystem": DESKTOP_RESUME_INVESTIGATION_SUBSYSTEM,
+            "profile_target": {
+                "name": event.display_target(),
+            },
+            "loop_classification": "resume-display-failure",
+            "loop_confidence": 0.99,
+            "loop_explanation": format!(
+                "After resume, the {} graphics stack reported GPU/display errors and {} restarted after {} crashed.",
+                event.driver,
+                event.display_manager,
+                event.crashed_processes.join(", ")
+            ),
+            "driver": event.driver,
+            "session_type": event.session_type,
+            "display_manager": event.display_manager,
+            "crashed_processes": event.crashed_processes,
+            "gpu_error_lines": event.gpu_error_lines,
+            "session_error_lines": event.session_error_lines,
+            "suspend_line": event.suspend_line,
+            "resume_line": event.resume_line,
+            "display_restart_line": event.display_restart_line,
+            "package_name": package_name,
+            "likely_external_root_cause": likely_external_root_cause,
+        }),
+        artifact: Some(ObservedArtifact {
+            kind: "display-stack".to_string(),
+            name: event.display_target(),
+            path: None,
+            package_name: package_name.clone(),
+            repo_root: None,
+            ecosystem: None,
+            metadata: json!({
+                "source": "desktop-resume",
+                "driver": event.driver,
+                "session_type": event.session_type,
+                "display_manager": event.display_manager,
+                "crashed_processes": event.crashed_processes,
+            }),
+        }),
+        repo_root: None,
+        ecosystem: None,
+    };
+    let _ = store.record_finding(&finding)?;
+    Ok(1)
 }
 
 fn collect_postgres_collation_mismatches(store: &Store) -> Result<usize> {
@@ -1440,6 +1539,31 @@ impl KernelOomKillEvent {
     }
 }
 
+impl DesktopResumeFailureEvent {
+    fn display_target(&self) -> String {
+        format!(
+            "{} {} desktop",
+            self.driver,
+            self.session_type.to_uppercase()
+        )
+    }
+
+    fn package_name(&self) -> Option<String> {
+        Some(current_kernel_image_package_name())
+    }
+
+    fn public_summary(&self) -> String {
+        let crashes = self.crashed_processes.join(", ");
+        format!(
+            "After suspend/resume, the {} {} session hit GPU/display failures, {} crashed, and {} restarted the display stack.",
+            self.driver,
+            self.session_type.to_uppercase(),
+            crashes,
+            self.display_manager
+        )
+    }
+}
+
 fn parse_kernel_oom_kill_events(raw: &str) -> Vec<KernelOomKillEvent> {
     let killed_re = Regex::new(
         r"Out of memory: Killed process (?P<pid>\d+) \((?P<task>[^)]+)\) total-vm:(?P<total_vm>\d+)kB, anon-rss:(?P<anon_rss>\d+)kB, file-rss:(?P<file_rss>\d+)kB, shmem-rss:(?P<shmem_rss>\d+)kB, UID:(?P<uid>\d+) .* oom_score_adj:(?P<oom_score_adj>-?\d+)",
@@ -1567,6 +1691,95 @@ fn parse_kernel_oom_kill_events(raw: &str) -> Vec<KernelOomKillEvent> {
     events
 }
 
+fn parse_latest_desktop_resume_failure(raw: &str) -> Option<DesktopResumeFailureEvent> {
+    let lines = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let resume_index = lines.iter().rposition(|line| {
+        line.contains("PM: suspend exit")
+            || line.contains("System returned from sleep operation 'suspend")
+            || line.contains("Waking up from system sleep state S3")
+    })?;
+    let start_index = lines[..=resume_index]
+        .iter()
+        .rposition(|line| {
+            line.contains("PM: suspend entry")
+                || line.contains("The system will suspend")
+                || line.contains("Performing sleep operation 'suspend'")
+        })
+        .unwrap_or_else(|| resume_index.saturating_sub(40));
+    let end_index = (resume_index + 120).min(lines.len().saturating_sub(1));
+    let window = &lines[start_index..=end_index];
+
+    let driver = desktop_resume_driver(window)?;
+    let mut crashed_processes = Vec::new();
+    let mut seen_processes = BTreeSet::new();
+    let mut gpu_error_lines = Vec::new();
+    let mut gpu_seen = BTreeSet::new();
+    let mut session_error_lines = Vec::new();
+    let mut session_seen = BTreeSet::new();
+    let suspend_line = window
+        .iter()
+        .find(|line| is_suspend_entry_line(line))
+        .cloned();
+    let resume_line = window
+        .iter()
+        .find(|line| is_resume_exit_line(line))
+        .cloned()
+        .unwrap_or_else(|| lines[resume_index].clone());
+    let display_restart_line = window
+        .iter()
+        .find(|line| is_display_restart_line(line))
+        .cloned();
+
+    let coredump_re =
+        Regex::new(r"Process (?:\d+ \()?(?P<process>[A-Za-z0-9_.-]+)\)? .* terminated abnormally")
+            .expect("valid desktop resume coredump regex");
+
+    for line in window {
+        if is_resume_gpu_error_line(line) {
+            if gpu_seen.insert(line.clone()) {
+                gpu_error_lines.push(line.clone());
+            }
+        }
+        if is_display_restart_line(line) || is_desktop_resume_session_error_line(line) {
+            if session_seen.insert(line.clone()) {
+                session_error_lines.push(line.clone());
+            }
+        }
+        if let Some(captures) = coredump_re.captures(line) {
+            if let Some(process) = captures
+                .name("process")
+                .map(|value| value.as_str().to_string())
+            {
+                if seen_processes.insert(process.clone()) {
+                    crashed_processes.push(process);
+                }
+            }
+        }
+    }
+
+    if gpu_error_lines.is_empty() || crashed_processes.is_empty() {
+        return None;
+    }
+    crashed_processes.sort();
+
+    Some(DesktopResumeFailureEvent {
+        driver,
+        session_type: desktop_resume_session_type(window),
+        display_manager: desktop_resume_display_manager(window),
+        crashed_processes,
+        gpu_error_lines,
+        session_error_lines,
+        suspend_line,
+        resume_line,
+        display_restart_line,
+    })
+}
+
 fn normalize_oom_task_memcg_target(raw: &str) -> Option<String> {
     let trailing_digits_re = Regex::new(r"-\d+$").expect("valid oom scope regex");
     for segment in raw.split('/') {
@@ -1621,6 +1834,99 @@ fn strip_kernel_log_prefix(raw: &str) -> String {
     raw.split_once(" kernel: ")
         .map(|(_, message)| message.trim().to_string())
         .unwrap_or_else(|| raw.trim().to_string())
+}
+
+fn is_suspend_entry_line(line: &str) -> bool {
+    line.contains("PM: suspend entry")
+        || line.contains("The system will suspend")
+        || line.contains("Performing sleep operation 'suspend'")
+}
+
+fn is_resume_exit_line(line: &str) -> bool {
+    line.contains("PM: suspend exit")
+        || line.contains("System returned from sleep operation 'suspend")
+        || line.contains("Waking up from system sleep state S3")
+}
+
+fn is_resume_gpu_error_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    (lower.contains("radeon") || lower.contains("amdgpu") || lower.contains("[drm"))
+        && (lower.contains("gpu lockup")
+            || lower.contains("ring 0 stalled")
+            || lower.contains("fence wait failed")
+            || lower.contains("failed testing ib")
+            || lower.contains("ib ring test failed")
+            || lower.contains("kernel rejected cs")
+            || lower.contains("could not connect to display")
+            || lower.contains("failed to read display number"))
+}
+
+fn is_display_restart_line(line: &str) -> bool {
+    line.contains("Display server stopping")
+        || line.contains("Display server stopped")
+        || line.contains("Display server starting")
+        || line.contains("Adding new display")
+        || line.contains("Attempt 1 starting the Display server")
+        || line.contains("Failed to read display number from pipe")
+}
+
+fn is_desktop_resume_session_error_line(line: &str) -> bool {
+    line.contains("could not connect to display")
+        || line.contains("Could not load the Qt platform plugin \"xcb\"")
+        || line.contains(
+            "This application failed to start because no Qt platform plugin could be initialized",
+        )
+}
+
+fn desktop_resume_driver(lines: &[String]) -> Option<String> {
+    if lines
+        .iter()
+        .any(|line| line.to_ascii_lowercase().contains("radeon"))
+    {
+        return Some("radeon".to_string());
+    }
+    if lines
+        .iter()
+        .any(|line| line.to_ascii_lowercase().contains("amdgpu"))
+    {
+        return Some("amdgpu".to_string());
+    }
+    None
+}
+
+fn desktop_resume_session_type(lines: &[String]) -> String {
+    if lines
+        .iter()
+        .any(|line| line.contains("kwin_x11") || line.contains("Starting X11 session"))
+    {
+        return "x11".to_string();
+    }
+    if lines
+        .iter()
+        .any(|line| line.to_ascii_lowercase().contains("wayland"))
+    {
+        return "wayland".to_string();
+    }
+    "desktop".to_string()
+}
+
+fn desktop_resume_display_manager(lines: &[String]) -> String {
+    if lines.iter().any(|line| line.contains("sddm")) {
+        return "sddm".to_string();
+    }
+    if lines.iter().any(|line| line.contains("lightdm")) {
+        return "lightdm".to_string();
+    }
+    "display-manager".to_string()
+}
+
+fn current_kernel_image_package_name() -> String {
+    let release = command_output("uname", &["-r"])
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("linux-image-{release}")
 }
 
 fn kib_to_mib(value: u64) -> f64 {
@@ -3962,10 +4268,10 @@ mod tests {
         kernel_module_package_hint, kernel_warning_module_candidates, looks_like_warning,
         normalize_oom_task_memcg_target, normalize_perf_symbol,
         normalize_stuck_process_target_name, parse_apparmor_denial, parse_coredump_info,
-        parse_dkms_status_line, parse_kernel_oom_kill_events, parse_perf_hot_paths,
-        parse_postgres_collation_mismatch_rows, parse_strace_syscall_name, process_runtime_seconds,
-        safe_perf_name, stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
-        summarize_top_syscalls, system_uptime_seconds,
+        parse_dkms_status_line, parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
+        parse_perf_hot_paths, parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
+        process_runtime_seconds, safe_perf_name, stuck_process_investigation_fingerprint,
+        stuck_process_source_fingerprint, summarize_top_syscalls, system_uptime_seconds,
     };
     use crate::models::PopularBinaryProfile;
     use serde_json::Value;
@@ -4125,6 +4431,46 @@ Mar 29 23:54:37 nucat kernel: MainThread invoked oom-killer: gfp_mask=0x140cca(G
         assert_eq!(events[0].anon_rss_kb, 204948);
         assert_eq!(events[0].cgroup_target.as_deref(), Some("element-desktop"));
         assert_eq!(events[0].invoker.as_deref(), Some("MainThread"));
+    }
+
+    #[test]
+    fn parses_desktop_resume_failures_into_structured_investigations() {
+        let raw = "\
+Mar 30 00:41:39 tinycat systemd-logind[953]: The system will suspend now!\n\
+Mar 30 00:41:40 tinycat kernel: PM: suspend entry (deep)\n\
+Mar 30 01:38:57 tinycat kernel: radeon 0000:01:05.0: ring 0 stalled for more than 10240msec\n\
+Mar 30 01:38:57 tinycat kernel: [drm:r600_ib_test [radeon]] *ERROR* radeon: fence wait failed (-35).\n\
+Mar 30 01:38:57 tinycat kernel: [drm:radeon_resume_kms [radeon]] *ERROR* ib ring test failed (-35).\n\
+Mar 30 01:38:58 tinycat kernel: PM: suspend exit\n\
+Mar 30 01:38:58 tinycat ksmserver[1174]: radeon: The kernel rejected CS, see dmesg for more information.\n\
+Mar 30 01:38:58 tinycat plasmashell[1176]: radeon: The kernel rejected CS, see dmesg for more information.\n\
+Mar 30 01:38:58 tinycat systemd-coredump[1695]: Process 853 (Xorg) of user 0 terminated abnormally with signal 7/BUS, processing...\n\
+Mar 30 01:38:58 tinycat systemd-coredump[1696]: Process 1213 (kwin_x11) of user 1000 terminated abnormally with signal 7/BUS, processing...\n\
+Mar 30 01:38:59 tinycat kwin_x11[1702]: qt.qpa.xcb: could not connect to display :0\n\
+Mar 30 01:38:59 tinycat sddm[829]: Display server stopping...\n\
+Mar 30 01:38:59 tinycat sddm[829]: Display server stopped.\n\
+Mar 30 01:38:59 tinycat sddm[829]: Adding new display...\n\
+Mar 30 01:39:00 tinycat sddm[829]: Failed to read display number from pipe\n\
+Mar 30 01:39:00 tinycat sddm[829]: Attempt 1 starting the Display server on vt 1 failed\n";
+        let event = parse_latest_desktop_resume_failure(raw).expect("desktop resume event");
+        assert_eq!(event.driver, "radeon");
+        assert_eq!(event.session_type, "x11");
+        assert_eq!(event.display_manager, "sddm");
+        assert_eq!(event.crashed_processes, vec!["Xorg", "kwin_x11"]);
+        assert!(
+            event
+                .gpu_error_lines
+                .iter()
+                .any(|line| line.contains("ring 0 stalled"))
+        );
+        assert!(
+            event
+                .session_error_lines
+                .iter()
+                .any(|line| line.contains("Failed to read display number from pipe"))
+        );
+        assert_eq!(event.display_target(), "radeon X11 desktop");
+        assert!(event.public_summary().contains("Xorg, kwin_x11 crashed"));
     }
 
     #[test]

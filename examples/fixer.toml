@@ -16,12 +16,15 @@ warning_logs = []
 [patch]
 codex_command = "codex"
 codex_args = []
+spark_model = "gpt-5.3-codex-spark"
 sandbox = "workspace-write"
 approval_policy = "never"
 extra_instructions = "Keep the change narrowly scoped and leave a concise summary in the final message."
 plan_before_patch = true
 review_after_patch = true
 review_fix_passes = 1
+spark_fallback_on_rate_limit = true
+rate_limit_cooldown_seconds = 21600
 
 [network]
 server_url = "http://127.0.0.1:8080/"

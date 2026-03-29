@@ -1336,6 +1336,7 @@ fn score_for(
     let detail_boost = match kind {
         "investigation" => match details.get("subsystem").and_then(Value::as_str) {
             Some("stuck-process") => 20,
+            Some("desktop-resume") => 19,
             Some("oom-kill") => 18,
             Some("runaway-process") => 16,
             _ => 12,
@@ -1561,7 +1562,11 @@ mod tests {
 
         let artifact_count = store
             .conn
-            .query_row("SELECT COUNT(*) FROM artifacts WHERE path = ?1", [stale_path.to_string_lossy().to_string()], |row| row.get::<_, i64>(0))
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE path = ?1",
+                [stale_path.to_string_lossy().to_string()],
+                |row| row.get::<_, i64>(0),
+            )
             .unwrap();
         assert_eq!(artifact_count, 1);
     }

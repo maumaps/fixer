@@ -81,6 +81,8 @@ pub struct PatchConfig {
     pub codex_args: Vec<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default = "default_spark_model")]
+    pub spark_model: Option<String>,
     #[serde(default)]
     pub sandbox: Option<String>,
     #[serde(default)]
@@ -93,6 +95,10 @@ pub struct PatchConfig {
     pub review_after_patch: bool,
     #[serde(default = "default_review_fix_passes")]
     pub review_fix_passes: u32,
+    #[serde(default = "default_true")]
+    pub spark_fallback_on_rate_limit: bool,
+    #[serde(default = "default_rate_limit_cooldown")]
+    pub rate_limit_cooldown_seconds: u64,
     #[serde(default)]
     pub auth_mode: CodexAuthMode,
     #[serde(default = "default_lease_budget_preset")]
@@ -222,12 +228,15 @@ impl Default for PatchConfig {
             codex_command: default_codex_command(),
             codex_args: Vec::new(),
             model: None,
+            spark_model: default_spark_model(),
             sandbox: Some("workspace-write".to_string()),
             approval_policy: Some("never".to_string()),
             extra_instructions: None,
             plan_before_patch: true,
             review_after_patch: true,
             review_fix_passes: default_review_fix_passes(),
+            spark_fallback_on_rate_limit: true,
+            rate_limit_cooldown_seconds: default_rate_limit_cooldown(),
             auth_mode: CodexAuthMode::UserLease,
             lease_budget_preset: default_lease_budget_preset(),
             lease_default_ttl_seconds: default_lease_default_ttl(),
@@ -405,6 +414,14 @@ fn default_lease_default_ttl() -> u64 {
 
 fn default_review_fix_passes() -> u32 {
     1
+}
+
+fn default_spark_model() -> Option<String> {
+    Some("gpt-5.3-codex-spark".to_string())
+}
+
+fn default_rate_limit_cooldown() -> u64 {
+    6 * 60 * 60
 }
 
 fn default_lease_failure_pause_threshold() -> u32 {

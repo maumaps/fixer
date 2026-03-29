@@ -1,3 +1,14 @@
+fixer (0.28.0-1) unstable; urgency=medium
+
+  * Prefer GPT-5.3-Codex-Spark automatically after primary Codex rate-limit hits and
+    retry the current patch stage on Spark immediately when needed.
+  * Record the model and fallback path used for Codex-produced fixes in job status,
+    worker attempt metadata, and published attempt sessions.
+  * Detect desktop sessions that disappear after suspend/resume as first-class
+    investigations instead of scattered crashes and warnings.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 30 Mar 2026 15:30:00 +0400
+
 fixer (0.27.0-1) unstable; urgency=medium
 
   * Avoid crashing when pruning stale /proc artifacts that are still referenced by findings.

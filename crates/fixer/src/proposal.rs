@@ -7,6 +7,8 @@ use crate::storage::Store;
 use crate::util::{command_exists, command_output, now_rfc3339, read_text};
 use crate::workspace::resolve_installed_package_metadata;
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
@@ -182,6 +184,12 @@ pub fn load_codex_job(job_dir: &std::path::Path) -> Result<CodexJobSpec> {
     serde_json::from_slice(&raw).with_context(|| format!("failed to parse {}", job_path.display()))
 }
 
+pub fn load_codex_job_status(bundle_dir: &Path) -> Result<CodexJobStatus> {
+    let path = bundle_dir.join("status.json");
+    let raw = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&raw).with_context(|| format!("failed to parse {}", path.display()))
+}
+
 pub fn load_published_codex_session(bundle_dir: &Path) -> Result<Value> {
     let evidence_path = bundle_dir.join("evidence.json");
     let prompt_path = {
@@ -235,10 +243,20 @@ pub fn load_published_codex_session(bundle_dir: &Path) -> Result<Value> {
         .transpose()?;
     let diff =
         render_public_session_diff(source_workspace_root.as_deref(), workspace_root.as_deref())?;
+    let status = load_codex_job_status(bundle_dir).ok();
     Ok(json!({
         "prompt": prompt,
         "response": response,
         "diff": diff,
+        "model": status.as_ref().and_then(|value| value.selected_model.clone()),
+        "models_used": status
+            .as_ref()
+            .map(|value| value.models_used.clone())
+            .unwrap_or_default(),
+        "rate_limit_fallback_used": status
+            .as_ref()
+            .map(|value| value.rate_limit_fallback_used)
+            .unwrap_or(false),
     }))
 }
 
@@ -343,6 +361,9 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
     let mut logs = Vec::new();
     let mut patch_prompt = base_patch_prompt.clone();
     let mut plan_output_path: Option<PathBuf> = None;
+    let mut models_used = Vec::<String>::new();
+    let mut rate_limit_fallback_used = false;
+    let mut selected_model: Option<String> = None;
 
     if config.patch.plan_before_patch {
         let plan_prompt = build_plan_prompt(
@@ -361,6 +382,9 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
             &plan_prompt,
         )?;
         logs.push(render_stage_log(&plan_stage));
+        models_used.extend(plan_stage.models_used.clone());
+        rate_limit_fallback_used |= plan_stage.rate_limit_fallback_used;
+        selected_model = plan_stage.selected_model.clone().or(selected_model);
         transcripts.push(CodexStageTranscript {
             label: plan_stage.label.to_string(),
             prompt: plan_prompt,
@@ -385,6 +409,9 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                 started_at,
                 finished_at,
                 output_path: job.output_path.exists().then(|| job.output_path.clone()),
+                selected_model,
+                models_used: ordered_unique_strings(&models_used),
+                rate_limit_fallback_used,
                 failure_kind: Some(classify_codex_failure(&plan_stage.log)),
                 error: Some(plan_stage.error),
             };
@@ -407,6 +434,9 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         &patch_prompt,
     )?;
     logs.push(render_stage_log(&patch_stage));
+    models_used.extend(patch_stage.models_used.clone());
+    rate_limit_fallback_used |= patch_stage.rate_limit_fallback_used;
+    selected_model = patch_stage.selected_model.clone().or(selected_model);
     transcripts.push(CodexStageTranscript {
         label: patch_stage.label.to_string(),
         prompt: patch_prompt.clone(),
@@ -431,6 +461,9 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
             started_at,
             finished_at,
             output_path: job.output_path.exists().then(|| job.output_path.clone()),
+            selected_model,
+            models_used: ordered_unique_strings(&models_used),
+            rate_limit_fallback_used,
             failure_kind: Some(classify_codex_failure(&patch_stage.log)),
             error: Some(patch_stage.error),
         };
@@ -470,6 +503,9 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                 &review_prompt,
             )?;
             logs.push(render_stage_log(&review_stage));
+            models_used.extend(review_stage.models_used.clone());
+            rate_limit_fallback_used |= review_stage.rate_limit_fallback_used;
+            selected_model = review_stage.selected_model.clone().or(selected_model);
             transcripts.push(CodexStageTranscript {
                 label: review_stage.label.to_string(),
                 prompt: review_prompt,
@@ -521,6 +557,9 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                         &refine_prompt,
                     )?;
                     logs.push(render_stage_log(&refine_stage));
+                    models_used.extend(refine_stage.models_used.clone());
+                    rate_limit_fallback_used |= refine_stage.rate_limit_fallback_used;
+                    selected_model = refine_stage.selected_model.clone().or(selected_model);
                     transcripts.push(CodexStageTranscript {
                         label: refine_stage.label.to_string(),
                         prompt: refine_prompt,
@@ -576,6 +615,9 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         started_at,
         finished_at,
         output_path: job.output_path.exists().then(|| job.output_path.clone()),
+        selected_model,
+        models_used: ordered_unique_strings(&models_used),
+        rate_limit_fallback_used,
         failure_kind: workflow_failure.as_ref().map(|(kind, _)| kind.clone()),
         error: workflow_failure.map(|(_, error)| error),
     };
@@ -651,7 +693,10 @@ pub fn supports_process_investigation_report(opportunity: &OpportunityRecord) ->
             .and_then(|details| details.get("subsystem"))
             .and_then(Value::as_str)
             .is_some_and(|subsystem| {
-                matches!(subsystem, "runaway-process" | "stuck-process" | "oom-kill")
+                matches!(
+                    subsystem,
+                    "runaway-process" | "stuck-process" | "oom-kill" | "desktop-resume"
+                )
             })
 }
 
@@ -1053,6 +1098,7 @@ fn truncate_public_session_text(text: &str, max_len: usize) -> String {
 struct CodexProcessOutcome {
     success: bool,
     log: String,
+    model_used: Option<String>,
 }
 
 struct CodexStageOutcome {
@@ -1061,6 +1107,9 @@ struct CodexStageOutcome {
     output: String,
     log: String,
     error: String,
+    selected_model: Option<String>,
+    models_used: Vec<String>,
+    rate_limit_fallback_used: bool,
 }
 
 struct CodexStageTranscript {
@@ -1074,6 +1123,124 @@ enum CodexReviewVerdict {
     FixNeeded,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CodexModelLimitState {
+    primary_model: Option<String>,
+    primary_rate_limited_until: Option<String>,
+    updated_at: Option<String>,
+}
+
+fn configured_primary_model_label(config: &FixerConfig) -> String {
+    config
+        .patch
+        .model
+        .clone()
+        .unwrap_or_else(|| "codex-default".to_string())
+}
+
+fn configured_spark_model(config: &FixerConfig) -> Option<String> {
+    config
+        .patch
+        .spark_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn codex_model_limit_state_path(config: &FixerConfig) -> PathBuf {
+    config.service.state_dir.join("codex-model-state.json")
+}
+
+fn load_codex_model_limit_state(config: &FixerConfig) -> CodexModelLimitState {
+    let path = codex_model_limit_state_path(config);
+    let Ok(raw) = fs::read(&path) else {
+        return CodexModelLimitState::default();
+    };
+    serde_json::from_slice(&raw).unwrap_or_default()
+}
+
+fn save_codex_model_limit_state(config: &FixerConfig, state: &CodexModelLimitState) -> Result<()> {
+    let path = codex_model_limit_state_path(config);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(state)?)?;
+    Ok(())
+}
+
+fn primary_model_rate_limit_active(config: &FixerConfig) -> bool {
+    let state = load_codex_model_limit_state(config);
+    let Some(until_raw) = state.primary_rate_limited_until.as_deref() else {
+        return false;
+    };
+    let Some(primary_model) = state.primary_model.as_deref() else {
+        return false;
+    };
+    if primary_model != configured_primary_model_label(config) {
+        return false;
+    }
+    DateTime::parse_from_rfc3339(until_raw)
+        .map(|until| until.with_timezone(&Utc) > Utc::now())
+        .unwrap_or(false)
+}
+
+fn remember_primary_model_rate_limit(config: &FixerConfig) -> Result<()> {
+    let mut state = load_codex_model_limit_state(config);
+    state.primary_model = Some(configured_primary_model_label(config));
+    state.primary_rate_limited_until = Some(
+        (Utc::now() + ChronoDuration::seconds(config.patch.rate_limit_cooldown_seconds as i64))
+            .to_rfc3339(),
+    );
+    state.updated_at = Some(Utc::now().to_rfc3339());
+    save_codex_model_limit_state(config, &state)
+}
+
+fn clear_primary_model_rate_limit(config: &FixerConfig) -> Result<()> {
+    let path = codex_model_limit_state_path(config);
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn initial_stage_model(config: &FixerConfig) -> Option<String> {
+    let spark_model = configured_spark_model(config);
+    if config.patch.spark_fallback_on_rate_limit
+        && spark_model.is_some()
+        && primary_model_rate_limit_active(config)
+    {
+        return spark_model;
+    }
+    config.patch.model.clone()
+}
+
+fn should_retry_with_spark(
+    config: &FixerConfig,
+    failure_kind: &str,
+    attempted_model: Option<&str>,
+) -> Option<String> {
+    if failure_kind != "rate-limit" || !config.patch.spark_fallback_on_rate_limit {
+        return None;
+    }
+    let spark_model = configured_spark_model(config)?;
+    if attempted_model.is_some_and(|model| model == spark_model) {
+        return None;
+    }
+    Some(spark_model)
+}
+
+fn ordered_unique_strings(values: &[String]) -> Vec<String> {
+    let mut unique = Vec::new();
+    for value in values {
+        if unique.iter().any(|item| item == value) {
+            continue;
+        }
+        unique.push(value.clone());
+    }
+    unique
+}
+
 fn run_codex_stage(
     config: &FixerConfig,
     repo_root: &Path,
@@ -1084,7 +1251,46 @@ fn run_codex_stage(
 ) -> Result<CodexStageOutcome> {
     let label = label.into();
     fs::write(prompt_path, prompt.as_bytes())?;
-    let outcome = run_codex_process(config, repo_root, output_path, prompt)?;
+    let mut models_used = Vec::new();
+    let mut logs = Vec::new();
+    let initial_model = initial_stage_model(config);
+    let mut outcome = run_codex_process(
+        config,
+        repo_root,
+        output_path,
+        prompt,
+        initial_model.as_deref(),
+    )?;
+    if let Some(model) = outcome.model_used.clone() {
+        models_used.push(model);
+    }
+    logs.push(render_process_attempt_log(&outcome));
+    let mut rate_limit_fallback_used = false;
+
+    let primary_label = configured_primary_model_label(config);
+    if !outcome.success {
+        let failure_kind = classify_codex_failure(&outcome.log);
+        if failure_kind == "rate-limit" {
+            let attempted_model = outcome.model_used.as_deref();
+            if attempted_model.unwrap_or("codex-default") == primary_label {
+                let _ = remember_primary_model_rate_limit(config);
+            }
+        }
+        if let Some(spark_model) =
+            should_retry_with_spark(config, &failure_kind, outcome.model_used.as_deref())
+        {
+            let retry_outcome =
+                run_codex_process(config, repo_root, output_path, prompt, Some(&spark_model))?;
+            if let Some(model) = retry_outcome.model_used.clone() {
+                models_used.push(model);
+            }
+            logs.push(render_process_attempt_log(&retry_outcome));
+            outcome = retry_outcome;
+            rate_limit_fallback_used = true;
+        }
+    } else if outcome.model_used.as_deref() == Some(primary_label.as_str()) {
+        let _ = clear_primary_model_rate_limit(config);
+    }
     let output = if output_path.exists() {
         read_text(output_path)
             .with_context(|| format!("failed to read {}", output_path.display()))?
@@ -1094,22 +1300,40 @@ fn run_codex_stage(
     let error = if outcome.success {
         String::new()
     } else {
-        summarize_failure_log(&outcome.log)
+        summarize_failure_log(&logs.join("\n\n"))
     };
     Ok(CodexStageOutcome {
         label,
         success: outcome.success,
         output,
-        log: outcome.log,
+        log: logs.join("\n\n"),
         error,
+        selected_model: outcome.model_used,
+        models_used,
+        rate_limit_fallback_used,
     })
+}
+
+fn render_process_attempt_log(outcome: &CodexProcessOutcome) -> String {
+    format!(
+        "model: {}\n\n{}",
+        outcome.model_used.as_deref().unwrap_or("codex-default"),
+        outcome.log
+    )
 }
 
 fn render_stage_log(stage: &CodexStageOutcome) -> String {
     format!(
-        "== {} ==\nstatus: {}\n\n{}",
+        "== {} ==\nstatus: {}\nmodel: {}\nmodels-tried: {}\nrate-limit-fallback: {}\n\n{}",
         stage.label,
         if stage.success { "ok" } else { "failed" },
+        stage.selected_model.as_deref().unwrap_or("codex-default"),
+        if stage.models_used.is_empty() {
+            "codex-default".to_string()
+        } else {
+            stage.models_used.join(", ")
+        },
+        stage.rate_limit_fallback_used,
         stage.log
     )
 }
@@ -1174,6 +1398,7 @@ fn run_codex_process(
     repo_root: &std::path::Path,
     output_path: &std::path::Path,
     prompt: &str,
+    model: Option<&str>,
 ) -> Result<CodexProcessOutcome> {
     if !command_exists(&config.patch.codex_command) {
         return Err(anyhow!(
@@ -1187,7 +1412,7 @@ fn run_codex_process(
     }
     cmd.arg("exec");
     cmd.arg("--skip-git-repo-check");
-    if let Some(model) = &config.patch.model {
+    if let Some(model) = model {
         cmd.arg("-m").arg(model);
     }
     if let Some(sandbox) = &config.patch.sandbox {
@@ -1217,6 +1442,11 @@ fn run_codex_process(
     Ok(CodexProcessOutcome {
         success: output.status.success(),
         log,
+        model_used: Some(
+            model
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "codex-default".to_string()),
+        ),
     })
 }
 
@@ -1224,6 +1454,14 @@ fn classify_codex_failure(log: &str) -> String {
     let lower = log.to_ascii_lowercase();
     if lower.contains("401 unauthorized") || lower.contains("missing bearer") {
         "auth".to_string()
+    } else if lower.contains("rate limit")
+        || lower.contains("rate-limit")
+        || lower.contains("too many requests")
+        || lower.contains("429")
+        || lower.contains("quota")
+        || lower.contains("usage limit")
+    {
+        "rate-limit".to_string()
     } else if lower.contains("500 internal server error")
         || lower.contains("failed to connect to websocket")
     {
@@ -1762,11 +2000,14 @@ fn render_process_investigation_report(
         .unwrap_or("runaway-process");
     let is_stuck_process = subsystem == "stuck-process";
     let is_oom_kill = subsystem == "oom-kill";
+    let is_desktop_resume = subsystem == "desktop-resume";
     let classification = details
         .get("loop_classification")
         .and_then(Value::as_str)
         .unwrap_or(if is_stuck_process {
             "unknown-uninterruptible-wait"
+        } else if is_desktop_resume {
+            "resume-display-failure"
         } else if is_oom_kill {
             "kernel-oom-kill"
         } else {
@@ -1781,6 +2022,8 @@ fn render_process_investigation_report(
         .and_then(Value::as_str)
         .unwrap_or(if is_stuck_process {
             "Fixer collected `/proc` evidence for a process wedged in `D` state but could not derive a stronger kernel-side hypothesis yet."
+        } else if is_desktop_resume {
+            "Fixer correlated suspend/resume timing with graphics stack errors, desktop-process crashes, and display-manager restart attempts."
         } else if is_oom_kill {
             "Fixer collected kernel log evidence showing that the OOM killer selected and terminated this process."
         } else {
@@ -1869,6 +2112,8 @@ fn render_process_investigation_report(
     let mut body = String::new();
     if is_stuck_process {
         body.push_str("# Stuck Process Investigation Report\n\n");
+    } else if is_desktop_resume {
+        body.push_str("# Desktop Resume Failure Investigation Report\n\n");
     } else if is_oom_kill {
         body.push_str("# OOM Kill Investigation Report\n\n");
     } else {
@@ -1879,6 +2124,8 @@ fn render_process_investigation_report(
         Some(error) => {
             if is_stuck_process {
                 body.push_str("Fixer diagnosed a likely stuck-process wait, but it could not automatically acquire a patchable source workspace on this host.\n\n");
+            } else if is_desktop_resume {
+                body.push_str("Fixer diagnosed a suspend/resume display-stack failure, but it could not automatically acquire a patchable graphics or desktop source workspace on this host.\n\n");
             } else if is_oom_kill {
                 body.push_str("Fixer diagnosed a kernel OOM kill, but it could not automatically acquire a patchable source workspace on this host.\n\n");
             } else {
@@ -1890,6 +2137,8 @@ fn render_process_investigation_report(
         None => {
             if is_stuck_process {
                 body.push_str("Fixer gathered enough evidence to describe the wait. Review the diagnosis below, then decide whether this looks like a package bug or a lower-level filesystem or kernel stall.\n\n");
+            } else if is_desktop_resume {
+                body.push_str("Fixer gathered enough evidence to describe the suspend/resume failure. Review the diagnosis below, then decide whether this looks like a graphics-driver, X11, compositor, or display-manager regression.\n\n");
             } else if is_oom_kill {
                 body.push_str("Fixer gathered enough evidence to describe the OOM kill. Review the diagnosis below, then decide whether this points at application memory growth, an unusually heavy workload, or broader system memory pressure.\n\n");
             } else {
@@ -1974,11 +2223,22 @@ fn render_process_investigation_report(
             body.push_str(&format!("- oom_score_adj: `{oom_score_adj}`\n"));
         }
     } else {
-        body.push_str("\n## Why Fixer Believes It Is Stuck\n\n");
-        body.push_str(&format!(
-            "- Target process: `{}`\n- Sampled PID: `{}`\n- Loop classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
-            target_name, sampled_pid, classification, confidence, explanation
-        ));
+        if is_desktop_resume {
+            body.push_str("\n## Why Fixer Believes Resume Broke The Desktop\n\n");
+        } else {
+            body.push_str("\n## Why Fixer Believes It Is Stuck\n\n");
+        }
+        if is_desktop_resume {
+            body.push_str(&format!(
+                "- Affected desktop target: `{}`\n- Failure classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
+                target_name, classification, confidence, explanation
+            ));
+        } else {
+            body.push_str(&format!(
+                "- Target process: `{}`\n- Sampled PID: `{}`\n- Loop classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
+                target_name, sampled_pid, classification, confidence, explanation
+            ));
+        }
         if let Some(process_state) = process_state {
             body.push_str(&format!("- Process state: `{process_state}`\n"));
         }
@@ -1992,6 +2252,35 @@ fn render_process_investigation_report(
             body.push_str(&format!(
                 "- Strace capture duration: `{strace_duration}` seconds\n"
             ));
+        }
+        if is_desktop_resume {
+            if let Some(driver) = details.get("driver").and_then(Value::as_str) {
+                body.push_str(&format!("- Graphics driver: `{driver}`\n"));
+            }
+            if let Some(session_type) = details.get("session_type").and_then(Value::as_str) {
+                body.push_str(&format!(
+                    "- Session type: `{}`\n",
+                    session_type.to_uppercase()
+                ));
+            }
+            if let Some(display_manager) = details.get("display_manager").and_then(Value::as_str) {
+                body.push_str(&format!("- Display manager: `{display_manager}`\n"));
+            }
+            if let Some(crashes) = details.get("crashed_processes").and_then(Value::as_array) {
+                let crashes = crashes.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+                if !crashes.is_empty() {
+                    body.push_str(&format!(
+                        "- Crashed desktop processes: `{}`\n",
+                        crashes.join(", ")
+                    ));
+                }
+            }
+            if let Some(suspend_line) = details.get("suspend_line").and_then(Value::as_str) {
+                body.push_str(&format!("- Suspend marker: `{suspend_line}`\n"));
+            }
+            if let Some(resume_line) = details.get("resume_line").and_then(Value::as_str) {
+                body.push_str(&format!("- Resume marker: `{resume_line}`\n"));
+            }
         }
     }
     if is_stuck_process {
@@ -2010,6 +2299,36 @@ fn render_process_investigation_report(
                 body.push_str("- Open targets:\n");
                 for target in targets {
                     body.push_str(&format!("  - `{target}`\n"));
+                }
+            }
+        }
+    }
+    if is_desktop_resume {
+        if let Some(gpu_error_lines) = details.get("gpu_error_lines").and_then(Value::as_array) {
+            let lines = gpu_error_lines
+                .iter()
+                .filter_map(Value::as_str)
+                .take(6)
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                body.push_str("\n## Graphics Stack Errors\n\n");
+                for line in lines {
+                    body.push_str(&format!("- `{line}`\n"));
+                }
+            }
+        }
+        if let Some(session_error_lines) =
+            details.get("session_error_lines").and_then(Value::as_array)
+        {
+            let lines = session_error_lines
+                .iter()
+                .filter_map(Value::as_str)
+                .take(6)
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                body.push_str("\n## Session And Display-Manager Errors\n\n");
+                for line in lines {
+                    body.push_str(&format!("- `{line}`\n"));
                 }
             }
         }
@@ -2050,6 +2369,10 @@ fn render_process_investigation_report(
         body.push_str("1. Confirm the process is still in `D` state with `ps -p <pid> -o pid,stat,wchan:40,comm`.\n");
         body.push_str("2. Re-read `/proc/<pid>/stack`, `/proc/<pid>/wchan`, and `/proc/<pid>/fd` to confirm the blocking path still points at the same wait site.\n");
         body.push_str("3. If you intervene on the suspected filesystem or mount backend, verify the process leaves `D` state instead of simply moving to a different wait site.\n");
+    } else if is_desktop_resume {
+        body.push_str("1. Reproduce one suspend/resume cycle and confirm the journal still shows the same graphics-driver errors right before or right after resume.\n");
+        body.push_str("2. Check whether `Xorg`, `kwin_x11`, or the display manager are crashing with the same signals and backtraces.\n");
+        body.push_str("3. If you change the kernel, Mesa, Xorg driver, or session type, verify the desktop comes back cleanly after resume and the journal no longer shows the same display-stack failure markers.\n");
     } else if is_oom_kill {
         body.push_str("1. Confirm the kernel is still logging OOM activity with `journalctl -k -g 'Out of memory|Killed process|oom-kill'`.\n");
         body.push_str("2. Check whether the same package or cgroup repeatedly gets selected as the OOM victim under the same workload.\n");
@@ -2071,6 +2394,8 @@ fn render_process_investigation_report(
                 .unwrap_or(false)
         {
             body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points below user space, so the next action is usually a kernel, mount, or storage investigation rather than a package patch.\n");
+        } else if is_desktop_resume {
+            body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points at the graphics stack around suspend/resume, so the next action is usually a kernel, Mesa, Xorg-driver, or compositor investigation rather than a narrow package patch.\n");
         } else if is_oom_kill {
             body.push_str("Treat this as the diagnosis half of the pipeline. The next action is to decide whether the application is growing unreasonably, the workload needs limits, or the host is simply under-provisioned for the current memory demand.\n");
         } else {
@@ -2531,15 +2856,17 @@ fn pg_amcheck_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        load_published_codex_session, parse_review_verdict, pg_amcheck_command,
-        prepare_codex_job_with_prior_patch, render_external_bug_report,
+        classify_codex_failure, load_published_codex_session, parse_review_verdict,
+        pg_amcheck_command, prepare_codex_job_with_prior_patch, primary_model_rate_limit_active,
+        remember_primary_model_rate_limit, render_external_bug_report,
         render_local_remediation_report, render_local_remediation_sql,
         render_process_investigation_report, sanitize_command_line_for_report,
         suggested_report_destination,
     };
     use crate::config::FixerConfig;
     use crate::models::{
-        InstalledPackageMetadata, OpportunityRecord, PatchAttempt, PreparedWorkspace,
+        CodexJobStatus, InstalledPackageMetadata, OpportunityRecord, PatchAttempt,
+        PreparedWorkspace,
     };
     use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
@@ -2951,6 +3278,63 @@ mod tests {
     }
 
     #[test]
+    fn desktop_resume_investigation_reports_explain_disappearing_desktop() {
+        let opportunity = OpportunityRecord {
+            id: 10,
+            finding_id: 10,
+            kind: "investigation".to_string(),
+            title: "Desktop resume failure investigation for radeon X11 desktop".to_string(),
+            score: 109,
+            state: "open".to_string(),
+            summary: "After suspend/resume, radeon X11 desktop failed: Xorg, kwin_x11 crashed after GPU/display errors, and sddm restarted the display stack.".to_string(),
+            evidence: json!({
+                "package_name": "linux-image-6.19.8+deb14-amd64",
+                "details": {
+                    "subsystem": "desktop-resume",
+                    "profile_target": { "name": "radeon X11 desktop" },
+                    "loop_classification": "resume-display-failure",
+                    "loop_confidence": 0.99,
+                    "loop_explanation": "Fixer correlated suspend/resume timing with graphics stack errors, desktop-process crashes, and display-manager restart attempts.",
+                    "driver": "radeon",
+                    "session_type": "x11",
+                    "display_manager": "sddm",
+                    "crashed_processes": ["Xorg", "kwin_x11"],
+                    "gpu_error_lines": [
+                        "Mar 30 01:38:57 tinycat kernel: radeon 0000:01:05.0: ring 0 stalled for more than 10240msec"
+                    ],
+                    "session_error_lines": [
+                        "Mar 30 01:39:00 tinycat sddm[829]: Failed to read display number from pipe"
+                    ],
+                    "suspend_line": "Mar 30 00:41:40 tinycat kernel: PM: suspend entry (deep)",
+                    "resume_line": "Mar 30 01:38:58 tinycat kernel: PM: suspend exit",
+                    "likely_external_root_cause": true
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-03-30T01:38:58Z".to_string(),
+            updated_at: "2026-03-30T01:38:58Z".to_string(),
+        };
+        let system = json!({
+            "os_pretty_name": "Debian GNU/Linux trixie/sid",
+            "kernel": "Linux 6.19.8+deb14-amd64"
+        });
+        let rendered = render_process_investigation_report(
+            &opportunity,
+            None,
+            &system,
+            Path::new("/tmp/evidence.json"),
+            None,
+        );
+        assert!(rendered.contains("Desktop Resume Failure Investigation Report"));
+        assert!(rendered.contains("Why Fixer Believes Resume Broke The Desktop"));
+        assert!(rendered.contains("Xorg, kwin_x11"));
+        assert!(rendered.contains("Graphics Stack Errors"));
+        assert!(rendered.contains("display-manager"));
+        assert!(rendered.contains("kernel, Mesa, Xorg-driver, or compositor investigation"));
+    }
+
+    #[test]
     fn published_codex_session_sanitizes_local_bundle_paths() {
         let dir = tempfile::tempdir().unwrap();
         let bundle_dir = dir.path().join("proposal");
@@ -3052,6 +3436,91 @@ mod tests {
 
         assert!(prompt.contains("## Review Pass 1"));
         assert!(!prompt.contains("initial prompt\ninitial prompt"));
+    }
+
+    #[test]
+    fn published_codex_session_includes_model_metadata_from_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_dir = dir.path().join("proposal");
+        let source_dir = dir.path().join("source");
+        let workspace_dir = bundle_dir.join("workspace");
+        std::fs::create_dir_all(source_dir.join("src")).unwrap();
+        std::fs::create_dir_all(workspace_dir.join("src")).unwrap();
+        std::fs::write(bundle_dir.join("prompt.md"), "initial prompt").unwrap();
+        std::fs::write(bundle_dir.join("codex-output.txt"), "combined response").unwrap();
+        std::fs::write(source_dir.join("src/file.c"), "old\n").unwrap();
+        std::fs::write(workspace_dir.join("src/file.c"), "new\n").unwrap();
+        std::fs::write(
+            bundle_dir.join("status.json"),
+            serde_json::to_vec_pretty(&CodexJobStatus {
+                job_id: "job-1".to_string(),
+                state: "ready".to_string(),
+                started_at: "2026-03-30T00:00:00Z".to_string(),
+                finished_at: "2026-03-30T00:01:00Z".to_string(),
+                output_path: Some(bundle_dir.join("codex-output.txt")),
+                selected_model: Some("gpt-5.3-codex-spark".to_string()),
+                models_used: vec!["gpt-5.4".to_string(), "gpt-5.3-codex-spark".to_string()],
+                rate_limit_fallback_used: true,
+                error: None,
+                failure_kind: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            bundle_dir.join("evidence.json"),
+            serde_json::to_vec_pretty(&json!({
+                "workspace": { "repo_root": workspace_dir },
+                "source_workspace": { "repo_root": source_dir },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let published = load_published_codex_session(&bundle_dir).unwrap();
+        assert_eq!(
+            published.get("model").and_then(Value::as_str),
+            Some("gpt-5.3-codex-spark")
+        );
+        assert_eq!(
+            published
+                .get("models_used")
+                .and_then(Value::as_array)
+                .map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            published
+                .get("rate_limit_fallback_used")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn classify_codex_failure_detects_rate_limit_signals() {
+        assert_eq!(
+            classify_codex_failure("HTTP 429 Too Many Requests: rate limit exceeded"),
+            "rate-limit"
+        );
+        assert_eq!(
+            classify_codex_failure("usage limit reached for this model"),
+            "rate-limit"
+        );
+    }
+
+    #[test]
+    fn remembers_primary_model_rate_limit_for_spark_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FixerConfig::default();
+        config.service.state_dir = dir.path().join("state");
+        config.patch.model = Some("gpt-5.4".to_string());
+        config.patch.spark_model = Some("gpt-5.3-codex-spark".to_string());
+        config.patch.rate_limit_cooldown_seconds = 3600;
+
+        assert!(!primary_model_rate_limit_active(&config));
+        remember_primary_model_rate_limit(&config).unwrap();
+        assert!(primary_model_rate_limit_active(&config));
     }
 
     #[test]
