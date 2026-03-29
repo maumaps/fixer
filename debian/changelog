@@ -1,3 +1,10 @@
+fixer (0.8.0-1) unstable; urgency=medium
+
+  * Enroll client hosts into the official HTTPS Fixer server.
+  * Do not auto-enable fixer-server.service on client package installs.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 20:05:00 +0400
+
 fixer (0.7.0-1) unstable; urgency=medium
 
   * Fix self-submission on the public host by storing participation mode as text.
