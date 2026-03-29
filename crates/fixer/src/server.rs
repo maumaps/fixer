@@ -3843,6 +3843,7 @@ fn is_publicly_visible(item: &SharedOpportunity) -> bool {
     match item.finding.kind.as_str() {
         "crash" => true,
         "hotspot" => true,
+        "investigation" => true,
         "warning" => {
             if item.finding.title == "Kernel warning" {
                 return false;
@@ -4555,6 +4556,7 @@ mod tests {
             hostname: None,
             capabilities: Vec::new(),
             has_codex: false,
+            richer_evidence_allowed: false,
         };
 
         let error = reject_incompatible_client(&request).unwrap_err();

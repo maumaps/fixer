@@ -266,6 +266,8 @@ pub struct ClientHello {
     pub hostname: Option<String>,
     pub capabilities: Vec<String>,
     pub has_codex: bool,
+    #[serde(default)]
+    pub richer_evidence_allowed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +283,8 @@ pub struct ProofOfWork {
 pub struct FindingBundle {
     pub captured_at: String,
     pub policy_version: String,
+    #[serde(default)]
+    pub richer_evidence_allowed: bool,
     pub status: StatusSnapshot,
     pub capabilities: Vec<Capability>,
     pub items: Vec<SharedOpportunity>,

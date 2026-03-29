@@ -38,6 +38,7 @@ pub fn create_proposal(
     fs::write(&evidence_path, serde_json::to_vec_pretty(&evidence)?)?;
 
     let prompt = build_prompt(
+        opportunity,
         &fs::canonicalize(&evidence_path).unwrap_or_else(|_| evidence_path.clone()),
         workspace,
         config,
@@ -131,6 +132,70 @@ pub fn supports_local_remediation(opportunity: &OpportunityRecord) -> bool {
         .and_then(|details| details.get("subsystem"))
         .and_then(Value::as_str)
         == Some("postgres-collation")
+}
+
+pub fn supports_process_investigation_report(opportunity: &OpportunityRecord) -> bool {
+    opportunity.kind == "investigation"
+        && opportunity
+            .evidence
+            .get("details")
+            .and_then(|details| details.get("subsystem"))
+            .and_then(Value::as_str)
+            .is_some_and(|subsystem| matches!(subsystem, "runaway-process" | "stuck-process"))
+}
+
+pub fn create_process_investigation_report_proposal(
+    store: &Store,
+    config: &FixerConfig,
+    opportunity: &OpportunityRecord,
+    acquisition_error: Option<&str>,
+) -> Result<ProposalRecord> {
+    let bundle_dir = config.service.state_dir.join("proposals").join(format!(
+        "{}-{}",
+        opportunity.id,
+        now_rfc3339().replace(':', "-")
+    ));
+    fs::create_dir_all(&bundle_dir)?;
+
+    let evidence_path = bundle_dir.join("evidence.json");
+    let summary_path = bundle_dir.join("proposal.md");
+    let package = opportunity
+        .evidence
+        .get("package_name")
+        .and_then(Value::as_str)
+        .and_then(|package_name| resolve_installed_package_metadata(package_name).ok());
+    let system = collect_system_context();
+    let report_kind = opportunity
+        .evidence
+        .get("details")
+        .and_then(|details| details.get("subsystem"))
+        .and_then(Value::as_str)
+        .unwrap_or("investigation");
+    let evidence = json!({
+        "report_kind": format!("{report_kind}-investigation"),
+        "opportunity": opportunity,
+        "package": package,
+        "system": system,
+        "workspace_error": acquisition_error,
+    });
+    fs::write(&evidence_path, serde_json::to_vec_pretty(&evidence)?)?;
+    fs::write(
+        &summary_path,
+        render_process_investigation_report(
+            opportunity,
+            package.as_ref(),
+            &system,
+            &evidence_path,
+            acquisition_error,
+        ),
+    )?;
+    store.create_proposal(
+        opportunity.id,
+        "deterministic",
+        "ready",
+        &bundle_dir,
+        Some(&summary_path),
+    )
 }
 
 pub fn create_local_remediation_proposal(
@@ -314,6 +379,7 @@ fn run_codex(
 }
 
 fn build_prompt(
+    opportunity: &OpportunityRecord,
     evidence_path: &std::path::Path,
     workspace: &PreparedWorkspace,
     config: &FixerConfig,
@@ -321,11 +387,17 @@ fn build_prompt(
     let extra = config.patch.extra_instructions.as_deref().unwrap_or(
         "Keep the patch narrowly scoped, validate locally, and explain any uncertainty.",
     );
+    let investigation_hint = if supports_process_investigation_report(opportunity) {
+        "\n\nStart by explaining the likely root cause from the collected perf, strace, and /proc evidence. If you cannot land a safe patch, leave a diagnosis that is strong enough for an upstream bug report."
+    } else {
+        ""
+    };
     format!(
-        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, run relevant tests if available, and summarize what changed.\n\n{}",
+        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, run relevant tests if available, and summarize what changed.{} \n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
+        investigation_hint,
         extra
     )
 }
@@ -662,6 +734,281 @@ fn render_external_issue_report(
     ));
     body.push_str("Please advise whether this matches a known issue, whether a newer package build is expected to fix it, and whether additional diagnostic data should be collected.\n\n");
     body.push_str("## Evidence Bundle\n\n");
+    body.push_str(&format!(
+        "Full local evidence: `{}`\n",
+        evidence_path.display()
+    ));
+    body
+}
+
+fn render_process_investigation_report(
+    opportunity: &OpportunityRecord,
+    package: Option<&InstalledPackageMetadata>,
+    system: &Value,
+    evidence_path: &std::path::Path,
+    acquisition_error: Option<&str>,
+) -> String {
+    let details = opportunity
+        .evidence
+        .get("details")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let subsystem = details
+        .get("subsystem")
+        .and_then(Value::as_str)
+        .unwrap_or("runaway-process");
+    let classification = details
+        .get("loop_classification")
+        .and_then(Value::as_str)
+        .unwrap_or(if subsystem == "stuck-process" {
+            "unknown-uninterruptible-wait"
+        } else {
+            "unknown-userspace-loop"
+        });
+    let confidence = details
+        .get("loop_confidence")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let explanation = details
+        .get("loop_explanation")
+        .and_then(Value::as_str)
+        .unwrap_or(if subsystem == "stuck-process" {
+            "Fixer collected `/proc` evidence for a process wedged in `D` state but could not derive a stronger kernel-side hypothesis yet."
+        } else {
+            "Fixer collected a CPU-hot process sample but could not derive a stronger hypothesis yet."
+        });
+    let target_name = details
+        .get("profile_target")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("process");
+    let hot_symbols = details
+        .get("top_hot_symbols")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .take(5)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let top_syscalls = details
+        .get("top_syscalls")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(format!(
+                        "{} x{}",
+                        item.get("name")?.as_str()?,
+                        item.get("count")?.as_u64()?
+                    ))
+                })
+                .take(5)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let dominant_sequence = details
+        .get("dominant_sequence")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" -> ")
+        })
+        .unwrap_or_default();
+    let command_line = details
+        .get("command_line")
+        .and_then(Value::as_str)
+        .map(sanitize_command_line_for_report);
+    let process_state = details.get("process_state").and_then(Value::as_str);
+    let wchan = details.get("wchan").and_then(Value::as_str);
+    let strace_duration = details
+        .get("strace_duration_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let sampled_pid = details
+        .get("sampled_pid")
+        .and_then(Value::as_i64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let package_name = package
+        .map(|pkg| pkg.package_name.clone())
+        .or_else(|| {
+            opportunity
+                .evidence
+                .get("package_name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let source_package = package
+        .map(|pkg| pkg.source_package.clone())
+        .or_else(|| {
+            details
+                .get("package_metadata")
+                .and_then(|value| value.get("source_package"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let mut body = String::new();
+    if subsystem == "stuck-process" {
+        body.push_str("# Stuck Process Investigation Report\n\n");
+    } else {
+        body.push_str("# Runaway CPU Investigation Report\n\n");
+    }
+    body.push_str("## Recommended Action\n\n");
+    match acquisition_error {
+        Some(error) => {
+            if subsystem == "stuck-process" {
+                body.push_str("Fixer diagnosed a likely stuck-process wait, but it could not automatically acquire a patchable source workspace on this host.\n\n");
+            } else {
+                body.push_str("Fixer diagnosed a likely runaway CPU loop, but it could not automatically acquire a patchable source workspace on this host.\n\n");
+            }
+            body.push_str(&format!("Workspace acquisition error: `{error}`\n\n"));
+            body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
+        }
+        None => {
+            if subsystem == "stuck-process" {
+                body.push_str("Fixer gathered enough evidence to describe the wait. Review the diagnosis below, then decide whether this looks like a package bug or a lower-level filesystem or kernel stall.\n\n");
+            } else {
+                body.push_str("Fixer gathered enough evidence to describe the loop. Review the diagnosis below, then run `fixer propose-fix <id> --engine codex` against a prepared source tree if you want an automated patch attempt.\n\n");
+            }
+        }
+    }
+
+    body.push_str("## Package And Environment\n\n");
+    body.push_str(&format!(
+        "- Package: `{}`\n- Source package: `{}`\n- OS: `{}`\n- Kernel: `{}`\n",
+        package_name,
+        source_package,
+        system
+            .get("os_pretty_name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        system
+            .get("kernel")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+    ));
+    if let Some(package) = package {
+        body.push_str(&format!(
+            "- Installed version: `{}`\n- Candidate version: `{}`\n- Homepage: `{}`\n",
+            package.installed_version.as_deref().unwrap_or("unknown"),
+            package.candidate_version.as_deref().unwrap_or("unknown"),
+            package.homepage.as_deref().unwrap_or("unknown"),
+        ));
+        if let Some((report_url, source)) = suggested_report_destination(package, system) {
+            body.push_str(&format!(
+                "- Suggested report URL: `{report_url}`\n- Report URL source: `{source}`\n"
+            ));
+        }
+    }
+
+    body.push_str("\n## Why Fixer Believes It Is Stuck\n\n");
+    body.push_str(&format!(
+        "- Target process: `{}`\n- Sampled PID: `{}`\n- Loop classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
+        target_name, sampled_pid, classification, confidence, explanation
+    ));
+    if let Some(process_state) = process_state {
+        body.push_str(&format!("- Process state: `{process_state}`\n"));
+    }
+    if let Some(wchan) = wchan {
+        body.push_str(&format!("- Wait channel: `{wchan}`\n"));
+    }
+    if let Some(command_line) = command_line {
+        body.push_str(&format!("- Command line: `{command_line}`\n"));
+    }
+    if strace_duration > 0 {
+        body.push_str(&format!(
+            "- Strace capture duration: `{strace_duration}` seconds\n"
+        ));
+    }
+    if subsystem == "stuck-process" {
+        if let Some(runtime_seconds) = details.get("runtime_seconds").and_then(Value::as_u64) {
+            body.push_str(&format!(
+                "- Runtime before capture: `{runtime_seconds}` seconds\n"
+            ));
+        }
+        if let Some(fd_targets) = details.get("fd_targets").and_then(Value::as_array) {
+            let targets = fd_targets
+                .iter()
+                .filter_map(Value::as_str)
+                .take(8)
+                .collect::<Vec<_>>();
+            if !targets.is_empty() {
+                body.push_str("- Open targets:\n");
+                for target in targets {
+                    body.push_str(&format!("  - `{target}`\n"));
+                }
+            }
+        }
+    }
+
+    if !hot_symbols.is_empty() {
+        body.push_str("\n## Dominant Call Path\n\n");
+        for symbol in hot_symbols {
+            body.push_str(&format!("- `{symbol}`\n"));
+        }
+    }
+
+    if !top_syscalls.is_empty() {
+        body.push_str("\n## Dominant Syscalls\n\n");
+        for syscall in top_syscalls {
+            body.push_str(&format!("- `{syscall}`\n"));
+        }
+    }
+    if !dominant_sequence.is_empty() {
+        body.push_str("\n## Repeated Loop Shape\n\n");
+        body.push_str(&format!("`{dominant_sequence}`\n"));
+    }
+    if subsystem == "stuck-process" {
+        if let Some(io_excerpt) = details.get("io_excerpt").and_then(Value::as_str) {
+            body.push_str("\n## I/O Snapshot\n\n```text\n");
+            body.push_str(io_excerpt);
+            body.push_str("\n```\n");
+        }
+        if let Some(stack_excerpt) = details.get("stack_excerpt").and_then(Value::as_str) {
+            body.push_str("\n## Kernel Stack Excerpt\n\n```text\n");
+            body.push_str(stack_excerpt);
+            body.push_str("\n```\n");
+        }
+    }
+
+    body.push_str("\n## Validation Steps\n\n");
+    if subsystem == "stuck-process" {
+        body.push_str("1. Confirm the process is still in `D` state with `ps -p <pid> -o pid,stat,wchan:40,comm`.\n");
+        body.push_str("2. Re-read `/proc/<pid>/stack`, `/proc/<pid>/wchan`, and `/proc/<pid>/fd` to confirm the blocking path still points at the same wait site.\n");
+        body.push_str("3. If you intervene on the suspected filesystem or mount backend, verify the process leaves `D` state instead of simply moving to a different wait site.\n");
+    } else {
+        body.push_str("1. Confirm the process still shows sustained CPU time with `systemd-cgtop`, `top`, or `ps -p <pid> -o %cpu,stat,comm`.\n");
+        body.push_str("2. Re-run a short syscall sample and confirm the dominant syscalls still match the sequence above.\n");
+        body.push_str("3. If you change the package, compare a fresh perf sample and strace excerpt to make sure the loop disappears rather than simply moving elsewhere.\n");
+    }
+
+    body.push_str("\n## Next Step\n\n");
+    if acquisition_error.is_some() {
+        body.push_str("Treat this as an upstream-report-ready diagnosis. Include the summary above, plus the evidence bundle path below, when filing the bug.\n");
+    } else {
+        if subsystem == "stuck-process"
+            && details
+                .get("likely_external_root_cause")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points below user space, so the next action is usually a kernel, mount, or storage investigation rather than a package patch.\n");
+        } else {
+            body.push_str("Treat this as the diagnosis half of the pipeline. A patch attempt should focus on the subsystem implicated by the dominant evidence above.\n");
+        }
+    }
+
+    body.push_str("\n## Evidence Bundle\n\n");
     body.push_str(&format!(
         "Full local evidence: `{}`\n",
         evidence_path.display()
@@ -1115,8 +1462,8 @@ fn pg_amcheck_command(
 mod tests {
     use super::{
         pg_amcheck_command, render_external_bug_report, render_local_remediation_report,
-        render_local_remediation_sql, sanitize_command_line_for_report,
-        suggested_report_destination,
+        render_local_remediation_sql, render_process_investigation_report,
+        sanitize_command_line_for_report, suggested_report_destination,
     };
     use crate::models::{InstalledPackageMetadata, OpportunityRecord};
     use serde_json::json;
@@ -1363,5 +1710,117 @@ mod tests {
     fn pg_amcheck_command_is_omitted_when_binary_is_missing() {
         let details = json!({});
         assert!(pg_amcheck_command(&details, "postgres", "5432", &[]).is_none());
+    }
+
+    #[test]
+    fn runaway_investigation_reports_include_root_cause_and_validation_steps() {
+        let opportunity = OpportunityRecord {
+            id: 7,
+            finding_id: 7,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for kdeconnectd".to_string(),
+            score: 90,
+            state: "open".to_string(),
+            summary: "kdeconnectd is stuck in a likely dbus spin loop.".to_string(),
+            evidence: json!({
+                "package_name": "kdeconnect",
+                "details": {
+                    "subsystem": "runaway-process",
+                    "profile_target": { "name": "kdeconnectd" },
+                    "sampled_pid": 4242,
+                    "loop_classification": "dbus-spin",
+                    "loop_confidence": 0.91,
+                    "loop_explanation": "Repeated recvmsg/sendmsg activity against the DBus socket suggests a message-loop spin.",
+                    "top_hot_symbols": [
+                        "QDBusConnection::send (82.10% in libQt6DBus.so.6)",
+                        "KdeConnect::LanLinkProvider::onMessage (11.40% in kdeconnectd)"
+                    ],
+                    "top_syscalls": [
+                        { "name": "recvmsg", "count": 122 },
+                        { "name": "sendmsg", "count": 121 },
+                        { "name": "ppoll", "count": 120 }
+                    ],
+                    "dominant_sequence": ["recvmsg", "sendmsg", "ppoll"],
+                    "process_state": "R (running)",
+                    "wchan": "do_epoll_wait",
+                    "command_line": "/usr/libexec/kdeconnectd --replace"
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+            updated_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let system = json!({
+            "os_pretty_name": "Debian GNU/Linux forky/sid",
+            "kernel": "Linux 6.19.8+deb14-amd64"
+        });
+        let rendered = render_process_investigation_report(
+            &opportunity,
+            None,
+            &system,
+            Path::new("/tmp/evidence.json"),
+            Some("could not acquire source package automatically"),
+        );
+        assert!(rendered.contains("Runaway CPU Investigation Report"));
+        assert!(rendered.contains("dbus-spin"));
+        assert!(rendered.contains("QDBusConnection::send"));
+        assert!(rendered.contains("recvmsg x122"));
+        assert!(rendered.contains("Validation Steps"));
+        assert!(rendered.contains("workspace"));
+    }
+
+    #[test]
+    fn stuck_process_investigation_reports_explain_d_state_waits() {
+        let opportunity = OpportunityRecord {
+            id: 8,
+            finding_id: 8,
+            kind: "investigation".to_string(),
+            title: "Stuck D-state investigation for rg".to_string(),
+            score: 88,
+            state: "open".to_string(),
+            summary: "rg has 3 processes stuck in `D` state.".to_string(),
+            evidence: json!({
+                "package_name": "ripgrep",
+                "details": {
+                    "subsystem": "stuck-process",
+                    "profile_target": { "name": "rg" },
+                    "sampled_pid": 7331,
+                    "runtime_seconds": 981,
+                    "loop_classification": "fuse-wait",
+                    "loop_confidence": 0.91,
+                    "loop_explanation": "The kernel stack and wait channel point to FUSE request handling.",
+                    "process_state": "D (disk sleep)",
+                    "wchan": "fuse_wait_answer",
+                    "fd_targets": [
+                        "/mnt/problematic-tree",
+                        "/mnt/problematic-tree/src"
+                    ],
+                    "io_excerpt": "read_bytes: 0\nwrite_bytes: 0",
+                    "stack_excerpt": "fuse_wait_answer\nrequest_wait_answer\n",
+                    "likely_external_root_cause": true
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+            updated_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let system = json!({
+            "os_pretty_name": "Debian GNU/Linux forky/sid",
+            "kernel": "Linux 6.19.8+deb14-amd64"
+        });
+        let rendered = render_process_investigation_report(
+            &opportunity,
+            None,
+            &system,
+            Path::new("/tmp/evidence.json"),
+            None,
+        );
+        assert!(rendered.contains("Stuck Process Investigation Report"));
+        assert!(rendered.contains("fuse-wait"));
+        assert!(rendered.contains("fuse_wait_answer"));
+        assert!(rendered.contains("/mnt/problematic-tree"));
+        assert!(rendered.contains("kernel, mount, or storage investigation"));
     }
 }

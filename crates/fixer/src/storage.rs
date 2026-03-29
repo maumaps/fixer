@@ -1180,11 +1180,72 @@ impl Store {
         }
         Ok(())
     }
+
+    pub fn prune_runaway_investigation_findings(
+        &self,
+        assessed_source_fingerprints: &[String],
+        current_fingerprints: &[String],
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, fingerprint
+            FROM findings
+            WHERE kind = 'investigation'
+              AND json_extract(details_json, '$.subsystem') = 'runaway-process'
+              AND COALESCE(json_extract(details_json, '$.source_hotspot_fingerprint'), '') = ?1
+            ",
+        )?;
+
+        for source_fingerprint in assessed_source_fingerprints {
+            let rows = stmt.query_map([source_fingerprint], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let findings = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            for (finding_id, fingerprint) in findings {
+                if current_fingerprints.iter().any(|item| item == &fingerprint) {
+                    continue;
+                }
+                self.delete_finding_cascade(finding_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn prune_stuck_process_investigation_findings(
+        &self,
+        assessed_source_fingerprints: &[String],
+        current_fingerprints: &[String],
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, fingerprint
+            FROM findings
+            WHERE kind = 'investigation'
+              AND json_extract(details_json, '$.subsystem') = 'stuck-process'
+              AND COALESCE(json_extract(details_json, '$.source_process_fingerprint'), '') = ?1
+            ",
+        )?;
+
+        for source_fingerprint in assessed_source_fingerprints {
+            let rows = stmt.query_map([source_fingerprint], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let findings = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            for (finding_id, fingerprint) in findings {
+                if current_fingerprints.iter().any(|item| item == &fingerprint) {
+                    continue;
+                }
+                self.delete_finding_cascade(finding_id)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn score_for(kind: &str, severity: &str, has_repo: bool, has_ecosystem: bool) -> i64 {
     let base = match kind {
         "crash" => 90,
+        "investigation" => 82,
         "hotspot" => 75,
         "warning" => 60,
         "complaint" => 50,

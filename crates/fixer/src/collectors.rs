@@ -7,18 +7,28 @@ use crate::util::{
     command_exists, command_output, command_output_os, find_postgres_binary, hash_text,
     maybe_canonicalize, now_rfc3339,
 };
+use crate::workspace::resolve_installed_package_metadata;
 use anyhow::Result;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration as StdDuration;
 
 const PERF_PROFILE_TARGET_LIMIT: usize = 3;
 const PERF_TOP_HOTSPOTS_PER_TARGET: usize = 3;
 const PERF_REPORT_LIMIT: usize = 12;
+const RUNAWAY_INVESTIGATION_SUBSYSTEM: &str = "runaway-process";
+const STUCK_PROCESS_INVESTIGATION_SUBSYSTEM: &str = "stuck-process";
+const RUNAWAY_STRACE_EXCERPT_LIMIT: usize = 24;
+const RUNAWAY_TOP_SYSCALL_LIMIT: usize = 6;
+const RUNAWAY_SEQUENCE_WINDOW: usize = 3;
+const STUCK_PROCESS_FD_TARGET_LIMIT: usize = 8;
 
 #[derive(Debug, Default, Clone)]
 pub struct CollectReport {
@@ -38,6 +48,7 @@ pub fn collect_once(config: &FixerConfig, store: &Store) -> Result<CollectReport
 
     if config.service.collect_processes {
         report.artifacts_seen += collect_process_artifacts(store)?;
+        report.findings_seen += collect_stuck_process_investigations(config, store)?;
     }
     report.artifacts_seen += collect_repos(&config.service.watched_repos, store)?;
     if config.service.collect_crashes {
@@ -98,6 +109,217 @@ fn collect_process_artifacts(store: &Store) -> Result<usize> {
         let _ = store.upsert_artifact(&artifact)?;
     }
     Ok(total)
+}
+
+#[derive(Debug, Clone)]
+struct StuckProcessSample {
+    pid: i32,
+    comm: String,
+    executable: Option<PathBuf>,
+    package_name: Option<String>,
+    runtime_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+struct StuckProcessGroup {
+    name: String,
+    executable: Option<PathBuf>,
+    package_name: Option<String>,
+    pids: Vec<i32>,
+    sample_pid: i32,
+    sample_runtime_seconds: u64,
+    comm: String,
+}
+
+fn collect_stuck_process_investigations(config: &FixerConfig, store: &Store) -> Result<usize> {
+    if !config.service.auto_investigate_stuck_processes {
+        return Ok(0);
+    }
+    let groups = collect_stuck_process_groups(config)?;
+    if groups.is_empty() {
+        return Ok(0);
+    }
+    let investigations_dir = config.service.state_dir.join("investigations");
+    fs::create_dir_all(&investigations_dir)?;
+    prune_runaway_investigation_artifacts(
+        &investigations_dir,
+        config.service.hotspot_investigation_retention_days,
+    )?;
+    let richer_evidence_allowed = richer_evidence_enabled(config, store);
+    let mut count = 0;
+    let mut assessed_sources = Vec::new();
+    let mut current_fingerprints = Vec::new();
+
+    for group in groups
+        .into_iter()
+        .take(config.service.stuck_process_investigation_limit)
+    {
+        let source_fingerprint = stuck_process_source_fingerprint(&group);
+        assessed_sources.push(source_fingerprint.clone());
+        if let Some(outcome) = maybe_record_stuck_process_investigation(
+            config,
+            store,
+            &investigations_dir,
+            &group,
+            &source_fingerprint,
+            richer_evidence_allowed,
+        )? {
+            current_fingerprints.push(outcome.finding_fingerprint);
+            if outcome.created {
+                count += 1;
+            }
+        }
+    }
+
+    if !assessed_sources.is_empty() {
+        assessed_sources.sort();
+        assessed_sources.dedup();
+        current_fingerprints.sort();
+        current_fingerprints.dedup();
+        store
+            .prune_stuck_process_investigation_findings(&assessed_sources, &current_fingerprints)?;
+    }
+    Ok(count)
+}
+
+fn collect_stuck_process_groups(config: &FixerConfig) -> Result<Vec<StuckProcessGroup>> {
+    let uptime_seconds = system_uptime_seconds();
+    let clock_ticks_per_second = clock_ticks_per_second();
+    let mut groups = BTreeMap::<String, Vec<StuckProcessSample>>::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        let process_dir = entry.path();
+        let Some(status_raw) = fs::read_to_string(process_dir.join("status")).ok() else {
+            continue;
+        };
+        let Some(state) = process_state_from_status(&status_raw) else {
+            continue;
+        };
+        if !state.starts_with('D') {
+            continue;
+        }
+        let runtime_seconds = process_runtime_seconds(pid, uptime_seconds, clock_ticks_per_second)
+            .unwrap_or_default();
+        if runtime_seconds < config.service.stuck_process_min_runtime_seconds {
+            continue;
+        }
+        let executable = fs::read_link(process_dir.join("exe"))
+            .ok()
+            .map(|path| maybe_canonicalize(&path));
+        let comm = status_raw
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key.trim() == "Name").then(|| value.trim().to_string())
+            })
+            .or_else(|| process_comm(pid))
+            .unwrap_or_else(|| "process".to_string());
+        let package_name = executable.as_deref().and_then(map_path_to_package);
+        let group_key = executable
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| comm.clone());
+        groups
+            .entry(group_key)
+            .or_default()
+            .push(StuckProcessSample {
+                pid,
+                comm,
+                executable,
+                package_name,
+                runtime_seconds,
+            });
+    }
+
+    let mut result = groups
+        .into_values()
+        .filter_map(|mut samples| {
+            samples.sort_by(|left, right| {
+                right
+                    .runtime_seconds
+                    .cmp(&left.runtime_seconds)
+                    .then_with(|| left.pid.cmp(&right.pid))
+            });
+            let sample = samples.first()?;
+            let executable = sample.executable.clone();
+            let name = executable
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|value| value.to_str())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| sample.comm.clone());
+            Some(StuckProcessGroup {
+                name,
+                executable,
+                package_name: sample.package_name.clone(),
+                pids: samples.iter().map(|item| item.pid).collect(),
+                sample_pid: sample.pid,
+                sample_runtime_seconds: sample.runtime_seconds,
+                comm: sample.comm.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| {
+        right
+            .pids
+            .len()
+            .cmp(&left.pids.len())
+            .then_with(|| {
+                right
+                    .sample_runtime_seconds
+                    .cmp(&left.sample_runtime_seconds)
+            })
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(result)
+}
+
+fn system_uptime_seconds() -> f64 {
+    fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|raw| raw.split_whitespace().next()?.parse::<f64>().ok())
+        .unwrap_or_default()
+}
+
+fn clock_ticks_per_second() -> f64 {
+    command_output("getconf", &["CLK_TCK"])
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| *value > 0.0)
+        .unwrap_or(100.0)
+}
+
+fn process_runtime_seconds(
+    pid: i32,
+    uptime_seconds: f64,
+    clock_ticks_per_second: f64,
+) -> Option<u64> {
+    let raw = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = raw.rsplit_once(") ")?.1;
+    let fields = after_comm.split_whitespace().collect::<Vec<_>>();
+    let start_ticks = fields.get(19)?.parse::<f64>().ok()?;
+    let elapsed = uptime_seconds - (start_ticks / clock_ticks_per_second);
+    (elapsed.is_finite() && elapsed >= 0.0).then_some(elapsed.floor() as u64)
+}
+
+fn stuck_process_source_fingerprint(group: &StuckProcessGroup) -> String {
+    hash_text(format!(
+        "stuck-process-source:{}:{}:{}",
+        group
+            .executable
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| group.name.clone()),
+        group.package_name.as_deref().unwrap_or("unknown"),
+        group.comm,
+    ))
 }
 
 fn collect_repos(repo_paths: &[PathBuf], store: &Store) -> Result<usize> {
@@ -1211,10 +1433,21 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
         return Ok(0);
     }
     let perf_dir = config.service.state_dir.join("perf");
+    let investigations_dir = config.service.state_dir.join("investigations");
     fs::create_dir_all(&perf_dir)?;
+    fs::create_dir_all(&investigations_dir)?;
+    prune_runaway_investigation_artifacts(
+        &investigations_dir,
+        config.service.hotspot_investigation_retention_days,
+    )?;
+    let richer_evidence_allowed = richer_evidence_enabled(config, store);
+    let strace_available = store.capability_available("strace")?;
     let mut count = 0;
     let mut assessed_targets = Vec::new();
     let mut current_fingerprints = Vec::new();
+    let mut assessed_investigation_sources = Vec::new();
+    let mut current_investigation_fingerprints = Vec::new();
+    let mut investigation_budget = config.service.hotspot_investigation_limit;
 
     for target in targets
         .into_iter()
@@ -1323,10 +1556,43 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
             };
             let _ = store.record_finding(&finding)?;
             count += 1;
+
+            if config.service.auto_investigate_hotspots && strace_available {
+                let source_hotspot_fingerprint = finding.fingerprint.clone();
+                if investigation_budget > 0 {
+                    assessed_investigation_sources.push(source_hotspot_fingerprint.clone());
+                    if let Some(outcome) = maybe_record_runaway_investigation(
+                        config,
+                        store,
+                        &investigations_dir,
+                        &target,
+                        &profile,
+                        hot_path,
+                        &source_hotspot_fingerprint,
+                        richer_evidence_allowed,
+                    )? {
+                        current_investigation_fingerprints.push(outcome.finding_fingerprint);
+                        if outcome.created {
+                            count += 1;
+                            investigation_budget = investigation_budget.saturating_sub(1);
+                        }
+                    }
+                }
+            }
         }
     }
     if !assessed_targets.is_empty() {
         store.prune_perf_hotspot_findings(&assessed_targets, &current_fingerprints)?;
+    }
+    if !assessed_investigation_sources.is_empty() {
+        assessed_investigation_sources.sort();
+        assessed_investigation_sources.dedup();
+        current_investigation_fingerprints.sort();
+        current_investigation_fingerprints.dedup();
+        store.prune_runaway_investigation_findings(
+            &assessed_investigation_sources,
+            &current_investigation_fingerprints,
+        )?;
     }
     Ok(count)
 }
@@ -1346,6 +1612,1172 @@ struct PerfProfileCapture {
     data_path: PathBuf,
     sampled_pids: Vec<i32>,
     hot_paths: Vec<PerfHotPath>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunawayInvestigationCheckpoint {
+    captured_at: String,
+    finding_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RunawaySyscallStat {
+    name: String,
+    count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct RunawayHypothesis {
+    classification: String,
+    confidence: f64,
+    explanation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RunawayPackageMetadata {
+    package_name: String,
+    source_package: Option<String>,
+    installed_version: Option<String>,
+    candidate_version: Option<String>,
+    homepage: Option<String>,
+    report_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct RunawayInvestigationSummary {
+    sampled_pid: i32,
+    sampled_pid_count: usize,
+    command_line: Option<String>,
+    executable: Option<String>,
+    process_state: Option<String>,
+    wchan: Option<String>,
+    top_hot_symbols: Vec<String>,
+    top_syscalls: Vec<RunawaySyscallStat>,
+    dominant_sequence: Vec<String>,
+    strace_line_count: usize,
+    strace_excerpt: Vec<String>,
+    status_excerpt: Option<String>,
+    sched_excerpt: Option<String>,
+    stack_excerpt: Option<String>,
+    hypothesis: RunawayHypothesis,
+    raw_artifacts: BTreeMap<String, String>,
+    package_metadata: Option<RunawayPackageMetadata>,
+}
+
+#[derive(Debug, Clone)]
+struct RunawayInvestigationOutcome {
+    finding_fingerprint: String,
+    created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct StuckProcessInvestigationSummary {
+    sampled_pid: i32,
+    sampled_pid_count: usize,
+    sampled_pids: Vec<i32>,
+    command_line: Option<String>,
+    executable: Option<String>,
+    process_state: Option<String>,
+    runtime_seconds: u64,
+    wchan: Option<String>,
+    cwd: Option<String>,
+    root: Option<String>,
+    fd_targets: Vec<String>,
+    io_excerpt: Option<String>,
+    status_excerpt: Option<String>,
+    sched_excerpt: Option<String>,
+    stack_excerpt: Option<String>,
+    hypothesis: RunawayHypothesis,
+    likely_external_root_cause: bool,
+    raw_artifacts: BTreeMap<String, String>,
+    package_metadata: Option<RunawayPackageMetadata>,
+}
+
+#[derive(Debug, Clone)]
+struct StraceCapture {
+    raw_log: String,
+    stderr: Option<String>,
+    log_path: PathBuf,
+}
+
+fn maybe_record_runaway_investigation(
+    config: &FixerConfig,
+    store: &Store,
+    investigations_dir: &Path,
+    target: &PopularBinaryProfile,
+    profile: &PerfProfileCapture,
+    hot_path: &PerfHotPath,
+    source_hotspot_fingerprint: &str,
+    include_richer_evidence: bool,
+) -> Result<Option<RunawayInvestigationOutcome>> {
+    let state_key = runaway_investigation_state_key(source_hotspot_fingerprint);
+    if let Some(checkpoint) = store.get_local_state::<RunawayInvestigationCheckpoint>(&state_key)? {
+        if investigation_cooldown_active(
+            &checkpoint.captured_at,
+            config.service.hotspot_investigation_cooldown_seconds,
+        ) {
+            return Ok(Some(RunawayInvestigationOutcome {
+                finding_fingerprint: checkpoint.finding_fingerprint,
+                created: false,
+            }));
+        }
+    }
+
+    let Some(sampled_pid) = sampled_pid_for_hot_path(profile, hot_path) else {
+        return Ok(None);
+    };
+    let capture_timestamp = now_rfc3339();
+    let capture_dir = investigations_dir.join(format!(
+        "{}-{}-{}",
+        capture_timestamp.replace(':', "-"),
+        safe_perf_name(&target.name),
+        abbreviated_hash(source_hotspot_fingerprint)
+    ));
+    fs::create_dir_all(&capture_dir)?;
+
+    let proc_snapshot = collect_proc_snapshot(sampled_pid, &capture_dir)?;
+    let strace_capture = capture_strace_sample(
+        sampled_pid,
+        config.service.hotspot_investigation_strace_seconds,
+        &capture_dir.join("strace.log"),
+    )?;
+    let top_hot_symbols = investigation_hot_symbol_summaries(profile);
+    let strace_lines = strace_capture
+        .as_ref()
+        .map(|capture| normalized_strace_lines(&capture.raw_log))
+        .unwrap_or_default();
+    let syscall_names = parse_strace_syscall_names(&strace_lines);
+    let top_syscalls = summarize_top_syscalls(&syscall_names);
+    let dominant_sequence = dominant_syscall_sequence(&syscall_names);
+    let hypothesis = classify_runaway_loop(&strace_lines, &top_syscalls, &top_hot_symbols);
+    let package_name = hot_path
+        .package_name
+        .clone()
+        .or_else(|| target.package_name.clone());
+    let package_metadata = package_name
+        .as_deref()
+        .and_then(resolve_installed_package_metadata_for_investigation);
+
+    let investigation = build_runaway_investigation_summary(
+        sampled_pid,
+        profile,
+        &top_hot_symbols,
+        &top_syscalls,
+        &dominant_sequence,
+        &hypothesis,
+        &proc_snapshot,
+        strace_capture.as_ref(),
+        package_metadata,
+        include_richer_evidence,
+    );
+    let fingerprint = runaway_investigation_fingerprint(
+        target,
+        hot_path,
+        &investigation.top_hot_symbols,
+        &investigation.top_syscalls,
+        &investigation.dominant_sequence,
+        &investigation.hypothesis,
+    );
+    let summary = runaway_investigation_summary_line(target, hot_path, &investigation);
+    let artifact = ObservedArtifact {
+        kind: "binary".to_string(),
+        name: target.name.clone(),
+        path: Some(target.path.clone()),
+        package_name,
+        repo_root: None,
+        ecosystem: None,
+        metadata: json!({
+            "source": "runaway-process-investigation",
+            "profile_target_name": target.name,
+            "profile_target_path": target.path,
+            "sampled_pids": profile.sampled_pids,
+        }),
+    };
+    let details = json!({
+        "subsystem": RUNAWAY_INVESTIGATION_SUBSYSTEM,
+        "source_hotspot_fingerprint": source_hotspot_fingerprint,
+        "source_hotspot_kind": "perf-hotspot",
+        "profile_duration_seconds": config.service.perf_duration_seconds,
+        "strace_duration_seconds": config.service.hotspot_investigation_strace_seconds,
+        "profile_target": {
+            "name": target.name,
+            "path": target.path,
+            "package_name": target.package_name,
+            "process_count": target.process_count,
+        },
+        "sampled_pids": profile.sampled_pids,
+        "sampled_pid_count": profile.sampled_pids.len(),
+        "sampled_pid": sampled_pid,
+        "hot_path_symbol": hot_path.symbol,
+        "hot_path_dso": hot_path.dso,
+        "hot_path_percent": hot_path.percent,
+        "top_hot_symbols": investigation.top_hot_symbols,
+        "top_syscalls": investigation.top_syscalls,
+        "dominant_sequence": investigation.dominant_sequence,
+        "strace_line_count": investigation.strace_line_count,
+        "process_state": investigation.process_state,
+        "wchan": investigation.wchan,
+        "loop_classification": investigation.hypothesis.classification,
+        "loop_confidence": investigation.hypothesis.confidence,
+        "loop_explanation": investigation.hypothesis.explanation,
+        "package_metadata": investigation.package_metadata,
+        "richer_evidence_included": include_richer_evidence,
+        "command_line": investigation.command_line,
+        "executable": investigation.executable,
+        "strace_excerpt": investigation.strace_excerpt,
+        "status_excerpt": investigation.status_excerpt,
+        "sched_excerpt": investigation.sched_excerpt,
+        "stack_excerpt": investigation.stack_excerpt,
+        "raw_artifacts": investigation.raw_artifacts,
+    });
+    let finding = FindingInput {
+        kind: "investigation".to_string(),
+        title: format!("Runaway CPU investigation for {}", target.name),
+        severity: "high".to_string(),
+        fingerprint: fingerprint.clone(),
+        summary,
+        details,
+        artifact: Some(artifact),
+        repo_root: None,
+        ecosystem: None,
+    };
+    let _ = store.record_finding(&finding)?;
+    store.set_local_state(
+        &state_key,
+        &RunawayInvestigationCheckpoint {
+            captured_at: capture_timestamp,
+            finding_fingerprint: fingerprint.clone(),
+        },
+    )?;
+    Ok(Some(RunawayInvestigationOutcome {
+        finding_fingerprint: fingerprint,
+        created: true,
+    }))
+}
+
+fn maybe_record_stuck_process_investigation(
+    config: &FixerConfig,
+    store: &Store,
+    investigations_dir: &Path,
+    group: &StuckProcessGroup,
+    source_process_fingerprint: &str,
+    include_richer_evidence: bool,
+) -> Result<Option<RunawayInvestigationOutcome>> {
+    let state_key = stuck_process_investigation_state_key(source_process_fingerprint);
+    if let Some(checkpoint) = store.get_local_state::<RunawayInvestigationCheckpoint>(&state_key)? {
+        if investigation_cooldown_active(
+            &checkpoint.captured_at,
+            config.service.stuck_process_investigation_cooldown_seconds,
+        ) {
+            return Ok(Some(RunawayInvestigationOutcome {
+                finding_fingerprint: checkpoint.finding_fingerprint,
+                created: false,
+            }));
+        }
+    }
+
+    let capture_timestamp = now_rfc3339();
+    let capture_dir = investigations_dir.join(format!(
+        "{}-{}-{}",
+        capture_timestamp.replace(':', "-"),
+        safe_perf_name(&group.name),
+        abbreviated_hash(source_process_fingerprint)
+    ));
+    fs::create_dir_all(&capture_dir)?;
+
+    let proc_snapshot = collect_proc_snapshot(group.sample_pid, &capture_dir)?;
+    let hypothesis = classify_stuck_process(
+        proc_snapshot.stack_excerpt.as_deref(),
+        proc_snapshot.wchan.as_deref(),
+        &proc_snapshot.fd_targets,
+    );
+    let package_metadata = group
+        .package_name
+        .as_deref()
+        .and_then(resolve_installed_package_metadata_for_investigation);
+    let investigation = build_stuck_process_investigation_summary(
+        group,
+        &proc_snapshot,
+        &hypothesis,
+        package_metadata,
+        include_richer_evidence,
+    );
+    let fingerprint = stuck_process_investigation_fingerprint(group, &investigation);
+    let summary = stuck_process_investigation_summary_line(group, &investigation);
+    let artifact = ObservedArtifact {
+        kind: "binary".to_string(),
+        name: group.name.clone(),
+        path: group.executable.clone(),
+        package_name: group.package_name.clone(),
+        repo_root: None,
+        ecosystem: None,
+        metadata: json!({
+            "source": "stuck-process-investigation",
+            "profile_target_name": group.name,
+            "sampled_pids": group.pids.clone(),
+        }),
+    };
+    let details = json!({
+        "subsystem": STUCK_PROCESS_INVESTIGATION_SUBSYSTEM,
+        "source_process_fingerprint": source_process_fingerprint,
+        "blocked_process_kind": "uninterruptible-sleep",
+        "profile_target": {
+            "name": group.name,
+            "path": group.executable.as_ref().map(|path| path.display().to_string()),
+            "package_name": group.package_name.clone(),
+            "process_count": group.pids.len(),
+        },
+        "sampled_pids": investigation.sampled_pids,
+        "sampled_pid_count": investigation.sampled_pid_count,
+        "sampled_pid": group.sample_pid,
+        "runtime_seconds": investigation.runtime_seconds,
+        "process_state": investigation.process_state,
+        "wchan": investigation.wchan,
+        "cwd": investigation.cwd,
+        "root": investigation.root,
+        "fd_targets": investigation.fd_targets,
+        "io_excerpt": investigation.io_excerpt,
+        "stack_excerpt": investigation.stack_excerpt,
+        "status_excerpt": investigation.status_excerpt,
+        "sched_excerpt": investigation.sched_excerpt,
+        "loop_classification": investigation.hypothesis.classification,
+        "loop_confidence": investigation.hypothesis.confidence,
+        "loop_explanation": investigation.hypothesis.explanation,
+        "likely_external_root_cause": investigation.likely_external_root_cause,
+        "package_metadata": investigation.package_metadata,
+        "richer_evidence_included": include_richer_evidence,
+        "command_line": investigation.command_line,
+        "executable": investigation.executable,
+        "raw_artifacts": investigation.raw_artifacts,
+    });
+    let finding = FindingInput {
+        kind: "investigation".to_string(),
+        title: format!("Stuck D-state investigation for {}", group.name),
+        severity: "high".to_string(),
+        fingerprint: fingerprint.clone(),
+        summary,
+        details,
+        artifact: Some(artifact),
+        repo_root: None,
+        ecosystem: None,
+    };
+    let _ = store.record_finding(&finding)?;
+    store.set_local_state(
+        &state_key,
+        &RunawayInvestigationCheckpoint {
+            captured_at: capture_timestamp,
+            finding_fingerprint: fingerprint.clone(),
+        },
+    )?;
+    Ok(Some(RunawayInvestigationOutcome {
+        finding_fingerprint: fingerprint,
+        created: true,
+    }))
+}
+
+fn richer_evidence_enabled(config: &FixerConfig, store: &Store) -> bool {
+    if !config.privacy.require_secondary_opt_in_for_richer_evidence {
+        return true;
+    }
+    store
+        .load_participation_state()
+        .ok()
+        .flatten()
+        .map(|state| state.richer_evidence_allowed)
+        .unwrap_or(config.participation.richer_evidence_allowed)
+}
+
+fn runaway_investigation_state_key(source_hotspot_fingerprint: &str) -> String {
+    format!("runaway-investigation:{source_hotspot_fingerprint}")
+}
+
+fn stuck_process_investigation_state_key(source_process_fingerprint: &str) -> String {
+    format!("stuck-process-investigation:{source_process_fingerprint}")
+}
+
+fn investigation_cooldown_active(captured_at: &str, cooldown_seconds: u64) -> bool {
+    let Ok(parsed) = DateTime::parse_from_rfc3339(captured_at) else {
+        return false;
+    };
+    Utc::now() - parsed.with_timezone(&Utc) < ChronoDuration::seconds(cooldown_seconds as i64)
+}
+
+fn abbreviated_hash(fingerprint: &str) -> &str {
+    fingerprint.get(..12).unwrap_or(fingerprint)
+}
+
+fn sampled_pid_for_hot_path(profile: &PerfProfileCapture, hot_path: &PerfHotPath) -> Option<i32> {
+    profile
+        .sampled_pids
+        .iter()
+        .copied()
+        .find(|pid| process_comm(*pid).as_deref() == Some(hot_path.comm.as_str()))
+        .or_else(|| profile.sampled_pids.first().copied())
+}
+
+fn process_comm(pid: i32) -> Option<String> {
+    fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[derive(Debug, Clone)]
+struct ProcSnapshot {
+    command_line: Option<String>,
+    executable: Option<String>,
+    process_state: Option<String>,
+    wchan: Option<String>,
+    cwd: Option<String>,
+    root: Option<String>,
+    fd_targets: Vec<String>,
+    io_excerpt: Option<String>,
+    status_excerpt: Option<String>,
+    sched_excerpt: Option<String>,
+    stack_excerpt: Option<String>,
+    raw_artifacts: BTreeMap<String, String>,
+}
+
+fn collect_proc_snapshot(pid: i32, capture_dir: &Path) -> Result<ProcSnapshot> {
+    let mut raw_artifacts = BTreeMap::new();
+    let command_line = read_proc_cmdline(pid);
+    if let Some(value) = &command_line {
+        let path = capture_dir.join("cmdline.txt");
+        fs::write(&path, value)?;
+        raw_artifacts.insert("cmdline".to_string(), path.display().to_string());
+    }
+
+    let executable = fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|path| path.display().to_string());
+    if let Some(value) = &executable {
+        let path = capture_dir.join("exe.txt");
+        fs::write(&path, value)?;
+        raw_artifacts.insert("exe".to_string(), path.display().to_string());
+    }
+
+    let cwd = fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .map(|path| path.display().to_string());
+    if let Some(value) = &cwd {
+        let path = capture_dir.join("cwd.txt");
+        fs::write(&path, value)?;
+        raw_artifacts.insert("cwd".to_string(), path.display().to_string());
+    }
+
+    let root = fs::read_link(format!("/proc/{pid}/root"))
+        .ok()
+        .map(|path| path.display().to_string());
+    if let Some(value) = &root {
+        let path = capture_dir.join("root.txt");
+        fs::write(&path, value)?;
+        raw_artifacts.insert("root".to_string(), path.display().to_string());
+    }
+
+    let status_raw = fs::read_to_string(format!("/proc/{pid}/status")).ok();
+    if let Some(raw) = &status_raw {
+        let path = capture_dir.join("status.txt");
+        fs::write(&path, raw)?;
+        raw_artifacts.insert("status".to_string(), path.display().to_string());
+    }
+
+    let sched_raw = fs::read_to_string(format!("/proc/{pid}/sched")).ok();
+    if let Some(raw) = &sched_raw {
+        let path = capture_dir.join("sched.txt");
+        fs::write(&path, raw)?;
+        raw_artifacts.insert("sched".to_string(), path.display().to_string());
+    }
+
+    let io_raw = fs::read_to_string(format!("/proc/{pid}/io")).ok();
+    if let Some(raw) = &io_raw {
+        let path = capture_dir.join("io.txt");
+        fs::write(&path, raw)?;
+        raw_artifacts.insert("io".to_string(), path.display().to_string());
+    }
+
+    let stack_raw = fs::read_to_string(format!("/proc/{pid}/stack")).ok();
+    if let Some(raw) = &stack_raw {
+        let path = capture_dir.join("stack.txt");
+        fs::write(&path, raw)?;
+        raw_artifacts.insert("stack".to_string(), path.display().to_string());
+    }
+
+    let wchan = fs::read_to_string(format!("/proc/{pid}/wchan"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(value) = &wchan {
+        let path = capture_dir.join("wchan.txt");
+        fs::write(&path, value)?;
+        raw_artifacts.insert("wchan".to_string(), path.display().to_string());
+    }
+
+    let fd_targets = collect_fd_targets(pid, STUCK_PROCESS_FD_TARGET_LIMIT);
+    if !fd_targets.is_empty() {
+        let path = capture_dir.join("fd-targets.txt");
+        fs::write(&path, fd_targets.join("\n"))?;
+        raw_artifacts.insert("fd_targets".to_string(), path.display().to_string());
+    }
+
+    Ok(ProcSnapshot {
+        command_line,
+        executable,
+        process_state: status_raw
+            .as_deref()
+            .and_then(process_state_from_status)
+            .map(ToString::to_string),
+        wchan,
+        cwd,
+        root,
+        fd_targets,
+        io_excerpt: io_raw
+            .as_deref()
+            .map(|raw| excerpt_lines(raw, RUNAWAY_STRACE_EXCERPT_LIMIT)),
+        status_excerpt: status_raw
+            .as_deref()
+            .map(|raw| excerpt_lines(raw, RUNAWAY_STRACE_EXCERPT_LIMIT)),
+        sched_excerpt: sched_raw
+            .as_deref()
+            .map(|raw| excerpt_lines(raw, RUNAWAY_STRACE_EXCERPT_LIMIT)),
+        stack_excerpt: stack_raw
+            .as_deref()
+            .map(|raw| excerpt_lines(raw, RUNAWAY_STRACE_EXCERPT_LIMIT)),
+        raw_artifacts,
+    })
+}
+
+fn collect_fd_targets(pid: i32, limit: usize) -> Vec<String> {
+    let mut targets = BTreeSet::new();
+    let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let Ok(target) = fs::read_link(entry.path()) else {
+            continue;
+        };
+        let target = target.display().to_string();
+        if target.starts_with("anon_inode:")
+            || target.starts_with("socket:[")
+            || target.starts_with("pipe:[")
+        {
+            continue;
+        }
+        targets.insert(target);
+        if targets.len() >= limit {
+            break;
+        }
+    }
+    targets.into_iter().collect()
+}
+
+fn read_proc_cmdline(pid: i32) -> Option<String> {
+    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let text = raw
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn capture_strace_sample(
+    pid: i32,
+    duration_seconds: u64,
+    output_path: &Path,
+) -> Result<Option<StraceCapture>> {
+    let mut child = match Command::new("strace")
+        .env("LC_ALL", "C")
+        .args([
+            "-ttT",
+            "-f",
+            "-s",
+            "160",
+            "-o",
+            output_path.to_string_lossy().as_ref(),
+            "-p",
+            &pid.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Ok(None),
+    };
+
+    thread::sleep(StdDuration::from_secs(duration_seconds.max(1)));
+    let _ = child.kill();
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let raw_log = fs::read_to_string(output_path).unwrap_or_default();
+    if raw_log.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(StraceCapture {
+        raw_log,
+        stderr: (!stderr.is_empty()).then_some(stderr),
+        log_path: output_path.to_path_buf(),
+    }))
+}
+
+fn normalized_strace_lines(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("strace:"))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn parse_strace_syscall_names(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|line| parse_strace_syscall_name(line))
+        .collect()
+}
+
+fn parse_strace_syscall_name(line: &str) -> Option<String> {
+    let mut text = line.trim();
+    if let Some(rest) = text.strip_prefix("[pid ") {
+        text = rest.split_once(']')?.1.trim_start();
+    }
+    if let Some((prefix, rest)) = text.split_once(' ') {
+        if prefix
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ch == ':' || ch == '.')
+        {
+            text = rest.trim_start();
+        }
+    }
+    let name_end = text.find('(')?;
+    let name = text[..name_end].trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn summarize_top_syscalls(syscalls: &[String]) -> Vec<RunawaySyscallStat> {
+    let mut counts = HashMap::<String, usize>::new();
+    for syscall in syscalls {
+        *counts.entry(syscall.clone()).or_insert(0) += 1;
+    }
+    let mut items = counts
+        .into_iter()
+        .map(|(name, count)| RunawaySyscallStat { name, count })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    items.truncate(RUNAWAY_TOP_SYSCALL_LIMIT);
+    items
+}
+
+fn dominant_syscall_sequence(syscalls: &[String]) -> Vec<String> {
+    if syscalls.len() < RUNAWAY_SEQUENCE_WINDOW {
+        return syscalls.to_vec();
+    }
+    let mut counts = HashMap::<Vec<String>, usize>::new();
+    for window in syscalls.windows(RUNAWAY_SEQUENCE_WINDOW) {
+        let key = window.to_vec();
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|left, right| {
+            left.1
+                .cmp(&right.1)
+                .then_with(|| right.0.join(">").cmp(&left.0.join(">")))
+        })
+        .map(|(sequence, _)| sequence)
+        .unwrap_or_default()
+}
+
+fn classify_runaway_loop(
+    strace_lines: &[String],
+    top_syscalls: &[RunawaySyscallStat],
+    top_hot_symbols: &[String],
+) -> RunawayHypothesis {
+    let lower_lines = strace_lines.join("\n").to_ascii_lowercase();
+    let lower_symbols = top_hot_symbols.join("\n").to_ascii_lowercase();
+    let top_names = top_syscalls
+        .iter()
+        .map(|item| item.name.as_str())
+        .collect::<Vec<_>>();
+
+    if lower_lines.contains("/run/dbus")
+        || lower_lines.contains("org.freedesktop")
+        || lower_symbols.contains("qdbus")
+        || lower_symbols.contains("dbus")
+    {
+        return RunawayHypothesis {
+            classification: "dbus-spin".to_string(),
+            confidence: 0.9,
+            explanation:
+                "The trace is dominated by DBus-style socket activity and DBus-related symbols, which looks like a message-loop spin."
+                    .to_string(),
+        };
+    }
+    if top_names.iter().any(|name| {
+        matches!(
+            *name,
+            "poll" | "ppoll" | "epoll_wait" | "select" | "pselect6"
+        )
+    }) {
+        return RunawayHypothesis {
+            classification: "busy-poll".to_string(),
+            confidence: 0.78,
+            explanation:
+                "The trace repeatedly returns to a poll-family syscall without meaningful blocking, which suggests a busy event-loop wakeup."
+                    .to_string(),
+        };
+    }
+    if top_names.iter().any(|name| {
+        matches!(
+            *name,
+            "recvmsg" | "sendmsg" | "recvfrom" | "sendto" | "connect" | "socket" | "getsockopt"
+        )
+    }) {
+        return RunawayHypothesis {
+            classification: "socket-churn".to_string(),
+            confidence: 0.72,
+            explanation:
+                "The trace is dominated by socket syscalls, which suggests the process is rapidly retrying or churning through network or IPC work."
+                    .to_string(),
+        };
+    }
+    if top_names.iter().any(|name| {
+        matches!(
+            *name,
+            "timerfd_settime" | "timerfd_gettime" | "clock_nanosleep" | "nanosleep"
+        )
+    }) || lower_symbols.contains("timer")
+    {
+        return RunawayHypothesis {
+            classification: "timer-churn".to_string(),
+            confidence: 0.68,
+            explanation:
+                "Timer-related syscalls or symbols dominate the sample, which suggests a wakeup timer is firing too aggressively."
+                    .to_string(),
+        };
+    }
+    if lower_lines.contains("enoent")
+        && top_names.iter().any(|name| {
+            matches!(
+                *name,
+                "openat" | "openat2" | "access" | "faccessat2" | "statx" | "newfstatat"
+            )
+        })
+    {
+        return RunawayHypothesis {
+            classification: "file-not-found-retry".to_string(),
+            confidence: 0.84,
+            explanation:
+                "The trace keeps retrying file lookups that fail with ENOENT, which suggests a missing-file retry loop."
+                    .to_string(),
+        };
+    }
+    RunawayHypothesis {
+        classification: "unknown-userspace-loop".to_string(),
+        confidence: 0.42,
+        explanation:
+            "The process is demonstrably CPU-hot, but the current syscall and symbol sample does not point to a single dominant loop family yet."
+                .to_string(),
+    }
+}
+
+fn classify_stuck_process(
+    stack_excerpt: Option<&str>,
+    wchan: Option<&str>,
+    fd_targets: &[String],
+) -> RunawayHypothesis {
+    let stack = stack_excerpt.unwrap_or_default().to_ascii_lowercase();
+    let wchan = wchan.unwrap_or_default().to_ascii_lowercase();
+    let fd_targets = fd_targets.join("\n").to_ascii_lowercase();
+
+    if stack.contains("fuse") || wchan.contains("fuse") {
+        return RunawayHypothesis {
+            classification: "fuse-wait".to_string(),
+            confidence: 0.91,
+            explanation:
+                "The kernel stack and wait channel point to FUSE request handling, so the process is likely blocked behind a userspace filesystem response."
+                    .to_string(),
+        };
+    }
+    if stack.contains("nfs") || stack.contains("sunrpc") || wchan.contains("nfs") {
+        return RunawayHypothesis {
+            classification: "nfs-wait".to_string(),
+            confidence: 0.88,
+            explanation:
+                "The kernel stack points to NFS or RPC wait paths, which suggests the process is blocked on remote filesystem I/O."
+                    .to_string(),
+        };
+    }
+    if stack.contains("overlay") || wchan.contains("overlay") {
+        return RunawayHypothesis {
+            classification: "overlayfs-wait".to_string(),
+            confidence: 0.77,
+            explanation:
+                "The kernel stack references overlayfs paths, which suggests the process is blocked on layered filesystem metadata or backing-store I/O."
+                    .to_string(),
+        };
+    }
+    if stack.contains("ext4")
+        || stack.contains("xfs")
+        || stack.contains("btrfs")
+        || wchan.contains("io_schedule")
+        || stack.contains("submit_bio")
+        || stack.contains("blk_")
+    {
+        return RunawayHypothesis {
+            classification: "filesystem-io-wait".to_string(),
+            confidence: 0.73,
+            explanation:
+                "The kernel stack points to block or filesystem wait paths, so the process appears to be stuck below user space waiting for storage I/O."
+                    .to_string(),
+        };
+    }
+    if fd_targets.contains("/mnt/")
+        || fd_targets.contains("/media/")
+        || fd_targets.contains("/run/user/")
+    {
+        return RunawayHypothesis {
+            classification: "mount-io-wait".to_string(),
+            confidence: 0.58,
+            explanation:
+                "The process is blocked in `D` state while holding file descriptors on a mount-like path, which suggests a stuck filesystem or mount backend."
+                    .to_string(),
+        };
+    }
+    RunawayHypothesis {
+        classification: "unknown-uninterruptible-wait".to_string(),
+        confidence: 0.38,
+        explanation:
+            "The process is stuck in `D` state, but the current `/proc` evidence does not yet isolate which kernel or filesystem path is blocking it."
+                .to_string(),
+    }
+}
+
+fn resolve_installed_package_metadata_for_investigation(
+    package_name: &str,
+) -> Option<RunawayPackageMetadata> {
+    let metadata = resolve_installed_package_metadata(package_name).ok()?;
+    Some(RunawayPackageMetadata {
+        package_name: metadata.package_name,
+        source_package: Some(metadata.source_package),
+        installed_version: metadata.installed_version,
+        candidate_version: metadata.candidate_version,
+        homepage: metadata.homepage,
+        report_url: metadata.report_url,
+    })
+}
+
+fn build_runaway_investigation_summary(
+    sampled_pid: i32,
+    profile: &PerfProfileCapture,
+    top_hot_symbols: &[String],
+    top_syscalls: &[RunawaySyscallStat],
+    dominant_sequence: &[String],
+    hypothesis: &RunawayHypothesis,
+    proc_snapshot: &ProcSnapshot,
+    strace_capture: Option<&StraceCapture>,
+    package_metadata: Option<RunawayPackageMetadata>,
+    include_richer_evidence: bool,
+) -> RunawayInvestigationSummary {
+    let mut raw_artifacts = proc_snapshot.raw_artifacts.clone();
+    if let Some(strace_capture) = strace_capture {
+        raw_artifacts.insert(
+            "strace".to_string(),
+            strace_capture.log_path.display().to_string(),
+        );
+        if let Some(stderr) = &strace_capture.stderr {
+            let stderr_path = strace_capture.log_path.with_extension("stderr.txt");
+            let _ = fs::write(&stderr_path, stderr);
+            raw_artifacts.insert(
+                "strace_stderr".to_string(),
+                stderr_path.display().to_string(),
+            );
+        }
+    }
+    let excerpt = strace_capture
+        .map(|capture| excerpt_list(&capture.raw_log, RUNAWAY_STRACE_EXCERPT_LIMIT))
+        .unwrap_or_default();
+    RunawayInvestigationSummary {
+        sampled_pid,
+        sampled_pid_count: profile.sampled_pids.len(),
+        command_line: include_richer_evidence
+            .then(|| proc_snapshot.command_line.clone())
+            .flatten(),
+        executable: include_richer_evidence
+            .then(|| proc_snapshot.executable.clone())
+            .flatten(),
+        process_state: proc_snapshot.process_state.clone(),
+        wchan: proc_snapshot.wchan.clone(),
+        top_hot_symbols: top_hot_symbols.to_vec(),
+        top_syscalls: top_syscalls.to_vec(),
+        dominant_sequence: dominant_sequence.to_vec(),
+        strace_line_count: strace_capture
+            .map(|capture| normalized_strace_lines(&capture.raw_log).len())
+            .unwrap_or_default(),
+        strace_excerpt: if include_richer_evidence {
+            excerpt
+        } else {
+            Vec::new()
+        },
+        status_excerpt: if include_richer_evidence {
+            proc_snapshot.status_excerpt.clone()
+        } else {
+            None
+        },
+        sched_excerpt: if include_richer_evidence {
+            proc_snapshot.sched_excerpt.clone()
+        } else {
+            None
+        },
+        stack_excerpt: if include_richer_evidence {
+            proc_snapshot.stack_excerpt.clone()
+        } else {
+            None
+        },
+        hypothesis: hypothesis.clone(),
+        raw_artifacts: if include_richer_evidence {
+            raw_artifacts
+        } else {
+            BTreeMap::new()
+        },
+        package_metadata,
+    }
+}
+
+fn build_stuck_process_investigation_summary(
+    group: &StuckProcessGroup,
+    proc_snapshot: &ProcSnapshot,
+    hypothesis: &RunawayHypothesis,
+    package_metadata: Option<RunawayPackageMetadata>,
+    include_richer_evidence: bool,
+) -> StuckProcessInvestigationSummary {
+    StuckProcessInvestigationSummary {
+        sampled_pid: group.sample_pid,
+        sampled_pid_count: group.pids.len(),
+        sampled_pids: group.pids.clone(),
+        command_line: include_richer_evidence
+            .then(|| proc_snapshot.command_line.clone())
+            .flatten(),
+        executable: include_richer_evidence
+            .then(|| proc_snapshot.executable.clone())
+            .flatten(),
+        process_state: proc_snapshot.process_state.clone(),
+        runtime_seconds: group.sample_runtime_seconds,
+        wchan: proc_snapshot.wchan.clone(),
+        cwd: if include_richer_evidence {
+            proc_snapshot.cwd.clone()
+        } else {
+            None
+        },
+        root: if include_richer_evidence {
+            proc_snapshot.root.clone()
+        } else {
+            None
+        },
+        fd_targets: if include_richer_evidence {
+            proc_snapshot.fd_targets.clone()
+        } else {
+            Vec::new()
+        },
+        io_excerpt: if include_richer_evidence {
+            proc_snapshot.io_excerpt.clone()
+        } else {
+            None
+        },
+        status_excerpt: if include_richer_evidence {
+            proc_snapshot.status_excerpt.clone()
+        } else {
+            None
+        },
+        sched_excerpt: if include_richer_evidence {
+            proc_snapshot.sched_excerpt.clone()
+        } else {
+            None
+        },
+        stack_excerpt: if include_richer_evidence {
+            proc_snapshot.stack_excerpt.clone()
+        } else {
+            None
+        },
+        hypothesis: hypothesis.clone(),
+        likely_external_root_cause: !matches!(
+            hypothesis.classification.as_str(),
+            "unknown-uninterruptible-wait"
+        ),
+        raw_artifacts: if include_richer_evidence {
+            proc_snapshot.raw_artifacts.clone()
+        } else {
+            BTreeMap::new()
+        },
+        package_metadata,
+    }
+}
+
+fn stuck_process_investigation_fingerprint(
+    group: &StuckProcessGroup,
+    investigation: &StuckProcessInvestigationSummary,
+) -> String {
+    hash_text(format!(
+        "stuck-process:{}:{}:{}:{}",
+        group
+            .executable
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| group.name.clone()),
+        investigation.hypothesis.classification,
+        investigation.wchan.as_deref().unwrap_or("unknown"),
+        investigation
+            .stack_excerpt
+            .as_deref()
+            .and_then(|excerpt| excerpt.lines().next())
+            .unwrap_or("no-stack"),
+    ))
+}
+
+fn stuck_process_investigation_summary_line(
+    group: &StuckProcessGroup,
+    investigation: &StuckProcessInvestigationSummary,
+) -> String {
+    let wait_point = investigation
+        .wchan
+        .as_deref()
+        .unwrap_or("an unknown wait point");
+    format!(
+        "{} has {} process(es) stuck in `D` state for at least {}s, likely blocked in {} via {}.",
+        group.name,
+        investigation.sampled_pid_count,
+        investigation.runtime_seconds,
+        investigation.hypothesis.classification.replace('-', " "),
+        wait_point,
+    )
+}
+
+fn runaway_investigation_fingerprint(
+    target: &PopularBinaryProfile,
+    hot_path: &PerfHotPath,
+    top_hot_symbols: &[String],
+    top_syscalls: &[RunawaySyscallStat],
+    dominant_sequence: &[String],
+    hypothesis: &RunawayHypothesis,
+) -> String {
+    hash_text(format!(
+        "runaway-process:{}:{}:{}:{}:{}:{}",
+        target.name,
+        target
+            .package_name
+            .as_deref()
+            .unwrap_or_else(|| hot_path.package_name.as_deref().unwrap_or("unknown")),
+        top_hot_symbols
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("|"),
+        top_syscalls
+            .iter()
+            .take(3)
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>()
+            .join("|"),
+        dominant_sequence.join(">"),
+        hypothesis.classification,
+    ))
+}
+
+fn runaway_investigation_summary_line(
+    target: &PopularBinaryProfile,
+    hot_path: &PerfHotPath,
+    investigation: &RunawayInvestigationSummary,
+) -> String {
+    let syscall_summary = if investigation.top_syscalls.is_empty() {
+        "no dominant syscall sample was captured".to_string()
+    } else {
+        investigation
+            .top_syscalls
+            .iter()
+            .take(3)
+            .map(|item| format!("{} x{}", item.name, item.count))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "{} is stuck in a likely {} loop: {:.2}% of sampled CPU passed through {}, with repeated {}.",
+        target.name,
+        investigation.hypothesis.classification.replace('-', " "),
+        hot_path.percent,
+        summarize_hot_symbol(&hot_path.symbol),
+        syscall_summary,
+    )
+}
+
+fn investigation_hot_symbol_summaries(profile: &PerfProfileCapture) -> Vec<String> {
+    profile
+        .hot_paths
+        .iter()
+        .take(5)
+        .map(|hot_path| {
+            let dso = hot_path
+                .dso_path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|value| value.to_str())
+                .unwrap_or(&hot_path.dso);
+            format!("{} ({:.2}% in {})", hot_path.symbol, hot_path.percent, dso)
+        })
+        .collect()
+}
+
+fn process_state_from_status(status: &str) -> Option<&str> {
+    status.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == "State").then(|| value.trim())
+    })
+}
+
+fn excerpt_lines(raw: &str, line_limit: usize) -> String {
+    excerpt_list(raw, line_limit).join("\n")
+}
+
+fn excerpt_list(raw: &str, line_limit: usize) -> Vec<String> {
+    raw.lines()
+        .take(line_limit)
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn prune_runaway_investigation_artifacts(root: &Path, retention_days: u64) -> Result<()> {
+    if retention_days == 0 || !root.exists() {
+        return Ok(());
+    }
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(StdDuration::from_secs(
+            retention_days.saturating_mul(24 * 60 * 60),
+        ))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified_at) = metadata.modified() else {
+            continue;
+        };
+        if modified_at < cutoff {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+    Ok(())
 }
 
 fn is_profile_candidate(target: &PopularBinaryProfile) -> bool {
@@ -2108,11 +3540,13 @@ fn frame_is_useful(frame: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        apparmor_finding_from_kernel_line, extend_unique_log_lines, is_low_signal_kernel_warning,
-        is_profile_candidate, kernel_module_lookup_names, kernel_module_package_hint,
-        kernel_warning_module_candidates, looks_like_warning, normalize_perf_symbol,
-        parse_apparmor_denial, parse_coredump_info, parse_dkms_status_line, parse_perf_hot_paths,
-        parse_postgres_collation_mismatch_rows, safe_perf_name,
+        apparmor_finding_from_kernel_line, classify_runaway_loop, classify_stuck_process,
+        dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
+        is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
+        kernel_module_package_hint, kernel_warning_module_candidates, looks_like_warning,
+        normalize_perf_symbol, parse_apparmor_denial, parse_coredump_info, parse_dkms_status_line,
+        parse_perf_hot_paths, parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
+        process_runtime_seconds, safe_perf_name, summarize_top_syscalls, system_uptime_seconds,
     };
     use crate::models::PopularBinaryProfile;
     use serde_json::Value;
@@ -2413,5 +3847,97 @@ Stack trace of thread 222:\n\
             normalize_perf_symbol("std::__foo<int> - - - -"),
             "std::__foo<int>"
         );
+    }
+
+    #[test]
+    fn parses_strace_syscall_names_with_attached_pid_prefixes() {
+        assert_eq!(
+            parse_strace_syscall_name(
+                "[pid 12454] 12:00:01.123456 recvmsg(8, 0x7ffc, 0) = 48 <0.000012>"
+            ),
+            Some("recvmsg".to_string())
+        );
+        assert_eq!(
+            parse_strace_syscall_name(
+                "12:00:01.123456 ppoll([{fd=8, events=POLLIN}], 1, NULL, NULL, 8) = 1 <0.000010>"
+            ),
+            Some("ppoll".to_string())
+        );
+    }
+
+    #[test]
+    fn classifies_dbus_spin_from_trace_and_symbols() {
+        let syscalls = vec![
+            "recvmsg".to_string(),
+            "sendmsg".to_string(),
+            "ppoll".to_string(),
+            "recvmsg".to_string(),
+            "sendmsg".to_string(),
+            "ppoll".to_string(),
+        ];
+        let top_syscalls = summarize_top_syscalls(&syscalls);
+        let sequence = dominant_syscall_sequence(&syscalls);
+        assert_eq!(sequence, vec!["recvmsg", "sendmsg", "ppoll"]);
+        let hypothesis = classify_runaway_loop(
+            &[
+                "12:00:01 recvmsg(8, ..., 0) = 48 <0.000012> /run/user/1000/bus".to_string(),
+                "12:00:01 sendmsg(8, ..., 0) = 32 <0.000010> org.freedesktop.DBus".to_string(),
+            ],
+            &top_syscalls,
+            &["QDBusConnection::send".to_string()],
+        );
+        assert_eq!(hypothesis.classification, "dbus-spin");
+        assert!(hypothesis.confidence > 0.8);
+    }
+
+    #[test]
+    fn classifies_missing_file_retry_loops() {
+        let syscalls = vec![
+            "openat".to_string(),
+            "statx".to_string(),
+            "openat".to_string(),
+            "statx".to_string(),
+        ];
+        let top_syscalls = summarize_top_syscalls(&syscalls);
+        let hypothesis = classify_runaway_loop(
+            &[
+                "12:00:01 openat(AT_FDCWD, \"/tmp/missing\", O_RDONLY) = -1 ENOENT (No such file or directory) <0.000009>".to_string(),
+                "12:00:01 statx(AT_FDCWD, \"/tmp/missing\", 0, STATX_ALL, 0x7fff) = -1 ENOENT (No such file or directory) <0.000008>".to_string(),
+            ],
+            &top_syscalls,
+            &[],
+        );
+        assert_eq!(hypothesis.classification, "file-not-found-retry");
+        assert!(hypothesis.confidence > 0.8);
+    }
+
+    #[test]
+    fn cooldown_only_blocks_recent_investigations() {
+        assert!(investigation_cooldown_active(
+            &chrono::Utc::now().to_rfc3339(),
+            3600
+        ));
+        assert!(!investigation_cooldown_active(
+            &(chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339(),
+            3600
+        ));
+    }
+
+    #[test]
+    fn classifies_stuck_processes_waiting_on_fuse() {
+        let hypothesis = classify_stuck_process(
+            Some("fuse_wait_answer\nrequest_wait_answer\n"),
+            Some("fuse_wait_answer"),
+            &["/mnt/problematic-tree".to_string()],
+        );
+        assert_eq!(hypothesis.classification, "fuse-wait");
+        assert!(hypothesis.confidence > 0.8);
+    }
+
+    #[test]
+    fn process_runtime_uses_proc_stat_start_time() {
+        let runtime =
+            process_runtime_seconds(std::process::id() as i32, system_uptime_seconds(), 100.0);
+        assert!(runtime.is_some());
     }
 }

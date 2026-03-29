@@ -187,12 +187,75 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
     };
 
     let opportunity = lease.issue.representative.opportunity.clone();
+    let supports_process_report = proposal::supports_process_investigation_report(&opportunity);
+    if supports_process_report && process_investigation_prefers_report_only(&opportunity) {
+        let report = proposal::create_process_investigation_report_proposal(
+            store,
+            config,
+            &opportunity,
+            Some(
+                "the collected evidence points below user space, so Fixer skipped an automatic package patch attempt",
+            ),
+        )?;
+        let submission_bundle = proposal::prepare_submission(store, report.id).ok();
+        let result = WorkerResultEnvelope {
+            lease_id: lease.lease_id.clone(),
+            attempt: PatchAttempt {
+                cluster_id: lease.issue.id,
+                install_id: participation.identity.install_id.clone(),
+                outcome: "report".to_string(),
+                state: report.state.clone(),
+                summary: format!(
+                    "{} Fixer produced a diagnosis report and intentionally skipped a package patch attempt because the wait appears to be below user space.",
+                    process_investigation_worker_summary(&opportunity)
+                ),
+                bundle_path: Some(report.bundle_path.display().to_string()),
+                output_path: report
+                    .output_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                validation_status: Some(report.state.clone()),
+                details: json!({
+                    "local_proposal_id": report.id,
+                    "local_submission_bundle": submission_bundle.map(|path| path.display().to_string()),
+                    "local_opportunity_id": opportunity.id,
+                    "diagnosis": process_investigation_worker_diagnosis(&opportunity),
+                    "report_only_reason": "likely-external-root-cause",
+                }),
+                created_at: now_rfc3339(),
+            },
+            impossible_reason: None,
+            evidence_request: None,
+        };
+        let endpoint = format!("v1/work/{}/result", lease.lease_id);
+        let submitted = post_json::<_, WorkerResultEnvelope>(config, &endpoint, &result)?;
+        store.set_local_state("last_worker_result", &submitted)?;
+        return Ok(WorkerRunOutcome {
+            hello,
+            offer,
+            result: Some(submitted),
+        });
+    }
     let result = match ensure_workspace_for_opportunity(config, &opportunity) {
         Ok(workspace) => {
+            let investigation_report = if supports_process_report {
+                proposal::create_process_investigation_report_proposal(
+                    store,
+                    config,
+                    &opportunity,
+                    None,
+                )
+                .ok()
+            } else {
+                None
+            };
             match proposal::create_proposal(store, config, &opportunity, &workspace, "codex") {
                 Ok(local_proposal) => {
                     let submission_bundle =
                         proposal::prepare_submission(store, local_proposal.id).ok();
+                    let diagnosis_bundle = investigation_report
+                        .as_ref()
+                        .and_then(|report| proposal::prepare_submission(store, report.id).ok());
                     WorkerResultEnvelope {
                         lease_id: lease.lease_id.clone(),
                         attempt: PatchAttempt {
@@ -201,11 +264,25 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                             outcome: "patch".to_string(),
                             state: local_proposal.state.clone(),
                             summary: if local_proposal.state == "ready" {
-                                "Patch proposal created locally. Review it and submit it upstream if it looks correct."
-                                    .to_string()
+                                if supports_process_report {
+                                    format!(
+                                        "{} A diagnosis report and patch proposal were created locally.",
+                                        process_investigation_worker_summary(&opportunity)
+                                    )
+                                } else {
+                                    "Patch proposal created locally. Review it and submit it upstream if it looks correct."
+                                        .to_string()
+                                }
                             } else {
-                                "Worker attempted a patch but the local proposal did not complete cleanly."
-                                    .to_string()
+                                if supports_process_report {
+                                    format!(
+                                        "{} The diagnosis was captured, but the patch proposal did not complete cleanly.",
+                                        process_investigation_worker_summary(&opportunity)
+                                    )
+                                } else {
+                                    "Worker attempted a patch but the local proposal did not complete cleanly."
+                                        .to_string()
+                                }
                             },
                             bundle_path: Some(local_proposal.bundle_path.display().to_string()),
                             output_path: local_proposal
@@ -216,7 +293,11 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                             details: json!({
                                 "local_proposal_id": local_proposal.id,
                                 "local_submission_bundle": submission_bundle.map(|path| path.display().to_string()),
+                                "diagnosis_proposal_id": investigation_report.as_ref().map(|report| report.id),
+                                "diagnosis_submission_bundle": diagnosis_bundle.map(|path| path.display().to_string()),
+                                "diagnosis_bundle_path": investigation_report.as_ref().map(|report| report.bundle_path.display().to_string()),
                                 "local_opportunity_id": opportunity.id,
+                                "diagnosis": process_investigation_worker_diagnosis(&opportunity),
                                 "workspace": workspace,
                             }),
                             created_at: now_rfc3339(),
@@ -225,28 +306,122 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                         evidence_request: None,
                     }
                 }
-                Err(error) => build_impossible_result(
+                Err(error) => {
+                    if let Some(report) = investigation_report {
+                        let submission_bundle = proposal::prepare_submission(store, report.id).ok();
+                        WorkerResultEnvelope {
+                            lease_id: lease.lease_id.clone(),
+                            attempt: PatchAttempt {
+                                cluster_id: lease.issue.id,
+                                install_id: participation.identity.install_id.clone(),
+                                outcome: "report".to_string(),
+                                state: report.state.clone(),
+                                summary: format!(
+                                    "{} A diagnosis report was created, but the patch attempt failed to run cleanly: {}",
+                                    process_investigation_worker_summary(&opportunity),
+                                    error
+                                ),
+                                bundle_path: Some(report.bundle_path.display().to_string()),
+                                output_path: report
+                                    .output_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string()),
+                                validation_status: Some(report.state.clone()),
+                                details: json!({
+                                    "local_proposal_id": report.id,
+                                    "local_submission_bundle": submission_bundle.map(|path| path.display().to_string()),
+                                    "local_opportunity_id": opportunity.id,
+                                    "diagnosis": process_investigation_worker_diagnosis(&opportunity),
+                                    "patch_error": error.to_string(),
+                                    "workspace": workspace,
+                                }),
+                                created_at: now_rfc3339(),
+                            },
+                            impossible_reason: None,
+                            evidence_request: None,
+                        }
+                    } else {
+                        build_impossible_result(
+                            &participation.identity.install_id,
+                            lease.issue.id,
+                            &lease.lease_id,
+                            "codex-execution",
+                            &error.to_string(),
+                            json!({"local_opportunity_id": opportunity.id}),
+                        )
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            if supports_process_report {
+                match proposal::create_process_investigation_report_proposal(
+                    store,
+                    config,
+                    &opportunity,
+                    Some(&error.to_string()),
+                ) {
+                    Ok(report) => {
+                        let submission_bundle = proposal::prepare_submission(store, report.id).ok();
+                        WorkerResultEnvelope {
+                            lease_id: lease.lease_id.clone(),
+                            attempt: PatchAttempt {
+                                cluster_id: lease.issue.id,
+                                install_id: participation.identity.install_id.clone(),
+                                outcome: "report".to_string(),
+                                state: report.state.clone(),
+                                summary: format!(
+                                    "{} A diagnosis report was created even though no patchable workspace was available.",
+                                    process_investigation_worker_summary(&opportunity)
+                                ),
+                                bundle_path: Some(report.bundle_path.display().to_string()),
+                                output_path: report
+                                    .output_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string()),
+                                validation_status: Some(report.state.clone()),
+                                details: json!({
+                                    "local_proposal_id": report.id,
+                                    "local_submission_bundle": submission_bundle.map(|path| path.display().to_string()),
+                                    "local_opportunity_id": opportunity.id,
+                                    "diagnosis": process_investigation_worker_diagnosis(&opportunity),
+                                    "workspace_error": error.to_string(),
+                                }),
+                                created_at: now_rfc3339(),
+                            },
+                            impossible_reason: None,
+                            evidence_request: None,
+                        }
+                    }
+                    Err(report_error) => build_impossible_result(
+                        &participation.identity.install_id,
+                        lease.issue.id,
+                        &lease.lease_id,
+                        "workspace-acquisition",
+                        &format!("{error}; failed to create diagnostic report: {report_error}"),
+                        json!({
+                            "local_opportunity_id": opportunity.id,
+                            "package_name": opportunity.evidence.get("package_name"),
+                            "repo_root": opportunity.repo_root.as_ref().map(|path| path.display().to_string()),
+                            "diagnosis": process_investigation_worker_diagnosis(&opportunity),
+                        }),
+                    ),
+                }
+            } else {
+                build_impossible_result(
                     &participation.identity.install_id,
                     lease.issue.id,
                     &lease.lease_id,
-                    "codex-execution",
+                    "workspace-acquisition",
                     &error.to_string(),
-                    json!({"local_opportunity_id": opportunity.id}),
-                ),
+                    json!({
+                        "local_opportunity_id": opportunity.id,
+                        "package_name": opportunity.evidence.get("package_name"),
+                        "repo_root": opportunity.repo_root.as_ref().map(|path| path.display().to_string()),
+                    }),
+                )
             }
         }
-        Err(error) => build_impossible_result(
-            &participation.identity.install_id,
-            lease.issue.id,
-            &lease.lease_id,
-            "workspace-acquisition",
-            &error.to_string(),
-            json!({
-                "local_opportunity_id": opportunity.id,
-                "package_name": opportunity.evidence.get("package_name"),
-                "repo_root": opportunity.repo_root.as_ref().map(|path| path.display().to_string()),
-            }),
-        ),
     };
 
     let endpoint = format!("v1/work/{}/result", lease.lease_id);
@@ -281,6 +456,7 @@ fn build_submission_bundle(
             .consent_policy_version
             .clone()
             .unwrap_or_else(|| config.privacy.policy_version.clone()),
+        richer_evidence_allowed: participation.state.richer_evidence_allowed,
         status,
         capabilities,
         items,
@@ -351,6 +527,7 @@ fn build_client_hello(
         hostname: current_hostname(),
         has_codex: capabilities.iter().any(|capability| capability == "codex"),
         capabilities,
+        richer_evidence_allowed: state.richer_evidence_allowed,
     })
 }
 
@@ -419,6 +596,43 @@ pub fn server_upgrade_message(hello: &ServerHello) -> Option<&str> {
     }
     let message = hello.upgrade_message.trim();
     (!message.is_empty()).then_some(message)
+}
+
+fn process_investigation_worker_summary(opportunity: &crate::models::OpportunityRecord) -> String {
+    let details = process_investigation_worker_diagnosis(opportunity);
+    let target = details
+        .get("profile_target")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("the process");
+    let classification = details
+        .get("loop_classification")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown-investigation")
+        .replace('-', " ");
+    if details.get("subsystem").and_then(Value::as_str) == Some("stuck-process") {
+        format!("{target} likely remains stuck in a {classification} wait.")
+    } else {
+        format!("{target} likely remains stuck in a {classification} loop.")
+    }
+}
+
+fn process_investigation_worker_diagnosis(opportunity: &crate::models::OpportunityRecord) -> Value {
+    opportunity
+        .evidence
+        .get("details")
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+}
+
+fn process_investigation_prefers_report_only(
+    opportunity: &crate::models::OpportunityRecord,
+) -> bool {
+    let details = process_investigation_worker_diagnosis(opportunity);
+    details
+        .get("likely_external_root_cause")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn build_impossible_result(

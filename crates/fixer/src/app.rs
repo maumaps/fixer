@@ -226,6 +226,16 @@ impl App {
                 &opportunity,
             );
         }
+        if engine == "deterministic"
+            && proposal::supports_process_investigation_report(&opportunity)
+        {
+            return proposal::create_process_investigation_report_proposal(
+                &self.store,
+                &self.config,
+                &opportunity,
+                None,
+            );
+        }
         match ensure_workspace_for_opportunity(&self.config, &opportunity) {
             Ok(workspace) => proposal::create_proposal(
                 &self.store,
@@ -234,12 +244,23 @@ impl App {
                 &workspace,
                 engine,
             ),
-            Err(error) if engine == "deterministic" => proposal::create_external_report_proposal(
-                &self.store,
-                &self.config,
-                &opportunity,
-                &error.to_string(),
-            ),
+            Err(error) if engine == "deterministic" => {
+                if proposal::supports_process_investigation_report(&opportunity) {
+                    proposal::create_process_investigation_report_proposal(
+                        &self.store,
+                        &self.config,
+                        &opportunity,
+                        Some(&error.to_string()),
+                    )
+                } else {
+                    proposal::create_external_report_proposal(
+                        &self.store,
+                        &self.config,
+                        &opportunity,
+                        &error.to_string(),
+                    )
+                }
+            }
             Err(error) => Err(anyhow!(
                 "{error}. Use `propose-fix {opportunity_id} --engine deterministic` to generate an external bug report instead."
             )),

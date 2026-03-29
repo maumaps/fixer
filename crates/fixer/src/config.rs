@@ -40,6 +40,24 @@ pub struct ServiceConfig {
     pub collect_bpftrace: bool,
     #[serde(default = "default_perf_duration")]
     pub perf_duration_seconds: u64,
+    #[serde(default = "default_true")]
+    pub auto_investigate_hotspots: bool,
+    #[serde(default = "default_true")]
+    pub auto_investigate_stuck_processes: bool,
+    #[serde(default = "default_hotspot_investigation_cooldown")]
+    pub hotspot_investigation_cooldown_seconds: u64,
+    #[serde(default = "default_hotspot_investigation_strace_duration")]
+    pub hotspot_investigation_strace_seconds: u64,
+    #[serde(default = "default_hotspot_investigation_limit")]
+    pub hotspot_investigation_limit: usize,
+    #[serde(default = "default_stuck_process_investigation_cooldown")]
+    pub stuck_process_investigation_cooldown_seconds: u64,
+    #[serde(default = "default_stuck_process_min_runtime")]
+    pub stuck_process_min_runtime_seconds: u64,
+    #[serde(default = "default_stuck_process_investigation_limit")]
+    pub stuck_process_investigation_limit: usize,
+    #[serde(default = "default_hotspot_investigation_retention_days")]
+    pub hotspot_investigation_retention_days: u64,
     #[serde(default = "default_coredump_limit")]
     pub coredump_limit: usize,
     #[serde(default = "default_journal_lines")]
@@ -159,6 +177,16 @@ impl Default for ServiceConfig {
             collect_perf: false,
             collect_bpftrace: false,
             perf_duration_seconds: default_perf_duration(),
+            auto_investigate_hotspots: true,
+            auto_investigate_stuck_processes: true,
+            hotspot_investigation_cooldown_seconds: default_hotspot_investigation_cooldown(),
+            hotspot_investigation_strace_seconds: default_hotspot_investigation_strace_duration(),
+            hotspot_investigation_limit: default_hotspot_investigation_limit(),
+            stuck_process_investigation_cooldown_seconds:
+                default_stuck_process_investigation_cooldown(),
+            stuck_process_min_runtime_seconds: default_stuck_process_min_runtime(),
+            stuck_process_investigation_limit: default_stuck_process_investigation_limit(),
+            hotspot_investigation_retention_days: default_hotspot_investigation_retention_days(),
             coredump_limit: default_coredump_limit(),
             journal_lines: default_journal_lines(),
             watched_repos: Vec::new(),
@@ -297,6 +325,34 @@ fn default_perf_duration() -> u64 {
 
 fn default_coredump_limit() -> usize {
     10
+}
+
+fn default_hotspot_investigation_cooldown() -> u64 {
+    3600
+}
+
+fn default_hotspot_investigation_strace_duration() -> u64 {
+    5
+}
+
+fn default_hotspot_investigation_limit() -> usize {
+    3
+}
+
+fn default_stuck_process_investigation_cooldown() -> u64 {
+    3600
+}
+
+fn default_stuck_process_min_runtime() -> u64 {
+    120
+}
+
+fn default_stuck_process_investigation_limit() -> usize {
+    3
+}
+
+fn default_hotspot_investigation_retention_days() -> u64 {
+    7
 }
 
 fn default_journal_lines() -> usize {
