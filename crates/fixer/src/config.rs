@@ -87,6 +87,10 @@ pub struct PatchConfig {
     pub approval_policy: Option<String>,
     #[serde(default)]
     pub extra_instructions: Option<String>,
+    #[serde(default = "default_true")]
+    pub review_after_patch: bool,
+    #[serde(default = "default_review_fix_passes")]
+    pub review_fix_passes: u32,
     #[serde(default)]
     pub auth_mode: CodexAuthMode,
     #[serde(default = "default_lease_budget_preset")]
@@ -219,6 +223,8 @@ impl Default for PatchConfig {
             sandbox: Some("workspace-write".to_string()),
             approval_policy: Some("never".to_string()),
             extra_instructions: None,
+            review_after_patch: true,
+            review_fix_passes: default_review_fix_passes(),
             auth_mode: CodexAuthMode::UserLease,
             lease_budget_preset: default_lease_budget_preset(),
             lease_default_ttl_seconds: default_lease_default_ttl(),
@@ -392,6 +398,10 @@ fn default_lease_budget_preset() -> LeaseBudgetPreset {
 
 fn default_lease_default_ttl() -> u64 {
     8 * 60 * 60
+}
+
+fn default_review_fix_passes() -> u32 {
+    1
 }
 
 fn default_lease_failure_pause_threshold() -> u32 {

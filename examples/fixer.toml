@@ -19,6 +19,8 @@ codex_args = []
 sandbox = "workspace-write"
 approval_policy = "never"
 extra_instructions = "Keep the change narrowly scoped and leave a concise summary in the final message."
+review_after_patch = true
+review_fix_passes = 1
 
 [network]
 server_url = "http://127.0.0.1:8080/"

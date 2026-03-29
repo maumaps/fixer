@@ -1,31 +1,53 @@
 # Maumap Fixer
 
-`fixer` is a local evidence engine for Debian and adjacent ecosystems. It inventories what is actually running, watches configured repos, ingests crashes and warnings, ranks fix opportunities, and can hand a bounded evidence bundle to Codex for a reviewed patch proposal.
+`fixer` is a local evidence engine for Linux machines.
 
-The current tree also includes a client/server federation model:
+It watches what is actually happening on a host, turns that into a small set of ranked problems, and helps turn those problems into one of two honest outcomes:
 
-- `fixerd` stays the local collector and SQLite store
-- `fixer-server` runs out of the box with local SQLite, and can switch to Postgres for shared/public deployments
-- hosts without Codex can submit findings
-- opted-in Codex-capable hosts can volunteer as workers, pull promoted issues, and either produce a patch proposal or explain why a patch is not currently possible
+- a diff-backed patch proposal
+- a clear triage handoff explaining why the fix belongs somewhere else
 
-## What this MVP includes
+The important boundary is that collection stays deterministic and local. AI only enters at the patch-and-explanation stage, after Fixer has already done the boring but important work of gathering evidence, mapping ownership, and shrinking the task.
 
-- Rust workspace with a shared library and two binaries: `fixer` and `fixerd`
-- SQLite-backed inventory of capabilities, artifacts, findings, opportunities, validations, and proposals
-- Collectors for process/package usage, watched repos, `coredumpctl`, warning logs, kernel warnings, targeted background `perf` profiling of the busiest binaries, and optional `bpftrace`
-- PostgreSQL collation mismatch detection for local clusters, with deterministic remediation proposals that start with `pg_amcheck`, then target only the affected indexes before refreshing the recorded collation version
-- Crash ingestion now requires an actual stack trace, then runs a best-effort symbolization pass with local binaries and debug-package hints before ranking the result
-- If a package has no patchable source workspace, deterministic proposals fall back to a precise external bug report with package versions, update availability, vendor/support routing, environment details, crash evidence, and a share-safe redacted command line
-- Pluggable repo adapters for Debian, npm, pip, and PGXN metadata/validation
-- Automatic workspace hydration for Debian-backed opportunities: use an existing repo when present, try `apt-get source` when `deb-src` is configured, otherwise fall back to cloning the package homepage when it is a cloneable upstream repo
-- Debian packaging for a local `.deb` install with a systemd service and default config
-- A new `fixer-server` binary for central or siloed deployments
-- Public deployment assets for `https://fixer.maumap.com`, including a landing page, a light public issues UI, a signed APT repository publisher, and deploy scripts for the canonical server
-- Explicit participation modes: `local-only`, `submitter`, and `submitter+worker`
-- Anonymous install identity, proof-of-work, quarantine, rate limits, and issue clustering for basic anti-spam and anti-abuse handling
+## What Fixer does today
 
-When `perf` is available, the daemon now profiles the busiest running binaries in the background instead of recording one anonymous system-wide sample. The resulting hotspot findings keep the hot symbol, the sampled process, the resolved DSO path, and the owning Debian package together so they can be reviewed later as real opportunities.
+Fixer currently includes:
+
+- a local collector daemon, `fixerd`
+- a CLI, `fixer`
+- a standalone aggregation server, `fixer-server`
+- a local SQLite store for findings, opportunities, validations, and proposals
+- opt-in federation so machines can share sanitized findings
+- volunteer worker flow so Codex-capable hosts can investigate promoted issues
+- a public site and APT repository at `https://fixer.maumap.com`
+
+On a single machine, Fixer can already:
+
+- inventory running binaries and map them to packages
+- inspect watched repositories and detect ecosystems
+- ingest crashes, warnings, hotspot profiles, runaway CPU loops, and stuck `D`-state processes
+- score and rank fix opportunities
+- hydrate a workspace automatically for many Debian-backed issues
+- generate either a patch proposal or a report-ready triage bundle
+
+In federation mode, opted-in hosts can:
+
+- upload structured findings
+- corroborate the same issue across machines
+- pull promoted issues as workers
+- publish a patch attempt or a successful triage result back to the server
+
+## How to think about it
+
+Fixer is easiest to understand as five steps:
+
+1. Observe the machine.
+2. Normalize what it found into stable findings.
+3. Rank those findings into opportunities worth attention.
+4. Resolve a real workspace when possible.
+5. Produce a patch or a clear explanation of why a patch would be dishonest.
+
+That means Fixer is not trying to be “an AI daemon that rewrites your machine.” It is much closer to maintenance infrastructure: a local evidence engine with an AI plug-in at the very edge.
 
 ## Quick start
 
@@ -35,91 +57,83 @@ When `perf` is available, the daemon now profiles the busiest running binaries i
 cargo build
 ```
 
-2. Copy the example config and edit watched repos or logs:
+2. Copy the example config:
 
 ```bash
 cp examples/fixer.toml ./fixer.toml
 ```
 
-3. Collect one snapshot:
+3. Run one collection pass:
 
 ```bash
 cargo run -p fixer -- --config ./fixer.toml collect
 ```
 
-4. Inspect the data:
+4. Inspect what Fixer found:
 
 ```bash
 cargo run -p fixer -- --config ./fixer.toml status
 cargo run -p fixer -- --config ./fixer.toml opportunities
 ```
 
-If something feels wrong before Fixer has a crisp finding yet, describe it in plain language and let it build a local triage plan:
-
-```bash
-cargo run -p fixer -- --config ./fixer.toml complain "chrome is slow when opening tabs"
-```
-
-5. Run the daemon loop:
+5. If you want the background daemon:
 
 ```bash
 cargo run -p fixer --bin fixerd -- --config ./fixer.toml run
 ```
 
-6. Opt in to federation if you want this host to upload findings:
+6. If something feels wrong before Fixer has a crisp finding yet, you can describe it in plain language and let it build a local triage plan:
+
+```bash
+cargo run -p fixer -- --config ./fixer.toml complain "chrome is slow when opening tabs"
+```
+
+## Federation quick start
+
+Until you opt in, Fixer stays local-only.
+
+To let one host submit findings:
 
 ```bash
 cargo run -p fixer -- --config ./fixer.toml opt-in --mode submitter
-```
-
-7. Push findings to a server:
-
-```bash
 cargo run -p fixer -- --config ./fixer.toml sync
 ```
 
-8. On a Codex-capable host, opt in as a worker and pull one lease:
+To let a Codex-capable host volunteer as a worker:
 
 ```bash
 cargo run -p fixer -- --config ./fixer.toml opt-in --mode submitter-worker
 cargo run -p fixer -- --config ./fixer.toml worker run
 ```
 
-9. Run the server:
+To run the server locally:
 
 ```bash
 cargo run -p fixer --bin fixer-server -- --config ./fixer-server.toml serve
 ```
 
-10. Build and publish release packages into a signed APT repo:
-
-```bash
-scripts/build-release-debs.sh
-scripts/publish-apt-repo.sh dist/packages/*/*/fixer_*_*.deb
-```
+The public deployment uses the same protocol and binaries. Local and public installs are meant to feel like the same system, just with different trust and visibility.
 
 ## Packaging
 
-Build installable Debian packages from the repo root:
+Build Debian packages from the repo root:
 
 ```bash
 dpkg-buildpackage -us -uc -b
 ```
 
-That produces two main packages:
+The two main packages are:
 
 - `fixer`: the CLI plus local collector daemon
-- `fixer-server`: the standalone aggregation server
+- `fixer-server`: the aggregation server
 
-For the collector/client package, prefer APT over `dpkg -i` so recommended
-helper tools are pulled in automatically:
+For the collector package, prefer APT over raw `dpkg -i` so helper tools are pulled in automatically:
 
 ```bash
 sudo apt install ../fixer_*.deb
 ```
 
-For a standalone local server, plain `dpkg -i` is enough on a normal Debian
-system because the package defaults to loopback plus local SQLite:
+For a local standalone server, plain `dpkg -i` is fine on a normal Debian machine:
 
 ```bash
 sudo dpkg -i ../fixer-server_*.deb
@@ -127,31 +141,38 @@ systemctl status fixer-server.service
 curl http://127.0.0.1:8080/healthz
 ```
 
-The collector package installs:
+The packaged server defaults to:
 
-- `/usr/bin/fixer`
-- `/usr/bin/fixerd`
-- `/etc/fixer/fixer.toml`
-- `/usr/lib/systemd/system/fixer.service`
+- bind address: `127.0.0.1:8080`
+- local state: `/var/lib/fixer-server/fixer-server.sqlite3`
 
-The server package installs:
+Shared or public deployments can switch to Postgres through `/etc/fixer/fixer-server.env` with `FIXER_SERVER_POSTGRES_URL=...`.
 
-- `/usr/bin/fixer-server`
-- `/etc/fixer/fixer-server.toml`
-- `/usr/lib/systemd/system/fixer-server.service`
+## Worker auth and safety
 
-The packaged standalone server binds to `127.0.0.1:8080` and stores its local
-state in `/var/lib/fixer-server/fixer-server.sqlite3`. Public deployments can
-override the database DSN through `/etc/fixer/fixer-server.env` with
-`FIXER_SERVER_POSTGRES_URL=...`.
+The packaged worker path defaults to `patch.auth_mode = "user-lease"`.
 
-The canonical public endpoint is `https://fixer.maumap.com`, and the public APT repository is expected at `https://fixer.maumap.com/apt/`.
+That means:
+
+- the root-owned service keeps responsibility for collection, leasing, and the SQLite state
+- Codex runs as a real user with that user's existing login
+- root does not need a copied Codex credential
+
+Typical setup looks like this:
+
+```bash
+sudo fixer auth lease bootstrap <user>
+sudo fixer auth lease grant <user> --ttl 8h --budget conservative
+sudo fixer auth lease status
+```
+
+Worker jobs run in isolated per-job workspace snapshots under `/var/lib/fixer/proposals/...`. The goal is not perfect sandboxing yet, but a much more supervised path than “run Codex as root and hope for the best.”
 
 ## Privacy and participation
 
-Network participation is opt-in. Until you explicitly run `fixer opt-in`, the daemon stays local-only.
+Fixer is intentionally cautious here.
 
-When you opt in, Fixer warns that it may unintentionally collect private data such as:
+Before opt-in, nothing is uploaded. After opt-in, Fixer still warns that it may collect sensitive machine evidence such as:
 
 - local paths
 - command lines
@@ -159,28 +180,42 @@ When you opt in, Fixer warns that it may unintentionally collect private data su
 - stack traces
 - package metadata
 
-Uploads go through best-effort secret redaction first, but redaction is not perfect. High-risk artifacts such as raw coredumps or whole repositories are not auto-uploaded; the intended model is a second explicit approval before richer evidence is shared.
+Uploads go through best-effort redaction first, but redaction is not perfect. Public pages only expose sanitized aggregate summaries, not raw evidence bundles, hostnames, install IDs, or richer artifacts.
 
-The public/no-config path is:
+`fixer complain` stays local-only by design. Even when the system daemon owns the main database, a normal user can still describe a problem in a per-user complaint workspace under `~/.local/state/fixer/complaints/`.
 
-- client binaries default to a baked-in server URL
-- each install creates an anonymous install ID locally
-- submissions and worker pulls require proof-of-work
-- new installs and new issue clusters stay quarantined until corroborated or trusted
+## Public deployment
 
-`fixer complain` is intentionally local-only. When the main daemon database is owned by the system service, the CLI falls back to a per-user complaint workspace under `~/.local/state/fixer/complaints/` so a normal user can still describe a problem, correlate it with collected evidence, and get a plan without mutating the shared system database.
+The canonical public endpoints are:
+
+- site: `https://fixer.maumap.com`
+- issues: `https://fixer.maumap.com/issues`
+- patches: `https://fixer.maumap.com/patches`
+- triage: `https://fixer.maumap.com/triage`
+- APT repo: `https://fixer.maumap.com/apt/`
+
+Release packages can be built and published with:
+
+```bash
+scripts/build-release-debs.sh
+scripts/publish-apt-repo.sh dist/packages/*/*/fixer_*_*.deb
+```
 
 ## Documentation
 
 - [Architecture notes](./doc/architecture.md)
 - [Design decisions](./doc/design-decisions.md)
-- [Original product brief](./doc/requirements.md)
+- [Product brief](./doc/requirements.md)
+- [Debian packaging notes](./debian/README.Debian)
 
-## Notes
+## Current limits
 
-- Debian-available helper tools now ship as package recommendations, so a normal `apt install ./fixer...deb` will usually pull in `perf`, `bpftrace`, `cargo`, `nodejs`, `npm`, `python3-pip`, and `postgresql-client`.
-- `pip-audit` is still not bundled through Debian packaging here because there is no native Debian package for it in this environment.
-- Optional tools are detected at runtime. Missing `npm`, `pip-audit`, `perf`, or `bpftrace` reduce features but do not block startup. When `perf` is present, the packaged daemon config enables targeted hotspot profiling by default.
-- Automated Debian source retrieval prefers `apt-get source`, but if the machine has no `deb-src` entries configured, Fixer now falls back to cloning a package homepage when it points at a real upstream repository.
-- The packaged service currently runs as root so it can access system-wide telemetry. Hardening and privilege separation are the next major step.
-- The new federation mode uses SQLite on clients and also defaults the server to SQLite for local installs. Public and larger shared deployments can switch the same server binary to Postgres through config or `FIXER_SERVER_POSTGRES_URL`.
+Fixer is already useful, but it is still early. A few boundaries are worth being explicit about:
+
+- optional tools like `perf`, `bpftrace`, `npm`, and `pip-audit` expand capability, but missing them should not block startup
+- workspace hydration is strongest for Debian-backed issues and still imperfect for everything else
+- some findings are best handled as successful triage rather than patches, especially when the real owner lives outside the current source tree
+- the system service still runs as root for telemetry access; privilege separation is improving, not finished
+- the public network is intentionally conservative, with quarantine, proof-of-work, and trust gating to keep the queue honest
+
+If you want the one-sentence summary: Fixer is trying to make real machine breakage legible, patchable, and shareable without pretending every problem deserves an instant AI patch.

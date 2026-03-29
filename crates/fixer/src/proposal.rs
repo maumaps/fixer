@@ -1,7 +1,7 @@
 use crate::config::FixerConfig;
 use crate::models::{
     CodexJobSpec, CodexJobStatus, ComplaintCollectionReport, InstalledPackageMetadata,
-    OpportunityRecord, PreparedWorkspace, ProposalRecord, SharedOpportunity,
+    OpportunityRecord, PatchAttempt, PreparedWorkspace, ProposalRecord, SharedOpportunity,
 };
 use crate::storage::Store;
 use crate::util::{command_exists, command_output, now_rfc3339, read_text};
@@ -20,6 +20,17 @@ pub fn create_proposal(
     workspace: &PreparedWorkspace,
     engine: &str,
 ) -> Result<ProposalRecord> {
+    create_proposal_with_prior_patch(store, config, opportunity, workspace, None, engine)
+}
+
+pub fn create_proposal_with_prior_patch(
+    store: &Store,
+    config: &FixerConfig,
+    opportunity: &OpportunityRecord,
+    workspace: &PreparedWorkspace,
+    prior_best_patch: Option<&PatchAttempt>,
+    engine: &str,
+) -> Result<ProposalRecord> {
     let bundle_dir = config.service.state_dir.join("proposals").join(format!(
         "{}-{}",
         opportunity.id,
@@ -30,17 +41,22 @@ pub fn create_proposal(
     let evidence_path = bundle_dir.join("evidence.json");
     let prompt_path = bundle_dir.join("prompt.md");
     let output_path = bundle_dir.join("codex-output.txt");
+    let prior_patch_context = materialize_prior_patch_context(&bundle_dir, prior_best_patch)?;
 
-    let evidence = json!({
+    let mut evidence = json!({
         "opportunity": opportunity,
         "workspace": workspace,
     });
+    if let Some(context) = prior_patch_context_json(&prior_patch_context) {
+        evidence["prior_best_patch"] = context;
+    }
     fs::write(&evidence_path, serde_json::to_vec_pretty(&evidence)?)?;
 
     let prompt = build_prompt(
         opportunity,
         &fs::canonicalize(&evidence_path).unwrap_or_else(|_| evidence_path.clone()),
         workspace,
+        prior_patch_context.as_ref(),
         config,
     );
     fs::write(&prompt_path, prompt.as_bytes())?;
@@ -93,6 +109,24 @@ pub fn prepare_codex_job(
     run_as_user: &str,
     allow_kernel: bool,
 ) -> Result<CodexJobSpec> {
+    prepare_codex_job_with_prior_patch(
+        config,
+        opportunity,
+        workspace,
+        None,
+        run_as_user,
+        allow_kernel,
+    )
+}
+
+pub fn prepare_codex_job_with_prior_patch(
+    config: &FixerConfig,
+    opportunity: &OpportunityRecord,
+    workspace: &PreparedWorkspace,
+    prior_best_patch: Option<&PatchAttempt>,
+    run_as_user: &str,
+    allow_kernel: bool,
+) -> Result<CodexJobSpec> {
     let bundle_dir = config.service.state_dir.join("proposals").join(format!(
         "{}-{}",
         opportunity.id,
@@ -103,18 +137,23 @@ pub fn prepare_codex_job(
     let evidence_path = bundle_dir.join("evidence.json");
     let prompt_path = bundle_dir.join("prompt.md");
     let output_path = bundle_dir.join("codex-output.txt");
+    let prior_patch_context = materialize_prior_patch_context(&bundle_dir, prior_best_patch)?;
 
-    let evidence = json!({
+    let mut evidence = json!({
         "opportunity": opportunity,
         "workspace": job_workspace,
         "source_workspace": workspace,
     });
+    if let Some(context) = prior_patch_context_json(&prior_patch_context) {
+        evidence["prior_best_patch"] = context;
+    }
     fs::write(&evidence_path, serde_json::to_vec_pretty(&evidence)?)?;
 
     let prompt = build_prompt(
         opportunity,
         &fs::canonicalize(&evidence_path).unwrap_or_else(|_| evidence_path.clone()),
         &job_workspace,
+        prior_patch_context.as_ref(),
         config,
     );
     fs::write(&prompt_path, prompt.as_bytes())?;
@@ -145,7 +184,14 @@ pub fn load_codex_job(job_dir: &std::path::Path) -> Result<CodexJobSpec> {
 
 pub fn load_published_codex_session(bundle_dir: &Path) -> Result<Value> {
     let evidence_path = bundle_dir.join("evidence.json");
-    let prompt_path = bundle_dir.join("prompt.md");
+    let prompt_path = {
+        let published = bundle_dir.join("published-prompt.md");
+        if published.exists() {
+            published
+        } else {
+            bundle_dir.join("prompt.md")
+        }
+    };
     let output_path = bundle_dir.join("codex-output.txt");
     let evidence_raw = fs::read(&evidence_path)
         .with_context(|| format!("failed to read {}", evidence_path.display()))?;
@@ -196,24 +242,272 @@ pub fn load_published_codex_session(bundle_dir: &Path) -> Result<Value> {
     }))
 }
 
+struct PriorPatchContext {
+    summary: String,
+    created_at: String,
+    fixer_version: Option<String>,
+    patch_path: Option<PathBuf>,
+    session_path: Option<PathBuf>,
+}
+
+fn materialize_prior_patch_context(
+    bundle_dir: &Path,
+    prior_best_patch: Option<&PatchAttempt>,
+) -> Result<Option<PriorPatchContext>> {
+    let Some(prior_best_patch) = prior_best_patch else {
+        return Ok(None);
+    };
+    let mut context = PriorPatchContext {
+        summary: prior_best_patch.summary.clone(),
+        created_at: prior_best_patch.created_at.clone(),
+        fixer_version: prior_patch_fixer_version(prior_best_patch).map(ToString::to_string),
+        patch_path: None,
+        session_path: None,
+    };
+    if let Some(diff) = prior_best_patch_diff(prior_best_patch) {
+        let patch_path = bundle_dir.join("prior-best.patch");
+        fs::write(&patch_path, diff.as_bytes())?;
+        context.patch_path = Some(patch_path);
+    }
+    if let Some(session) = prior_best_patch_session(prior_best_patch) {
+        let session_path = bundle_dir.join("prior-best-session.md");
+        let mut rendered = String::from("# Prior Fixer patch attempt\n\n");
+        if let Some(version) = context.fixer_version.as_deref() {
+            rendered.push_str(&format!("- Fixer version: `{version}`\n"));
+        } else {
+            rendered.push_str("- Fixer version: legacy or unknown\n");
+        }
+        rendered.push_str(&format!("- Created at: `{}`\n", context.created_at));
+        rendered.push_str(&format!("- Summary: {}\n", context.summary));
+        if let Some(prompt) = session.get("prompt").and_then(Value::as_str) {
+            rendered.push_str("\n## Prompt\n\n");
+            rendered.push_str(prompt);
+            rendered.push('\n');
+        }
+        if let Some(response) = session.get("response").and_then(Value::as_str) {
+            rendered.push_str("\n## Response\n\n");
+            rendered.push_str(response);
+            rendered.push('\n');
+        }
+        if let Some(diff) = session.get("diff").and_then(Value::as_str) {
+            rendered.push_str("\n## Diff\n\n```diff\n");
+            rendered.push_str(diff);
+            if !diff.ends_with('\n') {
+                rendered.push('\n');
+            }
+            rendered.push_str("```\n");
+        }
+        fs::write(&session_path, rendered.as_bytes())?;
+        context.session_path = Some(session_path);
+    }
+    Ok(Some(context))
+}
+
+fn prior_patch_context_json(context: &Option<PriorPatchContext>) -> Option<Value> {
+    let context = context.as_ref()?;
+    Some(json!({
+        "summary": context.summary,
+        "created_at": context.created_at,
+        "fixer_version": context.fixer_version,
+        "patch_path": context.patch_path.as_ref().map(|path| path.display().to_string()),
+        "session_path": context.session_path.as_ref().map(|path| path.display().to_string()),
+    }))
+}
+
+fn prior_patch_fixer_version(attempt: &PatchAttempt) -> Option<&str> {
+    attempt
+        .details
+        .get("worker_fixer_version")
+        .and_then(Value::as_str)
+        .or_else(|| attempt.details.get("fixer_version").and_then(Value::as_str))
+}
+
+fn prior_best_patch_session(attempt: &PatchAttempt) -> Option<&Value> {
+    attempt.details.get("published_session")
+}
+
+fn prior_best_patch_diff(attempt: &PatchAttempt) -> Option<&str> {
+    prior_best_patch_session(attempt)
+        .and_then(|session| session.get("diff"))
+        .and_then(Value::as_str)
+        .filter(|diff| !diff.trim().is_empty())
+}
+
 pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<CodexJobStatus> {
     let started_at = now_rfc3339();
-    let prompt = read_text(&job.prompt_path)
+    let patch_prompt = read_text(&job.prompt_path)
         .with_context(|| format!("failed to read {}", job.prompt_path.display()))?;
-    let outcome = run_codex_process(config, &job.workspace.repo_root, &job.output_path, &prompt)?;
-    let finished_at = now_rfc3339();
-    let log_path = job.bundle_dir.join("codex-run.log");
-    if !outcome.log.is_empty() {
-        fs::write(&log_path, outcome.log.as_bytes())?;
+    let source_workspace_root = source_workspace_root_from_bundle(&job.bundle_dir);
+    let evidence_path = job.bundle_dir.join("evidence.json");
+    let mut transcripts = Vec::new();
+    let mut logs = Vec::new();
+
+    let patch_stage = run_codex_stage(
+        config,
+        &job.workspace.repo_root,
+        &job.prompt_path,
+        &job.bundle_dir.join("patch-output.txt"),
+        "Patch Pass",
+        &patch_prompt,
+    )?;
+    logs.push(render_stage_log(&patch_stage));
+    transcripts.push(CodexStageTranscript {
+        label: patch_stage.label.to_string(),
+        prompt: patch_prompt.clone(),
+        response: patch_stage.output.clone(),
+    });
+    if !patch_stage.success {
+        let published_prompt = render_combined_prompt(&transcripts);
+        let published_output = render_combined_output(&transcripts, Some(&patch_stage.error));
+        fs::write(
+            job.bundle_dir.join("published-prompt.md"),
+            published_prompt.as_bytes(),
+        )?;
+        fs::write(&job.output_path, published_output.as_bytes())?;
+        let finished_at = now_rfc3339();
+        fs::write(
+            job.bundle_dir.join("codex-run.log"),
+            logs.join("\n\n").as_bytes(),
+        )?;
+        let status = CodexJobStatus {
+            job_id: job.job_id.clone(),
+            state: "failed".to_string(),
+            started_at,
+            finished_at,
+            output_path: job.output_path.exists().then(|| job.output_path.clone()),
+            failure_kind: Some(classify_codex_failure(&patch_stage.log)),
+            error: Some(patch_stage.error),
+        };
+        fs::write(
+            job.bundle_dir.join("status.json"),
+            serde_json::to_vec_pretty(&status)?,
+        )?;
+        return Ok(status);
     }
-    let error = if outcome.success {
-        None
-    } else {
-        Some(summarize_failure_log(&outcome.log))
-    };
+
+    let mut workflow_failure: Option<(String, String)> = None;
+    let patch_output_indicates_triage = stage_output_marks_successful_triage(&patch_stage.output);
+    if config.patch.review_after_patch && !patch_output_indicates_triage {
+        let mut refinement_round = 0;
+        loop {
+            let review_label = format!("Review Pass {}", refinement_round + 1);
+            let review_prompt = build_review_prompt(
+                &evidence_path,
+                &job.workspace,
+                source_workspace_root.as_deref(),
+                refinement_round,
+            );
+            let review_prompt_path = job
+                .bundle_dir
+                .join(format!("review-{}-prompt.md", refinement_round + 1));
+            let review_output_path = job
+                .bundle_dir
+                .join(format!("review-{}-output.txt", refinement_round + 1));
+            let review_stage = run_codex_stage(
+                config,
+                &job.workspace.repo_root,
+                &review_prompt_path,
+                &review_output_path,
+                &review_label,
+                &review_prompt,
+            )?;
+            logs.push(render_stage_log(&review_stage));
+            transcripts.push(CodexStageTranscript {
+                label: review_stage.label.to_string(),
+                prompt: review_prompt,
+                response: review_stage.output.clone(),
+            });
+            if !review_stage.success {
+                workflow_failure = Some((
+                    classify_codex_failure(&review_stage.log),
+                    review_stage.error,
+                ));
+                break;
+            }
+            match parse_review_verdict(&review_stage.output) {
+                Some(CodexReviewVerdict::Ok) => break,
+                Some(CodexReviewVerdict::FixNeeded) => {
+                    if refinement_round >= config.patch.review_fix_passes {
+                        workflow_failure = Some((
+                            "review".to_string(),
+                            format!(
+                                "{} still found unresolved issues after {} refinement pass(es).",
+                                review_label, refinement_round
+                            ),
+                        ));
+                        break;
+                    }
+                    refinement_round += 1;
+                    let refine_label = format!("Refinement Pass {}", refinement_round);
+                    let refine_prompt = build_refinement_prompt(
+                        &evidence_path,
+                        &job.workspace,
+                        source_workspace_root.as_deref(),
+                        &review_output_path,
+                        refinement_round,
+                    );
+                    let refine_prompt_path = job
+                        .bundle_dir
+                        .join(format!("refine-{}-prompt.md", refinement_round));
+                    let refine_output_path = job
+                        .bundle_dir
+                        .join(format!("refine-{}-output.txt", refinement_round));
+                    let refine_stage = run_codex_stage(
+                        config,
+                        &job.workspace.repo_root,
+                        &refine_prompt_path,
+                        &refine_output_path,
+                        &refine_label,
+                        &refine_prompt,
+                    )?;
+                    logs.push(render_stage_log(&refine_stage));
+                    transcripts.push(CodexStageTranscript {
+                        label: refine_stage.label.to_string(),
+                        prompt: refine_prompt,
+                        response: refine_stage.output.clone(),
+                    });
+                    if !refine_stage.success {
+                        workflow_failure = Some((
+                            classify_codex_failure(&refine_stage.log),
+                            refine_stage.error,
+                        ));
+                        break;
+                    }
+                }
+                None => {
+                    workflow_failure = Some((
+                        "review".to_string(),
+                        format!(
+                            "{} did not return a `RESULT: ok` or `RESULT: fix-needed` line.",
+                            review_label
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
+    let finished_at = now_rfc3339();
+    fs::write(
+        job.bundle_dir.join("published-prompt.md"),
+        render_combined_prompt(&transcripts).as_bytes(),
+    )?;
+    fs::write(
+        &job.output_path,
+        render_combined_output(
+            &transcripts,
+            workflow_failure.as_ref().map(|(_, error)| error),
+        )
+        .as_bytes(),
+    )?;
+    fs::write(
+        job.bundle_dir.join("codex-run.log"),
+        logs.join("\n\n").as_bytes(),
+    )?;
     let status = CodexJobStatus {
         job_id: job.job_id.clone(),
-        state: if outcome.success {
+        state: if workflow_failure.is_none() {
             "ready".to_string()
         } else {
             "failed".to_string()
@@ -221,8 +515,8 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         started_at,
         finished_at,
         output_path: job.output_path.exists().then(|| job.output_path.clone()),
-        failure_kind: (!outcome.success).then(|| classify_codex_failure(&outcome.log)),
-        error,
+        failure_kind: workflow_failure.as_ref().map(|(kind, _)| kind.clone()),
+        error: workflow_failure.map(|(_, error)| error),
     };
     fs::write(
         job.bundle_dir.join("status.json"),
@@ -698,6 +992,120 @@ struct CodexProcessOutcome {
     log: String,
 }
 
+struct CodexStageOutcome {
+    label: String,
+    success: bool,
+    output: String,
+    log: String,
+    error: String,
+}
+
+struct CodexStageTranscript {
+    label: String,
+    prompt: String,
+    response: String,
+}
+
+enum CodexReviewVerdict {
+    Ok,
+    FixNeeded,
+}
+
+fn run_codex_stage(
+    config: &FixerConfig,
+    repo_root: &Path,
+    prompt_path: &Path,
+    output_path: &Path,
+    label: impl Into<String>,
+    prompt: &str,
+) -> Result<CodexStageOutcome> {
+    let label = label.into();
+    fs::write(prompt_path, prompt.as_bytes())?;
+    let outcome = run_codex_process(config, repo_root, output_path, prompt)?;
+    let output = if output_path.exists() {
+        read_text(output_path)
+            .with_context(|| format!("failed to read {}", output_path.display()))?
+    } else {
+        String::new()
+    };
+    let error = if outcome.success {
+        String::new()
+    } else {
+        summarize_failure_log(&outcome.log)
+    };
+    Ok(CodexStageOutcome {
+        label,
+        success: outcome.success,
+        output,
+        log: outcome.log,
+        error,
+    })
+}
+
+fn render_stage_log(stage: &CodexStageOutcome) -> String {
+    format!(
+        "== {} ==\nstatus: {}\n\n{}",
+        stage.label,
+        if stage.success { "ok" } else { "failed" },
+        stage.log
+    )
+}
+
+fn render_combined_prompt(stages: &[CodexStageTranscript]) -> String {
+    stages
+        .iter()
+        .map(|stage| format!("## {}\n\n{}", stage.label, stage.prompt))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn render_combined_output(stages: &[CodexStageTranscript], note: Option<&String>) -> String {
+    let mut sections = stages
+        .iter()
+        .map(|stage| format!("## {}\n\n{}", stage.label, stage.response))
+        .collect::<Vec<_>>();
+    if let Some(note) = note.filter(|value| !value.trim().is_empty()) {
+        sections.push(format!("## Workflow Note\n\n{}", note));
+    }
+    sections.join("\n\n")
+}
+
+fn parse_review_verdict(output: &str) -> Option<CodexReviewVerdict> {
+    for line in output.lines() {
+        let normalized = line.trim().to_ascii_lowercase();
+        if normalized == "result: ok" {
+            return Some(CodexReviewVerdict::Ok);
+        }
+        if normalized == "result: fix-needed" {
+            return Some(CodexReviewVerdict::FixNeeded);
+        }
+    }
+    None
+}
+
+fn stage_output_marks_successful_triage(output: &str) -> bool {
+    [
+        "No source change landed.",
+        "outside this repository",
+        "outside this source tree",
+        "speculative and unsafe",
+        "no safe code change was made",
+    ]
+    .iter()
+    .any(|marker| output.contains(marker))
+}
+
+fn source_workspace_root_from_bundle(bundle_dir: &Path) -> Option<PathBuf> {
+    let evidence_path = bundle_dir.join("evidence.json");
+    let raw = fs::read(&evidence_path).ok()?;
+    let evidence = serde_json::from_slice::<Value>(&raw).ok()?;
+    evidence
+        .get("source_workspace")
+        .and_then(|value| value.get("repo_root"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+}
+
 fn run_codex_process(
     config: &FixerConfig,
     repo_root: &std::path::Path,
@@ -783,6 +1191,7 @@ fn build_prompt(
     opportunity: &OpportunityRecord,
     evidence_path: &std::path::Path,
     workspace: &PreparedWorkspace,
+    prior_patch_context: Option<&PriorPatchContext>,
     config: &FixerConfig,
 ) -> String {
     let extra = config.patch.extra_instructions.as_deref().unwrap_or(
@@ -793,13 +1202,93 @@ fn build_prompt(
     } else {
         ""
     };
+    let prior_patch_hint = prior_patch_context
+        .map(|context| {
+            let version = context
+                .fixer_version
+                .as_deref()
+                .map(|value| format!("It was generated by Fixer `{value}`."))
+                .unwrap_or_else(|| {
+                    "It was generated by an older or legacy Fixer version.".to_string()
+                });
+            let patch_path = context
+                .patch_path
+                .as_ref()
+                .map(|path| format!("\n- Prior patch: `{}`", path.display()))
+                .unwrap_or_default();
+            let session_path = context
+                .session_path
+                .as_ref()
+                .map(|path| format!("\n- Prior published session: `{}`", path.display()))
+                .unwrap_or_default();
+            format!(
+                "\n\nA previous Fixer patch attempt already exists for this issue. {version} Review that patch before changing code, improve it instead of starting blind, and clean up anything awkward or underexplained. In particular, remove avoidable `goto`, tighten the explanation of what the patch is doing, and make the resulting diff feel ready for upstream git review.{patch_path}{session_path}"
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, run relevant tests if available, and summarize what changed.{} \n\n{}",
+        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, run relevant tests if available, and summarize what changed.{}{} \n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
         investigation_hint,
+        prior_patch_hint,
         extra
+    )
+}
+
+fn build_review_prompt(
+    evidence_path: &Path,
+    workspace: &PreparedWorkspace,
+    source_workspace_root: Option<&Path>,
+    refinement_round: u32,
+) -> String {
+    let source_hint = source_workspace_root
+        .map(|path| {
+            format!(
+                " The original pre-edit snapshot is available at `{}` for diffing.",
+                path.display()
+            )
+        })
+        .unwrap_or_default();
+    let round_hint = if refinement_round == 0 {
+        "Review the first patch pass."
+    } else {
+        "Review the patch again after the latest refinement."
+    };
+    format!(
+        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{} Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, and anything that makes the patch less pull-request-ready.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
+        evidence_path.display(),
+        workspace.repo_root.display(),
+        workspace.source_kind,
+        round_hint,
+        source_hint,
+    )
+}
+
+fn build_refinement_prompt(
+    evidence_path: &Path,
+    workspace: &PreparedWorkspace,
+    source_workspace_root: Option<&Path>,
+    review_output_path: &Path,
+    refinement_round: u32,
+) -> String {
+    let source_hint = source_workspace_root
+        .map(|path| {
+            format!(
+                " The original pre-edit snapshot is available at `{}` if you need to compare the current patch against it.",
+                path.display()
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "You are refining a fixer patch after an explicit code review.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the review report at `{}`. This is refinement round {}.{} Address the review findings with the smallest reasonable follow-up changes. Keep the patch upstream-friendly, avoid awkward control flow when a simpler structure will do, run relevant tests if available, and summarize which review findings you addressed.",
+        evidence_path.display(),
+        workspace.repo_root.display(),
+        workspace.source_kind,
+        review_output_path.display(),
+        refinement_round,
+        source_hint,
     )
 }
 
@@ -1862,14 +2351,18 @@ fn pg_amcheck_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        load_published_codex_session, pg_amcheck_command, render_external_bug_report,
+        load_published_codex_session, parse_review_verdict, pg_amcheck_command,
+        prepare_codex_job_with_prior_patch, render_external_bug_report,
         render_local_remediation_report, render_local_remediation_sql,
         render_process_investigation_report, sanitize_command_line_for_report,
         suggested_report_destination,
     };
-    use crate::models::{InstalledPackageMetadata, OpportunityRecord};
+    use crate::config::FixerConfig;
+    use crate::models::{
+        InstalledPackageMetadata, OpportunityRecord, PatchAttempt, PreparedWorkspace,
+    };
     use serde_json::{Value, json};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn redacts_url_query_values_in_report_command_lines() {
@@ -2281,5 +2774,141 @@ mod tests {
         assert!(!diff.contains("diff -urN"));
         assert!(!diff.contains("./source/src/file.c"));
         assert!(!diff.contains("./workspace/src/file.c"));
+    }
+
+    #[test]
+    fn review_verdict_parser_accepts_explicit_results() {
+        assert!(matches!(
+            parse_review_verdict("RESULT: ok\n\nLooks good."),
+            Some(super::CodexReviewVerdict::Ok)
+        ));
+        assert!(matches!(
+            parse_review_verdict("Some heading\nRESULT: fix-needed\n\n## Findings"),
+            Some(super::CodexReviewVerdict::FixNeeded)
+        ));
+        assert!(parse_review_verdict("No explicit verdict here").is_none());
+    }
+
+    #[test]
+    fn published_codex_session_prefers_combined_prompt_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_dir = dir.path().join("proposal");
+        let source_dir = dir.path().join("source");
+        let workspace_dir = bundle_dir.join("workspace");
+        std::fs::create_dir_all(source_dir.join("src")).unwrap();
+        std::fs::create_dir_all(workspace_dir.join("src")).unwrap();
+        std::fs::write(bundle_dir.join("prompt.md"), "initial prompt").unwrap();
+        std::fs::write(
+            bundle_dir.join("published-prompt.md"),
+            "## Patch Pass\n\ninitial prompt\n\n## Review Pass 1\n\nreview prompt",
+        )
+        .unwrap();
+        std::fs::write(bundle_dir.join("codex-output.txt"), "combined response").unwrap();
+        std::fs::write(source_dir.join("src/file.c"), "old\n").unwrap();
+        std::fs::write(workspace_dir.join("src/file.c"), "new\n").unwrap();
+        std::fs::write(
+            bundle_dir.join("evidence.json"),
+            serde_json::to_vec_pretty(&json!({
+                "workspace": { "repo_root": workspace_dir },
+                "source_workspace": { "repo_root": source_dir },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let published = load_published_codex_session(&bundle_dir).unwrap();
+        let prompt = published.get("prompt").and_then(Value::as_str).unwrap();
+
+        assert!(prompt.contains("## Review Pass 1"));
+        assert!(!prompt.contains("initial prompt\ninitial prompt"));
+    }
+
+    #[test]
+    fn prior_best_patch_context_is_written_into_worker_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().join("source");
+        std::fs::create_dir_all(workspace_root.join("src")).unwrap();
+        std::fs::write(workspace_root.join("src/file.c"), "old\n").unwrap();
+
+        let mut config = FixerConfig::default();
+        config.service.state_dir = dir.path().join("state");
+
+        let opportunity = OpportunityRecord {
+            id: 42,
+            finding_id: 42,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for postgres".to_string(),
+            score: 110,
+            state: "open".to_string(),
+            summary: "postgres is stuck in a likely file not found retry loop.".to_string(),
+            evidence: json!({}),
+            repo_root: None,
+            ecosystem: Some("debian".to_string()),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+            updated_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let workspace = PreparedWorkspace {
+            repo_root: workspace_root.clone(),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("postgresql-18".to_string()),
+            source_package: Some("postgresql-18".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+        let prior_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Legacy patch proposal created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "worker_fixer_version": "0.18.0",
+                "published_session": {
+                    "prompt": "old prompt",
+                    "response": "old response",
+                    "diff": "--- a/src/file.c\n+++ b/src/file.c\n@@\n-goto fail;\n+return false;\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+
+        let job = prepare_codex_job_with_prior_patch(
+            &config,
+            &opportunity,
+            &workspace,
+            Some(&prior_patch),
+            "kom",
+            false,
+        )
+        .unwrap();
+
+        let prompt = std::fs::read_to_string(&job.prompt_path).unwrap();
+        assert!(prompt.contains("A previous Fixer patch attempt already exists"));
+        assert!(
+            prompt.contains("older or legacy Fixer version") || prompt.contains("Fixer `0.18.0`")
+        );
+        assert!(prompt.contains("prior-best.patch"));
+        assert!(prompt.contains("prior-best-session.md"));
+        assert!(job.bundle_dir.join("prior-best.patch").exists());
+        assert!(job.bundle_dir.join("prior-best-session.md").exists());
+
+        let evidence: Value =
+            serde_json::from_slice(&std::fs::read(job.bundle_dir.join("evidence.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            evidence["prior_best_patch"]["fixer_version"].as_str(),
+            Some("0.18.0")
+        );
+        assert_eq!(
+            evidence["prior_best_patch"]["patch_path"]
+                .as_str()
+                .map(PathBuf::from)
+                .map(|path| path.file_name().unwrap().to_string_lossy().to_string()),
+            Some("prior-best.patch".to_string())
+        );
     }
 }

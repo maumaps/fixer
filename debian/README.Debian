@@ -1,26 +1,27 @@
-Fixer installs a systemd service and a CLI.
+Fixer installs a CLI, a collector service, and an optional aggregation server.
 
-For the simplest install path, prefer:
+The easiest install path for the collector package is:
 
   sudo apt install ./fixer_<version>_<arch>.deb
 
-That allows APT to install recommended helper tools such as perf,
-bpftrace, cargo, nodejs, npm, python3-pip, and postgresql-client alongside the
-main package.
+Using APT instead of raw `dpkg -i` lets Debian pull in recommended helper tools
+such as `perf`, `bpftrace`, `cargo`, `nodejs`, `npm`, `python3-pip`, and
+`postgresql-client` when they are available.
 
-Optional integrations are still detected at runtime. Missing helper
-tools reduce capability surface but do not block startup or package
-installation.
+If some helpers are missing, that is fine. Fixer detects optional integrations
+at runtime and degrades gracefully instead of refusing to start.
 
-The aggregation server is split into its own package:
+The aggregation server is a separate package:
 
   sudo dpkg -i ./fixer-server_<version>_<arch>.deb
 
-That package is meant to work immediately on a local Debian system. It
-starts `fixer-server.service`, listens on `127.0.0.1:8080`, and stores
-its state in `/var/lib/fixer-server/fixer-server.sqlite3`.
+That package is meant to be friendly for local testing. On a normal Debian
+machine it starts `fixer-server.service`, listens on `127.0.0.1:8080`, and
+stores its state in:
 
-To switch the packaged server to PostgreSQL, put a DSN in:
+  /var/lib/fixer-server/fixer-server.sqlite3
+
+If you want the packaged server to use PostgreSQL instead, put a DSN in:
 
   /etc/fixer/fixer-server.env
 
@@ -28,36 +29,53 @@ using:
 
   FIXER_SERVER_POSTGRES_URL=postgres://...
 
-For Debian-backed opportunities without an attached repo, Fixer now
-tries to hydrate a workspace automatically. It prefers `apt-get source`
-when `deb-src` is configured and otherwise falls back to cloning the
-package homepage if it points at a real upstream repository.
+For Debian-backed opportunities without an attached repo, Fixer tries to
+hydrate a workspace automatically. The order is:
+
+1. use an already attached repo
+2. try `apt-get source` when `deb-src` is configured
+3. fall back to cloning the package homepage if it looks like a real upstream repo
 
 `pip-audit` is not currently available as a native Debian package in the
-environment used for this project, so Python dependency auditing is not
-yet pulled in automatically by the `.deb`.
+environment used for this project, so Python dependency auditing is not pulled
+in automatically by the `.deb`.
 
-Codex itself is not packaged here; install it separately if you want the
-`fixer propose-fix --engine codex` workflow.
+Codex itself is also not packaged here. Install it separately if you want the
+Codex-backed proposal flow.
 
-The packaged worker defaults to `patch.auth_mode = "user-lease"`. That keeps
-the root-owned `fixerd` service responsible for collection, leasing, and the
-SQLite state, while Codex patch generation is dispatched into a transient user
-systemd unit that uses the chosen user's existing Codex login.
+The packaged worker defaults to:
 
-Bootstrap and manage that lease explicitly:
+  patch.auth_mode = "user-lease"
+
+This is the safer path. The root-owned `fixerd` service stays responsible for
+collection, leasing, and the SQLite state, while Codex proposal generation runs
+as a real user with that user's existing Codex login.
+
+Typical setup:
 
   sudo fixer auth lease bootstrap <user>
   sudo fixer auth lease grant <user> --ttl 8h --budget conservative
   sudo fixer auth lease status
   sudo fixer auth lease revoke
 
-`bootstrap` checks that the target user has a working systemd user manager and
-an existing `~/.codex/auth.json`. `grant` stores only lease metadata and usage
-budget; it does not copy the user's auth into `/root` or the root service
-environment.
+`bootstrap` checks that the target user has:
 
-Autonomous worker jobs run inside an isolated per-job workspace snapshot under
-`/var/lib/fixer/proposals/...`, and the transient user unit is constrained with
-`ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=yes`, and a narrow
-set of writable paths for the bundle and Codex state directories.
+- a working systemd user manager
+- the directories Codex expects
+- an existing `~/.codex/auth.json`
+
+`grant` stores only lease metadata and budget state. It does not copy the
+user's auth into `/root` or into the root service environment.
+
+Autonomous worker jobs run in isolated per-job workspace snapshots under:
+
+  /var/lib/fixer/proposals/...
+
+The transient user unit is constrained with settings such as:
+
+- `ProtectSystem=strict`
+- `ProtectHome=read-only`
+- `PrivateTmp=yes`
+
+The goal is simple: keep collection privileged where it has to be, but avoid
+turning root into the place where Codex lives.

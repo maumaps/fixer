@@ -578,21 +578,28 @@ fn run_codex_job_as_user(
 fn create_worker_codex_proposal(
     store: &Store,
     config: &FixerConfig,
+    issue: &crate::models::IssueCluster,
     opportunity: &OpportunityRecord,
     workspace: &crate::models::PreparedWorkspace,
 ) -> Result<crate::models::ProposalRecord> {
     match config.patch.auth_mode {
-        CodexAuthMode::RootDirect => {
-            proposal::create_proposal(store, config, opportunity, workspace, "codex")
-        }
+        CodexAuthMode::RootDirect => proposal::create_proposal_with_prior_patch(
+            store,
+            config,
+            opportunity,
+            workspace,
+            issue.best_patch.as_ref(),
+            "codex",
+        ),
         CodexAuthMode::UserLease => {
             let lease = store
                 .load_codex_auth_lease()?
                 .ok_or_else(|| anyhow!("no active Codex auth lease is configured"))?;
-            let job = proposal::prepare_codex_job(
+            let job = proposal::prepare_codex_job_with_prior_patch(
                 config,
                 opportunity,
                 workspace,
+                issue.best_patch.as_ref(),
                 &lease.user,
                 lease.allow_kernel,
             )?;
@@ -817,7 +824,13 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
             } else {
                 None
             };
-            match create_worker_codex_proposal(store, config, &opportunity, &workspace) {
+            match create_worker_codex_proposal(
+                store,
+                config,
+                &lease.issue,
+                &opportunity,
+                &workspace,
+            ) {
                 Ok(local_proposal) => {
                     let submission_bundle =
                         proposal::prepare_submission(store, local_proposal.id).ok();
@@ -852,21 +865,76 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                             process_investigation_worker_diagnosis(&opportunity),
                         ),
                         ("workspace".to_string(), json!(workspace)),
+                        (
+                            "worker_fixer_version".to_string(),
+                            json!(current_binary_version()),
+                        ),
                     ]);
+                    if let Some(best_patch) = lease.issue.best_patch.as_ref() {
+                        details.insert(
+                            "supersedes_patch_created_at".to_string(),
+                            json!(best_patch.created_at),
+                        );
+                        if let Some(version) = best_patch
+                            .details
+                            .get("worker_fixer_version")
+                            .and_then(Value::as_str)
+                            .or_else(|| {
+                                best_patch
+                                    .details
+                                    .get("fixer_version")
+                                    .and_then(Value::as_str)
+                            })
+                        {
+                            details.insert(
+                                "supersedes_patch_fixer_version".to_string(),
+                                json!(version),
+                            );
+                        }
+                    }
                     if let Ok(public_session) =
                         proposal::load_published_codex_session(&local_proposal.bundle_path)
                     {
                         details.insert("published_session".to_string(), public_session);
+                    }
+                    let published_session = details.get("published_session").cloned();
+                    let published_session_ref = published_session.as_ref();
+                    let is_triage_ready = local_proposal.state == "ready"
+                        && !published_session_has_diff(published_session_ref)
+                        && published_session_marks_successful_triage(published_session_ref);
+                    if is_triage_ready {
+                        details.insert(
+                            "report_only_reason".to_string(),
+                            json!(worker_triage_reason(published_session_ref)),
+                        );
+                        details.insert(
+                            "handoff".to_string(),
+                            worker_triage_handoff(&opportunity, published_session_ref),
+                        );
                     }
                     WorkerResultEnvelope {
                         lease_id: lease.lease_id.clone(),
                         attempt: PatchAttempt {
                             cluster_id: lease.issue.id,
                             install_id: participation.identity.install_id.clone(),
-                            outcome: "patch".to_string(),
+                            outcome: if is_triage_ready {
+                                "triage".to_string()
+                            } else {
+                                "patch".to_string()
+                            },
                             state: local_proposal.state.clone(),
                             summary: if local_proposal.state == "ready" {
-                                if supports_process_report {
+                                if is_triage_ready {
+                                    if supports_process_report {
+                                        format!(
+                                            "{} A diagnosis report and external handoff were created locally.",
+                                            process_investigation_worker_summary(&opportunity)
+                                        )
+                                    } else {
+                                        "A diagnosis and external handoff were created locally. Review it and report it to the likely owner."
+                                            .to_string()
+                                    }
+                                } else if supports_process_report {
                                     format!(
                                         "{} A diagnosis report and patch proposal were created locally.",
                                         process_investigation_worker_summary(&opportunity)
@@ -1288,6 +1356,94 @@ fn process_investigation_prefers_report_only(
         .get("likely_external_root_cause")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+fn published_session_has_diff(session: Option<&Value>) -> bool {
+    session
+        .and_then(|value| value.get("diff"))
+        .and_then(Value::as_str)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn published_session_response(session: Option<&Value>) -> Option<&str> {
+    session
+        .and_then(|value| value.get("response"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn published_session_marks_successful_triage(session: Option<&Value>) -> bool {
+    let Some(response) = published_session_response(session) else {
+        return false;
+    };
+    [
+        "No source change landed.",
+        "outside this repository",
+        "outside this source tree",
+        "speculative and unsafe",
+        "no safe code change was made",
+    ]
+    .iter()
+    .any(|marker| response.contains(marker))
+}
+
+fn worker_triage_reason(session: Option<&Value>) -> &'static str {
+    let response = published_session_response(session).unwrap_or_default();
+    if response.contains("outside this repository") || response.contains("outside this source tree")
+    {
+        "likely-external-root-cause"
+    } else {
+        "no-safe-local-change"
+    }
+}
+
+fn worker_triage_handoff(
+    opportunity: &crate::models::OpportunityRecord,
+    session: Option<&Value>,
+) -> Value {
+    let diagnosis = process_investigation_worker_diagnosis(opportunity);
+    let target = diagnosis
+        .get("profile_target")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            published_session_response(session).and_then(|response| {
+                let shared_object_re =
+                    regex::Regex::new(r"\b([A-Za-z0-9_.+-]+\.so)\b").expect("valid so regex");
+                shared_object_re
+                    .captures(response)
+                    .and_then(|captures| captures.get(1))
+                    .map(|value| format!("module `{}` or the workload driving it", value.as_str()))
+            })
+        })
+        .unwrap_or_else(|| {
+            "external dependency or workload outside the current source tree".to_string()
+        });
+    let report_url = diagnosis
+        .get("package_metadata")
+        .and_then(|value| value.get("report_url"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            diagnosis
+                .get("package_metadata")
+                .and_then(|value| value.get("homepage"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        });
+    json!({
+        "target": target,
+        "report_url": report_url,
+        "next_steps": [
+            format!("Confirm the hotspot still points at {target} with a fresh perf sample before filing the bug."),
+            "Capture the actual hot backend or child process rather than the parent service wrapper if the issue recurs.",
+            format!("Map {target} to its owning package or project and file an upstream or distro bug with the summarized evidence."),
+            "If the owner is still unclear, collect another short strace plus `/proc/<pid>/maps` at the moment of the spike.",
+        ],
+    })
 }
 
 fn build_impossible_result(

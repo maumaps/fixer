@@ -75,7 +75,7 @@ pub fn evaluate_client_compatibility(
     }
 }
 
-fn is_binary_upgrade_available(client_version: &str, latest_client_version: &str) -> bool {
+pub fn is_binary_upgrade_available(client_version: &str, latest_client_version: &str) -> bool {
     let Some(client) = parse_semver(client_version) else {
         return false;
     };

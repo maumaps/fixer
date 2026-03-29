@@ -268,7 +268,7 @@ fn collect_stuck_process_groups(config: &FixerConfig) -> Result<Vec<StuckProcess
         let group_key = executable
             .as_ref()
             .map(|path| path.display().to_string())
-            .unwrap_or_else(|| comm.clone());
+            .unwrap_or_else(|| normalize_stuck_process_target_name(&comm));
         groups
             .entry(group_key)
             .or_default()
@@ -297,7 +297,7 @@ fn collect_stuck_process_groups(config: &FixerConfig) -> Result<Vec<StuckProcess
                 .and_then(|path| path.file_name())
                 .and_then(|value| value.to_str())
                 .map(ToString::to_string)
-                .unwrap_or_else(|| sample.comm.clone());
+                .unwrap_or_else(|| normalize_stuck_process_target_name(&sample.comm));
             Some(StuckProcessGroup {
                 name,
                 executable,
@@ -359,10 +359,24 @@ fn stuck_process_source_fingerprint(group: &StuckProcessGroup) -> String {
             .executable
             .as_ref()
             .map(|path| path.display().to_string())
-            .unwrap_or_else(|| group.name.clone()),
+            .unwrap_or_else(|| normalize_stuck_process_target_name(&group.name)),
         group.package_name.as_deref().unwrap_or("unknown"),
-        group.comm,
+        normalize_stuck_process_target_name(&group.comm),
     ))
+}
+
+fn normalize_stuck_process_target_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("kworker") {
+        return trimmed.to_string();
+    }
+    if let Some((_, suffix)) = trimmed.split_once('+') {
+        let suffix = suffix.trim();
+        if !suffix.is_empty() {
+            return format!("kworker+{suffix}");
+        }
+    }
+    "kworker".to_string()
 }
 
 fn collect_repos(repo_paths: &[PathBuf], store: &Store) -> Result<usize> {
@@ -2691,7 +2705,7 @@ fn stuck_process_investigation_fingerprint(
             .executable
             .as_ref()
             .map(|path| path.display().to_string())
-            .unwrap_or_else(|| group.name.clone()),
+            .unwrap_or_else(|| normalize_stuck_process_target_name(&group.name)),
         investigation.hypothesis.classification,
         investigation.wchan.as_deref().unwrap_or("unknown"),
         investigation
@@ -3607,17 +3621,20 @@ fn frame_is_useful(frame: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
+        RunawayHypothesis, StuckProcessGroup, StuckProcessInvestigationSummary,
         apparmor_finding_from_kernel_line, classify_runaway_loop, classify_stuck_process,
         dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
         is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
         kernel_module_package_hint, kernel_warning_module_candidates, looks_like_warning,
-        normalize_perf_symbol, parse_apparmor_denial, parse_coredump_info, parse_dkms_status_line,
-        parse_perf_hot_paths, parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
-        process_runtime_seconds, safe_perf_name, summarize_top_syscalls, system_uptime_seconds,
+        normalize_perf_symbol, normalize_stuck_process_target_name, parse_apparmor_denial,
+        parse_coredump_info, parse_dkms_status_line, parse_perf_hot_paths,
+        parse_postgres_collation_mismatch_rows, parse_strace_syscall_name, process_runtime_seconds,
+        safe_perf_name, stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
+        summarize_top_syscalls, system_uptime_seconds,
     };
     use crate::models::PopularBinaryProfile;
     use serde_json::Value;
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -3669,6 +3686,75 @@ mod tests {
         assert_eq!(
             finding.summary,
             "AppArmor denied cupsd via dbus: create net unix/stream"
+        );
+    }
+
+    #[test]
+    fn normalize_stuck_process_target_name_collapses_kworker_slots() {
+        assert_eq!(
+            normalize_stuck_process_target_name("kworker/u33:2+i915_flip"),
+            "kworker+i915_flip"
+        );
+        assert_eq!(
+            normalize_stuck_process_target_name("kworker/0:1-events"),
+            "kworker"
+        );
+        assert_eq!(normalize_stuck_process_target_name("postgres"), "postgres");
+    }
+
+    #[test]
+    fn stuck_process_fingerprint_ignores_kworker_slot_noise() {
+        let base_investigation = StuckProcessInvestigationSummary {
+            sampled_pid: 42,
+            sampled_pid_count: 1,
+            sampled_pids: vec![42],
+            command_line: None,
+            executable: None,
+            process_state: Some("D".to_string()),
+            runtime_seconds: 900,
+            wchan: Some("drm_atomic_helper_wait_for_flip_done".to_string()),
+            cwd: None,
+            root: None,
+            fd_targets: Vec::new(),
+            io_excerpt: None,
+            status_excerpt: None,
+            sched_excerpt: None,
+            stack_excerpt: Some("drm_atomic_helper_wait_for_flip_done\n__schedule".to_string()),
+            hypothesis: RunawayHypothesis {
+                classification: "unknown-uninterruptible-wait".to_string(),
+                confidence: 0.5,
+                explanation: "kernel worker is blocked in flip wait".to_string(),
+            },
+            likely_external_root_cause: false,
+            raw_artifacts: BTreeMap::new(),
+            package_metadata: None,
+        };
+        let a = StuckProcessGroup {
+            name: "kworker+i915_flip".to_string(),
+            executable: None,
+            package_name: None,
+            pids: vec![1001],
+            sample_pid: 1001,
+            sample_runtime_seconds: 900,
+            comm: "kworker/u33:0+i915_flip".to_string(),
+        };
+        let b = StuckProcessGroup {
+            name: "kworker+i915_flip".to_string(),
+            executable: None,
+            package_name: None,
+            pids: vec![1002],
+            sample_pid: 1002,
+            sample_runtime_seconds: 1800,
+            comm: "kworker/u33:3+i915_flip".to_string(),
+        };
+
+        assert_eq!(
+            stuck_process_source_fingerprint(&a),
+            stuck_process_source_fingerprint(&b)
+        );
+        assert_eq!(
+            stuck_process_investigation_fingerprint(&a, &base_investigation),
+            stuck_process_investigation_fingerprint(&b, &base_investigation)
         );
     }
 

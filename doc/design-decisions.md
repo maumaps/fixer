@@ -1,267 +1,312 @@
 # Design Decisions
 
-This document records the major implementation choices behind the current MVP and why they were made.
+This document records the main choices behind the current Fixer implementation.
 
-## 1. Rust for the core service and CLI
+The tone here is intentionally plain: what we chose, why we chose it, and what it costs us.
 
-Decision:
-- Build both the daemon and CLI in Rust.
+## 1. Rust for the core
 
-Why:
-- Good fit for a local long-running service.
-- Easy to ship as static-ish binaries with predictable runtime behavior.
-- Strong ecosystem for CLI tooling, SQLite, and process management.
-- Keeps the implementation aligned with Codex CLI's environment and the Debian packaging target.
+What we chose:
 
-Tradeoff:
-- Slower iteration than a scripting language for quick experiments.
-- Some integrations still shell out to external tools instead of using native Rust libraries.
-
-## 2. SQLite as the local system of record
-
-Decision:
-- Use a single local SQLite database instead of a separate service.
+- the CLI, daemon, and server are written in Rust
 
 Why:
-- Zero extra deployment surface.
-- Works well for a single-machine daemon.
-- Simple to back up, inspect, and package.
-- Enough structure for capabilities, artifacts, findings, opportunities, validations, and proposals.
 
-Tradeoff:
-- Not designed for distributed or multi-writer deployments.
-- Some richer analytics will eventually want materialized views or a more explicit event log.
+- long-running local services benefit from predictable resource use
+- Rust fits well with CLI tooling, SQLite, HTTP, and Debian packaging
+- it keeps the core stable while still letting us shell out to proven system tools
 
-Related choice:
-- The new federation server uses Postgres instead of SQLite.
-- Clients stay on SQLite; only the central or siloed server takes on the multi-host aggregation problem.
+What it costs:
 
-## 3. Non-AI collection, AI only at the patch boundary
+- quick experiments are slower than they would be in a scripting language
+- some integrations are still wrappers around external tools rather than native Rust libraries
 
-Decision:
-- Keep all observation, normalization, ranking, and ownership inference deterministic.
-- Use Codex only for bounded patch proposal generation.
+## 2. SQLite on the client, Postgres on the server
+
+What we chose:
+
+- every client keeps a local SQLite database
+- the aggregation server can use SQLite locally and Postgres for shared deployments
 
 Why:
-- Makes the trust boundary obvious.
-- Keeps raw crashes and system telemetry local.
-- Avoids spending model tokens on work the machine can do deterministically.
-- Matches the product thesis from the original brief: AI is a plug-in, not the operating system.
 
-Tradeoff:
-- The system does less autonomous "magic" in v1.
-- Some contextual triage that an AI could help with is postponed until the evidence bundle is richer.
+- local installs should be simple and self-contained
+- the public and shared server needs stronger multi-writer behavior
+- this keeps the client lightweight while giving the server room to grow
 
-## 4. System service by default
+What it costs:
 
-Decision:
-- Package the daemon as a systemd system service and currently run it as root.
+- some logic exists in both local and server persistence paths
+- richer server-side analytics will eventually want more explicit migration and reporting support
 
-Why:
-- The product goal is machine-wide visibility.
-- Systemd packaging and lifecycle control are natural on Debian and Ubuntu.
-- Access to `coredumpctl`, kernel logs, and process telemetry is simpler from a system service.
+## 3. Deterministic collection, bounded AI at the edge
 
-Tradeoff:
-- Root is broader than we want long term.
-- A future version should split privileged collectors from unprivileged proposal generation and validation.
+What we chose:
 
-## 5. Explicit opt-in before any upload
-
-Decision:
-- Keep network participation disabled until the operator explicitly opts in.
-- Ship an explicit warning that Fixer may unintentionally collect private data.
+- evidence gathering, normalization, ranking, and most ownership inference stay deterministic
+- Codex is used only at the proposal stage
 
 Why:
-- The system gathers command lines, file paths, warning text, stack traces, and other machine evidence.
-- Even with best-effort redaction, some private data can still slip through.
-- Opt-in makes the privacy boundary concrete instead of buried in packaging defaults.
 
-Tradeoff:
-- The zero-config experience starts in local-only mode, so users who want federation must take one explicit action.
+- it keeps the trust boundary easy to explain
+- it is cheaper, easier to debug, and safer for private telemetry
+- the model sees a small, purpose-built bundle instead of an undifferentiated machine state
 
-## 6. Anonymous install identity instead of user accounts
+What it costs:
 
-Decision:
-- Use a generated anonymous install ID with no human login, tokens, or registration flow.
+- the system feels less magical than a fully agentic toy demo
+- some nuanced triage still depends on improving the evidence bundle first
+
+## 4. A system service by default
+
+What we chose:
+
+- the packaged collector runs as a systemd system service
+- it currently runs as root
 
 Why:
-- Matches the “just works” requirement.
-- Keeps public and siloed deployments simple.
-- Still gives the server enough continuity to rate-limit, quarantine, and build trust over time.
 
-Tradeoff:
-- Install identity is weaker than real authentication.
-- Abuse defenses need proof-of-work, rate limits, quarantine, and trust heuristics to compensate.
+- machine-wide visibility is the whole point
+- access to `/proc`, kernel logs, `coredumpctl`, and similar telemetry is much simpler there
+
+What it costs:
+
+- root is broader than we want long term
+- we have to be deliberate about how proposal execution and worker actions are separated
+
+## 5. Explicit opt-in before network participation
+
+What we chose:
+
+- nothing is uploaded until the user opts in
+- the policy text is intentionally blunt about privacy risk
+
+Why:
+
+- crash data, command lines, paths, and logs can contain private information
+- even best-effort redaction is not a promise
+- consent should be a real product boundary, not hidden in defaults
+
+What it costs:
+
+- federation is not zero-click
+- the happiest path for privacy is slightly slower than the happiest path for growth
+
+## 6. Anonymous install identity instead of accounts
+
+What we chose:
+
+- installs identify themselves with a generated install ID, not a human login
+
+Why:
+
+- it keeps setup light
+- it works for public and siloed installs without account infrastructure
+- it still gives the server enough continuity for rate limits, trust, and quarantine
+
+What it costs:
+
+- identity is weaker than a real auth system
+- the server has to lean on proof-of-work, duplicate suppression, and trust heuristics
 
 ## 7. Capability detection instead of hard dependency sprawl
 
-Decision:
-- Detect optional helper tools at runtime.
-- Keep only a small hard dependency set in the Debian package.
+What we chose:
+
+- optional helper tools are discovered at runtime
 
 Why:
-- The package should install on a clean machine even if npm, Python auditing tools, or eBPF tools are absent.
-- The CLI can report what is available instead of failing at startup.
-- Debian packaging stays simpler and more shareable.
 
-Tradeoff:
-- The feature surface varies by host.
-- Operator docs have to explain that missing tools reduce capability rather than break the package.
+- Fixer should install on a plain machine without dragging in every optional tool
+- operators can still get value from a partial setup
+- this keeps packaging humane
 
-## 8. External observability tools first
+What it costs:
 
-Decision:
-- Use `coredumpctl`, `journalctl`, `perf`, `dpkg-query`, and optional `bpftrace` by shelling out to system tools.
+- feature depth varies by host
+- docs have to explain missing capability as graceful degradation, not silent failure
 
-Why:
-- These are the source-of-truth tools already expected on the target systems.
-- Faster path to a working MVP than writing or embedding custom tracing stacks.
-- Keeps the code close to the operational reality of Debian machines.
-- `coredumpctl info` already exposes stack frames, and local symbolizers can often improve unresolved offsets enough to keep evidence useful even when full debug info is missing.
+## 8. Real system tools first
 
-Tradeoff:
-- Output parsing is less elegant than tight library integration.
-- Tool availability and output format differences need defensive handling.
+What we chose:
 
-## 9. Simple finding-to-opportunity mapping in v1
-
-Decision:
-- Model one opportunity per finding with an easily explainable score.
+- Fixer shells out to tools like `coredumpctl`, `journalctl`, `perf`, `dpkg-query`, and optional `bpftrace`
 
 Why:
-- Easy to reason about and debug.
-- Enough to prove the data flow end to end.
-- Avoids a premature complex ranking engine while the collectors are still evolving.
 
-Tradeoff:
-- Related findings are not yet clustered into a single higher-level issue.
-- Scoring is intentionally coarse and will need to become more evidence-driven later.
+- those tools are already the source of truth on the target systems
+- it is the fastest way to build something honest and useful
+- it keeps Fixer close to the operational reality of Debian machines
+
+What it costs:
+
+- output parsing is never as tidy as a native API
+- tool availability and output shape need defensive handling
+
+## 9. One finding becomes one opportunity in the MVP
+
+What we chose:
+
+- the first version keeps the mapping simple: one finding, one opportunity
+
+Why:
+
+- it makes the data flow easy to inspect and debug
+- collector quality matters more than a fancy ranking engine right now
+
+What it costs:
+
+- some related signals are not grouped as elegantly as they should be
+- clustering work has to happen later, especially on the server side
 
 ## 10. Adapter-based ecosystem support
 
-Decision:
-- Represent Debian, Cargo, npm, pip, and PGXN support as ecosystem adapters.
+What we chose:
+
+- ecosystem-specific logic lives behind adapters
 
 Why:
-- Keeps metadata discovery and validation logic out of the collector core.
-- Makes it easier to add or deepen ecosystems later.
-- Lets a watched repo expose validation commands and upstream metadata in a consistent shape.
 
-Tradeoff:
-- Current adapters are intentionally thin and focus on repo metadata, not full dependency graph resolution.
+- Debian, Cargo, npm, pip, and PGXN each expose metadata differently
+- adapters keep that complexity out of the collector core
+- it gives us one consistent shape for validation and ownership hints
 
-## 11. Automatic workspace hydration for Debian-backed findings
+What it costs:
 
-Decision:
-- When an opportunity has no repo attached but does have a Debian package name, resolve a workspace automatically.
-- Prefer Debian source via `apt-get source`, then fall back to cloning the package homepage when it points at a real upstream repository.
+- adapters are intentionally thin today
+- deep ecosystem support is still uneven
 
-Why:
-- Matches the product goal of not requiring the user to hand over repos manually.
-- Lets machine-level crash and warning findings become patchable workspaces.
-- Works even on systems where `deb-src` is not configured, as long as the package exposes a usable upstream homepage.
+## 11. Automatic workspace hydration
 
-Tradeoff:
-- A homepage clone is not the same thing as the Debian packaging repo.
-- Rebuilding the exact Debian package still needs source indexes and package-specific build dependencies.
-- Validation time can become large for upstream projects, especially big Cargo workspaces.
+What we chose:
 
-## 12. External bug reports for non-patchable packages
-
-Decision:
-- When Fixer cannot acquire a patchable workspace for a package-backed finding, deterministic proposals become precise external bug reports instead of patch attempts.
+- when an opportunity has no attached repo, Fixer tries to fetch one automatically
 
 Why:
-- Closed-source and binary-only packages like Zoom are still important maintenance targets.
-- A precise vendor-ready report is more useful than a fake patch flow when no source tree is available.
-- Package version, candidate version, upgrade availability, OS details, and the symbolized stack are often enough to move vendor support conversations forward.
-- Shareable reports should not leak meeting links, tokens, or similar command-line secrets, so the rendered report redacts URL query values even though the local evidence bundle remains intact.
-- When package metadata exposes a support or bug-report URL, the report should surface that target directly so the automated path does not stop at "someone should file this somewhere."
 
-Tradeoff:
-- This path does not validate a code change because there is no code workspace to validate.
-- Vendor bug trackers and support flows are less standardized than upstream source repos.
+- machine-level failures are only patchable if they can be connected to code
+- users should not have to hand-feed the obvious source tree in every case
+
+Current order:
+
+1. attached repo
+2. `apt-get source`
+3. clone the package homepage if it looks like a real upstream repo
+
+What it costs:
+
+- a homepage clone is not always the same thing as the distro packaging tree
+- buildability and validation can still be messy
+
+## 12. Honest triage is a success state
+
+What we chose:
+
+- workers can succeed by publishing a clear triage handoff, not only by producing a diff
+
+Why:
+
+- some real issues do not belong in the current source tree
+- pretending every successful investigation should end in a patch trains the system to lie
+- a strong handoff is often more valuable than a speculative patch
+
+What it costs:
+
+- public and internal result types are a little more complex
+- the UI has to distinguish patch success from triage success clearly
 
 ## 13. Proposal bundles as filesystem artifacts
 
-Decision:
-- Materialize each patch proposal as a directory containing evidence, prompt, and output files.
+What we chose:
+
+- every proposal is materialized as a directory with evidence, prompt, output, and metadata
 
 Why:
-- Easy to inspect and debug manually.
-- Good audit trail for what was sent to Codex and what came back.
-- Makes submission handoff straightforward.
 
-Tradeoff:
-- Bundle cleanup and retention are not automated yet.
-- The current evidence bundle contains opportunity data, but not yet rich adjacent-code slices.
+- it makes debugging and review much easier
+- it creates an audit trail
+- it gives the submission and publication paths something concrete to point at
 
-## 14. Client/server federation with the same protocol for public and siloed installs
+What it costs:
 
-Decision:
-- Add a `fixer-server` binary and use the same client protocol for a public central deployment and for siloed/corporate installs.
-- Public builds use a baked-in default server URL; siloed installs override it in config or packaging.
+- cleanup and retention need ongoing attention
+- the bundle format is now part of the product surface
 
-Why:
-- Keeps the client simple and zero-config.
-- Avoids maintaining separate “cloud” and “enterprise” client code paths.
-- Lets hosts without Codex still contribute findings while Codex-capable volunteers do the patch attempts.
+## 14. One protocol for local, siloed, and public deployments
 
-Tradeoff:
-- The server becomes another product surface to operate and package.
-- The default public server URL is opinionated and must be override-friendly.
+What we chose:
 
-## 15. Proof-of-work plus quarantine as the first anti-spam layer
-
-Decision:
-- Protect anonymous submission and worker-pull endpoints with proof-of-work, per-install and per-IP rate limits, duplicate suppression, quarantine, and trust scores.
+- the same client protocol is used everywhere
 
 Why:
-- The system deliberately avoids user accounts and manual auth.
-- We still need a cheap way to make abuse expensive and keep spam out of the worker queue.
-- Quarantine lets us accept submissions without immediately turning them into globally leased work.
 
-Tradeoff:
-- Proof-of-work adds client CPU time.
-- The current trust model is intentionally simple and will need refinement if the public network grows.
+- the client stays simple
+- local and public installs feel like the same product
+- override paths are easier than maintaining separate “cloud” and “enterprise” stacks
 
-## 16. Single Debian binary package in the MVP
+What it costs:
 
-Decision:
-- Ship one `fixer` Debian package containing both the CLI and daemon.
+- the server becomes a more serious product surface
+- backwards compatibility matters sooner
+
+## 15. Proof-of-work plus quarantine as the first anti-abuse layer
+
+What we chose:
+
+- anonymous endpoints use proof-of-work, rate limits, duplicate suppression, quarantine, and trust scores
 
 Why:
-- Simplest install story for early users.
-- Avoids splitting packages before the runtime boundary is stable.
-- Keeps service, config, and CLI in one shareable artifact.
 
-Tradeoff:
-- Collector-only deployments still receive the CLI.
-- If privilege separation becomes stronger, splitting packages may become the better design.
+- we do not want account friction
+- we still need the worker queue to stay usable
+- quarantine gives new data somewhere safe to land before it becomes global work
 
-## 17. Deliberate non-goals in this version
+What it costs:
 
-These are intentionally not implemented yet:
+- clients spend CPU time to participate
+- the trust model is intentionally simple and will need refinement over time
 
-- autonomous upstream submissions
-- patching distro binaries in place
-- shipping raw coredumps or entire repos to an LLM
-- a kernel module or deep in-kernel policy engine
-- a desktop UI
-- mandatory user accounts or manual API key setup
+## 16. User-leased Codex auth instead of root-owned Codex auth
 
-These omissions are part of the design, not missing polish. The MVP favors a narrow, reviewable system over maximum automation.
+What we chose:
 
-## 18. What should change next
+- the collector service stays root-owned
+- Codex proposal work is leased from a real user and runs with that user's existing auth
 
-If we keep building on this implementation, the next decisions worth revisiting are:
+Why:
 
-- whether to introduce a separate unprivileged worker for validation and Codex execution
-- whether to add a richer event log alongside the current normalized tables
-- whether to split packaging into `fixer` and `fixerd`
-- whether to bootstrap Debian source indexes and package build-dependencies automatically
-- whether to replace generic validation commands with per-ecosystem policy packs
-- whether to add structured adjacent-code bundles before asking Codex for patches
-- whether to add richer evidence requests with explicit second approval in the CLI
-- whether to add admin and moderation tools for siloed servers
+- it is much safer than copying a Codex login into root
+- it respects the fact that patch generation is higher-risk than collection
+- it creates a natural budget and supervision point
+
+What it costs:
+
+- worker setup is a little more involved
+- unattended workers depend on a working user systemd manager and lease state
+
+## 17. Public pages should be useful, not voyeuristic
+
+What we chose:
+
+- public pages expose sanitized summaries, published sessions, patches, and triage handoffs
+- they do not expose raw host details or internal evidence bundles
+
+Why:
+
+- the point of public visibility is shared maintenance, not machine gossip
+- useful public output needs enough detail to act on, but not enough to leak local context
+
+What it costs:
+
+- sanitization and public rendering need active maintenance
+- some rich local evidence cannot be shown directly even when it would be informative
+
+## The through-line
+
+Most of these choices are really the same choice repeated in different forms:
+
+- keep the evidence path boring
+- keep the trust boundary obvious
+- prefer a smaller honest system over a bigger theatrical one
+
+That does not make Fixer less ambitious. It just means the ambition is aimed at real maintenance work rather than at looking autonomous in a demo.

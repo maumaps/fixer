@@ -1,3 +1,15 @@
+fixer (0.20.0-1) unstable; urgency=medium
+
+  * Split successful triage from successful patches and add a public triage view.
+  * Publish git-friendlier public patch emails with cover text and raw diff fallback.
+  * Re-queue legacy patches for improvement and feed the prior patch/session into Codex.
+  * Add a post-patch Codex review and refinement loop for cleaner upstream-ready changes.
+  * Normalize and recluster stuck-process investigations, including existing UUID-era rows.
+  * Prefer shared public work from other installs before self-reported work in worker leasing.
+  * Refresh the project docs in a clearer, more humane voice.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 23:01:22 +0400
+
 fixer (0.19.0-1) unstable; urgency=medium
 
   * Publish pull-request-ready public patch diffs with a dedicated .patch route.

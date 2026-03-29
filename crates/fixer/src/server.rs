@@ -8,10 +8,10 @@ use crate::pow::verify_pow;
 use crate::privacy::PRIVACY_WARNING;
 use crate::protocol::{
     CURRENT_PROTOCOL_VERSION, MIN_SUPPORTED_PROTOCOL_VERSION, current_binary_version,
-    evaluate_client_compatibility,
+    evaluate_client_compatibility, is_binary_upgrade_available,
 };
 use crate::util::{hash_text, now_rfc3339};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
@@ -22,6 +22,7 @@ use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -327,6 +328,12 @@ code, pre {
     color: var(--good);
 }
 
+.tag.triage {
+    background: rgba(163, 118, 25, 0.12);
+    border-color: rgba(163, 118, 25, 0.22);
+    color: #8b5f00;
+}
+
 .tag.severity-high {
     background: rgba(177, 76, 34, 0.12);
     border-color: rgba(177, 76, 34, 0.22);
@@ -457,6 +464,7 @@ struct PublicIssue {
     score: i64,
     corroboration_count: i64,
     best_patch_available: bool,
+    best_triage_available: bool,
     last_seen: String,
 }
 
@@ -467,6 +475,15 @@ struct PublishedAttemptSession {
     diff: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct PublicPatchCover {
+    subject: String,
+    problem: String,
+    why: String,
+    changed_files: Vec<String>,
+    validation_notes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct PublicAttempt {
     outcome: String,
@@ -475,6 +492,15 @@ struct PublicAttempt {
     validation_status: Option<String>,
     created_at: String,
     published_session: Option<PublishedAttemptSession>,
+    handoff: Option<PublicTriageHandoff>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PublicTriageHandoff {
+    reason: String,
+    target: String,
+    report_url: Option<String>,
+    next_steps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -490,8 +516,11 @@ struct PublicIssueDetail {
     score: i64,
     corroboration_count: i64,
     best_patch_available: bool,
+    best_triage_available: bool,
     best_patch_diff_url: Option<String>,
     best_patch: Option<PublicAttempt>,
+    best_triage: Option<PublicAttempt>,
+    best_triage_handoff: Option<PublicTriageHandoff>,
     last_seen: String,
     attempts: Vec<PublicAttempt>,
 }
@@ -514,6 +543,23 @@ struct PublicPatchEntry {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct PublicTriageEntry {
+    id: String,
+    kind: String,
+    title: String,
+    summary: String,
+    package_name: Option<String>,
+    source_package: Option<String>,
+    ecosystem: Option<String>,
+    severity: Option<String>,
+    score: i64,
+    corroboration_count: i64,
+    last_seen: String,
+    best_triage: PublicAttempt,
+    handoff: PublicTriageHandoff,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct Healthz {
     status: &'static str,
     database: &'static str,
@@ -527,6 +573,7 @@ struct DashboardSnapshot {
     promoted_issue_count: i64,
     quarantined_issue_count: i64,
     ready_patch_count: i64,
+    ready_triage_count: i64,
     last_submission_at: Option<String>,
     top_issues: Vec<PublicIssue>,
 }
@@ -596,8 +643,10 @@ pub async fn serve(config: FixerConfig) -> Result<()> {
     let app = Router::new()
         .route("/", get(landing_page))
         .route("/issues", get(public_issues_page))
+        .route("/triage", get(public_triage_page))
         .route("/patches", get(public_patches_page))
         .route("/issues/{id}/best.patch", get(public_issue_best_patch))
+        .route("/issues/{id}/best.diff", get(public_issue_best_diff))
         .route("/issues/{id}", get(public_issue_detail_page))
         .route("/healthz", get(healthz))
         .route("/assets/app.css", get(stylesheet))
@@ -606,6 +655,7 @@ pub async fn serve(config: FixerConfig) -> Result<()> {
         .route("/v1/work/pull", post(pull_work))
         .route("/v1/work/{lease_id}/result", post(submit_work_result))
         .route("/v1/issues", get(list_issues))
+        .route("/v1/triage", get(list_triage))
         .route("/v1/patches", get(list_patches))
         .route("/v1/issues/{id}", get(get_issue))
         .route(
@@ -647,6 +697,13 @@ async fn public_patches_page(
     Ok(Html(render_patches_page(&patches)))
 }
 
+async fn public_triage_page(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Html<String>, ApiError> {
+    let triage = load_public_triage(&state.db, 100).await?;
+    Ok(Html(render_triage_page(&triage)))
+}
+
 async fn public_issue_detail_page(
     State(state): State<Arc<ServerState>>,
     AxumPath(id): AxumPath<String>,
@@ -657,6 +714,25 @@ async fn public_issue_detail_page(
 }
 
 async fn public_issue_best_patch(
+    State(state): State<Arc<ServerState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    validate_uuid_param(&id, "issue id")?;
+    let issue = load_public_issue_detail(&state.db, id).await?;
+    let best_patch = issue
+        .best_patch
+        .as_ref()
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "public patch not found"))?;
+    let patch = render_public_patch_email(&issue, best_patch)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "public patch diff not found"))?;
+    Ok((
+        [(header::CONTENT_TYPE, "text/x-patch; charset=utf-8")],
+        patch,
+    )
+        .into_response())
+}
+
+async fn public_issue_best_diff(
     State(state): State<Arc<ServerState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, ApiError> {
@@ -967,7 +1043,7 @@ async fn pull_work(
         }));
     }
 
-    let Some(issue) = next_issue_for_worker(&state.db)
+    let Some(issue) = next_issue_for_worker(&state.db, &install_id)
         .await
         .map_err(ApiError::internal)?
     else {
@@ -1015,7 +1091,6 @@ async fn submit_work_result(
             "lease id in path and payload do not match",
         ));
     }
-    let result_clone = result.clone();
     let lease_row = active_worker_lease(&state.db, &lease_id)
         .await
         .map_err(ApiError::internal)?;
@@ -1038,6 +1113,8 @@ async fn submit_work_result(
             "lease expired before the worker submitted a result",
         ));
     }
+    let result = canonicalize_worker_result_envelope(result);
+    let result_clone = result.clone();
 
     store_worker_result(&state.db, &cluster_id, &result)
         .await
@@ -1062,6 +1139,13 @@ async fn list_patches(
 ) -> Result<Json<Vec<PublicPatchEntry>>, ApiError> {
     let patches = load_public_patches(&state.db, 100).await?;
     Ok(Json(patches))
+}
+
+async fn list_triage(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<Vec<PublicTriageEntry>>, ApiError> {
+    let triage = load_public_triage(&state.db, 100).await?;
+    Ok(Json(triage))
 }
 
 async fn get_issue(
@@ -1095,7 +1179,9 @@ async fn init_db(db: &ServerDb, config: &FixerConfig) -> Result<()> {
     if needs_schema_migration(db).await? {
         migrate_legacy_schema(db, config).await?;
     }
-    ensure_current_schema(db).await
+    ensure_current_schema(db).await?;
+    backfill_result_classification(db).await?;
+    recluster_current_issue_state(db, config.server.quarantine_corroboration_threshold).await
 }
 
 async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
@@ -1152,6 +1238,7 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             promoted BOOLEAN NOT NULL DEFAULT FALSE,
             representative_json JSONB NOT NULL,
             best_patch_json JSONB,
+            best_triage_json JSONB,
             last_seen TIMESTAMPTZ NOT NULL
         );
 
@@ -1258,6 +1345,7 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             promoted INTEGER NOT NULL DEFAULT 0,
             representative_json TEXT NOT NULL,
             best_patch_json TEXT,
+            best_triage_json TEXT,
             last_seen TEXT NOT NULL
         );
 
@@ -1312,7 +1400,1065 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             )?;
         }
     }
+    ensure_forward_issue_cluster_schema(db).await?;
     Ok(())
+}
+
+async fn ensure_forward_issue_cluster_schema(db: &ServerDb) -> Result<()> {
+    match db {
+        ServerDb::Postgres(db) => {
+            db.batch_execute(
+                "
+            ALTER TABLE issue_clusters
+            ADD COLUMN IF NOT EXISTS best_triage_json JSONB
+            ",
+            )
+            .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let mut stmt = connection.prepare("PRAGMA table_info(issue_clusters)")?;
+            let columns = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !columns.iter().any(|name| name == "best_triage_json") {
+                connection.execute(
+                    "ALTER TABLE issue_clusters ADD COLUMN best_triage_json TEXT",
+                    [],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn backfill_result_classification(db: &ServerDb) -> Result<()> {
+    match db {
+        ServerDb::Postgres(client) => {
+            let attempt_rows = client
+                .query(
+                    "
+                SELECT id, cluster_id, bundle_json
+                FROM patch_attempts
+                ",
+                    &[],
+                )
+                .await?;
+            let mut attempts_by_cluster = HashMap::<String, Vec<PatchAttempt>>::new();
+            for row in attempt_rows {
+                let attempt_id: String = row.get(0);
+                let cluster_id: String = row.get(1);
+                let bundle_json: Value = row.get(2);
+                let envelope = serde_json::from_value::<WorkerResultEnvelope>(bundle_json.clone())?;
+                let canonical = canonicalize_worker_result_envelope(envelope);
+                attempts_by_cluster
+                    .entry(cluster_id)
+                    .or_default()
+                    .push(canonical.attempt.clone());
+                let canonical_json = serde_json::to_value(&canonical)?;
+                if canonical_json != bundle_json {
+                    client
+                        .execute(
+                            "
+                        UPDATE patch_attempts
+                        SET outcome = $2,
+                            state = $3,
+                            summary = $4,
+                            bundle_json = $5
+                        WHERE id = $1
+                        ",
+                            &[
+                                &attempt_id,
+                                &canonical.attempt.outcome,
+                                &canonical.attempt.state,
+                                &canonical.attempt.summary,
+                                &canonical_json,
+                            ],
+                        )
+                        .await?;
+                }
+            }
+            let cluster_rows = client
+                .query(
+                    "
+                SELECT id, best_patch_json, best_triage_json
+                FROM issue_clusters
+                ",
+                    &[],
+                )
+                .await?;
+            for row in cluster_rows {
+                let cluster_id: String = row.get(0);
+                let mut candidates = attempts_by_cluster.remove(&cluster_id).unwrap_or_default();
+                if let Some(value) = row.get::<_, Option<Value>>(1) {
+                    if let Ok(attempt) = serde_json::from_value::<PatchAttempt>(value) {
+                        candidates.push(canonicalize_patch_attempt(attempt));
+                    }
+                }
+                if let Some(value) = row.get::<_, Option<Value>>(2) {
+                    if let Ok(attempt) = serde_json::from_value::<PatchAttempt>(value) {
+                        candidates.push(canonicalize_patch_attempt(attempt));
+                    }
+                }
+                let (best_patch, best_triage) = best_attempts_from_candidates(candidates);
+                client
+                    .execute(
+                        "
+                    UPDATE issue_clusters
+                    SET best_patch_json = $2,
+                        best_triage_json = $3
+                    WHERE id = $1
+                    ",
+                        &[
+                            &cluster_id,
+                            &best_patch.as_ref().map(serde_json::to_value).transpose()?,
+                            &best_triage.as_ref().map(serde_json::to_value).transpose()?,
+                        ],
+                    )
+                    .await?;
+            }
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let mut attempt_stmt = connection.prepare(
+                "
+                SELECT id, cluster_id, bundle_json
+                FROM patch_attempts
+                ",
+            )?;
+            let attempt_rows = attempt_stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut attempts_by_cluster = HashMap::<String, Vec<PatchAttempt>>::new();
+            for row in attempt_rows {
+                let (attempt_id, cluster_id, bundle_json) = row?;
+                let envelope = serde_json::from_str::<WorkerResultEnvelope>(&bundle_json)?;
+                let canonical = canonicalize_worker_result_envelope(envelope);
+                attempts_by_cluster
+                    .entry(cluster_id)
+                    .or_default()
+                    .push(canonical.attempt.clone());
+                let canonical_json = serde_json::to_string(&canonical)?;
+                if canonical_json != bundle_json {
+                    connection.execute(
+                        "
+                        UPDATE patch_attempts
+                        SET outcome = ?2,
+                            state = ?3,
+                            summary = ?4,
+                            bundle_json = ?5
+                        WHERE id = ?1
+                        ",
+                        params![
+                            attempt_id,
+                            canonical.attempt.outcome,
+                            canonical.attempt.state,
+                            canonical.attempt.summary,
+                            canonical_json,
+                        ],
+                    )?;
+                }
+            }
+            let mut cluster_stmt = connection.prepare(
+                "
+                SELECT id, best_patch_json, best_triage_json
+                FROM issue_clusters
+                ",
+            )?;
+            let cluster_rows = cluster_stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            for row in cluster_rows {
+                let (cluster_id, best_patch_raw, best_triage_raw) = row?;
+                let mut candidates = attempts_by_cluster.remove(&cluster_id).unwrap_or_default();
+                if let Some(raw) = best_patch_raw {
+                    if let Ok(attempt) = serde_json::from_str::<PatchAttempt>(&raw) {
+                        candidates.push(canonicalize_patch_attempt(attempt));
+                    }
+                }
+                if let Some(raw) = best_triage_raw {
+                    if let Ok(attempt) = serde_json::from_str::<PatchAttempt>(&raw) {
+                        candidates.push(canonicalize_patch_attempt(attempt));
+                    }
+                }
+                let (best_patch, best_triage) = best_attempts_from_candidates(candidates);
+                connection.execute(
+                    "
+                    UPDATE issue_clusters
+                    SET best_patch_json = ?2,
+                        best_triage_json = ?3
+                    WHERE id = ?1
+                    ",
+                    params![
+                        cluster_id,
+                        best_patch.as_ref().map(serde_json::to_string).transpose()?,
+                        best_triage
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()?,
+                    ],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn recluster_current_issue_state(
+    db: &ServerDb,
+    quarantine_corroboration_threshold: i64,
+) -> Result<()> {
+    let state = load_current_issue_state(db).await?;
+    let Some(reclustered) = recluster_issue_state(state, quarantine_corroboration_threshold)?
+    else {
+        return Ok(());
+    };
+    write_reclustered_issue_state(db, &reclustered).await
+}
+
+async fn load_current_issue_state(db: &ServerDb) -> Result<CurrentIssueState> {
+    match db {
+        ServerDb::Postgres(client) => {
+            let issue_clusters = client
+                .query(
+                    "
+                SELECT id, cluster_key, kind, title, summary, public_title, public_summary,
+                       public_visible, package_name, source_package, ecosystem, severity, score,
+                       corroboration_count, quarantined, promoted, representative_json,
+                       best_patch_json, best_triage_json, last_seen
+                FROM issue_clusters
+                ",
+                    &[],
+                )
+                .await?
+                .into_iter()
+                .map(|row| CurrentIssueCluster {
+                    id: row.get(0),
+                    cluster_key: row.get(1),
+                    kind: row.get(2),
+                    title: row.get(3),
+                    summary: row.get(4),
+                    public_title: row.get(5),
+                    public_summary: row.get(6),
+                    public_visible: row.get(7),
+                    package_name: row.get(8),
+                    source_package: row.get(9),
+                    ecosystem: row.get(10),
+                    severity: row.get(11),
+                    score: row.get(12),
+                    corroboration_count: row.get(13),
+                    quarantined: row.get(14),
+                    promoted: row.get(15),
+                    representative_json: row.get(16),
+                    best_patch_json: row.get(17),
+                    best_triage_json: row.get(18),
+                    last_seen: row.get::<_, DateTime<Utc>>(19).to_rfc3339(),
+                })
+                .collect::<Vec<_>>();
+            let cluster_reports = client
+                .query(
+                    "
+                SELECT cluster_id, install_id, submission_id, created_at
+                FROM cluster_reports
+                ",
+                    &[],
+                )
+                .await?
+                .into_iter()
+                .map(|row| CurrentClusterReport {
+                    cluster_id: row.get(0),
+                    install_id: row.get(1),
+                    submission_id: row.get(2),
+                    created_at: row.get::<_, DateTime<Utc>>(3).to_rfc3339(),
+                })
+                .collect::<Vec<_>>();
+            let worker_leases = client
+                .query(
+                    "
+                SELECT id, cluster_id, install_id, state, leased_at, expires_at, work_json
+                FROM worker_leases
+                ",
+                    &[],
+                )
+                .await?
+                .into_iter()
+                .map(|row| CurrentWorkerLease {
+                    id: row.get(0),
+                    cluster_id: row.get(1),
+                    install_id: row.get(2),
+                    state: row.get(3),
+                    leased_at: row.get::<_, DateTime<Utc>>(4).to_rfc3339(),
+                    expires_at: row.get::<_, DateTime<Utc>>(5).to_rfc3339(),
+                    work_json: row.get(6),
+                })
+                .collect::<Vec<_>>();
+            let patch_attempts = client
+                .query(
+                    "
+                SELECT id, cluster_id, lease_id, install_id, outcome, state, summary, bundle_json, created_at
+                FROM patch_attempts
+                ",
+                    &[],
+                )
+                .await?
+                .into_iter()
+                .map(|row| CurrentPatchAttempt {
+                    id: row.get(0),
+                    cluster_id: row.get(1),
+                    lease_id: row.get(2),
+                    install_id: row.get(3),
+                    outcome: row.get(4),
+                    state: row.get(5),
+                    summary: row.get(6),
+                    bundle_json: row.get(7),
+                    created_at: row.get::<_, DateTime<Utc>>(8).to_rfc3339(),
+                })
+                .collect::<Vec<_>>();
+            let evidence_requests = client
+                .query(
+                    "
+                SELECT id, issue_id, requested_by_install_id, reason, requested_fields_json, requested_at, response_json
+                FROM evidence_requests
+                ",
+                    &[],
+                )
+                .await?
+                .into_iter()
+                .map(|row| CurrentEvidenceRequest {
+                    id: row.get(0),
+                    issue_id: row.get(1),
+                    requested_by_install_id: row.get(2),
+                    reason: row.get(3),
+                    requested_fields_json: row.get(4),
+                    requested_at: row.get::<_, DateTime<Utc>>(5).to_rfc3339(),
+                    response_json: row.get(6),
+                })
+                .collect::<Vec<_>>();
+            Ok(CurrentIssueState {
+                issue_clusters,
+                cluster_reports,
+                worker_leases,
+                patch_attempts,
+                evidence_requests,
+            })
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let mut issue_stmt = connection.prepare(
+                "
+                SELECT id, cluster_key, kind, title, summary, public_title, public_summary,
+                       public_visible, package_name, source_package, ecosystem, severity, score,
+                       corroboration_count, quarantined, promoted, representative_json,
+                       best_patch_json, best_triage_json, last_seen
+                FROM issue_clusters
+                ",
+            )?;
+            let issue_clusters = issue_stmt
+                .query_map([], |row| {
+                    Ok(CurrentIssueCluster {
+                        id: row.get(0)?,
+                        cluster_key: row.get(1)?,
+                        kind: row.get(2)?,
+                        title: row.get(3)?,
+                        summary: row.get(4)?,
+                        public_title: row.get(5)?,
+                        public_summary: row.get(6)?,
+                        public_visible: row.get::<_, i64>(7)? != 0,
+                        package_name: row.get(8)?,
+                        source_package: row.get(9)?,
+                        ecosystem: row.get(10)?,
+                        severity: row.get(11)?,
+                        score: row.get(12)?,
+                        corroboration_count: row.get(13)?,
+                        quarantined: row.get::<_, i64>(14)? != 0,
+                        promoted: row.get::<_, i64>(15)? != 0,
+                        representative_json: serde_json::from_str(&row.get::<_, String>(16)?)
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    16,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
+                        best_patch_json: row
+                            .get::<_, Option<String>>(17)?
+                            .map(|raw| serde_json::from_str::<Value>(&raw))
+                            .transpose()
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    17,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
+                        best_triage_json: row
+                            .get::<_, Option<String>>(18)?
+                            .map(|raw| serde_json::from_str::<Value>(&raw))
+                            .transpose()
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    18,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
+                        last_seen: row.get(19)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut report_stmt = connection.prepare(
+                "
+                SELECT cluster_id, install_id, submission_id, created_at
+                FROM cluster_reports
+                ",
+            )?;
+            let cluster_reports = report_stmt
+                .query_map([], |row| {
+                    Ok(CurrentClusterReport {
+                        cluster_id: row.get(0)?,
+                        install_id: row.get(1)?,
+                        submission_id: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut lease_stmt = connection.prepare(
+                "
+                SELECT id, cluster_id, install_id, state, leased_at, expires_at, work_json
+                FROM worker_leases
+                ",
+            )?;
+            let worker_leases = lease_stmt
+                .query_map([], |row| {
+                    Ok(CurrentWorkerLease {
+                        id: row.get(0)?,
+                        cluster_id: row.get(1)?,
+                        install_id: row.get(2)?,
+                        state: row.get(3)?,
+                        leased_at: row.get(4)?,
+                        expires_at: row.get(5)?,
+                        work_json: serde_json::from_str(&row.get::<_, String>(6)?).map_err(
+                            |error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    6,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            },
+                        )?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut attempt_stmt = connection.prepare(
+                "
+                SELECT id, cluster_id, lease_id, install_id, outcome, state, summary, bundle_json, created_at
+                FROM patch_attempts
+                ",
+            )?;
+            let patch_attempts = attempt_stmt
+                .query_map([], |row| {
+                    Ok(CurrentPatchAttempt {
+                        id: row.get(0)?,
+                        cluster_id: row.get(1)?,
+                        lease_id: row.get(2)?,
+                        install_id: row.get(3)?,
+                        outcome: row.get(4)?,
+                        state: row.get(5)?,
+                        summary: row.get(6)?,
+                        bundle_json: serde_json::from_str(&row.get::<_, String>(7)?).map_err(
+                            |error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    7,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            },
+                        )?,
+                        created_at: row.get(8)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut evidence_stmt = connection.prepare(
+                "
+                SELECT id, issue_id, requested_by_install_id, reason, requested_fields_json, requested_at, response_json
+                FROM evidence_requests
+                ",
+            )?;
+            let evidence_requests = evidence_stmt
+                .query_map([], |row| {
+                    Ok(CurrentEvidenceRequest {
+                        id: row.get(0)?,
+                        issue_id: row.get(1)?,
+                        requested_by_install_id: row.get(2)?,
+                        reason: row.get(3)?,
+                        requested_fields_json: serde_json::from_str(&row.get::<_, String>(4)?)
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    4,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
+                        requested_at: row.get(5)?,
+                        response_json: row
+                            .get::<_, Option<String>>(6)?
+                            .map(|raw| serde_json::from_str::<Value>(&raw))
+                            .transpose()
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    6,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(CurrentIssueState {
+                issue_clusters,
+                cluster_reports,
+                worker_leases,
+                patch_attempts,
+                evidence_requests,
+            })
+        }
+    }
+}
+
+fn recluster_issue_state(
+    state: CurrentIssueState,
+    quarantine_corroboration_threshold: i64,
+) -> Result<Option<CurrentIssueState>> {
+    let mut grouped_clusters = BTreeMap::<String, CurrentClusterAccumulator>::new();
+    let mut needs_recluster = false;
+    for row in &state.issue_clusters {
+        let representative: SharedOpportunity =
+            serde_json::from_value(row.representative_json.clone())?;
+        let cluster_key = cluster_key_for(&representative);
+        let public_fields = build_public_issue_fields(&representative);
+        if cluster_key != row.cluster_key
+            || public_fields.title != row.public_title
+            || public_fields.summary != row.public_summary
+            || public_fields.visible != row.public_visible
+        {
+            needs_recluster = true;
+        }
+        match grouped_clusters.entry(cluster_key.clone()) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                needs_recluster = true;
+                entry.get_mut().absorb(row, &public_fields);
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(CurrentClusterAccumulator::new(
+                    row,
+                    cluster_key,
+                    &public_fields,
+                ));
+            }
+        }
+    }
+    if !needs_recluster {
+        return Ok(None);
+    }
+
+    let mut cluster_id_map = HashMap::<String, String>::new();
+    let mut issue_clusters = grouped_clusters
+        .into_values()
+        .map(|group| {
+            for existing_id in &group.existing_ids {
+                cluster_id_map.insert(existing_id.clone(), group.canonical_id.clone());
+            }
+            CurrentIssueCluster {
+                id: group.canonical_id,
+                cluster_key: group.cluster_key,
+                kind: group.kind,
+                title: group.title,
+                summary: group.summary,
+                public_title: group.public_title,
+                public_summary: group.public_summary,
+                public_visible: group.public_visible,
+                package_name: group.package_name,
+                source_package: group.source_package,
+                ecosystem: group.ecosystem,
+                severity: group.severity,
+                score: group.score,
+                corroboration_count: 0,
+                quarantined: true,
+                promoted: group.any_promoted,
+                representative_json: group.representative_json,
+                best_patch_json: group.fallback_best_patch_json,
+                best_triage_json: group.fallback_best_triage_json,
+                last_seen: group.last_seen,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut cluster_report_map = HashMap::<(String, String), CurrentClusterReport>::new();
+    for report in state.cluster_reports {
+        let Some(cluster_id) = cluster_id_map.get(&report.cluster_id).cloned() else {
+            continue;
+        };
+        let key = (cluster_id.clone(), report.install_id.clone());
+        match cluster_report_map.get_mut(&key) {
+            Some(existing) if report.created_at > existing.created_at => {
+                existing.submission_id = report.submission_id.clone();
+                existing.created_at = report.created_at.clone();
+            }
+            Some(_) => {}
+            None => {
+                cluster_report_map.insert(
+                    key,
+                    CurrentClusterReport {
+                        cluster_id,
+                        install_id: report.install_id,
+                        submission_id: report.submission_id,
+                        created_at: report.created_at,
+                    },
+                );
+            }
+        }
+    }
+    let cluster_reports = cluster_report_map.into_values().collect::<Vec<_>>();
+
+    let worker_leases = state
+        .worker_leases
+        .into_iter()
+        .filter_map(|lease| {
+            cluster_id_map
+                .get(&lease.cluster_id)
+                .map(|cluster_id| CurrentWorkerLease {
+                    id: lease.id.clone(),
+                    cluster_id: cluster_id.clone(),
+                    install_id: lease.install_id,
+                    state: lease.state,
+                    leased_at: lease.leased_at,
+                    expires_at: lease.expires_at,
+                    work_json: rewrite_work_lease_json(lease.work_json, cluster_id, &lease.id),
+                })
+        })
+        .collect::<Vec<_>>();
+
+    let patch_attempts = state
+        .patch_attempts
+        .into_iter()
+        .filter_map(|attempt| {
+            cluster_id_map
+                .get(&attempt.cluster_id)
+                .map(|cluster_id| CurrentPatchAttempt {
+                    id: attempt.id,
+                    cluster_id: cluster_id.clone(),
+                    lease_id: attempt.lease_id.clone(),
+                    install_id: attempt.install_id,
+                    outcome: attempt.outcome,
+                    state: attempt.state,
+                    summary: attempt.summary,
+                    bundle_json: rewrite_worker_result_json(
+                        attempt.bundle_json,
+                        cluster_id,
+                        attempt.lease_id.as_deref(),
+                    ),
+                    created_at: attempt.created_at,
+                })
+        })
+        .collect::<Vec<_>>();
+
+    let evidence_requests = state
+        .evidence_requests
+        .into_iter()
+        .filter_map(|request| {
+            cluster_id_map
+                .get(&request.issue_id)
+                .map(|issue_id| CurrentEvidenceRequest {
+                    id: request.id,
+                    issue_id: issue_id.clone(),
+                    requested_by_install_id: request.requested_by_install_id,
+                    reason: request.reason,
+                    requested_fields_json: request.requested_fields_json,
+                    requested_at: request.requested_at,
+                    response_json: request.response_json,
+                })
+        })
+        .collect::<Vec<_>>();
+
+    let mut issue_counts = HashMap::<String, i64>::new();
+    for report in &cluster_reports {
+        *issue_counts.entry(report.cluster_id.clone()).or_default() += 1;
+    }
+
+    let mut patch_attempt_best = HashMap::<String, (&str, Value)>::new();
+    let mut triage_attempt_best = HashMap::<String, (&str, Value)>::new();
+    for attempt in &patch_attempts {
+        if attempt.state != "ready" {
+            continue;
+        }
+        let payload = attempt
+            .bundle_json
+            .get("attempt")
+            .cloned()
+            .unwrap_or_else(|| {
+                json!({
+                    "cluster_id": attempt.cluster_id,
+                    "install_id": attempt.install_id,
+                    "outcome": attempt.outcome,
+                    "state": attempt.state,
+                    "summary": attempt.summary,
+                    "bundle_path": Value::Null,
+                    "output_path": Value::Null,
+                    "validation_status": Value::Null,
+                    "details": {},
+                    "created_at": attempt.created_at,
+                })
+            });
+        if attempt.outcome == "patch" {
+            patch_attempt_best
+                .entry(attempt.cluster_id.clone())
+                .and_modify(|existing| {
+                    if attempt.created_at.as_str() > existing.0 {
+                        *existing = (attempt.created_at.as_str(), payload.clone());
+                    }
+                })
+                .or_insert((attempt.created_at.as_str(), payload.clone()));
+        }
+        if attempt.outcome == "triage" {
+            triage_attempt_best
+                .entry(attempt.cluster_id.clone())
+                .and_modify(|existing| {
+                    if attempt.created_at.as_str() > existing.0 {
+                        *existing = (attempt.created_at.as_str(), payload.clone());
+                    }
+                })
+                .or_insert((attempt.created_at.as_str(), payload));
+        }
+    }
+
+    for issue in &mut issue_clusters {
+        issue.corroboration_count = *issue_counts.get(&issue.id).unwrap_or(&0);
+        issue.promoted =
+            issue.promoted || issue.corroboration_count >= quarantine_corroboration_threshold;
+        issue.quarantined = !issue.promoted;
+        if let Some((_, best_patch)) = patch_attempt_best.get(&issue.id) {
+            issue.best_patch_json = Some(best_patch.clone());
+        } else if let Some(best_patch) = issue.best_patch_json.clone() {
+            let best_patch = rewrite_patch_attempt_json(best_patch, &issue.id);
+            if let Ok(attempt) = serde_json::from_value::<PatchAttempt>(best_patch) {
+                let attempt = canonicalize_patch_attempt(attempt);
+                if attempt.state == "ready" && attempt.outcome == "patch" {
+                    issue.best_patch_json = Some(serde_json::to_value(attempt)?);
+                } else {
+                    issue.best_patch_json = None;
+                }
+            } else {
+                issue.best_patch_json = None;
+            }
+        }
+        if let Some((_, best_triage)) = triage_attempt_best.get(&issue.id) {
+            issue.best_triage_json = Some(best_triage.clone());
+        } else if let Some(best_triage) = issue.best_triage_json.clone() {
+            let best_triage = rewrite_patch_attempt_json(best_triage, &issue.id);
+            if let Ok(attempt) = serde_json::from_value::<PatchAttempt>(best_triage) {
+                let attempt = canonicalize_patch_attempt(attempt);
+                if attempt.state == "ready" && attempt.outcome == "triage" {
+                    issue.best_triage_json = Some(serde_json::to_value(attempt)?);
+                } else {
+                    issue.best_triage_json = None;
+                }
+            } else {
+                issue.best_triage_json = None;
+            }
+        }
+    }
+
+    Ok(Some(CurrentIssueState {
+        issue_clusters,
+        cluster_reports,
+        worker_leases,
+        patch_attempts,
+        evidence_requests,
+    }))
+}
+
+async fn write_reclustered_issue_state(db: &ServerDb, state: &CurrentIssueState) -> Result<()> {
+    match db {
+        ServerDb::Postgres(client) => {
+            client.batch_execute("BEGIN").await?;
+            let result = async {
+                client.execute("DELETE FROM patch_attempts", &[]).await?;
+                client.execute("DELETE FROM evidence_requests", &[]).await?;
+                client.execute("DELETE FROM worker_leases", &[]).await?;
+                client.execute("DELETE FROM cluster_reports", &[]).await?;
+                client.execute("DELETE FROM issue_clusters", &[]).await?;
+
+                for issue in &state.issue_clusters {
+                    client
+                        .execute(
+                            "
+                        INSERT INTO issue_clusters
+                            (id, cluster_key, kind, title, summary, public_title, public_summary, public_visible,
+                             package_name, source_package, ecosystem, severity, score, corroboration_count,
+                             quarantined, promoted, representative_json, best_patch_json, best_triage_json, last_seen)
+                        VALUES
+                            ($1, $2, $3, $4, $5, $6, $7, $8,
+                             $9, $10, $11, $12, $13, $14,
+                             $15, $16, $17, $18, $19, $20)
+                        ",
+                            &[
+                                &issue.id,
+                                &issue.cluster_key,
+                                &issue.kind,
+                                &issue.title,
+                                &issue.summary,
+                                &issue.public_title,
+                                &issue.public_summary,
+                                &issue.public_visible,
+                                &issue.package_name,
+                                &issue.source_package,
+                                &issue.ecosystem,
+                                &issue.severity,
+                                &issue.score,
+                                &issue.corroboration_count,
+                                &issue.quarantined,
+                                &issue.promoted,
+                                &issue.representative_json,
+                                &issue.best_patch_json,
+                                &issue.best_triage_json,
+                                &parse_timestamp(&issue.last_seen)
+                                    .ok_or_else(|| anyhow!("invalid timestamp {}", issue.last_seen))?,
+                            ],
+                        )
+                        .await?;
+                }
+                for report in &state.cluster_reports {
+                    client
+                        .execute(
+                            "
+                        INSERT INTO cluster_reports (cluster_id, install_id, submission_id, created_at)
+                        VALUES ($1, $2, $3, $4)
+                        ",
+                            &[
+                                &report.cluster_id,
+                                &report.install_id,
+                                &report.submission_id,
+                                &parse_timestamp(&report.created_at)
+                                    .ok_or_else(|| anyhow!("invalid timestamp {}", report.created_at))?,
+                            ],
+                        )
+                        .await?;
+                }
+                for lease in &state.worker_leases {
+                    client
+                        .execute(
+                            "
+                        INSERT INTO worker_leases (id, cluster_id, install_id, state, leased_at, expires_at, work_json)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        ",
+                            &[
+                                &lease.id,
+                                &lease.cluster_id,
+                                &lease.install_id,
+                                &lease.state,
+                                &parse_timestamp(&lease.leased_at)
+                                    .ok_or_else(|| anyhow!("invalid timestamp {}", lease.leased_at))?,
+                                &parse_timestamp(&lease.expires_at)
+                                    .ok_or_else(|| anyhow!("invalid timestamp {}", lease.expires_at))?,
+                                &lease.work_json,
+                            ],
+                        )
+                        .await?;
+                }
+                for attempt in &state.patch_attempts {
+                    client
+                        .execute(
+                            "
+                        INSERT INTO patch_attempts (id, cluster_id, lease_id, install_id, outcome, state, summary, bundle_json, created_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        ",
+                            &[
+                                &attempt.id,
+                                &attempt.cluster_id,
+                                &attempt.lease_id,
+                                &attempt.install_id,
+                                &attempt.outcome,
+                                &attempt.state,
+                                &attempt.summary,
+                                &attempt.bundle_json,
+                                &parse_timestamp(&attempt.created_at)
+                                    .ok_or_else(|| anyhow!("invalid timestamp {}", attempt.created_at))?,
+                            ],
+                        )
+                        .await?;
+                }
+                for request in &state.evidence_requests {
+                    client
+                        .execute(
+                            "
+                        INSERT INTO evidence_requests
+                            (id, issue_id, requested_by_install_id, reason, requested_fields_json, requested_at, response_json)
+                        VALUES
+                            ($1, $2, $3, $4, $5, $6, $7)
+                        ",
+                            &[
+                                &request.id,
+                                &request.issue_id,
+                                &request.requested_by_install_id,
+                                &request.reason,
+                                &request.requested_fields_json,
+                                &parse_timestamp(&request.requested_at)
+                                    .ok_or_else(|| anyhow!("invalid timestamp {}", request.requested_at))?,
+                                &request.response_json,
+                            ],
+                        )
+                        .await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    client.batch_execute("COMMIT").await?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = client.batch_execute("ROLLBACK").await;
+                    Err(error)
+                }
+            }
+        }
+        ServerDb::Sqlite(path) => {
+            let mut connection = sqlite_connection(path)?;
+            let tx = connection.transaction()?;
+            tx.execute("DELETE FROM patch_attempts", [])?;
+            tx.execute("DELETE FROM evidence_requests", [])?;
+            tx.execute("DELETE FROM worker_leases", [])?;
+            tx.execute("DELETE FROM cluster_reports", [])?;
+            tx.execute("DELETE FROM issue_clusters", [])?;
+
+            for issue in &state.issue_clusters {
+                tx.execute(
+                    "
+                    INSERT INTO issue_clusters
+                        (id, cluster_key, kind, title, summary, public_title, public_summary, public_visible,
+                         package_name, source_package, ecosystem, severity, score, corroboration_count,
+                         quarantined, promoted, representative_json, best_patch_json, best_triage_json, last_seen)
+                    VALUES
+                        (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                         ?9, ?10, ?11, ?12, ?13, ?14,
+                         ?15, ?16, ?17, ?18, ?19, ?20)
+                    ",
+                    params![
+                        issue.id,
+                        issue.cluster_key,
+                        issue.kind,
+                        issue.title,
+                        issue.summary,
+                        issue.public_title,
+                        issue.public_summary,
+                        issue.public_visible,
+                        issue.package_name,
+                        issue.source_package,
+                        issue.ecosystem,
+                        issue.severity,
+                        issue.score,
+                        issue.corroboration_count,
+                        issue.quarantined,
+                        issue.promoted,
+                        serde_json::to_string(&issue.representative_json)?,
+                        issue.best_patch_json
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()?,
+                        issue.best_triage_json
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()?,
+                        issue.last_seen,
+                    ],
+                )?;
+            }
+            for report in &state.cluster_reports {
+                tx.execute(
+                    "
+                    INSERT INTO cluster_reports (cluster_id, install_id, submission_id, created_at)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ",
+                    params![
+                        report.cluster_id,
+                        report.install_id,
+                        report.submission_id,
+                        report.created_at
+                    ],
+                )?;
+            }
+            for lease in &state.worker_leases {
+                tx.execute(
+                    "
+                    INSERT INTO worker_leases (id, cluster_id, install_id, state, leased_at, expires_at, work_json)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    ",
+                    params![
+                        lease.id,
+                        lease.cluster_id,
+                        lease.install_id,
+                        lease.state,
+                        lease.leased_at,
+                        lease.expires_at,
+                        serde_json::to_string(&lease.work_json)?,
+                    ],
+                )?;
+            }
+            for attempt in &state.patch_attempts {
+                tx.execute(
+                    "
+                    INSERT INTO patch_attempts (id, cluster_id, lease_id, install_id, outcome, state, summary, bundle_json, created_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    ",
+                    params![
+                        attempt.id,
+                        attempt.cluster_id,
+                        attempt.lease_id,
+                        attempt.install_id,
+                        attempt.outcome,
+                        attempt.state,
+                        attempt.summary,
+                        serde_json::to_string(&attempt.bundle_json)?,
+                        attempt.created_at,
+                    ],
+                )?;
+            }
+            for request in &state.evidence_requests {
+                tx.execute(
+                    "
+                    INSERT INTO evidence_requests
+                        (id, issue_id, requested_by_install_id, reason, requested_fields_json, requested_at, response_json)
+                    VALUES
+                        (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    ",
+                    params![
+                        request.id,
+                        request.issue_id,
+                        request.requested_by_install_id,
+                        request.reason,
+                        serde_json::to_string(&request.requested_fields_json)?,
+                        request.requested_at,
+                        request
+                            .response_json
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()?,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1447,6 +2593,7 @@ struct MigratedIssueCluster {
     promoted: bool,
     representative_json: Value,
     best_patch_json: Option<Value>,
+    best_triage_json: Option<Value>,
     last_seen: String,
 }
 
@@ -1503,6 +2650,111 @@ struct MigratedRateEvent {
 }
 
 #[derive(Debug, Clone)]
+struct CurrentIssueState {
+    issue_clusters: Vec<CurrentIssueCluster>,
+    cluster_reports: Vec<CurrentClusterReport>,
+    worker_leases: Vec<CurrentWorkerLease>,
+    patch_attempts: Vec<CurrentPatchAttempt>,
+    evidence_requests: Vec<CurrentEvidenceRequest>,
+}
+
+#[derive(Debug, Clone)]
+struct CurrentIssueCluster {
+    id: String,
+    cluster_key: String,
+    kind: String,
+    title: String,
+    summary: String,
+    public_title: String,
+    public_summary: String,
+    public_visible: bool,
+    package_name: Option<String>,
+    source_package: Option<String>,
+    ecosystem: Option<String>,
+    severity: Option<String>,
+    score: i64,
+    corroboration_count: i64,
+    quarantined: bool,
+    promoted: bool,
+    representative_json: Value,
+    best_patch_json: Option<Value>,
+    best_triage_json: Option<Value>,
+    last_seen: String,
+}
+
+#[derive(Debug, Clone)]
+struct CurrentClusterReport {
+    cluster_id: String,
+    install_id: String,
+    submission_id: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct CurrentWorkerLease {
+    id: String,
+    cluster_id: String,
+    install_id: String,
+    state: String,
+    leased_at: String,
+    expires_at: String,
+    work_json: Value,
+}
+
+#[derive(Debug, Clone)]
+struct CurrentPatchAttempt {
+    id: String,
+    cluster_id: String,
+    lease_id: Option<String>,
+    install_id: String,
+    outcome: String,
+    state: String,
+    summary: String,
+    bundle_json: Value,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct CurrentEvidenceRequest {
+    id: String,
+    issue_id: String,
+    requested_by_install_id: Option<String>,
+    reason: String,
+    requested_fields_json: Value,
+    requested_at: String,
+    response_json: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct CurrentClusterAccumulator {
+    existing_ids: Vec<String>,
+    canonical_id: String,
+    canonical_corroboration_count: i64,
+    canonical_promoted: bool,
+    canonical_score: i64,
+    canonical_last_seen: String,
+    cluster_key: String,
+    kind: String,
+    title: String,
+    summary: String,
+    public_title: String,
+    public_summary: String,
+    public_visible: bool,
+    package_name: Option<String>,
+    source_package: Option<String>,
+    ecosystem: Option<String>,
+    severity: Option<String>,
+    score: i64,
+    representative_json: Value,
+    last_seen: String,
+    any_promoted: bool,
+    fallback_best_patch_json: Option<Value>,
+    fallback_best_patch_seen_at: Option<String>,
+    fallback_best_triage_json: Option<Value>,
+    fallback_best_triage_seen_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct ClusterAccumulator {
     legacy_ids: Vec<i64>,
     kind: String,
@@ -1521,6 +2773,7 @@ struct ClusterAccumulator {
     any_promoted: bool,
     fallback_best_patch_json: Option<Value>,
     fallback_best_patch_seen_at: Option<String>,
+    fallback_best_triage_json: Option<Value>,
 }
 
 impl ClusterAccumulator {
@@ -1546,6 +2799,7 @@ impl ClusterAccumulator {
                 .best_patch_json
                 .as_ref()
                 .map(|_| row.last_seen.clone()),
+            fallback_best_triage_json: None,
         }
     }
 
@@ -1577,6 +2831,118 @@ impl ClusterAccumulator {
         {
             self.fallback_best_patch_json = row.best_patch_json.clone();
             self.fallback_best_patch_seen_at = Some(row.last_seen.clone());
+        }
+        if replace_representative {
+            self.kind = row.kind.clone();
+            self.title = row.title.clone();
+            self.summary = row.summary.clone();
+            self.public_title = public_fields.title.clone();
+            self.public_summary = public_fields.summary.clone();
+            self.representative_json = row.representative_json.clone();
+            self.last_seen = row.last_seen.clone();
+        } else {
+            self.last_seen = self.last_seen.clone().max(row.last_seen.clone());
+        }
+    }
+}
+
+impl CurrentClusterAccumulator {
+    fn new(
+        row: &CurrentIssueCluster,
+        cluster_key: String,
+        public_fields: &PublicIssueFields,
+    ) -> Self {
+        Self {
+            existing_ids: vec![row.id.clone()],
+            canonical_id: row.id.clone(),
+            canonical_corroboration_count: row.corroboration_count,
+            canonical_promoted: row.promoted,
+            canonical_score: row.score,
+            canonical_last_seen: row.last_seen.clone(),
+            cluster_key,
+            kind: row.kind.clone(),
+            title: row.title.clone(),
+            summary: row.summary.clone(),
+            public_title: public_fields.title.clone(),
+            public_summary: public_fields.summary.clone(),
+            public_visible: public_fields.visible,
+            package_name: row.package_name.clone(),
+            source_package: row.source_package.clone(),
+            ecosystem: row.ecosystem.clone(),
+            severity: row.severity.clone(),
+            score: row.score,
+            representative_json: row.representative_json.clone(),
+            last_seen: row.last_seen.clone(),
+            any_promoted: row.promoted,
+            fallback_best_patch_json: row.best_patch_json.clone(),
+            fallback_best_patch_seen_at: row
+                .best_patch_json
+                .as_ref()
+                .map(|_| row.last_seen.clone()),
+            fallback_best_triage_json: row.best_triage_json.clone(),
+            fallback_best_triage_seen_at: row
+                .best_triage_json
+                .as_ref()
+                .map(|_| row.last_seen.clone()),
+        }
+    }
+
+    fn absorb(&mut self, row: &CurrentIssueCluster, public_fields: &PublicIssueFields) {
+        self.existing_ids.push(row.id.clone());
+        self.public_visible |= public_fields.visible;
+        let replace_representative =
+            row.score > self.score || (row.score == self.score && row.last_seen > self.last_seen);
+        let replace_canonical = row.corroboration_count > self.canonical_corroboration_count
+            || (row.corroboration_count == self.canonical_corroboration_count
+                && row.promoted
+                && !self.canonical_promoted)
+            || (row.corroboration_count == self.canonical_corroboration_count
+                && row.promoted == self.canonical_promoted
+                && row.score > self.canonical_score)
+            || (row.corroboration_count == self.canonical_corroboration_count
+                && row.promoted == self.canonical_promoted
+                && row.score == self.canonical_score
+                && row.last_seen > self.canonical_last_seen);
+        if replace_canonical {
+            self.canonical_id = row.id.clone();
+            self.canonical_corroboration_count = row.corroboration_count;
+            self.canonical_promoted = row.promoted;
+            self.canonical_score = row.score;
+            self.canonical_last_seen = row.last_seen.clone();
+        }
+        self.score = self.score.max(row.score);
+        if self.package_name.is_none() {
+            self.package_name = row.package_name.clone();
+        }
+        if self.source_package.is_none() {
+            self.source_package = row.source_package.clone();
+        }
+        if self.ecosystem.is_none() {
+            self.ecosystem = row.ecosystem.clone();
+        }
+        if self.severity.is_none() {
+            self.severity = row.severity.clone();
+        }
+        self.any_promoted |= row.promoted;
+        if row.best_patch_json.is_some()
+            && self
+                .fallback_best_patch_seen_at
+                .as_deref()
+                .map(|current| row.last_seen.as_str() >= current)
+                .unwrap_or(true)
+        {
+            self.fallback_best_patch_json = row.best_patch_json.clone();
+            self.fallback_best_patch_seen_at = Some(row.last_seen.clone());
+        }
+        if row.best_triage_json.is_some()
+            && self
+                .fallback_best_triage_seen_at
+                .as_deref()
+                .map(|current| row.last_seen.as_str() >= current)
+                .unwrap_or(true)
+        {
+            self.fallback_best_triage_json = row.best_triage_json.clone();
+            self.fallback_best_triage_seen_at = Some(row.last_seen.clone());
         }
         if replace_representative {
             self.kind = row.kind.clone();
@@ -2057,6 +3423,7 @@ fn migrate_legacy_state(
                 promoted: group.any_promoted,
                 representative_json: group.representative_json,
                 best_patch_json: group.fallback_best_patch_json,
+                best_triage_json: group.fallback_best_triage_json,
                 last_seen: group.last_seen,
             }
         })
@@ -2100,19 +3467,42 @@ fn migrate_legacy_state(
                 .as_ref()
                 .and_then(|legacy_id| lease_id_map.get(legacy_id))
                 .cloned();
+            let rewritten_bundle = rewrite_worker_result_json(
+                attempt.bundle_json.clone(),
+                &cluster_id,
+                lease_id.as_deref(),
+            );
+            let canonical_bundle = serde_json::from_value::<WorkerResultEnvelope>(rewritten_bundle)
+                .ok()
+                .map(canonicalize_worker_result_envelope);
             Some(MigratedPatchAttempt {
                 id: new_server_id(),
                 cluster_id: cluster_id.clone(),
                 lease_id: lease_id.clone(),
                 install_id: attempt.install_id.clone(),
-                outcome: attempt.outcome.clone(),
-                state: attempt.state.clone(),
-                summary: attempt.summary.clone(),
-                bundle_json: rewrite_worker_result_json(
-                    attempt.bundle_json.clone(),
-                    &cluster_id,
-                    lease_id.as_deref(),
-                ),
+                outcome: canonical_bundle
+                    .as_ref()
+                    .map(|bundle| bundle.attempt.outcome.clone())
+                    .unwrap_or_else(|| attempt.outcome.clone()),
+                state: canonical_bundle
+                    .as_ref()
+                    .map(|bundle| bundle.attempt.state.clone())
+                    .unwrap_or_else(|| attempt.state.clone()),
+                summary: canonical_bundle
+                    .as_ref()
+                    .map(|bundle| bundle.attempt.summary.clone())
+                    .unwrap_or_else(|| attempt.summary.clone()),
+                bundle_json: canonical_bundle
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .ok()?
+                    .unwrap_or_else(|| {
+                        rewrite_worker_result_json(
+                            attempt.bundle_json.clone(),
+                            &cluster_id,
+                            lease_id.as_deref(),
+                        )
+                    }),
                 created_at: attempt.created_at.clone(),
             })
         })
@@ -2178,27 +3568,41 @@ fn migrate_legacy_state(
     let cluster_reports = cluster_report_map.into_values().collect::<Vec<_>>();
 
     let mut patch_attempt_best = HashMap::<String, (&str, Value)>::new();
+    let mut triage_attempt_best = HashMap::<String, (&str, Value)>::new();
     for attempt in &patch_attempts {
-        if attempt.outcome == "patch" && attempt.state == "ready" {
-            let payload = attempt
-                .bundle_json
-                .get("attempt")
-                .cloned()
-                .unwrap_or_else(|| {
-                    json!({
-                        "cluster_id": attempt.cluster_id,
-                        "install_id": attempt.install_id,
-                        "outcome": attempt.outcome,
-                        "state": attempt.state,
-                        "summary": attempt.summary,
-                        "bundle_path": Value::Null,
-                        "output_path": Value::Null,
-                        "validation_status": Value::Null,
-                        "details": {},
-                        "created_at": attempt.created_at,
-                    })
-                });
+        if attempt.state != "ready" {
+            continue;
+        }
+        let payload = attempt
+            .bundle_json
+            .get("attempt")
+            .cloned()
+            .unwrap_or_else(|| {
+                json!({
+                    "cluster_id": attempt.cluster_id,
+                    "install_id": attempt.install_id,
+                    "outcome": attempt.outcome,
+                    "state": attempt.state,
+                    "summary": attempt.summary,
+                    "bundle_path": Value::Null,
+                    "output_path": Value::Null,
+                    "validation_status": Value::Null,
+                    "details": {},
+                    "created_at": attempt.created_at,
+                })
+            });
+        if attempt.outcome == "patch" {
             patch_attempt_best
+                .entry(attempt.cluster_id.clone())
+                .and_modify(|existing| {
+                    if attempt.created_at.as_str() > existing.0 {
+                        *existing = (attempt.created_at.as_str(), payload.clone());
+                    }
+                })
+                .or_insert((attempt.created_at.as_str(), payload.clone()));
+        }
+        if attempt.outcome == "triage" {
+            triage_attempt_best
                 .entry(attempt.cluster_id.clone())
                 .and_modify(|existing| {
                     if attempt.created_at.as_str() > existing.0 {
@@ -2221,7 +3625,32 @@ fn migrate_legacy_state(
         if let Some((_, best_patch)) = patch_attempt_best.get(&issue.id) {
             issue.best_patch_json = Some(best_patch.clone());
         } else if let Some(best_patch) = issue.best_patch_json.clone() {
-            issue.best_patch_json = Some(rewrite_patch_attempt_json(best_patch, &issue.id));
+            let best_patch = rewrite_patch_attempt_json(best_patch, &issue.id);
+            if let Ok(attempt) = serde_json::from_value::<PatchAttempt>(best_patch) {
+                let attempt = canonicalize_patch_attempt(attempt);
+                if attempt.state == "ready" && attempt.outcome == "patch" {
+                    issue.best_patch_json = Some(serde_json::to_value(attempt)?);
+                } else {
+                    issue.best_patch_json = None;
+                }
+            } else {
+                issue.best_patch_json = None;
+            }
+        }
+        if let Some((_, best_triage)) = triage_attempt_best.get(&issue.id) {
+            issue.best_triage_json = Some(best_triage.clone());
+        } else if let Some(best_triage) = issue.best_triage_json.clone() {
+            let best_triage = rewrite_patch_attempt_json(best_triage, &issue.id);
+            if let Ok(attempt) = serde_json::from_value::<PatchAttempt>(best_triage) {
+                let attempt = canonicalize_patch_attempt(attempt);
+                if attempt.state == "ready" && attempt.outcome == "triage" {
+                    issue.best_triage_json = Some(serde_json::to_value(attempt)?);
+                } else {
+                    issue.best_triage_json = None;
+                }
+            } else {
+                issue.best_triage_json = None;
+            }
         }
     }
 
@@ -2338,8 +3767,8 @@ async fn write_migrated_state(db: &ServerDb, state: &MigratedServerState) -> Res
                 INSERT INTO issue_clusters
                     (id, cluster_key, kind, title, summary, public_title, public_summary, public_visible,
                      package_name, source_package, ecosystem, severity, score, corroboration_count,
-                     quarantined, promoted, representative_json, best_patch_json, last_seen)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+                     quarantined, promoted, representative_json, best_patch_json, best_triage_json, last_seen)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
                 ",
                     &[
                         &issue.id,
@@ -2360,6 +3789,7 @@ async fn write_migrated_state(db: &ServerDb, state: &MigratedServerState) -> Res
                         &issue.promoted,
                         &issue.representative_json,
                         &issue.best_patch_json,
+                        &issue.best_triage_json,
                         &parse_timestamp(&issue.last_seen).unwrap_or_else(Utc::now),
                     ],
                 )
@@ -2479,8 +3909,8 @@ async fn write_migrated_state(db: &ServerDb, state: &MigratedServerState) -> Res
                 INSERT INTO issue_clusters
                     (id, cluster_key, kind, title, summary, public_title, public_summary, public_visible,
                      package_name, source_package, ecosystem, severity, score, corroboration_count,
-                     quarantined, promoted, representative_json, best_patch_json, last_seen)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                     quarantined, promoted, representative_json, best_patch_json, best_triage_json, last_seen)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
                 ",
                     params![
                         issue.id,
@@ -2501,6 +3931,10 @@ async fn write_migrated_state(db: &ServerDb, state: &MigratedServerState) -> Res
                         issue.promoted,
                         serde_json::to_string(&issue.representative_json)?,
                         issue.best_patch_json.as_ref().map(serde_json::to_string).transpose()?,
+                        issue.best_triage_json
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()?,
                         issue.last_seen,
                     ],
                 )?;
@@ -3138,6 +4572,8 @@ async fn store_worker_result(
     cluster_id: &str,
     result: &WorkerResultEnvelope,
 ) -> Result<()> {
+    let successful_ready_result = result.attempt.state == "ready"
+        && matches!(result.attempt.outcome.as_str(), "patch" | "triage");
     match db {
         ServerDb::Postgres(db) => {
             let patch_attempt_id = new_server_id();
@@ -3168,16 +4604,8 @@ async fn store_worker_result(
                 &[&result.lease_id],
             )
             .await?;
-            if result.attempt.outcome == "patch" && result.attempt.state == "ready" {
-                db.execute(
-                    "
-                UPDATE issue_clusters
-                SET best_patch_json = $2
-                WHERE id = $1
-                ",
-                    &[&cluster_id, &serde_json::to_value(&result.attempt)?],
-                )
-                .await?;
+            refresh_issue_cluster_best_results(db, cluster_id).await?;
+            if successful_ready_result {
                 db.execute(
                     "
                 UPDATE installs
@@ -3218,15 +4646,8 @@ async fn store_worker_result(
             ",
                 [result.lease_id.as_str()],
             )?;
-            if result.attempt.outcome == "patch" && result.attempt.state == "ready" {
-                connection.execute(
-                    "
-                UPDATE issue_clusters
-                SET best_patch_json = ?2
-                WHERE id = ?1
-                ",
-                    params![cluster_id, serde_json::to_string(&result.attempt)?],
-                )?;
+            refresh_issue_cluster_best_results_sqlite(&connection, cluster_id)?;
+            if successful_ready_result {
                 connection.execute(
                     "
                 UPDATE installs
@@ -3239,6 +4660,108 @@ async fn store_worker_result(
             }
         }
     }
+    Ok(())
+}
+
+fn compare_attempt_created_at(left: &PatchAttempt, right: &PatchAttempt) -> Ordering {
+    parse_timestamp(&left.created_at)
+        .cmp(&parse_timestamp(&right.created_at))
+        .then_with(|| left.created_at.cmp(&right.created_at))
+}
+
+fn select_best_attempt(candidates: &[PatchAttempt], outcome: &str) -> Option<PatchAttempt> {
+    candidates
+        .iter()
+        .filter(|attempt| attempt.state == "ready" && attempt.outcome == outcome)
+        .cloned()
+        .max_by(compare_attempt_created_at)
+}
+
+fn best_attempts_from_candidates(
+    candidates: Vec<PatchAttempt>,
+) -> (Option<PatchAttempt>, Option<PatchAttempt>) {
+    (
+        select_best_attempt(&candidates, "patch"),
+        select_best_attempt(&candidates, "triage"),
+    )
+}
+
+async fn refresh_issue_cluster_best_results(db: &Client, cluster_id: &str) -> Result<()> {
+    let rows = db
+        .query(
+            "
+        SELECT bundle_json
+        FROM patch_attempts
+        WHERE cluster_id = $1
+        ",
+            &[&cluster_id],
+        )
+        .await?;
+    let candidates = rows
+        .into_iter()
+        .filter_map(|row| {
+            let bundle_json: Value = row.get(0);
+            serde_json::from_value::<WorkerResultEnvelope>(bundle_json)
+                .ok()
+                .map(canonicalize_worker_result_envelope)
+                .map(|envelope| envelope.attempt)
+        })
+        .collect::<Vec<_>>();
+    let (best_patch, best_triage) = best_attempts_from_candidates(candidates);
+    db.execute(
+        "
+        UPDATE issue_clusters
+        SET best_patch_json = $2,
+            best_triage_json = $3
+        WHERE id = $1
+        ",
+        &[
+            &cluster_id,
+            &best_patch.as_ref().map(serde_json::to_value).transpose()?,
+            &best_triage.as_ref().map(serde_json::to_value).transpose()?,
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+fn refresh_issue_cluster_best_results_sqlite(
+    connection: &Connection,
+    cluster_id: &str,
+) -> Result<()> {
+    let mut stmt = connection.prepare(
+        "
+        SELECT bundle_json
+        FROM patch_attempts
+        WHERE cluster_id = ?1
+        ",
+    )?;
+    let rows = stmt.query_map([cluster_id], |row| row.get::<_, String>(0))?;
+    let candidates = rows
+        .filter_map(|row| {
+            row.ok()
+                .and_then(|raw| serde_json::from_str::<WorkerResultEnvelope>(&raw).ok())
+                .map(canonicalize_worker_result_envelope)
+                .map(|envelope| envelope.attempt)
+        })
+        .collect::<Vec<_>>();
+    let (best_patch, best_triage) = best_attempts_from_candidates(candidates);
+    connection.execute(
+        "
+        UPDATE issue_clusters
+        SET best_patch_json = ?2,
+            best_triage_json = ?3
+        WHERE id = ?1
+        ",
+        params![
+            cluster_id,
+            best_patch.as_ref().map(serde_json::to_string).transpose()?,
+            best_triage
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        ],
+    )?;
     Ok(())
 }
 
@@ -3560,18 +5083,33 @@ async fn upsert_issue_cluster(
     }
 }
 
-async fn next_issue_for_worker(db: &ServerDb) -> Result<Option<IssueCluster>> {
+struct WorkerCandidate {
+    issue: IssueCluster,
+    has_foreign_reports: bool,
+}
+
+async fn next_issue_for_worker(
+    db: &ServerDb,
+    worker_install_id: &str,
+) -> Result<Option<IssueCluster>> {
     match db {
         ServerDb::Postgres(db) => {
-            let row = db
-                .query_opt(
+            let rows = db
+                .query(
                     "
         SELECT id, cluster_key, kind, title, summary, package_name, source_package, ecosystem,
                severity, score, corroboration_count, quarantined, promoted, representative_json,
-               best_patch_json, last_seen
+               best_patch_json, last_seen,
+               EXISTS (
+                    SELECT 1
+                    FROM cluster_reports report
+                    WHERE report.cluster_id = issue.id
+                      AND report.install_id <> $1
+               ) AS has_foreign_reports
         FROM issue_clusters issue
         WHERE promoted = TRUE
           AND public_visible = TRUE
+          AND best_triage_json IS NULL
           AND NOT EXISTS (
                 SELECT 1
                 FROM worker_leases lease
@@ -3580,7 +5118,6 @@ async fn next_issue_for_worker(db: &ServerDb) -> Result<Option<IssueCluster>> {
                   AND lease.expires_at > NOW()
           )
         ORDER BY
-            (best_patch_json IS NOT NULL) ASC,
             CASE kind
                 WHEN 'investigation' THEN 0
                 WHEN 'crash' THEN 1
@@ -3589,34 +5126,43 @@ async fn next_issue_for_worker(db: &ServerDb) -> Result<Option<IssueCluster>> {
             END ASC,
             score DESC,
             last_seen DESC
-        LIMIT 1
+        LIMIT 64
         ",
-                    &[],
+                    &[&worker_install_id],
                 )
                 .await?;
-            row.map(issue_from_row).transpose()
+            let candidates = rows
+                .into_iter()
+                .map(worker_candidate_from_row)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(select_worker_candidate(candidates))
         }
         ServerDb::Sqlite(path) => {
             let connection = sqlite_connection(path)?;
             let now = Utc::now().to_rfc3339();
-            let row = connection
-                .query_row(
-                    "
+            let mut stmt = connection.prepare(
+                "
         SELECT id, cluster_key, kind, title, summary, package_name, source_package, ecosystem,
                severity, score, corroboration_count, quarantined, promoted, representative_json,
-               best_patch_json, last_seen
+               best_patch_json, last_seen,
+               EXISTS (
+                    SELECT 1
+                    FROM cluster_reports report
+                    WHERE report.cluster_id = issue.id
+                      AND report.install_id <> ?1
+               ) AS has_foreign_reports
         FROM issue_clusters issue
         WHERE promoted = 1
           AND public_visible = 1
+          AND best_triage_json IS NULL
           AND NOT EXISTS (
                 SELECT 1
                 FROM worker_leases lease
                 WHERE lease.cluster_id = issue.id
                   AND lease.state = 'leased'
-                  AND lease.expires_at > ?1
+                  AND lease.expires_at > ?2
           )
         ORDER BY
-            CASE WHEN best_patch_json IS NOT NULL THEN 1 ELSE 0 END ASC,
             CASE kind
                 WHEN 'investigation' THEN 0
                 WHEN 'crash' THEN 1
@@ -3625,15 +5171,61 @@ async fn next_issue_for_worker(db: &ServerDb) -> Result<Option<IssueCluster>> {
             END ASC,
             score DESC,
             last_seen DESC
-        LIMIT 1
+        LIMIT 64
         ",
-                    [now],
-                    issue_from_sqlite_row,
-                )
-                .optional()?;
-            Ok(row)
+            )?;
+            let rows = stmt.query_map([worker_install_id, now.as_str()], |row| {
+                let issue = issue_from_sqlite_row(row)?;
+                let has_foreign_reports = row.get::<_, i64>(16)? != 0;
+                Ok(WorkerCandidate {
+                    issue,
+                    has_foreign_reports,
+                })
+            })?;
+            let candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(select_worker_candidate(candidates))
         }
     }
+}
+
+fn select_worker_candidate(candidates: Vec<WorkerCandidate>) -> Option<IssueCluster> {
+    candidates
+        .iter()
+        .find(|candidate| {
+            candidate.has_foreign_reports && issue_is_available_for_worker(&candidate.issue)
+        })
+        .map(|candidate| candidate.issue.clone())
+        .or_else(|| {
+            candidates
+                .into_iter()
+                .find(|candidate| issue_is_available_for_worker(&candidate.issue))
+                .map(|candidate| candidate.issue)
+        })
+}
+
+fn issue_is_available_for_worker(issue: &IssueCluster) -> bool {
+    match issue.best_patch.as_ref() {
+        None => true,
+        Some(best_patch) => patch_attempt_needs_worker_refresh(best_patch),
+    }
+}
+
+fn patch_attempt_needs_worker_refresh(attempt: &PatchAttempt) -> bool {
+    if attempt.state != "ready" || attempt.outcome != "patch" {
+        return false;
+    }
+    match patch_attempt_fixer_version(attempt) {
+        Some(version) => is_binary_upgrade_available(version, current_binary_version()),
+        None => true,
+    }
+}
+
+fn patch_attempt_fixer_version(attempt: &PatchAttempt) -> Option<&str> {
+    attempt
+        .details
+        .get("worker_fixer_version")
+        .and_then(Value::as_str)
+        .or_else(|| attempt.details.get("fixer_version").and_then(Value::as_str))
 }
 
 fn issue_from_row(row: Row) -> Result<IssueCluster> {
@@ -3660,6 +5252,15 @@ fn issue_from_row(row: Row) -> Result<IssueCluster> {
         representative,
         best_patch,
         last_seen: last_seen.to_rfc3339(),
+    })
+}
+
+fn worker_candidate_from_row(row: Row) -> Result<WorkerCandidate> {
+    let has_foreign_reports: bool = row.get(16);
+    let issue = issue_from_row(row)?;
+    Ok(WorkerCandidate {
+        issue,
+        has_foreign_reports,
     })
 }
 
@@ -3715,6 +5316,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 (SELECT COUNT(*) FROM issue_clusters WHERE promoted = TRUE),
                 (SELECT COUNT(*) FROM issue_clusters WHERE promoted = FALSE),
                 (SELECT COUNT(*) FROM issue_clusters WHERE best_patch_json IS NOT NULL),
+                (SELECT COUNT(*) FROM issue_clusters WHERE best_patch_json IS NULL AND best_triage_json IS NOT NULL),
                 (SELECT MAX(received_at) FROM submissions)
             ",
                     &[],
@@ -3722,7 +5324,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 .await
                 .map_err(ApiError::internal)?;
             let last_submission_at = row
-                .get::<_, Option<DateTime<Utc>>>(5)
+                .get::<_, Option<DateTime<Utc>>>(6)
                 .map(|value| value.to_rfc3339());
             Ok(DashboardSnapshot {
                 install_count: row.get(0),
@@ -3730,6 +5332,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 promoted_issue_count: row.get(2),
                 quarantined_issue_count: row.get(3),
                 ready_patch_count: row.get(4),
+                ready_triage_count: row.get(5),
                 last_submission_at,
                 top_issues: load_public_issues(db, 8).await?,
             })
@@ -3763,6 +5366,13 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                     |row| row.get(0),
                 )
                 .map_err(ApiError::internal)?;
+            let ready_triage_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM issue_clusters WHERE best_patch_json IS NULL AND best_triage_json IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
             let last_submission_at = connection
                 .query_row("SELECT MAX(received_at) FROM submissions", [], |row| {
                     row.get::<_, Option<String>>(0)
@@ -3776,6 +5386,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 promoted_issue_count,
                 quarantined_issue_count,
                 ready_patch_count,
+                ready_triage_count,
                 last_submission_at,
                 top_issues: load_public_issues(db, 8).await?,
             })
@@ -3790,7 +5401,9 @@ async fn load_public_issues(db: &ServerDb, limit: i64) -> Result<Vec<PublicIssue
                 .query(
                     "
             SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
-                   severity, score, corroboration_count, (best_patch_json IS NOT NULL) AS best_patch_available,
+                   severity, score, corroboration_count,
+                   (best_patch_json IS NOT NULL) AS best_patch_available,
+                   (best_triage_json IS NOT NULL) AS best_triage_available,
                    last_seen
             FROM issue_clusters
             WHERE promoted = TRUE AND public_visible = TRUE
@@ -3809,7 +5422,9 @@ async fn load_public_issues(db: &ServerDb, limit: i64) -> Result<Vec<PublicIssue
                 .prepare(
                     "
             SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
-                   severity, score, corroboration_count, (best_patch_json IS NOT NULL) AS best_patch_available,
+                   severity, score, corroboration_count,
+                   (best_patch_json IS NOT NULL) AS best_patch_available,
+                   (best_triage_json IS NOT NULL) AS best_triage_available,
                    last_seen
             FROM issue_clusters
             WHERE promoted = 1 AND public_visible = 1
@@ -3834,7 +5449,9 @@ async fn load_public_issue(db: &ServerDb, id: String) -> Result<PublicIssue, Api
                 .query_opt(
                     "
             SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
-                   severity, score, corroboration_count, (best_patch_json IS NOT NULL) AS best_patch_available,
+                   severity, score, corroboration_count,
+                   (best_patch_json IS NOT NULL) AS best_patch_available,
+                   (best_triage_json IS NOT NULL) AS best_triage_available,
                    last_seen
             FROM issue_clusters
             WHERE id = $1 AND promoted = TRUE AND public_visible = TRUE
@@ -3854,7 +5471,9 @@ async fn load_public_issue(db: &ServerDb, id: String) -> Result<PublicIssue, Api
                 .query_row(
                     "
             SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
-                   severity, score, corroboration_count, (best_patch_json IS NOT NULL) AS best_patch_available,
+                   severity, score, corroboration_count,
+                   (best_patch_json IS NOT NULL) AS best_patch_available,
+                   (best_triage_json IS NOT NULL) AS best_triage_available,
                    last_seen
             FROM issue_clusters
             WHERE id = ?1 AND promoted = 1 AND public_visible = 1
@@ -3875,6 +5494,7 @@ async fn load_public_issue_detail(
 ) -> Result<PublicIssueDetail, ApiError> {
     let issue = load_public_issue(db, id.clone()).await?;
     let best_patch = load_public_issue_best_patch(db, &id).await?;
+    let best_triage = load_public_issue_best_triage(db, &id).await?;
     let best_patch_diff_url = public_best_patch_diff_url(&id, best_patch.as_ref());
     let attempts = load_public_attempts(db, &id, 10).await?;
     Ok(PublicIssueDetail {
@@ -3889,8 +5509,13 @@ async fn load_public_issue_detail(
         score: issue.score,
         corroboration_count: issue.corroboration_count,
         best_patch_available: issue.best_patch_available,
+        best_triage_available: issue.best_triage_available,
         best_patch_diff_url,
         best_patch,
+        best_triage_handoff: best_triage
+            .as_ref()
+            .and_then(|attempt| attempt.handoff.clone()),
+        best_triage,
         last_seen: issue.last_seen,
         attempts,
     })
@@ -3957,6 +5582,67 @@ async fn load_public_issue_best_patch(
     }
 }
 
+async fn load_public_issue_best_triage(
+    db: &ServerDb,
+    id: &str,
+) -> Result<Option<PublicAttempt>, ApiError> {
+    match db {
+        ServerDb::Postgres(db) => {
+            let row = db
+                .query_opt(
+                    "
+            SELECT best_triage_json
+            FROM issue_clusters
+            WHERE id = $1
+              AND promoted = TRUE
+              AND public_visible = TRUE
+              AND best_triage_json IS NOT NULL
+            ",
+                    &[&id],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            row.map(|row| {
+                let best_triage_json: Value = row.get(0);
+                serde_json::from_value::<PatchAttempt>(best_triage_json)
+                    .map(public_attempt_from_patch_attempt)
+                    .map_err(ApiError::internal)
+            })
+            .transpose()
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            connection
+                .query_row(
+                    "
+            SELECT best_triage_json
+            FROM issue_clusters
+            WHERE id = ?1
+              AND promoted = 1
+              AND public_visible = 1
+              AND best_triage_json IS NOT NULL
+            ",
+                    [id],
+                    |row| {
+                        let best_triage =
+                            serde_json::from_str::<PatchAttempt>(&row.get::<_, String>(0)?)
+                                .map(public_attempt_from_patch_attempt)
+                                .map_err(|error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        0,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                })?;
+                        Ok(best_triage)
+                    },
+                )
+                .optional()
+                .map_err(ApiError::internal)
+        }
+    }
+}
+
 async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatchEntry>, ApiError> {
     let mut patches = match db {
         ServerDb::Postgres(db) => {
@@ -4011,6 +5697,62 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
     Ok(patches)
 }
 
+async fn load_public_triage(db: &ServerDb, limit: i64) -> Result<Vec<PublicTriageEntry>, ApiError> {
+    let mut triage = match db {
+        ServerDb::Postgres(db) => {
+            let rows = db
+                .query(
+                    "
+            SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
+                   severity, score, corroboration_count, best_triage_json, last_seen
+            FROM issue_clusters
+            WHERE promoted = TRUE
+              AND public_visible = TRUE
+              AND best_patch_json IS NULL
+              AND best_triage_json IS NOT NULL
+            ORDER BY last_seen DESC, score DESC
+            LIMIT $1
+            ",
+                    &[&limit],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            rows.into_iter()
+                .map(public_triage_from_row)
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            let mut stmt = connection
+                .prepare(
+                    "
+            SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
+                   severity, score, corroboration_count, best_triage_json, last_seen
+            FROM issue_clusters
+            WHERE promoted = 1
+              AND public_visible = 1
+              AND best_patch_json IS NULL
+              AND best_triage_json IS NOT NULL
+            ORDER BY last_seen DESC, score DESC
+            LIMIT ?1
+            ",
+                )
+                .map_err(ApiError::internal)?;
+            let rows = stmt
+                .query_map([limit], public_triage_from_sqlite_row)
+                .map_err(ApiError::internal)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(ApiError::internal)?
+        }
+    };
+    triage.sort_by(|left, right| {
+        parse_timestamp(&right.best_triage.created_at)
+            .cmp(&parse_timestamp(&left.best_triage.created_at))
+            .then_with(|| right.score.cmp(&left.score))
+    });
+    Ok(triage)
+}
+
 async fn load_public_attempts(
     db: &ServerDb,
     cluster_id: &str,
@@ -4056,7 +5798,7 @@ async fn load_public_attempts(
 }
 
 fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
-    let last_seen: DateTime<Utc> = row.get(11);
+    let last_seen: DateTime<Utc> = row.get(12);
     Ok(PublicIssue {
         id: row.get(0),
         kind: row.get(1),
@@ -4069,6 +5811,7 @@ fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
         score: row.get(8),
         corroboration_count: row.get(9),
         best_patch_available: row.get(10),
+        best_triage_available: row.get(11),
         last_seen: last_seen.to_rfc3339(),
     })
 }
@@ -4097,6 +5840,33 @@ fn public_patch_from_row(row: Row) -> Result<PublicPatchEntry, ApiError> {
     })
 }
 
+fn public_triage_from_row(row: Row) -> Result<PublicTriageEntry, ApiError> {
+    let best_triage_json: Value = row.get(10);
+    let best_triage = serde_json::from_value::<PatchAttempt>(best_triage_json)
+        .map(public_attempt_from_patch_attempt)
+        .map_err(ApiError::internal)?;
+    let handoff = best_triage
+        .handoff
+        .clone()
+        .ok_or_else(|| ApiError::internal("triage result missing public handoff"))?;
+    let last_seen: DateTime<Utc> = row.get(11);
+    Ok(PublicTriageEntry {
+        id: row.get(0),
+        kind: row.get(1),
+        title: row.get(2),
+        summary: row.get(3),
+        package_name: row.get(4),
+        source_package: row.get(5),
+        ecosystem: row.get(6),
+        severity: row.get(7),
+        score: row.get(8),
+        corroboration_count: row.get(9),
+        last_seen: last_seen.to_rfc3339(),
+        best_triage,
+        handoff,
+    })
+}
+
 fn public_attempt_from_row(row: Row) -> Result<PublicAttempt, ApiError> {
     let bundle_json: Value = row.get(0);
     let envelope =
@@ -4117,7 +5887,8 @@ fn public_issue_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pub
         score: row.get(8)?,
         corroboration_count: row.get(9)?,
         best_patch_available: row.get::<_, i64>(10)? != 0,
-        last_seen: row.get(11)?,
+        best_triage_available: row.get::<_, i64>(11)? != 0,
+        last_seen: row.get(12)?,
     })
 }
 
@@ -4149,6 +5920,40 @@ fn public_patch_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pub
     })
 }
 
+fn public_triage_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicTriageEntry> {
+    let best_triage = serde_json::from_str::<PatchAttempt>(&row.get::<_, String>(10)?)
+        .map(public_attempt_from_patch_attempt)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let handoff = best_triage.handoff.clone().ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            10,
+            rusqlite::types::Type::Text,
+            "triage result missing public handoff".into(),
+        )
+    })?;
+    Ok(PublicTriageEntry {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        title: row.get(2)?,
+        summary: row.get(3)?,
+        package_name: row.get(4)?,
+        source_package: row.get(5)?,
+        ecosystem: row.get(6)?,
+        severity: row.get(7)?,
+        score: row.get(8)?,
+        corroboration_count: row.get(9)?,
+        last_seen: row.get(11)?,
+        best_triage,
+        handoff,
+    })
+}
+
 fn public_attempt_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicAttempt> {
     let raw: String = row.get(0)?;
     let envelope = serde_json::from_str::<WorkerResultEnvelope>(&raw).map_err(|error| {
@@ -4158,11 +5963,9 @@ fn public_attempt_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<P
 }
 
 fn public_attempt_from_patch_attempt(attempt: PatchAttempt) -> PublicAttempt {
-    let published_session = attempt
-        .details
-        .get("published_session")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<PublishedAttemptSession>(value).ok());
+    let attempt = canonicalize_patch_attempt(attempt);
+    let published_session = published_session_from_attempt_details(&attempt.details);
+    let handoff = public_triage_handoff_from_attempt(&attempt, published_session.as_ref());
     PublicAttempt {
         outcome: attempt.outcome,
         state: attempt.state,
@@ -4170,6 +5973,7 @@ fn public_attempt_from_patch_attempt(attempt: PatchAttempt) -> PublicAttempt {
         validation_status: attempt.validation_status,
         created_at: attempt.created_at,
         published_session,
+        handoff,
     }
 }
 
@@ -4188,6 +5992,490 @@ fn public_best_patch_diff_url(
     public_attempt_diff(best_patch?).map(|_| format!("/issues/{issue_id}/best.patch"))
 }
 
+fn public_best_patch_raw_diff_url(
+    issue_id: &str,
+    best_patch: Option<&PublicAttempt>,
+) -> Option<String> {
+    public_attempt_diff(best_patch?).map(|_| format!("/issues/{issue_id}/best.diff"))
+}
+
+fn build_public_patch_cover(
+    title: &str,
+    summary: &str,
+    package_name: Option<&str>,
+    source_package: Option<&str>,
+    corroboration_count: i64,
+    last_seen: &str,
+    attempt: &PublicAttempt,
+) -> Option<PublicPatchCover> {
+    let diff = public_attempt_diff(attempt)?;
+    let changed_files = patch_changed_files(diff);
+    let issue_phrase = concise_issue_phrase(summary, title);
+    let subject = patch_subject(package_name, source_package, &changed_files, &issue_phrase);
+    let why = patch_rationale(attempt, diff, &changed_files, &issue_phrase);
+    let validation_notes =
+        patch_validation_notes(corroboration_count, last_seen, attempt, &changed_files);
+    Some(PublicPatchCover {
+        subject,
+        problem: ensure_sentence(summary),
+        why,
+        changed_files,
+        validation_notes,
+    })
+}
+
+fn render_public_patch_email(issue: &PublicIssueDetail, attempt: &PublicAttempt) -> Option<String> {
+    let diff = public_attempt_diff(attempt)?;
+    let cover = build_public_patch_cover(
+        &issue.title,
+        &issue.summary,
+        issue.package_name.as_deref(),
+        issue.source_package.as_deref(),
+        issue.corroboration_count,
+        &issue.last_seen,
+        attempt,
+    )?;
+    let mut patch = String::new();
+    let _ = write!(
+        patch,
+        "From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\nFrom: Fixer <fixer@maumap.com>\nDate: {}\nSubject: [PATCH] {}\n\nProblem:\n{}\n\nWhy this patch is being proposed:\n{}\n",
+        format_patch_email_date(&attempt.created_at),
+        cover.subject,
+        cover.problem,
+        cover.why
+    );
+    if !cover.changed_files.is_empty() {
+        patch.push_str("\nFiles touched:\n");
+        for path in &cover.changed_files {
+            let _ = writeln!(patch, "- {}", path);
+        }
+    }
+    if !cover.validation_notes.is_empty() {
+        patch.push_str("\nValidation:\n");
+        for note in &cover.validation_notes {
+            let _ = writeln!(patch, "- {}", note);
+        }
+    }
+    let _ = write!(
+        patch,
+        "\nIssue: https://fixer.maumap.com/issues/{}\n\n---\n{}",
+        issue.id, diff
+    );
+    Some(patch)
+}
+
+fn patch_changed_files(diff: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for line in diff.lines() {
+        let Some(path) = line.strip_prefix("+++ b/") else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() || path == "/dev/null" {
+            continue;
+        }
+        if !files.iter().any(|existing| existing == path) {
+            files.push(path.to_string());
+        }
+    }
+    files
+}
+
+fn patch_subject(
+    package_name: Option<&str>,
+    source_package: Option<&str>,
+    changed_files: &[String],
+    issue_phrase: &str,
+) -> String {
+    let package = source_package
+        .or(package_name)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("fixer");
+    let subject = if let Some(file_name) = changed_files
+        .first()
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+    {
+        format!("{package}: update {file_name} for {issue_phrase}")
+    } else {
+        format!("{package}: address {issue_phrase}")
+    };
+    truncate_patch_subject(&subject, 72)
+}
+
+fn concise_issue_phrase(summary: &str, title: &str) -> String {
+    let clause = summary
+        .split([':', '.'])
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(title)
+        .trim();
+    let simplified = clause
+        .split_once(" is ")
+        .map(|(_, rest)| rest)
+        .or_else(|| clause.split_once(" has ").map(|(_, rest)| rest))
+        .unwrap_or(clause)
+        .trim();
+    for prefix in [
+        "stuck in a likely ",
+        "stuck in an ",
+        "stuck in a ",
+        "stuck in ",
+        "showing a likely ",
+        "showing ",
+        "a likely ",
+        "likely ",
+    ] {
+        if simplified
+            .to_ascii_lowercase()
+            .starts_with(&prefix.to_ascii_lowercase())
+        {
+            return ensure_sentence(simplified[prefix.len()..].trim())
+                .trim_end_matches('.')
+                .to_string();
+        }
+    }
+    ensure_sentence(simplified)
+        .trim_end_matches('.')
+        .to_string()
+}
+
+fn patch_rationale(
+    attempt: &PublicAttempt,
+    diff: &str,
+    changed_files: &[String],
+    issue_phrase: &str,
+) -> String {
+    if let Some(rationale) = extract_added_comment_rationale(diff) {
+        return ensure_sentence(&rationale);
+    }
+    if let Some(response) = attempt
+        .published_session
+        .as_ref()
+        .and_then(|session| session.response.as_deref())
+        .and_then(meaningful_patch_response)
+    {
+        return ensure_sentence(&response);
+    }
+    if is_informative_patch_summary(&attempt.summary) {
+        return ensure_sentence(&attempt.summary);
+    }
+    let touched = if changed_files.is_empty() {
+        "the affected code paths".to_string()
+    } else {
+        format!("the affected code in {}", changed_files.join(", "))
+    };
+    ensure_sentence(&format!(
+        "Fixer observed {} and is proposing a concrete upstream starting point by updating {}",
+        issue_phrase, touched
+    ))
+}
+
+fn patch_validation_notes(
+    corroboration_count: i64,
+    last_seen: &str,
+    attempt: &PublicAttempt,
+    changed_files: &[String],
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    let status = attempt
+        .validation_status
+        .as_deref()
+        .unwrap_or(&attempt.state);
+    notes.push(format!(
+        "Fixer marked this proposal `{}` on {}.",
+        status,
+        format_timestamp(&attempt.created_at)
+    ));
+    notes.push(format!(
+        "The underlying issue cluster has {} report(s) and was last seen {}.",
+        corroboration_count,
+        format_timestamp(last_seen)
+    ));
+    if !changed_files.is_empty() {
+        notes.push(format!(
+            "The published diff touches {}.",
+            changed_files.join(", ")
+        ));
+    }
+    notes
+}
+
+fn extract_added_comment_rationale(diff: &str) -> Option<String> {
+    let mut block = Vec::new();
+    let mut in_block = false;
+    for line in diff.lines() {
+        let Some(rest) = line.strip_prefix('+') else {
+            if in_block && !block.is_empty() {
+                break;
+            }
+            continue;
+        };
+        let trimmed = rest.trim_start();
+        if !in_block {
+            if trimmed.starts_with("/*") {
+                in_block = true;
+                let fragment = trim_added_comment_fragment(trimmed);
+                if !fragment.is_empty() {
+                    block.push(fragment);
+                }
+                if trimmed.contains("*/") {
+                    break;
+                }
+            } else if let Some(comment) = trimmed.strip_prefix("//") {
+                let comment = comment.trim();
+                if !comment.is_empty() {
+                    return Some(comment.to_string());
+                }
+            }
+            continue;
+        }
+        let fragment = trim_added_comment_fragment(trimmed);
+        if !fragment.is_empty() {
+            block.push(fragment);
+        }
+        if trimmed.contains("*/") {
+            break;
+        }
+    }
+    if block.is_empty() {
+        None
+    } else {
+        Some(block.join(" "))
+    }
+}
+
+fn trim_added_comment_fragment(text: &str) -> String {
+    text.trim()
+        .trim_start_matches("/*")
+        .trim_start_matches('*')
+        .trim_end_matches("*/")
+        .trim()
+        .to_string()
+}
+
+fn meaningful_patch_response(response: &str) -> Option<String> {
+    response
+        .split("\n\n")
+        .map(str::trim)
+        .find(|paragraph| {
+            !paragraph.is_empty()
+                && !paragraph.starts_with("## ")
+                && !paragraph.starts_with("[Patch Pass]")
+                && !paragraph.starts_with("[Review Pass]")
+                && !paragraph.starts_with("[Refinement Pass]")
+        })
+        .map(str::to_string)
+}
+
+fn is_informative_patch_summary(summary: &str) -> bool {
+    let lowered = summary.to_ascii_lowercase();
+    ![
+        "patch proposal created locally",
+        "review it and submit it upstream",
+        "diagnosis report and patch proposal were created locally",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn ensure_sentence(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if matches!(trimmed.chars().last(), Some('.' | '!' | '?')) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
+    }
+}
+
+fn truncate_patch_subject(subject: &str, max_len: usize) -> String {
+    if subject.len() <= max_len {
+        return subject.to_string();
+    }
+    let mut boundary = max_len.saturating_sub(1);
+    while boundary > 0 && !subject.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let truncated = subject[..boundary].trim_end();
+    format!("{truncated}…")
+}
+
+fn format_patch_email_date(timestamp: &str) -> String {
+    DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.to_rfc2822())
+        .unwrap_or_else(|_| timestamp.to_string())
+}
+
+fn published_session_from_attempt_details(details: &Value) -> Option<PublishedAttemptSession> {
+    details
+        .get("published_session")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<PublishedAttemptSession>(value).ok())
+}
+
+fn attempt_response_text(attempt: &PatchAttempt) -> Option<&str> {
+    attempt
+        .details
+        .get("published_session")
+        .and_then(|value| value.get("response"))
+        .and_then(Value::as_str)
+}
+
+fn attempt_diff_text(attempt: &PatchAttempt) -> Option<&str> {
+    attempt
+        .details
+        .get("published_session")
+        .and_then(|value| value.get("diff"))
+        .and_then(Value::as_str)
+        .filter(|diff| !diff.trim().is_empty())
+}
+
+fn attempt_has_public_diff(attempt: &PatchAttempt) -> bool {
+    attempt_diff_text(attempt).is_some()
+}
+
+fn response_marks_successful_triage(response: &str) -> bool {
+    [
+        "No source change landed.",
+        "outside this repository",
+        "outside this source tree",
+        "speculative and unsafe",
+        "no safe code change was made",
+    ]
+    .iter()
+    .any(|marker| response.contains(marker))
+}
+
+fn inferred_triage_reason(attempt: &PatchAttempt) -> Option<String> {
+    if let Some(reason) = attempt
+        .details
+        .get("report_only_reason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(reason.to_string());
+    }
+    let response = attempt_response_text(attempt)?;
+    if !response_marks_successful_triage(response) {
+        return None;
+    }
+    if response.contains("outside this repository") || response.contains("outside this source tree")
+    {
+        return Some("likely-external-root-cause".to_string());
+    }
+    Some("no-safe-local-change".to_string())
+}
+
+fn canonical_triage_summary(summary: &str) -> String {
+    summary
+        .replace(
+            "A diagnosis report and patch proposal were created locally.",
+            "A diagnosis report and external handoff were created locally.",
+        )
+        .replace(
+            "Patch proposal created locally. Review it and submit it upstream if it looks correct.",
+            "A diagnosis and external handoff were created locally. Review it and report it to the likely owner.",
+        )
+}
+
+fn canonicalize_patch_attempt(mut attempt: PatchAttempt) -> PatchAttempt {
+    if attempt.state != "ready" {
+        return attempt;
+    }
+    if attempt_has_public_diff(&attempt) {
+        attempt.outcome = "patch".to_string();
+        return attempt;
+    }
+    if let Some(reason) = inferred_triage_reason(&attempt) {
+        attempt.outcome = "triage".to_string();
+        attempt.summary = canonical_triage_summary(&attempt.summary);
+        if let Some(object) = attempt.details.as_object_mut() {
+            object
+                .entry("report_only_reason".to_string())
+                .or_insert_with(|| json!(reason));
+        }
+        return attempt;
+    }
+    if attempt.outcome == "patch" {
+        attempt.outcome = "report".to_string();
+    }
+    attempt
+}
+
+fn canonicalize_worker_result_envelope(mut result: WorkerResultEnvelope) -> WorkerResultEnvelope {
+    result.attempt = canonicalize_patch_attempt(result.attempt);
+    result
+}
+
+fn public_triage_handoff_from_attempt(
+    attempt: &PatchAttempt,
+    published_session: Option<&PublishedAttemptSession>,
+) -> Option<PublicTriageHandoff> {
+    let reason = inferred_triage_reason(attempt)?;
+    let target = attempt
+        .details
+        .get("handoff")
+        .and_then(|value| value.get("target"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| infer_external_target_from_response(published_session?.response.as_deref()?))
+        .unwrap_or_else(|| {
+            "external dependency or workload outside the current source tree".to_string()
+        });
+    let report_url = attempt
+        .details
+        .get("handoff")
+        .and_then(|value| value.get("report_url"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .filter(|value| !value.trim().is_empty());
+    let next_steps = attempt
+        .details
+        .get("handoff")
+        .and_then(|value| value.get("next_steps"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty())
+        .unwrap_or_else(|| default_triage_next_steps(&target));
+    Some(PublicTriageHandoff {
+        reason,
+        target,
+        report_url,
+        next_steps,
+    })
+}
+
+fn infer_external_target_from_response(response: &str) -> Option<String> {
+    let shared_object_re =
+        Regex::new(r"\b([A-Za-z0-9_.+-]+\.so)\b").expect("valid shared object regex");
+    shared_object_re
+        .captures(response)
+        .and_then(|captures| captures.get(1))
+        .map(|value| format!("module `{}` or the workload driving it", value.as_str()))
+}
+
+fn default_triage_next_steps(target: &str) -> Vec<String> {
+    vec![
+        format!(
+            "Confirm the hotspot still points at {target} with a fresh perf sample before filing the bug."
+        ),
+        "Capture the actual hot backend or child process rather than the parent service wrapper if the issue recurs.".to_string(),
+        format!(
+            "Map {target} to its owning package or project and file an upstream or distro bug with the summarized evidence."
+        ),
+        "If the owner is still unclear, collect another short strace plus `/proc/<pid>/maps` at the moment of the spike.".to_string(),
+    ]
+}
+
 #[derive(Debug, Clone)]
 struct PublicIssueFields {
     title: String,
@@ -4199,6 +6487,7 @@ fn cluster_key_for(item: &SharedOpportunity) -> String {
     match item.finding.kind.as_str() {
         "crash" => normalized_crash_cluster_key(item),
         "warning" => normalized_warning_cluster_key(item),
+        "investigation" => normalized_investigation_cluster_key(item),
         _ => hash_text(format!(
             "{}|{}|{}|{}",
             item.finding.kind,
@@ -4309,6 +6598,91 @@ fn normalized_warning_cluster_key(item: &SharedOpportunity) -> String {
     ))
 }
 
+fn normalized_investigation_cluster_key(item: &SharedOpportunity) -> String {
+    let subsystem = item
+        .finding
+        .details
+        .get("subsystem")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    match subsystem {
+        "stuck-process" => {
+            let target = normalized_investigation_target_name(item);
+            let classification = item
+                .finding
+                .details
+                .get("loop_classification")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let wchan = item
+                .finding
+                .details
+                .get("wchan")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("-");
+            let stack_signature = item
+                .finding
+                .details
+                .get("stack_excerpt")
+                .and_then(Value::as_str)
+                .and_then(|excerpt| excerpt.lines().next())
+                .map(normalize_stack_frame)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "-".to_string());
+            hash_text(format!(
+                "investigation|stuck-process|{}|{}|{}|{}",
+                target, classification, wchan, stack_signature,
+            ))
+        }
+        "runaway-process" => {
+            let target = normalized_investigation_target_name(item);
+            let classification = item
+                .finding
+                .details
+                .get("loop_classification")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let hot_symbol = item
+                .finding
+                .details
+                .get("top_hot_symbols")
+                .and_then(Value::as_array)
+                .and_then(|symbols| symbols.first())
+                .and_then(Value::as_str)
+                .map(normalize_stack_frame)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "-".to_string());
+            let dominant_sequence = item
+                .finding
+                .details
+                .get("dominant_sequence")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "-".to_string());
+            hash_text(format!(
+                "investigation|runaway-process|{}|{}|{}|{}",
+                target, classification, hot_symbol, dominant_sequence,
+            ))
+        }
+        _ => hash_text(format!(
+            "investigation|{}|{}|{}|{}",
+            subsystem,
+            item.finding.package_name.as_deref().unwrap_or("-"),
+            item.opportunity.ecosystem.as_deref().unwrap_or("-"),
+            sanitize_public_text(&item.opportunity.summary),
+        )),
+    }
+}
+
 fn normalized_primary_stack_signature(item: &SharedOpportunity) -> Option<String> {
     let frames = item
         .finding
@@ -4326,10 +6700,52 @@ fn normalized_primary_stack_signature(item: &SharedOpportunity) -> Option<String
 }
 
 fn build_public_issue_fields(item: &SharedOpportunity) -> PublicIssueFields {
+    if let Some(fields) = investigation_public_issue_fields(item) {
+        return fields;
+    }
     PublicIssueFields {
         title: sanitize_public_text(&item.opportunity.title),
         summary: sanitize_public_text(&item.opportunity.summary),
         visible: is_publicly_visible(item),
+    }
+}
+
+fn investigation_public_issue_fields(item: &SharedOpportunity) -> Option<PublicIssueFields> {
+    if item.finding.kind != "investigation" {
+        return None;
+    }
+    let subsystem = item
+        .finding
+        .details
+        .get("subsystem")
+        .and_then(Value::as_str)?;
+    match subsystem {
+        "stuck-process" => {
+            let target = normalized_investigation_target_name(item);
+            let classification = item
+                .finding
+                .details
+                .get("loop_classification")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown-uninterruptible-wait")
+                .replace('-', " ");
+            let wait_point = item
+                .finding
+                .details
+                .get("wchan")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("an unknown wait point");
+            Some(PublicIssueFields {
+                title: format!("Stuck D-state investigation for {target}"),
+                summary: format!(
+                    "{} shows a repeated `D`-state wait, likely blocked in {} via {}.",
+                    target, classification, wait_point
+                ),
+                visible: is_publicly_visible(item),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -4394,6 +6810,45 @@ fn normalize_proc_path(raw: &str) -> String {
 fn normalize_stack_frame(frame: &str) -> String {
     let offset_re = Regex::new(r"\+0x[0-9a-fA-F]+").expect("valid frame offset regex");
     sanitize_public_text(&offset_re.replace_all(frame, "").to_string())
+}
+
+fn normalized_investigation_target_name(item: &SharedOpportunity) -> String {
+    let path_target = item
+        .finding
+        .details
+        .get("profile_target")
+        .and_then(|value| value.get("path"))
+        .and_then(Value::as_str)
+        .map(file_name_or_self)
+        .filter(|value| !value.trim().is_empty());
+    let named_target = item
+        .finding
+        .details
+        .get("profile_target")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| item.finding.artifact_name.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .map(normalize_kernel_worker_target_name);
+    path_target
+        .map(ToString::to_string)
+        .or(named_target)
+        .or_else(|| item.finding.package_name.clone())
+        .unwrap_or_else(|| sanitize_public_text(&item.opportunity.title))
+}
+
+fn normalize_kernel_worker_target_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("kworker") {
+        return sanitize_public_text(trimmed);
+    }
+    if let Some((_, suffix)) = trimmed.split_once('+') {
+        let suffix = suffix.trim();
+        if !suffix.is_empty() {
+            return format!("kworker+{}", sanitize_public_text(suffix));
+        }
+    }
+    "kworker".to_string()
 }
 
 fn normalize_kernel_warning_message(raw: &str) -> String {
@@ -4478,6 +6933,7 @@ sudo apt install fixer"
             <div class="hero-actions">
                 <a class="button primary" href="/issues">Browse promoted issues</a>
                 <a class="button" href="/patches">Successful patches</a>
+                <a class="button" href="/triage">Successful triage</a>
                 <a class="button" href="{github_url}">GitHub</a>
                 <a class="button" href="{apt_repo_url}">APT repository</a>
             </div>
@@ -4499,6 +6955,10 @@ sudo apt install fixer"
             <article class="panel stat">
                 <div class="stat-value">{}</div>
                 <div class="stat-label">Ready patch attempts</div>
+            </article>
+            <article class="panel stat">
+                <div class="stat-value">{}</div>
+                <div class="stat-label">Successful triage handoffs</div>
             </article>
         </section>
 
@@ -4533,6 +6993,7 @@ sudo apt install fixer"
         snapshot.submission_count,
         snapshot.promoted_issue_count,
         snapshot.ready_patch_count,
+        snapshot.ready_triage_count,
         html_escape(PRIVACY_WARNING),
         html_escape(&apt_snippet),
     );
@@ -4543,6 +7004,41 @@ sudo apt install fixer"
         NavPage::Home,
         body,
         snapshot.quarantined_issue_count,
+    )
+}
+
+fn render_triage_page(entries: &[PublicTriageEntry]) -> String {
+    let triage_markup = if entries.is_empty() {
+        "<p class=\"fine-print\">No successful public triage handoffs are available yet.</p>"
+            .to_string()
+    } else {
+        entries
+            .iter()
+            .map(render_public_triage_card)
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let body = format!(
+        r#"
+        <section class="hero">
+            <p class="tag">Public triage board</p>
+            <h1>Successful triage</h1>
+            <p class="lede">These issues have a credible public diagnosis and clear next steps, but no honest diff-backed fix in the current source tree. Each card preserves the handoff target so repeat sightings can converge on the real owner.</p>
+            <p class="fine-print">Public JSON: <a href="/v1/triage">/v1/triage</a></p>
+        </section>
+
+        <section class="panel section">
+            <h2>Ready handoffs</h2>
+            <div class="issue-list">{triage_markup}</div>
+        </section>
+        "#
+    );
+    render_page(
+        "Fixer Triage",
+        "Successful public Fixer triage handoffs",
+        NavPage::Triage,
+        body,
+        0,
     )
 }
 
@@ -4615,7 +7111,7 @@ fn render_patches_page(patches: &[PublicPatchEntry]) -> String {
 }
 
 fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
-    let best_patch_markup = render_best_patch_panel(issue);
+    let best_result_markup = render_best_result_panel(issue);
     let attempts_markup = if issue.attempts.is_empty() {
         "<p class=\"fine-print\">No public attempts have been published for this issue yet.</p>"
             .to_string()
@@ -4655,11 +7151,12 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
             issue.score,
             issue.corroboration_count,
             issue.best_patch_available,
+            issue.best_triage_available,
         ),
         html_escape(&format_timestamp(&issue.last_seen)),
         issue.id,
         issue.id,
-        best_patch_markup,
+        best_result_markup,
         attempts_markup,
     );
     render_page(
@@ -4671,16 +7168,33 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
     )
 }
 
-fn render_best_patch_panel(issue: &PublicIssueDetail) -> String {
+fn render_best_result_panel(issue: &PublicIssueDetail) -> String {
+    if let Some(panel) = render_best_patch_panel(issue) {
+        return panel;
+    }
+    render_best_triage_panel(issue).unwrap_or_default()
+}
+
+fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
     let Some(best_patch) = issue.best_patch.as_ref() else {
-        return String::new();
+        return None;
     };
     let Some(diff) = public_attempt_diff(best_patch) else {
-        return String::new();
+        return None;
     };
-    let Some(diff_url) = issue.best_patch_diff_url.as_deref() else {
-        return String::new();
+    let Some(patch_url) = issue.best_patch_diff_url.as_deref() else {
+        return None;
     };
+    let raw_diff_url = public_best_patch_raw_diff_url(&issue.id, Some(best_patch));
+    let cover = build_public_patch_cover(
+        &issue.title,
+        &issue.summary,
+        issue.package_name.as_deref(),
+        issue.source_package.as_deref(),
+        issue.corroboration_count,
+        &issue.last_seen,
+        best_patch,
+    )?;
     let validation = best_patch
         .validation_status
         .as_deref()
@@ -4691,14 +7205,58 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> String {
             )
         })
         .unwrap_or_default();
-    format!(
+    let changed_files = if cover.changed_files.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<section class=\"patch-summary\"><h4>Files touched</h4><ul class=\"attempt-list\">{}</ul></section>",
+            cover
+                .changed_files
+                .iter()
+                .map(|path| format!("<li><code>{}</code></li>", html_escape(path)))
+                .collect::<Vec<_>>()
+                .join("")
+        )
+    };
+    let validation_notes = if cover.validation_notes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<section class=\"patch-summary\"><h4>Validation</h4><ul class=\"attempt-list\">{}</ul></section>",
+            cover
+                .validation_notes
+                .iter()
+                .map(|note| format!("<li>{}</li>", html_escape(note)))
+                .collect::<Vec<_>>()
+                .join("")
+        )
+    };
+    let raw_diff_button = raw_diff_url
+        .as_deref()
+        .map(|url| {
+            format!(
+                "<a class=\"button\" href=\"{}\" download=\"fixer-{}.diff\">Raw diff</a>",
+                url, issue.id
+            )
+        })
+        .unwrap_or_default();
+    Some(format!(
         r#"<section class="panel section patch-panel">
             <h2>Pull-request-ready diff</h2>
-            <p class="fine-print">This is the current best public patch attempt for the issue. Use it as a PR starting point or apply it locally with <code>git apply -p1</code>.</p>
+            <p class="fine-print">This is the current best public patch attempt for the issue. The downloadable <code>.patch</code> now includes a short cover letter so it reads like something you could send upstream with <code>git am</code>. If you only want the raw diff, grab the <code>.diff</code> instead.</p>
             <div class="meta"><span class="tag patch">best patch</span><span class="tag">created: {}</span>{}</div>
             <p class="issue-summary">{}</p>
+            <section class="patch-summary">
+                <h4>Suggested subject</h4>
+                <pre class="code-block"><code>{}</code></pre>
+                <p class="issue-summary"><strong>Problem.</strong> {}</p>
+                <p class="issue-summary"><strong>Why this patch is being proposed.</strong> {}</p>
+            </section>
+            {}
+            {}
             <div class="hero-actions">
                 <a class="button primary" href="{}" download="fixer-{}.patch">Download .patch</a>
+                {}
                 <a class="button" href="/patches">Browse successful patches</a>
             </div>
             <pre class="code-block"><code>{}</code></pre>
@@ -4706,10 +7264,73 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> String {
         html_escape(&format_timestamp(&best_patch.created_at)),
         validation,
         html_escape(&best_patch.summary),
-        diff_url,
+        html_escape(&cover.subject),
+        html_escape(&cover.problem),
+        html_escape(&cover.why),
+        changed_files,
+        validation_notes,
+        patch_url,
         issue.id,
+        raw_diff_button,
         html_escape(diff)
-    )
+    ))
+}
+
+fn render_best_triage_panel(issue: &PublicIssueDetail) -> Option<String> {
+    let best_triage = issue.best_triage.as_ref()?;
+    let handoff = issue.best_triage_handoff.as_ref()?;
+    let validation = best_triage
+        .validation_status
+        .as_deref()
+        .map(|status| {
+            format!(
+                "<span class=\"tag\">validation: {}</span>",
+                html_escape(status)
+            )
+        })
+        .unwrap_or_default();
+    let report_url = handoff
+        .report_url
+        .as_deref()
+        .map(|url| {
+            format!(
+                "<p class=\"fine-print\">Suggested bug target: <a href=\"{0}\">{0}</a></p>",
+                html_escape(url)
+            )
+        })
+        .unwrap_or_default();
+    let next_steps = handoff
+        .next_steps
+        .iter()
+        .map(|step| format!("<li>{}</li>", html_escape(step)))
+        .collect::<Vec<_>>()
+        .join("");
+    Some(format!(
+        r#"<section class="panel section patch-panel">
+            <h2>Successful triage</h2>
+            <p class="fine-print">Fixer did not find an honest diff-backed change in this source tree. Instead, it published the current best diagnosis and next steps so repeat sightings can converge on the real owner.</p>
+            <div class="meta"><span class="tag triage">best triage</span><span class="tag">created: {}</span>{}</div>
+            <p class="issue-summary">{}</p>
+            <section class="patch-summary">
+                <h4>Likely owner</h4>
+                <p class="issue-summary">{}</p>
+                <p class="fine-print">Reason: {}</p>
+                {}
+                <h4>Next steps</h4>
+                <ul class="attempt-list">{}</ul>
+            </section>
+            <div class="hero-actions">
+                <a class="button" href="/triage">Browse successful triage</a>
+            </div>
+        </section>"#,
+        html_escape(&format_timestamp(&best_triage.created_at)),
+        validation,
+        html_escape(&best_triage.summary),
+        html_escape(&handoff.target),
+        html_escape(&handoff.reason),
+        report_url,
+        next_steps,
+    ))
 }
 
 fn render_page(
@@ -4725,6 +7346,11 @@ fn render_page(
         ""
     };
     let issues_class = if matches!(nav_page, NavPage::Issues) {
+        "active"
+    } else {
+        ""
+    };
+    let triage_class = if matches!(nav_page, NavPage::Triage) {
         "active"
     } else {
         ""
@@ -4759,6 +7385,7 @@ fn render_page(
             <div class="nav-links">
                 <a class="{}" href="/">Overview</a>
                 <a class="{}" href="/issues">Issues</a>
+                <a class="{}" href="/triage">Triage</a>
                 <a class="{}" href="/patches">Patches</a>
                 <span class="nav-status" id="health-indicator" aria-live="polite" title="Health: checking">⚪ Health</span>
                 <a href="https://github.com/maumaps/fixer">GitHub</a>
@@ -4775,6 +7402,7 @@ fn render_page(
         html_escape(description),
         home_class,
         issues_class,
+        triage_class,
         patches_class,
         body,
         html_escape(&footer_note),
@@ -4817,6 +7445,7 @@ fn render_issue_card(issue: &PublicIssue) -> String {
             issue.score,
             issue.corroboration_count,
             issue.best_patch_available,
+            issue.best_triage_available,
         ),
         extra
     )
@@ -4850,6 +7479,35 @@ fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
             sections.join("")
         )
     };
+    let handoff_markup = attempt
+        .handoff
+        .as_ref()
+        .map(|handoff| {
+            let next_steps = handoff
+                .next_steps
+                .iter()
+                .map(|step| format!("<li>{}</li>", html_escape(step)))
+                .collect::<Vec<_>>()
+                .join("");
+            let report_url = handoff
+                .report_url
+                .as_deref()
+                .map(|url| {
+                    format!(
+                        "<p class=\"fine-print\">Suggested bug target: <a href=\"{0}\">{0}</a></p>",
+                        html_escape(url)
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "<section class=\"patch-summary\"><h4>Handoff</h4><p class=\"issue-summary\">Likely owner: {}</p><p class=\"fine-print\">Reason: {}</p>{}<ul class=\"attempt-list\">{}</ul></section>",
+                html_escape(&handoff.target),
+                html_escape(&handoff.reason),
+                report_url,
+                next_steps
+            )
+        })
+        .unwrap_or_default();
 
     format!(
         r#"<article class="issue-card">
@@ -4859,6 +7517,7 @@ fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
             </div>
             <p class="issue-summary">{}</p>
             <div class="meta"><span class="tag">state: {}</span><span class="tag">created: {}</span>{}</div>
+            {}
             {}
         </article>"#,
         html_escape(&format!("{} attempt", attempt.outcome)),
@@ -4874,19 +7533,36 @@ fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
                 html_escape(status)
             ))
             .unwrap_or_default(),
+        handoff_markup,
         session_markup
     )
 }
 
 fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
+    let cover = build_public_patch_cover(
+        &entry.title,
+        &entry.summary,
+        entry.package_name.as_deref(),
+        entry.source_package.as_deref(),
+        entry.corroboration_count,
+        &entry.last_seen,
+        &entry.best_patch,
+    );
     let preview = render_patch_preview(entry.best_patch.published_session.as_ref());
     let actions = entry
         .best_patch_diff_url
         .as_deref()
         .map(|url| {
             format!(
-                "<div class=\"hero-actions\"><a class=\"button primary\" href=\"{}\" download=\"fixer-{}.patch\">Download .patch</a></div>",
-                url, entry.id
+                "<div class=\"hero-actions\"><a class=\"button primary\" href=\"{}\" download=\"fixer-{}.patch\">Download .patch</a>{}</div>",
+                url,
+                entry.id,
+                public_best_patch_raw_diff_url(&entry.id, Some(&entry.best_patch))
+                    .map(|raw_url| format!(
+                        "<a class=\"button\" href=\"{}\" download=\"fixer-{}.diff\">Raw diff</a>",
+                        raw_url, entry.id
+                    ))
+                    .unwrap_or_default()
             )
         })
         .unwrap_or_default();
@@ -4899,6 +7575,7 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
         entry.score,
         entry.corroboration_count,
         true,
+        false,
     );
     let _ = write!(
         patch_tags,
@@ -4927,6 +7604,7 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             </section>
             {}
             {}
+            {}
             <p class="fine-print">Full published attempt: <a href="/issues/{}">/issues/{}</a>. Issue JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
         </article>"#,
         entry.id,
@@ -4934,7 +7612,96 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
         html_escape(&entry.summary),
         patch_tags,
         html_escape(&entry.best_patch.summary),
+        cover
+            .as_ref()
+            .map(|cover| format!(
+                "<section class=\"patch-summary\"><h4>Suggested subject</h4><pre class=\"code-block\"><code>{}</code></pre><p class=\"issue-summary\"><strong>Why.</strong> {}</p></section>",
+                html_escape(&cover.subject),
+                html_escape(&cover.why)
+            ))
+            .unwrap_or_default(),
         actions,
+        preview,
+        entry.id,
+        entry.id,
+        entry.id,
+        entry.id
+    )
+}
+
+fn render_public_triage_card(entry: &PublicTriageEntry) -> String {
+    let preview = render_patch_preview(entry.best_triage.published_session.as_ref());
+    let next_steps = entry
+        .handoff
+        .next_steps
+        .iter()
+        .map(|step| format!("<li>{}</li>", html_escape(step)))
+        .collect::<Vec<_>>()
+        .join("");
+    let report_url = entry
+        .handoff
+        .report_url
+        .as_deref()
+        .map(|url| {
+            format!(
+                "<p class=\"fine-print\">Suggested bug target: <a href=\"{0}\">{0}</a></p>",
+                html_escape(url)
+            )
+        })
+        .unwrap_or_default();
+    let mut triage_tags = render_issue_tags(
+        entry.kind.as_str(),
+        entry.package_name.as_deref(),
+        entry.source_package.as_deref(),
+        entry.ecosystem.as_deref(),
+        entry.severity.as_deref(),
+        entry.score,
+        entry.corroboration_count,
+        false,
+        true,
+    );
+    let _ = write!(
+        triage_tags,
+        "<span class=\"tag triage\">triaged: {}</span>",
+        html_escape(&format_timestamp(&entry.best_triage.created_at))
+    );
+    if let Some(status) = entry.best_triage.validation_status.as_deref() {
+        let _ = write!(
+            triage_tags,
+            "<span class=\"tag\">validation: {}</span>",
+            html_escape(status)
+        );
+    }
+    format!(
+        r#"<article class="issue-card patch-card">
+            <div class="issue-topline">
+                <h3><a href="/issues/{}">{}</a></h3>
+                <span class="tag triage">successful triage</span>
+            </div>
+            <p class="issue-summary">{}</p>
+            <div class="meta">{}</div>
+            <section class="patch-summary">
+                <h4>Attempt Summary</h4>
+                <p class="issue-summary">{}</p>
+                <h4>Likely owner</h4>
+                <p class="issue-summary">{}</p>
+                <p class="fine-print">Reason: {}</p>
+                {}
+                <h4>Next steps</h4>
+                <ul class="attempt-list">{}</ul>
+            </section>
+            {}
+            <p class="fine-print">Full published attempt: <a href="/issues/{}">/issues/{}</a>. Issue JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
+        </article>"#,
+        entry.id,
+        html_escape(&entry.title),
+        html_escape(&entry.summary),
+        triage_tags,
+        html_escape(&entry.best_triage.summary),
+        html_escape(&entry.handoff.target),
+        html_escape(&entry.handoff.reason),
+        report_url,
+        next_steps,
         preview,
         entry.id,
         entry.id,
@@ -4986,6 +7753,7 @@ fn render_issue_tags(
     score: i64,
     corroboration_count: i64,
     best_patch_available: bool,
+    best_triage_available: bool,
 ) -> String {
     let mut tags = Vec::new();
     if let Some(severity) = severity {
@@ -5020,6 +7788,9 @@ fn render_issue_tags(
     ));
     if best_patch_available {
         tags.push("<span class=\"tag patch\">patch attempt ready</span>".to_string());
+    }
+    if best_triage_available {
+        tags.push("<span class=\"tag triage\">successful triage</span>".to_string());
     }
     tags.join("")
 }
@@ -5057,6 +7828,7 @@ fn html_escape(value: &str) -> String {
 enum NavPage {
     Home,
     Issues,
+    Triage,
     Patches,
 }
 
@@ -5087,7 +7859,10 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::FixerConfig;
     use crate::models::{FindingRecord, OpportunityRecord};
+    use tempfile::tempdir;
+    use tokio::runtime::Runtime;
 
     fn sample_crash(process_name: &str, summary: &str, stack_frames: &[&str]) -> SharedOpportunity {
         SharedOpportunity {
@@ -5129,6 +7904,167 @@ mod tests {
         }
     }
 
+    fn sample_stuck_process_investigation(
+        target: &str,
+        runtime_seconds: u64,
+        last_seen: &str,
+    ) -> SharedOpportunity {
+        SharedOpportunity {
+            local_opportunity_id: 1,
+            opportunity: OpportunityRecord {
+                id: 1,
+                finding_id: 1,
+                kind: "investigation".to_string(),
+                title: format!("Stuck D-state investigation for {target}"),
+                score: 110,
+                state: "open".to_string(),
+                summary: format!(
+                    "{target} has 1 process(es) stuck in `D` state for at least {runtime_seconds}s, likely blocked in unknown uninterruptible wait via drm_atomic_helper_wait_for_flip_done."
+                ),
+                evidence: json!({}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: last_seen.to_string(),
+                updated_at: last_seen.to_string(),
+            },
+            finding: FindingRecord {
+                id: 1,
+                kind: "investigation".to_string(),
+                title: format!("Stuck D-state investigation for {target}"),
+                severity: "high".to_string(),
+                fingerprint: "legacy-fingerprint".to_string(),
+                summary: format!(
+                    "{target} has 1 process(es) stuck in `D` state for at least {runtime_seconds}s, likely blocked in unknown uninterruptible wait via drm_atomic_helper_wait_for_flip_done."
+                ),
+                details: json!({
+                    "subsystem": "stuck-process",
+                    "profile_target": {
+                        "name": target,
+                        "path": Value::Null,
+                        "package_name": Value::Null,
+                        "process_count": 1,
+                    },
+                    "sampled_pid_count": 1,
+                    "runtime_seconds": runtime_seconds,
+                    "wchan": "drm_atomic_helper_wait_for_flip_done",
+                    "stack_excerpt": "drm_atomic_helper_wait_for_flip_done\n__schedule",
+                    "loop_classification": "unknown-uninterruptible-wait",
+                }),
+                artifact_name: Some(target.to_string()),
+                artifact_path: None,
+                package_name: None,
+                repo_root: None,
+                ecosystem: None,
+                first_seen: last_seen.to_string(),
+                last_seen: last_seen.to_string(),
+            },
+        }
+    }
+
+    fn test_runtime() -> Runtime {
+        Runtime::new().expect("tokio runtime")
+    }
+
+    fn init_test_server_db() -> (tempfile::TempDir, ServerDb) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("server.sqlite3");
+        let db = ServerDb::Sqlite(path);
+        test_runtime()
+            .block_on(init_db(&db, &FixerConfig::default()))
+            .unwrap();
+        (dir, db)
+    }
+
+    fn sqlite_test_connection(db: &ServerDb) -> Connection {
+        match db {
+            ServerDb::Sqlite(path) => sqlite_connection(path).unwrap(),
+            ServerDb::Postgres(_) => panic!("expected sqlite test db"),
+        }
+    }
+
+    fn insert_test_install(connection: &Connection, install_id: &str, seen_at: &str) {
+        connection
+            .execute(
+                "
+                INSERT INTO installs
+                    (install_id, first_seen, last_seen, mode, hostname, version, has_codex, capabilities_json)
+                VALUES (?1, ?2, ?2, 'submitter-worker', NULL, '0.0.0-test', 1, '[]')
+                ",
+                rusqlite::params![install_id, seen_at],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_issue(
+        connection: &Connection,
+        issue_id: &str,
+        cluster_key: &str,
+        score: i64,
+        last_seen: &str,
+        representative: &SharedOpportunity,
+        report_install_ids: &[&str],
+    ) {
+        connection
+            .execute(
+                "
+                INSERT INTO issue_clusters
+                    (id, cluster_key, kind, title, summary, public_title, public_summary, public_visible,
+                     package_name, source_package, ecosystem, severity, score, corroboration_count,
+                     quarantined, promoted, representative_json, best_patch_json, best_triage_json, last_seen)
+                VALUES
+                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13, 0, 1, ?14, NULL, NULL, ?15)
+                ",
+                rusqlite::params![
+                    issue_id,
+                    cluster_key,
+                    &representative.opportunity.kind,
+                    &representative.opportunity.title,
+                    &representative.opportunity.summary,
+                    sanitize_public_text(&representative.opportunity.title),
+                    sanitize_public_text(&representative.opportunity.summary),
+                    representative.finding.package_name.as_deref(),
+                    representative.finding.package_name.as_deref(),
+                    representative.opportunity.ecosystem.as_deref(),
+                    &representative.finding.severity,
+                    score,
+                    report_install_ids.len() as i64,
+                    serde_json::to_string(representative).unwrap(),
+                    last_seen,
+                ],
+            )
+            .unwrap();
+
+        for (index, install_id) in report_install_ids.iter().enumerate() {
+            insert_test_install(connection, install_id, last_seen);
+            let submission_id = format!("{issue_id}-submission-{index}");
+            connection
+                .execute(
+                    "
+                    INSERT INTO submissions
+                        (id, install_id, content_hash, payload_hash, received_at, remote_addr, quarantined, bundle_json)
+                    VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, '{}')
+                    ",
+                    rusqlite::params![
+                        submission_id,
+                        install_id,
+                        format!("{issue_id}-content-{index}"),
+                        format!("{issue_id}-payload-{index}"),
+                        last_seen,
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "
+                    INSERT INTO cluster_reports (cluster_id, install_id, submission_id, created_at)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ",
+                    rusqlite::params![issue_id, install_id, submission_id, last_seen],
+                )
+                .unwrap();
+        }
+    }
+
     #[test]
     fn html_escape_handles_reserved_characters() {
         assert_eq!(
@@ -5151,6 +8087,7 @@ mod tests {
             score: 93,
             corroboration_count: 3,
             best_patch_available: true,
+            best_triage_available: false,
             last_seen: "2026-03-29T00:00:00Z".to_string(),
         };
 
@@ -5191,6 +8128,19 @@ mod tests {
     }
 
     #[test]
+    fn render_page_marks_triage_nav_active() {
+        let markup = render_page(
+            "Fixer Triage",
+            "Successful public triage handoffs",
+            NavPage::Triage,
+            "<section>body</section>".to_string(),
+            0,
+        );
+
+        assert!(markup.contains("<a class=\"active\" href=\"/triage\">Triage</a>"));
+    }
+
+    #[test]
     fn public_attempt_uses_published_session_only() {
         let public_attempt = public_attempt_from_patch_attempt(PatchAttempt {
             cluster_id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
@@ -5226,6 +8176,38 @@ mod tests {
     }
 
     #[test]
+    fn diffless_ready_patch_is_reported_as_successful_triage() {
+        let public_attempt = public_attempt_from_patch_attempt(PatchAttempt {
+            cluster_id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "A diagnosis report and patch proposal were created locally.".to_string(),
+            bundle_path: Some("/var/lib/fixer/proposals/example".to_string()),
+            output_path: Some("/var/lib/fixer/proposals/example/codex-output.txt".to_string()),
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "Read ./evidence.json",
+                    "response": "No source change landed. The hotspot appears outside this repository in h3_postgis.so.",
+                    "diff": null,
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        });
+
+        assert_eq!(public_attempt.outcome, "triage");
+        assert!(public_attempt.summary.contains("external handoff"));
+        assert_eq!(
+            public_attempt
+                .handoff
+                .as_ref()
+                .map(|handoff| handoff.reason.as_str()),
+            Some("likely-external-root-cause")
+        );
+    }
+
+    #[test]
     fn render_public_patch_card_includes_preview_and_issue_links() {
         let card = render_public_patch_card(&PublicPatchEntry {
             id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
@@ -5251,14 +8233,21 @@ mod tests {
                 published_session: Some(PublishedAttemptSession {
                     prompt: "Read ./evidence.json".to_string(),
                     response: Some("Patched ./workspace/src/file.c".to_string()),
-                    diff: Some("--- a/src/file.c\n+++ b/src/file.c\n".to_string()),
+                    diff: Some(
+                        "--- a/src/file.c\n+++ b/src/file.c\n@@\n+/* Avoid the retry loop on missing files. */\n"
+                            .to_string(),
+                    ),
                 }),
+                handoff: None,
             },
         });
 
         assert!(card.contains("successful patch"));
+        assert!(card.contains("Suggested subject"));
+        assert!(card.contains("Avoid the retry loop on missing files."));
         assert!(card.contains("Diff Excerpt"));
         assert!(card.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch"));
+        assert!(card.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.diff"));
         assert!(card.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
         assert!(card.contains("/v1/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
     }
@@ -5277,6 +8266,7 @@ mod tests {
             score: 106,
             corroboration_count: 2,
             best_patch_available: true,
+            best_triage_available: false,
             best_patch_diff_url: Some(
                 "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch".to_string(),
             ),
@@ -5289,9 +8279,15 @@ mod tests {
                 published_session: Some(PublishedAttemptSession {
                     prompt: "Read ./evidence.json".to_string(),
                     response: Some("Patched ./workspace/src/file.c".to_string()),
-                    diff: Some("--- a/src/file.c\n+++ b/src/file.c\n".to_string()),
+                    diff: Some(
+                        "--- a/src/file.c\n+++ b/src/file.c\n@@\n+/* Avoid the retry loop on missing files. */\n"
+                            .to_string(),
+                    ),
                 }),
+                handoff: None,
             }),
+            best_triage: None,
+            best_triage_handoff: None,
             last_seen: "2026-03-29T00:00:00Z".to_string(),
             attempts: Vec::new(),
         };
@@ -5300,8 +8296,216 @@ mod tests {
 
         assert!(markup.contains("Pull-request-ready diff"));
         assert!(markup.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch"));
+        assert!(markup.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.diff"));
         assert!(markup.contains("Download .patch"));
-        assert!(markup.contains("--- a/src/file.c"));
+        assert!(markup.contains("Suggested subject"));
+        assert!(markup.contains("Why this patch is being proposed."));
+        assert!(markup.contains("Avoid the retry loop on missing files."));
+    }
+
+    #[test]
+    fn render_public_patch_email_includes_cover_letter_and_diff() {
+        let issue = PublicIssueDetail {
+            id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for postgres".to_string(),
+            summary: "postgres is stuck in a likely file not found retry loop: repeated open/read/close churn.".to_string(),
+            package_name: Some("postgresql-18".to_string()),
+            source_package: Some("postgresql-18".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 106,
+            corroboration_count: 2,
+            best_patch_available: true,
+            best_triage_available: false,
+            best_patch_diff_url: Some(
+                "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch".to_string(),
+            ),
+            best_patch: Some(PublicAttempt {
+                outcome: "patch".to_string(),
+                state: "ready".to_string(),
+                summary: "Patch proposal created locally.".to_string(),
+                validation_status: Some("ready".to_string()),
+                created_at: "2026-03-29T00:00:00Z".to_string(),
+                published_session: Some(PublishedAttemptSession {
+                    prompt: "Read ./evidence.json".to_string(),
+                    response: None,
+                    diff: Some(
+                        "--- a/src/backend/utils/fmgr/dfmgr.c\n+++ b/src/backend/utils/fmgr/dfmgr.c\n@@\n+/* Prefer the suffixed shared library name first to avoid a guaranteed failed probe. */\n"
+                            .to_string(),
+                    ),
+                }),
+                handoff: None,
+            }),
+            best_triage: None,
+            best_triage_handoff: None,
+            last_seen: "2026-03-29T00:00:00Z".to_string(),
+            attempts: Vec::new(),
+        };
+
+        let patch = render_public_patch_email(&issue, issue.best_patch.as_ref().unwrap()).unwrap();
+
+        assert!(patch.contains(
+            "Subject: [PATCH] postgresql-18: update dfmgr.c for file not found retry loop"
+        ));
+        assert!(patch.contains("Problem:\npostgres is stuck in a likely file not found retry loop: repeated open/read/close churn."));
+        assert!(patch.contains("Why this patch is being proposed:\nPrefer the suffixed shared library name first to avoid a guaranteed failed probe."));
+        assert!(patch.contains("Files touched:\n- src/backend/utils/fmgr/dfmgr.c"));
+        assert!(patch.contains(
+            "Issue: https://fixer.maumap.com/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"
+        ));
+        assert!(patch.contains("--- a/src/backend/utils/fmgr/dfmgr.c"));
+    }
+
+    #[test]
+    fn legacy_best_patch_is_available_for_worker_refresh() {
+        let legacy_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Legacy patch proposal created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "legacy prompt",
+                    "response": "legacy response",
+                    "diff": "--- a/src/file.c\n+++ b/src/file.c\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let current_patch = PatchAttempt {
+            details: json!({
+                "worker_fixer_version": current_binary_version(),
+                "published_session": {
+                    "prompt": "new prompt",
+                    "response": "new response",
+                    "diff": "--- a/src/file.c\n+++ b/src/file.c\n",
+                }
+            }),
+            ..legacy_patch.clone()
+        };
+
+        assert!(patch_attempt_needs_worker_refresh(&legacy_patch));
+        assert!(!patch_attempt_needs_worker_refresh(&current_patch));
+    }
+
+    #[test]
+    fn worker_queue_accepts_legacy_patch_issue_for_improvement() {
+        let issue = IssueCluster {
+            id: "issue-1".to_string(),
+            cluster_key: "cluster-1".to_string(),
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for postgres".to_string(),
+            summary: "postgres is stuck in a likely file not found retry loop".to_string(),
+            package_name: Some("postgresql-18".to_string()),
+            source_package: Some("postgresql-18".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 110,
+            corroboration_count: 2,
+            quarantined: false,
+            promoted: true,
+            representative: sample_crash(
+                "postgres",
+                "postgres is stuck in a likely file not found retry loop",
+                &["internal_load_library+0x20"],
+            ),
+            best_patch: Some(PatchAttempt {
+                cluster_id: "issue-1".to_string(),
+                install_id: "install-1".to_string(),
+                outcome: "patch".to_string(),
+                state: "ready".to_string(),
+                summary: "Legacy patch proposal created locally.".to_string(),
+                bundle_path: None,
+                output_path: None,
+                validation_status: Some("ready".to_string()),
+                details: json!({
+                    "published_session": {
+                        "prompt": "legacy prompt",
+                        "response": null,
+                        "diff": "--- a/src/backend/utils/fmgr/dfmgr.c\n+++ b/src/backend/utils/fmgr/dfmgr.c\n",
+                    }
+                }),
+                created_at: "2026-03-29T00:00:00Z".to_string(),
+            }),
+            last_seen: "2026-03-29T16:13:42Z".to_string(),
+        };
+
+        assert!(issue_is_available_for_worker(&issue));
+    }
+
+    #[test]
+    fn worker_queue_prefers_public_issue_from_other_install() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let self_issue = sample_crash(
+            "self-only",
+            "Top frame: self_only_frame [self-only.so]",
+            &["self_only_frame [self-only.so]"],
+        );
+        let shared_issue = sample_crash(
+            "shared",
+            "Top frame: shared_frame [shared.so]",
+            &["shared_frame [shared.so]"],
+        );
+
+        insert_test_issue(
+            &connection,
+            "issue-self",
+            "cluster-self",
+            200,
+            "2026-03-29T18:00:00Z",
+            &self_issue,
+            &["worker-install"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-shared",
+            "cluster-shared",
+            100,
+            "2026-03-29T17:00:00Z",
+            &shared_issue,
+            &["other-install"],
+        );
+
+        let issue = test_runtime()
+            .block_on(next_issue_for_worker(&db, "worker-install"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(issue.id, "issue-shared");
+    }
+
+    #[test]
+    fn worker_queue_falls_back_to_self_reported_issue_when_shared_queue_is_empty() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let self_issue = sample_crash(
+            "self-only",
+            "Top frame: self_only_frame [self-only.so]",
+            &["self_only_frame [self-only.so]"],
+        );
+
+        insert_test_issue(
+            &connection,
+            "issue-self",
+            "cluster-self",
+            200,
+            "2026-03-29T18:00:00Z",
+            &self_issue,
+            &["worker-install"],
+        );
+
+        let issue = test_runtime()
+            .block_on(next_issue_for_worker(&db, "worker-install"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(issue.id, "issue-self");
     }
 
     #[test]
@@ -5406,6 +8610,121 @@ mod tests {
         );
 
         assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
+    }
+
+    #[test]
+    fn stuck_process_cluster_key_ignores_kworker_slot_and_runtime_noise() {
+        let a = sample_stuck_process_investigation(
+            "kworker/u33:0+i915_flip",
+            152,
+            "2026-03-29T17:52:00Z",
+        );
+        let b = sample_stuck_process_investigation(
+            "kworker/u33:3+i915_flip",
+            2141,
+            "2026-03-29T17:52:00Z",
+        );
+
+        assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
+
+        let public = build_public_issue_fields(&a);
+        assert_eq!(
+            public.title,
+            "Stuck D-state investigation for kworker+i915_flip"
+        );
+        assert!(public.summary.contains("kworker+i915_flip"));
+        assert!(!public.summary.contains("152s"));
+    }
+
+    #[test]
+    fn recluster_issue_state_merges_duplicate_stuck_process_investigations() {
+        let a = sample_stuck_process_investigation(
+            "kworker/u33:0+i915_flip",
+            152,
+            "2026-03-29T17:52:00Z",
+        );
+        let b = sample_stuck_process_investigation(
+            "kworker/u33:3+i915_flip",
+            2141,
+            "2026-03-29T17:52:30Z",
+        );
+        let state = CurrentIssueState {
+            issue_clusters: vec![
+                CurrentIssueCluster {
+                    id: "issue-a".to_string(),
+                    cluster_key: hash_text("legacy-a"),
+                    kind: a.opportunity.kind.clone(),
+                    title: a.opportunity.title.clone(),
+                    summary: a.opportunity.summary.clone(),
+                    public_title: sanitize_public_text(&a.opportunity.title),
+                    public_summary: sanitize_public_text(&a.opportunity.summary),
+                    public_visible: true,
+                    package_name: None,
+                    source_package: None,
+                    ecosystem: None,
+                    severity: Some("high".to_string()),
+                    score: a.opportunity.score,
+                    corroboration_count: 1,
+                    quarantined: true,
+                    promoted: false,
+                    representative_json: serde_json::to_value(&a).unwrap(),
+                    best_patch_json: None,
+                    best_triage_json: None,
+                    last_seen: "2026-03-29T17:52:00Z".to_string(),
+                },
+                CurrentIssueCluster {
+                    id: "issue-b".to_string(),
+                    cluster_key: hash_text("legacy-b"),
+                    kind: b.opportunity.kind.clone(),
+                    title: b.opportunity.title.clone(),
+                    summary: b.opportunity.summary.clone(),
+                    public_title: sanitize_public_text(&b.opportunity.title),
+                    public_summary: sanitize_public_text(&b.opportunity.summary),
+                    public_visible: true,
+                    package_name: None,
+                    source_package: None,
+                    ecosystem: None,
+                    severity: Some("high".to_string()),
+                    score: b.opportunity.score,
+                    corroboration_count: 2,
+                    quarantined: false,
+                    promoted: true,
+                    representative_json: serde_json::to_value(&b).unwrap(),
+                    best_patch_json: None,
+                    best_triage_json: None,
+                    last_seen: "2026-03-29T17:52:30Z".to_string(),
+                },
+            ],
+            cluster_reports: vec![
+                CurrentClusterReport {
+                    cluster_id: "issue-a".to_string(),
+                    install_id: "install-a".to_string(),
+                    submission_id: "sub-a".to_string(),
+                    created_at: "2026-03-29T17:52:00Z".to_string(),
+                },
+                CurrentClusterReport {
+                    cluster_id: "issue-b".to_string(),
+                    install_id: "install-b".to_string(),
+                    submission_id: "sub-b".to_string(),
+                    created_at: "2026-03-29T17:52:30Z".to_string(),
+                },
+            ],
+            worker_leases: Vec::new(),
+            patch_attempts: Vec::new(),
+            evidence_requests: Vec::new(),
+        };
+
+        let reclustered = recluster_issue_state(state, 2).unwrap().unwrap();
+
+        assert_eq!(reclustered.issue_clusters.len(), 1);
+        assert_eq!(reclustered.cluster_reports.len(), 2);
+        assert_eq!(reclustered.issue_clusters[0].id, "issue-b");
+        assert_eq!(reclustered.issue_clusters[0].corroboration_count, 2);
+        assert!(reclustered.issue_clusters[0].promoted);
+        assert_eq!(
+            reclustered.issue_clusters[0].public_title,
+            "Stuck D-state investigation for kworker+i915_flip"
+        );
     }
 
     #[test]

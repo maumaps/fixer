@@ -1,234 +1,263 @@
 # Fixer Architecture
 
-This document describes the architecture of the current MVP implementation in this repository. It is intentionally grounded in the code that exists today, not the longer-term product vision from `doc/requirements.md`.
+This document explains the architecture that exists in this repository today.
+
+It is intentionally practical. The goal is to help someone new to the codebase understand how evidence moves through the system, where responsibilities live, and what Fixer is trying to protect.
+
+## The short version
+
+Fixer has one job: turn real machine problems into small, reviewable maintenance tasks.
+
+In practice that means:
+
+1. collect deterministic evidence locally
+2. normalize it into findings
+3. rank those findings into opportunities
+4. optionally federate sanitized opportunities to a server
+5. let workers try to turn promoted issues into either a patch or an honest triage handoff
+
+The collection side is deliberately boring. The patch side is deliberately bounded.
+
+## Runtime pieces
+
+The current system is made of three binaries:
+
+- `fixer`
+  - the operator-facing CLI
+  - used for collection, inspection, validation, proposal generation, participation, sync, and worker runs
+- `fixerd`
+  - the long-running daemon wrapper around the same collection pipeline
+  - performs a collection cycle, sleeps, and repeats
+- `fixer-server`
+  - the aggregation server for opted-in hosts
+  - accepts submissions, clusters issues, promotes corroborated work, and accepts worker results
 
 ## System shape
 
-Fixer is now split into four layers:
+It helps to think about Fixer as four layers.
 
-1. Collection and normalization
-   - `fixerd` runs collection cycles.
-   - Collectors inventory local machine activity and normalize it into a small set of persisted records.
-2. Persistence and ranking
-   - SQLite stores capabilities, artifacts, findings, opportunities, validation runs, and patch proposals.
-   - A simple scoring function turns findings into ranked opportunities.
-3. Federation and aggregation
-   - Opted-in clients can upload structured finding bundles to a Fixer server.
-   - `fixer-server` stores anonymous submissions in Postgres, clusters repeated findings into issues, keeps new installs and new issues quarantined by default, and leases promoted issues to trusted workers.
-   - Basic anti-spam and anti-abuse controls are proof-of-work, per-install and per-IP rate limits, duplicate-content suppression, quarantine, and install trust scores.
-4. Operator and worker workflows
-   - `fixer` exposes commands for collection, inspection, validation, and proposal generation.
-   - It also exposes explicit participation commands: `opt-in`, `opt-out`, `sync`, `worker run`, and `participation`.
-   - Codex is only used at the proposal stage and only on a bounded evidence bundle, whether that proposal is local-only or comes from a leased server issue.
+### 1. Collection and normalization
 
-## Main binaries
+`fixerd` and `fixer collect` gather evidence from the local machine:
 
-- `fixer`
-  - Operator-facing CLI.
-  - Commands include `collect`, `status`, `capabilities`, `crashes`, `warnings`, `hotspots`, `owners`, `opportunities`, `inspect`, `validate`, `propose-fix`, and `prepare-submit`.
-- `fixerd`
-  - Long-running daemon wrapper around the same collection pipeline.
-  - Reads config, performs a collection cycle, sleeps, and repeats.
-- `fixer-server`
-  - Aggregation server for opted-in clients.
-  - Stores submissions in Postgres, clusters issues, exposes promoted issues, and accepts worker results.
+- running processes and binaries
+- Debian package ownership
+- watched repositories
+- crashes from `coredumpctl`
+- warnings and kernel messages
+- targeted `perf` profiles
+- optional `bpftrace`
+- runaway CPU loops and stuck `D`-state processes
 
-## Module layout
+The output of this layer is not “AI insight.” It is a normalized set of findings that are stable enough to compare over time.
 
-The shared application logic lives in `crates/fixer/src/`.
+### 2. Local persistence and ranking
 
-- `app.rs`
-  - Top-level orchestration for loading config, opening the store, running collection, validating, and preparing proposals.
-- `config.rs`
-  - TOML-backed runtime configuration.
-  - Holds service settings, watched repos, log paths, sampling toggles, Codex settings, client network defaults, privacy policy versioning, participation defaults, and server settings.
-- `capabilities.rs`
-  - Detects optional helper tools at runtime.
-  - This lets the package stay installable even when optional integrations are absent.
-- `collectors.rs`
-  - Collects process/package usage, watched repos, crashes, warning logs, kernel warnings, targeted perf hotspots for the busiest binaries, and optional `bpftrace` output.
-  - Crash collection only keeps coredumps that include stack frames, chooses the most informative thread when multiple thread stacks are present, and runs a best-effort local symbolization pass on unresolved frames.
-- `adapters.rs`
-  - Repo-level ecosystem detection and metadata/validation lookup for Debian, Cargo, npm, pip, and PGXN.
-- `storage.rs`
-  - SQLite schema creation and all read/write operations.
-- `proposal.rs`
-  - Creates proposal bundles, writes evidence files, and optionally invokes `codex exec`.
-  - Deterministic proposals can also generate external bug-report bundles when Fixer cannot acquire a patchable workspace, including package/update metadata and a redacted report-safe command line.
-- `workspace.rs`
-  - Resolves a patchable workspace for an opportunity.
-  - Uses an attached repo when one exists, then tries `apt-get source` for Debian packages, then falls back to cloning a package homepage when it looks like a real upstream repository.
-- `models.rs`
-  - Shared record types for local findings and proposals plus the wire format for client/server federation.
-- `privacy.rs`
-  - Participation policy text plus best-effort secret redaction for outbound bundles.
-- `pow.rs`
-  - Hashcash-style proof-of-work helpers used by submissions and worker pulls.
-- `network.rs`
-  - Client-side participation state, submission bundle building, sync, and worker execution.
-- `server.rs`
-  - Axum HTTP server plus Postgres-backed clustering, quarantine, leasing, and worker result handling.
+The local store is SQLite.
 
-## Data model
+It keeps:
 
-The current pipeline uses these record types:
+- capabilities
+- artifacts
+- findings
+- opportunities
+- validation runs
+- proposals
+- participation state
 
-- Capabilities
-  - Runtime view of which helper binaries are available.
-  - Example: `perf`, `bpftrace`, `coredumpctl`, `npm`, `codex`.
-- Artifacts
-  - Things observed on the system or in configured repos.
-  - Examples: a running binary, a watched repo.
-- Findings
-  - Normalized observations worth tracking.
-  - Examples: a crash, a warning, a hotspot, missing repo metadata.
-- Opportunities
-  - Ranked findings ready for operator action.
-  - One opportunity is derived from one finding in the MVP.
-- Validation runs
-  - Results of ecosystem-specific validation commands for an opportunity.
-- Proposals
-  - Output bundles for deterministic or Codex-backed patch proposals.
-  - Proposal bundles now also record the prepared workspace that Fixer resolved for patching.
-- Participation state
-  - Local opt-in state, consent policy version/digest, richer-evidence opt-in, and anonymous install identity.
-- Submission bundles
-  - Structured uploads containing capabilities, status, redactions, and a set of ranked opportunities plus their underlying findings.
-- Issue clusters
-  - Server-side aggregation records keyed by normalized finding fingerprints and stack/module signatures.
-- Worker leases and patch attempts
-  - Server-side records for volunteer workers that try to patch promoted issues or explain why a safe patch is not currently possible.
-
-## Collection flow
-
-Each collection cycle follows this order:
-
-1. Detect runtime capabilities and persist them.
-2. Inventory currently running executables from `/proc`.
-3. Map executable paths to Debian packages with `dpkg-query -S` when possible.
-4. Inspect configured watched repos and enrich them through an ecosystem adapter.
-5. Ingest recent crashes from `coredumpctl`.
-   - Reject coredumps with no stack frames at all.
-   - Prefer the thread with the highest number of useful frames for summaries and evidence.
-   - Try to improve `n/a (object + offset)` frames through local symbolizers and package/debug-symbol hints before storing the crash.
-6. Ingest warning lines from configured logs and kernel warnings from `journalctl`.
-7. If `perf` is available, sample the busiest running binaries and turn their hottest symbols plus owning packages into hotspot findings.
-8. Optionally capture a short `bpftrace` run.
-9. Normalize each observation into a finding fingerprint.
-10. Upsert or refresh the corresponding opportunity.
-
-When an operator later validates or proposes a fix for an opportunity, Fixer resolves a workspace in this order:
-
-1. use the repo already attached to the opportunity
-2. fetch Debian source with `apt-get source` if `deb-src` is configured
-3. clone the package homepage if it points at a cloneable upstream repo
-
-If none of those work and the operator asks for a deterministic proposal, Fixer falls back to an external bug-report bundle instead of failing outright. That bundle includes installed and candidate package versions, upgrade guidance, host details, crash metadata, the locally symbolized stack, a redacted command line suitable for sharing with a vendor, and any vendor/support URL discoverable from package metadata.
-
-If the host is opted in as a submitter, the same local opportunity graph can also be serialized into a submission bundle. Before upload, Fixer applies best-effort secret redaction to known high-risk string classes such as passwords, query tokens, and bearer headers. The explicit participation policy warns that redaction is not perfect and that private data may still be present unintentionally.
-
-## Scoring model
-
-The scoring model is intentionally simple in v1. It prioritizes:
+The ranking model is intentionally simple. It prefers obvious, actionable pain over cleverness:
 
 - crashes over hotspots
 - hotspots over warnings
-- warnings over repo hygiene findings
+- warnings over hygiene findings
 - higher severity over lower severity
-- opportunities that already have a repo root or ecosystem hint
+- findings with ownership or workspace hints over findings with none
 
-This is a placeholder for a more evidence-rich opportunity engine later. The current version is deliberately easy to understand and debug.
+### 3. Federation and aggregation
 
-## Repo and ecosystem resolution
+Opted-in clients can upload sanitized bundles to a Fixer server.
 
-Repo inspection uses deterministic adapters instead of AI:
+The server:
 
-- Debian
-  - looks at `debian/control` and related packaging metadata
-- Cargo
-  - looks at `Cargo.toml`
-- npm
-  - looks at `package.json`
-- pip
-  - looks at `pyproject.toml`, `requirements.txt`, or `setup.cfg`
-- PGXN
-  - looks at `META.json`
+- stores submissions
+- clusters repeated findings into issues
+- keeps new installs and new issue clusters quarantined by default
+- promotes corroborated or trusted issues
+- leases promoted work to volunteer workers
 
-Each adapter can provide:
+The same protocol is used for local, siloed, and public installs. The public deployment is not a separate product line.
 
-- a display name
-- upstream and bug tracker URLs
-- a small owner list
-- validation commands
-- raw metadata for storage
+### 4. Worker and proposal flow
 
-Owner detection currently uses `git shortlog` as a pragmatic fallback.
+Workers reuse the same local proposal pipeline. The only difference is where the work item came from.
+
+A worker:
+
+1. pulls a promoted issue lease
+2. resolves or prepares a workspace
+3. builds a bounded evidence bundle
+4. runs deterministic helpers and, when allowed, Codex
+5. returns one of three honest outcomes
+
+Those outcomes are:
+
+- patch
+- successful triage
+- report or impossibility result
+
+Fixer tries hard not to fake a patch when the real answer is “this belongs in a different tree.”
+
+## Module layout
+
+The shared logic lives in `crates/fixer/src/`.
+
+- `app.rs`
+  - top-level command orchestration
+- `config.rs`
+  - TOML-backed runtime configuration
+- `capabilities.rs`
+  - runtime detection of optional helper tools
+- `collectors.rs`
+  - local evidence gathering and normalization
+- `adapters.rs`
+  - ecosystem-specific repo inspection and validation metadata
+- `storage.rs`
+  - local SQLite schema and persistence
+- `proposal.rs`
+  - proposal bundles, evidence files, and Codex-facing artifacts
+- `workspace.rs`
+  - workspace acquisition and hydration
+- `models.rs`
+  - shared local and wire-format record types
+- `privacy.rs`
+  - consent text and best-effort redaction
+- `pow.rs`
+  - proof-of-work helpers for anonymous network endpoints
+- `network.rs`
+  - client-side participation, sync, and worker execution
+- `server.rs`
+  - Axum server plus clustering, moderation, leasing, and public rendering
+
+## Data model
+
+The most important records are:
+
+- Capabilities
+  - what helper tools are available on this host
+- Artifacts
+  - concrete things observed on the system or in a repo
+- Findings
+  - normalized observations such as crashes, warnings, hotspots, or stuck processes
+- Opportunities
+  - ranked findings that look worth acting on
+- Validation runs
+  - ecosystem-aware checks for an opportunity
+- Proposals
+  - local bundles containing evidence, prompt, output, and workspace metadata
+- Participation state
+  - local opt-in status, consent version, richer-evidence preference, and install identity
+- Submission bundles
+  - the upload payload for opted-in hosts
+- Issue clusters
+  - server-side aggregation of repeated findings
+- Worker leases
+  - the server-side record that a worker is actively handling an issue
+- Patch attempts
+  - worker results, including successful triage and report-only outcomes
+
+## Collection flow
+
+Each collection cycle is intentionally predictable:
+
+1. detect capabilities
+2. inventory running executables from `/proc`
+3. map binaries and libraries to Debian packages when possible
+4. inspect watched repositories
+5. ingest recent crashes from `coredumpctl`
+6. ingest warnings and kernel messages
+7. sample hot paths with `perf` when available
+8. optionally run short `bpftrace` captures
+9. normalize observations into finding fingerprints
+10. upsert or refresh the corresponding opportunities
+
+The important boundary here is that collection stays deterministic. We want it to be debuggable when it gets something wrong.
+
+## Workspace acquisition
+
+When Fixer wants to validate or propose a fix, it tries to find a real workspace in this order:
+
+1. use the repo already attached to the opportunity
+2. fetch Debian source with `apt-get source`
+3. clone the package homepage when it looks like a real upstream repository
+
+If none of those work, Fixer should not bluff. It falls back to a triage or bug-report path rather than pretending a patch exists.
 
 ## Proposal flow
 
-Proposal generation is intentionally bounded:
+Proposal generation is deliberately narrow:
 
-1. Read the selected opportunity from SQLite.
-2. Write an evidence bundle into the state directory.
-3. Write a prompt that points Codex at that evidence bundle.
-4. Either:
-   - create a deterministic summary artifact, or
-   - run `codex exec` inside the opportunity's repo root.
-5. Persist the proposal bundle, output paths, and workspace metadata.
+1. read the selected opportunity
+2. write an evidence bundle into the state directory
+3. write the prompt and supporting files
+4. resolve the workspace
+5. run deterministic helpers and, when enabled, Codex
+6. persist the resulting bundle and metadata
 
-The system does not auto-submit patches upstream. `prepare-submit` creates a handoff artifact for manual review and publication.
+The system does not silently submit patches upstream. The output is designed for review and handoff.
 
-In the federated flow:
+## Federation flow
 
-1. A submitter uploads a redacted finding bundle after explicit opt-in.
-2. The server stores the raw bundle, normalizes issue clusters, and keeps them quarantined until corroborated or trusted.
-3. A trusted worker host with Codex can pull a promoted issue lease.
-4. The worker reuses the normal workspace-acquisition and proposal pipeline locally.
-5. The worker sends back either:
-   - a patch attempt with local bundle/output paths and a “review and submit upstream” summary
-   - an impossibility reason explaining why a safe patch could not be produced
-   - an optional request for richer evidence
+In the networked path:
+
+1. a submitter uploads a redacted finding bundle after explicit opt-in
+2. the server stores the bundle and clusters issues
+3. new installs and new issues stay quarantined until corroborated or trusted
+4. a worker host pulls a promoted issue lease
+5. the worker runs the normal local investigation and proposal flow
+6. the worker publishes a patch, a successful triage handoff, or a report-only result
+
+Public pages only show sanitized summaries and published worker output that is safe to expose.
 
 ## Packaging and runtime layout
 
-The Debian package installs:
+The Debian packaging installs:
 
 - `/usr/bin/fixer`
 - `/usr/bin/fixerd`
 - `/usr/bin/fixer-server`
 - `/etc/fixer/fixer.toml`
-- `/usr/lib/systemd/system/fixer.service`
-- `/usr/lib/tmpfiles.d/fixer.conf`
+- `/etc/fixer/fixer-server.toml`
+- systemd units for the collector and server
 
-Default runtime paths:
+Typical runtime paths are:
 
-- database: `/var/lib/fixer/fixer.sqlite3`
-- state directory: `/var/lib/fixer`
-- default public server URL: `https://fixer.maumaps.org`
+- local database: `/var/lib/fixer/fixer.sqlite3`
+- local state directory: `/var/lib/fixer`
+- standalone server database: `/var/lib/fixer-server/fixer-server.sqlite3`
+- public site: `https://fixer.maumap.com`
 
-The service runs as root in the current package because the MVP needs broad visibility into system telemetry. This is a practical choice, not the desired end state.
+The current packaged collector still runs as root because it needs broad telemetry access. That is a pragmatic choice, not the desired end state.
 
-## Current limitations
+## What the architecture is trying to protect
 
-The MVP intentionally stops short of the full product vision:
+A lot of the shape above is there to protect a few important boundaries:
 
-- no TUI or web UI yet
-- no admin UI for siloed server promotion or moderation yet
-- no source package graph beyond basic package/path mapping
-- no automatic `deb-src` enablement or build-dependency installation yet
-- no upstream issue search or maintainer routing beyond local metadata and `git shortlog`
-- no raw eBPF integration library yet; optional eBPF support shells out to `bpftrace`
-- no automatic branch creation, PR creation, or issue submission
-- no privilege separation between collection and proposal execution
-- no richer-evidence approval path implemented yet beyond the policy/config shape
+- collection should be inspectable and deterministic
+- private machine evidence should stay local unless a user opts in
+- public output should be sanitized
+- worker output should be reviewable
+- “no honest local fix” should be treated as a valid result, not as failure
 
-## Near-term extensions
+That last point matters more than it sounds. Fixer gets healthier when it can say, in public, “this is a real problem, but the fix belongs elsewhere.”
 
-The next meaningful architecture steps are:
+## Current rough edges
 
-- split privileged collection from unprivileged validation and patch generation
-- enrich artifact ownership from package metadata to source package and upstream trackers
-- add Debian source-index management and build-dependency bootstrap for fully hands-off package rebuilds
-- add better finding deduplication for warnings and crashes
-- add validation profiles for each ecosystem beyond the current generic commands
-- expand proposal bundles with adjacent-code slicing instead of only opportunity metadata
+A few things are still in motion:
+
+- privilege separation is improving but not finished
+- workspace acquisition is much stronger for Debian-backed issues than for everything else
+- clustering still needs periodic refinement as new finding types are added
+- richer-evidence approval exists in the model, but the UX around it is still maturing
+- public boards and worker routing are intentionally conservative, which can make progress feel slower than a looser system
+
+If you are reading the code for the first time, the most useful mental model is this: Fixer is trying to make system maintenance legible. Everything else is in service of that.
