@@ -650,7 +650,9 @@ pub fn supports_process_investigation_report(opportunity: &OpportunityRecord) ->
             .get("details")
             .and_then(|details| details.get("subsystem"))
             .and_then(Value::as_str)
-            .is_some_and(|subsystem| matches!(subsystem, "runaway-process" | "stuck-process"))
+            .is_some_and(|subsystem| {
+                matches!(subsystem, "runaway-process" | "stuck-process" | "oom-kill")
+            })
 }
 
 pub fn create_process_investigation_report_proposal(
@@ -1758,11 +1760,15 @@ fn render_process_investigation_report(
         .get("subsystem")
         .and_then(Value::as_str)
         .unwrap_or("runaway-process");
+    let is_stuck_process = subsystem == "stuck-process";
+    let is_oom_kill = subsystem == "oom-kill";
     let classification = details
         .get("loop_classification")
         .and_then(Value::as_str)
-        .unwrap_or(if subsystem == "stuck-process" {
+        .unwrap_or(if is_stuck_process {
             "unknown-uninterruptible-wait"
+        } else if is_oom_kill {
+            "kernel-oom-kill"
         } else {
             "unknown-userspace-loop"
         });
@@ -1773,8 +1779,10 @@ fn render_process_investigation_report(
     let explanation = details
         .get("loop_explanation")
         .and_then(Value::as_str)
-        .unwrap_or(if subsystem == "stuck-process" {
+        .unwrap_or(if is_stuck_process {
             "Fixer collected `/proc` evidence for a process wedged in `D` state but could not derive a stronger kernel-side hypothesis yet."
+        } else if is_oom_kill {
+            "Fixer collected kernel log evidence showing that the OOM killer selected and terminated this process."
         } else {
             "Fixer collected a CPU-hot process sample but could not derive a stronger hypothesis yet."
         });
@@ -1859,16 +1867,20 @@ fn render_process_investigation_report(
         .unwrap_or_else(|| "unknown".to_string());
 
     let mut body = String::new();
-    if subsystem == "stuck-process" {
+    if is_stuck_process {
         body.push_str("# Stuck Process Investigation Report\n\n");
+    } else if is_oom_kill {
+        body.push_str("# OOM Kill Investigation Report\n\n");
     } else {
         body.push_str("# Runaway CPU Investigation Report\n\n");
     }
     body.push_str("## Recommended Action\n\n");
     match acquisition_error {
         Some(error) => {
-            if subsystem == "stuck-process" {
+            if is_stuck_process {
                 body.push_str("Fixer diagnosed a likely stuck-process wait, but it could not automatically acquire a patchable source workspace on this host.\n\n");
+            } else if is_oom_kill {
+                body.push_str("Fixer diagnosed a kernel OOM kill, but it could not automatically acquire a patchable source workspace on this host.\n\n");
             } else {
                 body.push_str("Fixer diagnosed a likely runaway CPU loop, but it could not automatically acquire a patchable source workspace on this host.\n\n");
             }
@@ -1876,8 +1888,10 @@ fn render_process_investigation_report(
             body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
         }
         None => {
-            if subsystem == "stuck-process" {
+            if is_stuck_process {
                 body.push_str("Fixer gathered enough evidence to describe the wait. Review the diagnosis below, then decide whether this looks like a package bug or a lower-level filesystem or kernel stall.\n\n");
+            } else if is_oom_kill {
+                body.push_str("Fixer gathered enough evidence to describe the OOM kill. Review the diagnosis below, then decide whether this points at application memory growth, an unusually heavy workload, or broader system memory pressure.\n\n");
             } else {
                 body.push_str("Fixer gathered enough evidence to describe the loop. Review the diagnosis below, then run `fixer propose-fix <id> --engine codex` against a prepared source tree if you want an automated patch attempt.\n\n");
             }
@@ -1912,26 +1926,75 @@ fn render_process_investigation_report(
         }
     }
 
-    body.push_str("\n## Why Fixer Believes It Is Stuck\n\n");
-    body.push_str(&format!(
-        "- Target process: `{}`\n- Sampled PID: `{}`\n- Loop classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
-        target_name, sampled_pid, classification, confidence, explanation
-    ));
-    if let Some(process_state) = process_state {
-        body.push_str(&format!("- Process state: `{process_state}`\n"));
-    }
-    if let Some(wchan) = wchan {
-        body.push_str(&format!("- Wait channel: `{wchan}`\n"));
-    }
-    if let Some(command_line) = command_line {
-        body.push_str(&format!("- Command line: `{command_line}`\n"));
-    }
-    if strace_duration > 0 {
+    if is_oom_kill {
+        body.push_str("\n## Why Fixer Believes This Was an OOM Kill\n\n");
         body.push_str(&format!(
-            "- Strace capture duration: `{strace_duration}` seconds\n"
+            "- Victim process: `{}`\n- Killed PID: `{}`\n- Classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
+            target_name,
+            details
+                .get("pid")
+                .and_then(Value::as_i64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            classification,
+            confidence,
+            explanation
         ));
+        if let Some(invoker) = details.get("invoker").and_then(Value::as_str) {
+            body.push_str(&format!("- OOM killer invoker: `{invoker}`\n"));
+        }
+        if let Some(task_memcg) = details.get("task_memcg").and_then(Value::as_str) {
+            body.push_str(&format!("- Memory cgroup: `{task_memcg}`\n"));
+        }
+        if let Some(total_vm_kb) = details.get("total_vm_kb").and_then(Value::as_u64) {
+            body.push_str(&format!(
+                "- Virtual memory at kill time: `{:.1}` GiB\n",
+                total_vm_kb as f64 / (1024.0 * 1024.0)
+            ));
+        }
+        if let Some(anon_rss_kb) = details.get("anon_rss_kb").and_then(Value::as_u64) {
+            body.push_str(&format!(
+                "- Anonymous RSS at kill time: `{:.0}` MiB\n",
+                anon_rss_kb as f64 / 1024.0
+            ));
+        }
+        if let Some(file_rss_kb) = details.get("file_rss_kb").and_then(Value::as_u64) {
+            body.push_str(&format!(
+                "- File-backed RSS at kill time: `{:.0}` MiB\n",
+                file_rss_kb as f64 / 1024.0
+            ));
+        }
+        if let Some(shmem_rss_kb) = details.get("shmem_rss_kb").and_then(Value::as_u64) {
+            body.push_str(&format!(
+                "- Shared-memory RSS at kill time: `{:.0}` MiB\n",
+                shmem_rss_kb as f64 / 1024.0
+            ));
+        }
+        if let Some(oom_score_adj) = details.get("oom_score_adj").and_then(Value::as_i64) {
+            body.push_str(&format!("- oom_score_adj: `{oom_score_adj}`\n"));
+        }
+    } else {
+        body.push_str("\n## Why Fixer Believes It Is Stuck\n\n");
+        body.push_str(&format!(
+            "- Target process: `{}`\n- Sampled PID: `{}`\n- Loop classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
+            target_name, sampled_pid, classification, confidence, explanation
+        ));
+        if let Some(process_state) = process_state {
+            body.push_str(&format!("- Process state: `{process_state}`\n"));
+        }
+        if let Some(wchan) = wchan {
+            body.push_str(&format!("- Wait channel: `{wchan}`\n"));
+        }
+        if let Some(command_line) = command_line {
+            body.push_str(&format!("- Command line: `{command_line}`\n"));
+        }
+        if strace_duration > 0 {
+            body.push_str(&format!(
+                "- Strace capture duration: `{strace_duration}` seconds\n"
+            ));
+        }
     }
-    if subsystem == "stuck-process" {
+    if is_stuck_process {
         if let Some(runtime_seconds) = details.get("runtime_seconds").and_then(Value::as_u64) {
             body.push_str(&format!(
                 "- Runtime before capture: `{runtime_seconds}` seconds\n"
@@ -1969,7 +2032,7 @@ fn render_process_investigation_report(
         body.push_str("\n## Repeated Loop Shape\n\n");
         body.push_str(&format!("`{dominant_sequence}`\n"));
     }
-    if subsystem == "stuck-process" {
+    if is_stuck_process {
         if let Some(io_excerpt) = details.get("io_excerpt").and_then(Value::as_str) {
             body.push_str("\n## I/O Snapshot\n\n```text\n");
             body.push_str(io_excerpt);
@@ -1983,10 +2046,14 @@ fn render_process_investigation_report(
     }
 
     body.push_str("\n## Validation Steps\n\n");
-    if subsystem == "stuck-process" {
+    if is_stuck_process {
         body.push_str("1. Confirm the process is still in `D` state with `ps -p <pid> -o pid,stat,wchan:40,comm`.\n");
         body.push_str("2. Re-read `/proc/<pid>/stack`, `/proc/<pid>/wchan`, and `/proc/<pid>/fd` to confirm the blocking path still points at the same wait site.\n");
         body.push_str("3. If you intervene on the suspected filesystem or mount backend, verify the process leaves `D` state instead of simply moving to a different wait site.\n");
+    } else if is_oom_kill {
+        body.push_str("1. Confirm the kernel is still logging OOM activity with `journalctl -k -g 'Out of memory|Killed process|oom-kill'`.\n");
+        body.push_str("2. Check whether the same package or cgroup repeatedly gets selected as the OOM victim under the same workload.\n");
+        body.push_str("3. Compare the victim's memory footprint and cgroup context before and after any package, workload, or memory-limit change.\n");
     } else {
         body.push_str("1. Confirm the process still shows sustained CPU time with `systemd-cgtop`, `top`, or `ps -p <pid> -o %cpu,stat,comm`.\n");
         body.push_str("2. Re-run a short syscall sample and confirm the dominant syscalls still match the sequence above.\n");
@@ -1997,13 +2064,15 @@ fn render_process_investigation_report(
     if acquisition_error.is_some() {
         body.push_str("Treat this as an upstream-report-ready diagnosis. Include the summary above, plus the evidence bundle path below, when filing the bug.\n");
     } else {
-        if subsystem == "stuck-process"
+        if is_stuck_process
             && details
                 .get("likely_external_root_cause")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
         {
             body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points below user space, so the next action is usually a kernel, mount, or storage investigation rather than a package patch.\n");
+        } else if is_oom_kill {
+            body.push_str("Treat this as the diagnosis half of the pipeline. The next action is to decide whether the application is growing unreasonably, the workload needs limits, or the host is simply under-provisioned for the current memory demand.\n");
         } else {
             body.push_str("Treat this as the diagnosis half of the pipeline. A patch attempt should focus on the subsystem implicated by the dominant evidence above.\n");
         }
@@ -2828,6 +2897,57 @@ mod tests {
         assert!(rendered.contains("fuse_wait_answer"));
         assert!(rendered.contains("/mnt/problematic-tree"));
         assert!(rendered.contains("kernel, mount, or storage investigation"));
+    }
+
+    #[test]
+    fn oom_kill_investigation_reports_explain_kernel_victim_selection() {
+        let opportunity = OpportunityRecord {
+            id: 9,
+            finding_id: 9,
+            kind: "investigation".to_string(),
+            title: "OOM kill investigation for element-desktop".to_string(),
+            score: 108,
+            state: "open".to_string(),
+            summary: "element-desktop was killed by the kernel OOM killer.".to_string(),
+            evidence: json!({
+                "package_name": "element-desktop",
+                "details": {
+                    "subsystem": "oom-kill",
+                    "profile_target": { "name": "element-desktop" },
+                    "pid": 2415866,
+                    "loop_classification": "kernel-oom-kill",
+                    "loop_confidence": 1.0,
+                    "loop_explanation": "The kernel OOM killer explicitly selected and terminated the process.",
+                    "invoker": "MainThread",
+                    "task_memcg": "/user.slice/user-1000.slice/user@1000.service/app.slice/app-element\\x2ddesktop@1cf7c2c7954847c9a04e1e68b4e8e95b.service",
+                    "total_vm_kb": 1464797676u64,
+                    "anon_rss_kb": 204948u64,
+                    "file_rss_kb": 164u64,
+                    "shmem_rss_kb": 15408u64,
+                    "oom_score_adj": 300
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+            updated_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let system = json!({
+            "os_pretty_name": "Debian GNU/Linux trixie/sid",
+            "kernel": "Linux 6.19.8+deb14-amd64"
+        });
+        let rendered = render_process_investigation_report(
+            &opportunity,
+            None,
+            &system,
+            Path::new("/tmp/evidence.json"),
+            Some("could not acquire source package automatically"),
+        );
+        assert!(rendered.contains("OOM Kill Investigation Report"));
+        assert!(rendered.contains("Why Fixer Believes This Was an OOM Kill"));
+        assert!(rendered.contains("Anonymous RSS at kill time"));
+        assert!(rendered.contains("MainThread"));
+        assert!(rendered.contains("journalctl -k -g 'Out of memory|Killed process|oom-kill'"));
     }
 
     #[test]

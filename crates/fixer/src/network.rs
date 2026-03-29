@@ -1432,10 +1432,12 @@ fn process_investigation_worker_summary(opportunity: &crate::models::Opportunity
         .and_then(Value::as_str)
         .unwrap_or("unknown-investigation")
         .replace('-', " ");
-    if details.get("subsystem").and_then(Value::as_str) == Some("stuck-process") {
-        format!("{target} likely remains stuck in a {classification} wait.")
-    } else {
-        format!("{target} likely remains stuck in a {classification} loop.")
+    match details.get("subsystem").and_then(Value::as_str) {
+        Some("stuck-process") => {
+            format!("{target} likely remains stuck in a {classification} wait.")
+        }
+        Some("oom-kill") => format!("{target} was killed by the kernel OOM killer."),
+        _ => format!("{target} likely remains stuck in a {classification} loop."),
     }
 }
 

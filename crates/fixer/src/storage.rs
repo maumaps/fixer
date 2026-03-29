@@ -1329,6 +1329,7 @@ fn score_for(
     let detail_boost = match kind {
         "investigation" => match details.get("subsystem").and_then(Value::as_str) {
             Some("stuck-process") => 20,
+            Some("oom-kill") => 18,
             Some("runaway-process") => 16,
             _ => 12,
         },

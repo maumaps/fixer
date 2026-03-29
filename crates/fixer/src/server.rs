@@ -7689,6 +7689,29 @@ fn normalized_investigation_cluster_key(item: &SharedOpportunity) -> String {
                 target, classification, hot_symbol, dominant_sequence,
             ))
         }
+        "oom-kill" => {
+            let target = normalized_investigation_target_name(item);
+            let constraint = item
+                .finding
+                .details
+                .get("constraint")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let cgroup_target = item
+                .finding
+                .details
+                .get("task_memcg_target")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("-");
+            hash_text(format!(
+                "investigation|oom-kill|{}|{}|{}|{}",
+                target,
+                item.finding.package_name.as_deref().unwrap_or("-"),
+                cgroup_target,
+                constraint,
+            ))
+        }
         _ => hash_text(format!(
             "investigation|{}|{}|{}|{}",
             subsystem,
@@ -7757,6 +7780,32 @@ fn investigation_public_issue_fields(item: &SharedOpportunity) -> Option<PublicI
                 summary: format!(
                     "{} shows a repeated `D`-state wait, likely blocked in {} via {}.",
                     target, classification, wait_point
+                ),
+                visible: is_publicly_visible(item),
+            })
+        }
+        "oom-kill" => {
+            let target = normalized_investigation_target_name(item);
+            let anon_rss_mib = item
+                .finding
+                .details
+                .get("anon_rss_kb")
+                .and_then(Value::as_u64)
+                .map(|value| value as f64 / 1024.0)
+                .unwrap_or_default();
+            let scope = item
+                .finding
+                .details
+                .get("task_memcg_target")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| format!(" in `{value}`"))
+                .unwrap_or_default();
+            Some(PublicIssueFields {
+                title: format!("OOM kill investigation for {target}"),
+                summary: format!(
+                    "{target} was killed by the kernel OOM killer after reaching about {:.0} MiB anonymous RSS{}.",
+                    anon_rss_mib, scope
                 ),
                 visible: is_publicly_visible(item),
             })
@@ -9113,6 +9162,53 @@ mod tests {
         }
     }
 
+    fn sample_oom_kill_investigation(target: &str, cgroup_target: &str) -> SharedOpportunity {
+        SharedOpportunity {
+            local_opportunity_id: 1,
+            opportunity: OpportunityRecord {
+                id: 1,
+                finding_id: 1,
+                kind: "investigation".to_string(),
+                title: format!("OOM kill investigation for {target}"),
+                score: 108,
+                state: "open".to_string(),
+                summary: format!(
+                    "{target} was killed by the kernel OOM killer after reaching about 200 MiB anonymous RSS in `{cgroup_target}`."
+                ),
+                evidence: json!({}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "2026-03-29T20:50:00Z".to_string(),
+                updated_at: "2026-03-29T20:50:00Z".to_string(),
+            },
+            finding: FindingRecord {
+                id: 1,
+                kind: "investigation".to_string(),
+                title: format!("OOM kill investigation for {target}"),
+                severity: "high".to_string(),
+                fingerprint: format!("oom-kill-{target}"),
+                summary: format!(
+                    "{target} was killed by the kernel OOM killer after reaching about 200 MiB anonymous RSS in `{cgroup_target}`."
+                ),
+                details: json!({
+                    "subsystem": "oom-kill",
+                    "profile_target": { "name": target },
+                    "loop_classification": "kernel-oom-kill",
+                    "constraint": "CONSTRAINT_NONE",
+                    "task_memcg_target": cgroup_target,
+                    "anon_rss_kb": 204948u64,
+                }),
+                artifact_name: Some(target.to_string()),
+                artifact_path: None,
+                package_name: Some(cgroup_target.to_string()),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "2026-03-29T20:50:00Z".to_string(),
+                last_seen: "2026-03-29T20:50:00Z".to_string(),
+            },
+        }
+    }
+
     fn public_issue_for_test(id: &str, opportunity: &SharedOpportunity) -> PublicIssue {
         let public = build_public_issue_fields(opportunity);
         PublicIssue {
@@ -10115,6 +10211,22 @@ mod tests {
         );
         assert!(public.summary.contains("kworker+i915_flip"));
         assert!(!public.summary.contains("152s"));
+    }
+
+    #[test]
+    fn oom_kill_cluster_key_prefers_target_and_memcg_family() {
+        let a = sample_oom_kill_investigation("chrome", "google-chrome");
+        let mut b = sample_oom_kill_investigation("chrome", "google-chrome");
+        b.finding.summary = "chrome was killed by the kernel OOM killer after reaching about 6400 MiB anonymous RSS in `google-chrome`.".to_string();
+        b.finding.details["anon_rss_kb"] = json!(6676808u64);
+        b.opportunity.summary = b.finding.summary.clone();
+
+        assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
+
+        let public = build_public_issue_fields(&a);
+        assert_eq!(public.title, "OOM kill investigation for chrome");
+        assert!(public.summary.contains("kernel OOM killer"));
+        assert!(public.summary.contains("google-chrome"));
     }
 
     #[test]

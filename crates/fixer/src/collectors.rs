@@ -10,6 +10,7 @@ use crate::util::{
 use crate::workspace::resolve_installed_package_metadata;
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -58,6 +59,7 @@ pub fn collect_once(config: &FixerConfig, store: &Store) -> Result<CollectReport
     }
     if config.service.collect_warnings {
         report.findings_seen += collect_warning_logs(config, store)?;
+        report.findings_seen += collect_kernel_oom_kill_investigations(config, store)?;
         report.findings_seen += collect_kernel_warnings(config, store)?;
         report.findings_seen += collect_postgres_collation_mismatches(store)?;
     }
@@ -174,6 +176,26 @@ struct StuckProcessGroup {
     sample_pid: i32,
     sample_runtime_seconds: u64,
     comm: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KernelOomKillEvent {
+    process_name: String,
+    pid: i32,
+    uid: u32,
+    total_vm_kb: u64,
+    anon_rss_kb: u64,
+    file_rss_kb: u64,
+    shmem_rss_kb: u64,
+    oom_score_adj: i32,
+    constraint: Option<String>,
+    cpuset: Option<String>,
+    task_memcg: Option<String>,
+    cgroup_target: Option<String>,
+    invoker: Option<String>,
+    killed_line: String,
+    oom_kill_line: Option<String>,
+    invoker_line: Option<String>,
 }
 
 fn collect_stuck_process_investigations(config: &FixerConfig, store: &Store) -> Result<usize> {
@@ -671,6 +693,101 @@ fn collect_kernel_warnings(config: &FixerConfig, store: &Store) -> Result<usize>
             summary: line.clone(),
             details: Value::Object(details),
             artifact,
+            repo_root: None,
+            ecosystem: None,
+        };
+        let _ = store.record_finding(&finding)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn collect_kernel_oom_kill_investigations(config: &FixerConfig, store: &Store) -> Result<usize> {
+    if !store.capability_available("journalctl")? {
+        return Ok(0);
+    }
+    let journal_lines = config.service.journal_lines.saturating_mul(4).to_string();
+    let output = command_output(
+        "journalctl",
+        &[
+            "-k",
+            "-b",
+            "-g",
+            "Out of memory: Killed process|oom-kill:|invoked oom-killer",
+            "-n",
+            journal_lines.as_str(),
+            "--no-pager",
+        ],
+    )
+    .unwrap_or_default();
+    let mut count = 0;
+    for event in parse_kernel_oom_kill_events(&output) {
+        let package_name = event.package_name();
+        let cgroup_target = event.cgroup_target.clone();
+        let likely_external_root_cause = package_name.is_none();
+        let finding = FindingInput {
+            kind: "investigation".to_string(),
+            title: format!("OOM kill investigation for {}", event.process_name),
+            severity: "high".to_string(),
+            fingerprint: hash_text(format!(
+                "oom-kill:{}:{}:{}:{}",
+                event.process_name,
+                package_name.as_deref().unwrap_or("-"),
+                cgroup_target.as_deref().unwrap_or("-"),
+                event.constraint.as_deref().unwrap_or("-"),
+            )),
+            summary: event.public_summary(),
+            details: json!({
+                "subsystem": "oom-kill",
+                "profile_target": {
+                    "name": event.process_name.clone(),
+                },
+                "loop_classification": "kernel-oom-kill",
+                "loop_confidence": 1.0,
+                "loop_explanation": format!(
+                    "The kernel OOM killer explicitly selected {} (pid {}) and logged its memory footprint at the kill site.",
+                    event.process_name, event.pid
+                ),
+                "pid": event.pid,
+                "uid": event.uid,
+                "total_vm_kb": event.total_vm_kb,
+                "anon_rss_kb": event.anon_rss_kb,
+                "file_rss_kb": event.file_rss_kb,
+                "shmem_rss_kb": event.shmem_rss_kb,
+                "oom_score_adj": event.oom_score_adj,
+                "constraint": event.constraint.clone(),
+                "cpuset": event.cpuset.clone(),
+                "task_memcg": event.task_memcg.clone(),
+                "task_memcg_target": cgroup_target.clone(),
+                "invoker": event.invoker.clone(),
+                "killed_line": event.killed_line.clone(),
+                "oom_kill_line": event.oom_kill_line.clone(),
+                "invoker_line": event.invoker_line.clone(),
+                "package_name": package_name.clone(),
+                "likely_external_root_cause": likely_external_root_cause,
+            }),
+            artifact: Some(ObservedArtifact {
+                kind: "binary".to_string(),
+                name: event.process_name.clone(),
+                path: None,
+                package_name: package_name.clone(),
+                repo_root: None,
+                ecosystem: None,
+                metadata: json!({
+                    "source": "kernel-oom-kill",
+                    "pid": event.pid,
+                    "uid": event.uid,
+                    "total_vm_kb": event.total_vm_kb,
+                    "anon_rss_kb": event.anon_rss_kb,
+                    "file_rss_kb": event.file_rss_kb,
+                    "shmem_rss_kb": event.shmem_rss_kb,
+                    "oom_score_adj": event.oom_score_adj,
+                    "constraint": event.constraint.clone(),
+                    "cpuset": event.cpuset.clone(),
+                    "task_memcg": event.task_memcg.clone(),
+                    "task_memcg_target": event.cgroup_target.clone(),
+                }),
+            }),
             repo_root: None,
             ecosystem: None,
         };
@@ -1298,6 +1415,220 @@ impl ParsedAppArmorDenial {
         }
         format!("AppArmor denied {actor}: {operation}")
     }
+}
+
+impl KernelOomKillEvent {
+    fn package_name(&self) -> Option<String> {
+        self.cgroup_target
+            .as_ref()
+            .filter(|value| !value.trim().is_empty() && *value != &self.process_name)
+            .cloned()
+    }
+
+    fn public_summary(&self) -> String {
+        let anon_mib = kib_to_mib(self.anon_rss_kb);
+        let total_vm_gib = kib_to_gib(self.total_vm_kb);
+        let scope = self
+            .cgroup_target
+            .as_deref()
+            .map(|target| format!(" in `{target}`"))
+            .unwrap_or_default();
+        format!(
+            "{} was killed by the kernel OOM killer after reaching about {:.0} MiB anonymous RSS ({:.1} GiB virtual memory){}.",
+            self.process_name, anon_mib, total_vm_gib, scope
+        )
+    }
+}
+
+fn parse_kernel_oom_kill_events(raw: &str) -> Vec<KernelOomKillEvent> {
+    let killed_re = Regex::new(
+        r"Out of memory: Killed process (?P<pid>\d+) \((?P<task>[^)]+)\) total-vm:(?P<total_vm>\d+)kB, anon-rss:(?P<anon_rss>\d+)kB, file-rss:(?P<file_rss>\d+)kB, shmem-rss:(?P<shmem_rss>\d+)kB, UID:(?P<uid>\d+) .* oom_score_adj:(?P<oom_score_adj>-?\d+)",
+    )
+    .expect("valid oom kill regex");
+    let detail_re = Regex::new(
+        r"oom-kill:constraint=(?P<constraint>[^,]+).*cpuset=(?P<cpuset>[^,]+).*task_memcg=(?P<task_memcg>[^,]+),task=(?P<task>[^,]+),pid=(?P<pid>\d+),uid=(?P<uid>\d+)",
+    )
+    .expect("valid oom detail regex");
+    let invoker_re =
+        Regex::new(r"^(?P<invoker>.+?) invoked oom-killer:").expect("valid oom invoker regex");
+
+    let mut details_by_pid =
+        HashMap::<i32, (Option<String>, Option<String>, Option<String>, String)>::new();
+    let mut invoker_lines = Vec::<(String, String)>::new();
+
+    for line in raw.lines() {
+        let message = strip_kernel_log_prefix(line);
+        if let Some(captures) = detail_re.captures(&message) {
+            let Some(pid) = captures
+                .name("pid")
+                .and_then(|value| value.as_str().parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let constraint = captures
+                .name("constraint")
+                .map(|value| value.as_str().to_string());
+            let cpuset = captures
+                .name("cpuset")
+                .map(|value| value.as_str().to_string());
+            let task_memcg = captures
+                .name("task_memcg")
+                .map(|value| value.as_str().to_string());
+            details_by_pid.insert(pid, (constraint, cpuset, task_memcg, line.to_string()));
+            continue;
+        }
+        if let Some(captures) = invoker_re.captures(&message) {
+            let invoker = captures
+                .name("invoker")
+                .map(|value| value.as_str().trim().to_string())
+                .unwrap_or_default();
+            if !invoker.is_empty() {
+                invoker_lines.push((invoker, line.to_string()));
+            }
+        }
+    }
+
+    let mut events = Vec::new();
+    for line in raw.lines() {
+        let message = strip_kernel_log_prefix(line);
+        let Some(captures) = killed_re.captures(&message) else {
+            continue;
+        };
+        let Some(pid) = captures
+            .name("pid")
+            .and_then(|value| value.as_str().parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let process_name = captures
+            .name("task")
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| "process".to_string());
+        let total_vm_kb = captures
+            .name("total_vm")
+            .and_then(|value| value.as_str().parse::<u64>().ok())
+            .unwrap_or_default();
+        let anon_rss_kb = captures
+            .name("anon_rss")
+            .and_then(|value| value.as_str().parse::<u64>().ok())
+            .unwrap_or_default();
+        let file_rss_kb = captures
+            .name("file_rss")
+            .and_then(|value| value.as_str().parse::<u64>().ok())
+            .unwrap_or_default();
+        let shmem_rss_kb = captures
+            .name("shmem_rss")
+            .and_then(|value| value.as_str().parse::<u64>().ok())
+            .unwrap_or_default();
+        let uid = captures
+            .name("uid")
+            .and_then(|value| value.as_str().parse::<u32>().ok())
+            .unwrap_or_default();
+        let oom_score_adj = captures
+            .name("oom_score_adj")
+            .and_then(|value| value.as_str().parse::<i32>().ok())
+            .unwrap_or_default();
+        let (constraint, cpuset, task_memcg, oom_kill_line) = details_by_pid
+            .get(&pid)
+            .cloned()
+            .unwrap_or((None, None, None, String::new()));
+        let task_memcg = task_memcg.filter(|value| !value.trim().is_empty());
+        let cgroup_target = task_memcg
+            .as_deref()
+            .and_then(normalize_oom_task_memcg_target);
+        let nearest_invoker = invoker_lines
+            .iter()
+            .find(|(_, invoker_line)| {
+                let invoker_time = invoker_line.split(" kernel: ").next().unwrap_or_default();
+                let event_time = line.split(" kernel: ").next().unwrap_or_default();
+                invoker_time <= event_time
+            })
+            .cloned();
+
+        events.push(KernelOomKillEvent {
+            process_name,
+            pid,
+            uid,
+            total_vm_kb,
+            anon_rss_kb,
+            file_rss_kb,
+            shmem_rss_kb,
+            oom_score_adj,
+            constraint,
+            cpuset: cpuset.filter(|value| !value.trim().is_empty()),
+            task_memcg,
+            cgroup_target,
+            invoker: nearest_invoker.as_ref().map(|(invoker, _)| invoker.clone()),
+            killed_line: line.to_string(),
+            oom_kill_line: (!oom_kill_line.trim().is_empty()).then_some(oom_kill_line),
+            invoker_line: nearest_invoker.map(|(_, raw)| raw),
+        });
+    }
+    events
+}
+
+fn normalize_oom_task_memcg_target(raw: &str) -> Option<String> {
+    let trailing_digits_re = Regex::new(r"-\d+$").expect("valid oom scope regex");
+    for segment in raw.split('/') {
+        if let Some(app) = segment.strip_prefix("app-") {
+            let decoded = decode_systemd_unit_component(app);
+            if let Some(service) = decoded.strip_suffix(".service") {
+                let base = service
+                    .split_once('@')
+                    .map(|(head, _)| head)
+                    .unwrap_or(service)
+                    .trim();
+                if !base.is_empty() {
+                    return Some(base.to_string());
+                }
+            }
+            if let Some(scope) = decoded.strip_suffix(".scope") {
+                let normalized = trailing_digits_re.replace(scope, "").to_string();
+                if !normalized.is_empty() {
+                    return Some(normalized);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn decode_systemd_unit_component(raw: &str) -> String {
+    let mut decoded = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && bytes[index + 1] == b'x'
+            && bytes[index + 2].is_ascii_hexdigit()
+            && bytes[index + 3].is_ascii_hexdigit()
+        {
+            let hex = &raw[index + 2..index + 4];
+            if let Ok(value) = u8::from_str_radix(hex, 16) {
+                decoded.push(value as char);
+                index += 4;
+                continue;
+            }
+        }
+        decoded.push(bytes[index] as char);
+        index += 1;
+    }
+    decoded
+}
+
+fn strip_kernel_log_prefix(raw: &str) -> String {
+    raw.split_once(" kernel: ")
+        .map(|(_, message)| message.trim().to_string())
+        .unwrap_or_else(|| raw.trim().to_string())
+}
+
+fn kib_to_mib(value: u64) -> f64 {
+    value as f64 / 1024.0
+}
+
+fn kib_to_gib(value: u64) -> f64 {
+    value as f64 / (1024.0 * 1024.0)
 }
 
 fn apparmor_finding_from_kernel_line(line: &str) -> Option<FindingInput> {
@@ -3629,8 +3960,9 @@ mod tests {
         dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
         is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
         kernel_module_package_hint, kernel_warning_module_candidates, looks_like_warning,
-        normalize_perf_symbol, normalize_stuck_process_target_name, parse_apparmor_denial,
-        parse_coredump_info, parse_dkms_status_line, parse_perf_hot_paths,
+        normalize_oom_task_memcg_target, normalize_perf_symbol,
+        normalize_stuck_process_target_name, parse_apparmor_denial, parse_coredump_info,
+        parse_dkms_status_line, parse_kernel_oom_kill_events, parse_perf_hot_paths,
         parse_postgres_collation_mismatch_rows, parse_strace_syscall_name, process_runtime_seconds,
         safe_perf_name, stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
         summarize_top_syscalls, system_uptime_seconds,
@@ -3778,6 +4110,37 @@ mod tests {
         assert!(is_low_signal_kernel_warning(
             "Mar 29 12:41:59 nucat kernel: show_signal: 666 callbacks suppressed"
         ));
+    }
+
+    #[test]
+    fn parses_kernel_oom_kill_events_into_structured_investigations() {
+        let raw = "\
+Mar 29 23:54:40 nucat kernel: Out of memory: Killed process 2415866 (element-desktop) total-vm:1464797676kB, anon-rss:204948kB, file-rss:164kB, shmem-rss:15408kB, UID:1000 pgtables:1996kB oom_score_adj:300\n\
+Mar 29 23:54:40 nucat kernel: oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=user.slice,mems_allowed=0,global_oom,task_memcg=/user.slice/user-1000.slice/user@1000.service/app.slice/app-element\\x2ddesktop@1cf7c2c7954847c9a04e1e68b4e8e95b.service,task=element-desktop,pid=2415866,uid=1000\n\
+Mar 29 23:54:37 nucat kernel: MainThread invoked oom-killer: gfp_mask=0x140cca(GFP_HIGHUSER_MOVABLE|__GFP_COMP), order=0, oom_score_adj=200\n";
+        let events = parse_kernel_oom_kill_events(raw);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].process_name, "element-desktop");
+        assert_eq!(events[0].pid, 2415866);
+        assert_eq!(events[0].anon_rss_kb, 204948);
+        assert_eq!(events[0].cgroup_target.as_deref(), Some("element-desktop"));
+        assert_eq!(events[0].invoker.as_deref(), Some("MainThread"));
+    }
+
+    #[test]
+    fn normalizes_oom_memcg_targets_from_systemd_app_units() {
+        assert_eq!(
+            normalize_oom_task_memcg_target(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/app-google\\x2dchrome@22ccba5c949444b6969fe39ce4794260.service"
+            ),
+            Some("google-chrome".to_string())
+        );
+        assert_eq!(
+            normalize_oom_task_memcg_target(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.kde.yakuake-12836.scope/tab(595051).scope"
+            ),
+            Some("org.kde.yakuake".to_string())
+        );
     }
 
     #[test]
