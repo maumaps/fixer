@@ -187,11 +187,8 @@ pub fn load_published_codex_session(bundle_dir: &Path) -> Result<Value> {
             ))
         })
         .transpose()?;
-    let diff = render_public_session_diff(
-        source_workspace_root.as_deref(),
-        workspace_root.as_deref(),
-        bundle_dir,
-    )?;
+    let diff =
+        render_public_session_diff(source_workspace_root.as_deref(), workspace_root.as_deref())?;
     Ok(json!({
         "prompt": prompt,
         "response": response,
@@ -559,7 +556,6 @@ fn copy_directory_recursively(
 fn render_public_session_diff(
     source_workspace_root: Option<&Path>,
     workspace_root: Option<&Path>,
-    bundle_dir: &Path,
 ) -> Result<Option<String>> {
     let (Some(source_workspace_root), Some(workspace_root)) =
         (source_workspace_root, workspace_root)
@@ -586,22 +582,63 @@ fn render_public_session_diff(
     match output.status.code() {
         Some(0) => Ok(None),
         Some(1) => {
-            let diff = String::from_utf8_lossy(&output.stdout).to_string();
-            Ok(Some(truncate_public_session_text(
-                &sanitize_public_session_text(
-                    &diff,
-                    bundle_dir,
-                    Some(workspace_root),
-                    Some(source_workspace_root),
-                ),
-                128 * 1024,
-            )))
+            let diff = normalize_public_patch_diff(
+                &String::from_utf8_lossy(&output.stdout),
+                source_workspace_root,
+                workspace_root,
+            );
+            if diff.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(truncate_public_session_text(&diff, 128 * 1024)))
+            }
         }
         _ => Err(anyhow!(
             "failed to generate a public diff for the Codex session: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )),
     }
+}
+
+fn normalize_public_patch_diff(
+    text: &str,
+    source_workspace_root: &Path,
+    workspace_root: &Path,
+) -> String {
+    let mut replacements = vec![
+        (workspace_root.to_path_buf(), "b".to_string()),
+        (source_workspace_root.to_path_buf(), "a".to_string()),
+    ];
+    replacements.sort_by(|(left, _), (right, _)| {
+        right
+            .to_string_lossy()
+            .len()
+            .cmp(&left.to_string_lossy().len())
+    });
+
+    let mut normalized = text.to_string();
+    for (from, to) in replacements {
+        let from = from.to_string_lossy();
+        if !from.is_empty() {
+            normalized = normalized.replace(from.as_ref(), &to);
+        }
+    }
+
+    let trailing_newline = normalized.ends_with('\n');
+    let mut lines = normalized
+        .lines()
+        .filter(|line| {
+            !(line.starts_with("diff -ur")
+                || line.starts_with("diff -r ")
+                || line.starts_with("Only in ")
+                || line.starts_with("Binary files "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if trailing_newline && !lines.is_empty() {
+        lines.push('\n');
+    }
+    lines
 }
 
 fn sanitize_public_session_text(
@@ -2239,7 +2276,10 @@ mod tests {
         assert!(response.contains("./workspace/src/file.c"));
         assert!(response.contains("./source/src/file.c"));
         assert!(!response.contains(source_dir.to_string_lossy().as_ref()));
-        assert!(diff.contains("./source/src/file.c"));
-        assert!(diff.contains("./workspace/src/file.c"));
+        assert!(diff.contains("--- a/src/file.c"));
+        assert!(diff.contains("+++ b/src/file.c"));
+        assert!(!diff.contains("diff -urN"));
+        assert!(!diff.contains("./source/src/file.c"));
+        assert!(!diff.contains("./workspace/src/file.c"));
     }
 }

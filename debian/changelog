@@ -1,3 +1,11 @@
+fixer (0.19.0-1) unstable; urgency=medium
+
+  * Publish pull-request-ready public patch diffs with a dedicated .patch route.
+  * Surface best-patch downloads directly on issue pages and the public patches board.
+  * Normalize published diffs to a/... and b/... paths so they can seed real PRs.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 22:05:00 +0400
+
 fixer (0.18.0-1) unstable; urgency=medium
 
   * Add a public successful-patches page and JSON feed.

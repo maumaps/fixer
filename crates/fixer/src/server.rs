@@ -283,6 +283,15 @@ code, pre {
     margin-top: 0.9rem;
 }
 
+.patch-panel {
+    border-color: rgba(36, 92, 45, 0.2);
+    background: linear-gradient(
+        180deg,
+        rgba(255, 255, 255, 0.86),
+        rgba(238, 247, 239, 0.84)
+    );
+}
+
 .patch-summary {
     padding: 0.9rem 1rem;
     border-radius: 16px;
@@ -347,6 +356,16 @@ code, pre {
     border: 1px solid var(--line);
     background: #211a12;
     color: #fef3db;
+}
+
+.attempt-session {
+    margin-top: 0.95rem;
+}
+
+.attempt-session summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--accent-strong);
 }
 
 .fine-print {
@@ -471,6 +490,8 @@ struct PublicIssueDetail {
     score: i64,
     corroboration_count: i64,
     best_patch_available: bool,
+    best_patch_diff_url: Option<String>,
+    best_patch: Option<PublicAttempt>,
     last_seen: String,
     attempts: Vec<PublicAttempt>,
 }
@@ -488,6 +509,7 @@ struct PublicPatchEntry {
     score: i64,
     corroboration_count: i64,
     last_seen: String,
+    best_patch_diff_url: Option<String>,
     best_patch: PublicAttempt,
 }
 
@@ -575,6 +597,7 @@ pub async fn serve(config: FixerConfig) -> Result<()> {
         .route("/", get(landing_page))
         .route("/issues", get(public_issues_page))
         .route("/patches", get(public_patches_page))
+        .route("/issues/{id}/best.patch", get(public_issue_best_patch))
         .route("/issues/{id}", get(public_issue_detail_page))
         .route("/healthz", get(healthz))
         .route("/assets/app.css", get(stylesheet))
@@ -631,6 +654,23 @@ async fn public_issue_detail_page(
     validate_uuid_param(&id, "issue id")?;
     let issue = load_public_issue_detail(&state.db, id).await?;
     Ok(Html(render_issue_detail_page(&issue)))
+}
+
+async fn public_issue_best_patch(
+    State(state): State<Arc<ServerState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    validate_uuid_param(&id, "issue id")?;
+    let best_patch = load_public_issue_best_patch(&state.db, &id).await?;
+    let diff = best_patch
+        .as_ref()
+        .and_then(public_attempt_diff)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "public patch diff not found"))?;
+    Ok((
+        [(header::CONTENT_TYPE, "text/x-diff; charset=utf-8")],
+        diff.to_string(),
+    )
+        .into_response())
 }
 
 async fn healthz(State(state): State<Arc<ServerState>>) -> Result<Json<Healthz>, ApiError> {
@@ -3834,6 +3874,8 @@ async fn load_public_issue_detail(
     id: String,
 ) -> Result<PublicIssueDetail, ApiError> {
     let issue = load_public_issue(db, id.clone()).await?;
+    let best_patch = load_public_issue_best_patch(db, &id).await?;
+    let best_patch_diff_url = public_best_patch_diff_url(&id, best_patch.as_ref());
     let attempts = load_public_attempts(db, &id, 10).await?;
     Ok(PublicIssueDetail {
         id: issue.id,
@@ -3847,9 +3889,72 @@ async fn load_public_issue_detail(
         score: issue.score,
         corroboration_count: issue.corroboration_count,
         best_patch_available: issue.best_patch_available,
+        best_patch_diff_url,
+        best_patch,
         last_seen: issue.last_seen,
         attempts,
     })
+}
+
+async fn load_public_issue_best_patch(
+    db: &ServerDb,
+    id: &str,
+) -> Result<Option<PublicAttempt>, ApiError> {
+    match db {
+        ServerDb::Postgres(db) => {
+            let row = db
+                .query_opt(
+                    "
+            SELECT best_patch_json
+            FROM issue_clusters
+            WHERE id = $1
+              AND promoted = TRUE
+              AND public_visible = TRUE
+              AND best_patch_json IS NOT NULL
+            ",
+                    &[&id],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            row.map(|row| {
+                let best_patch_json: Value = row.get(0);
+                serde_json::from_value::<PatchAttempt>(best_patch_json)
+                    .map(public_attempt_from_patch_attempt)
+                    .map_err(ApiError::internal)
+            })
+            .transpose()
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            connection
+                .query_row(
+                    "
+            SELECT best_patch_json
+            FROM issue_clusters
+            WHERE id = ?1
+              AND promoted = 1
+              AND public_visible = 1
+              AND best_patch_json IS NOT NULL
+            ",
+                    [id],
+                    |row| {
+                        let best_patch =
+                            serde_json::from_str::<PatchAttempt>(&row.get::<_, String>(0)?)
+                                .map(public_attempt_from_patch_attempt)
+                                .map_err(|error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        0,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                })?;
+                        Ok(best_patch)
+                    },
+                )
+                .optional()
+                .map_err(ApiError::internal)
+        }
+    }
 }
 
 async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatchEntry>, ApiError> {
@@ -3969,13 +4074,14 @@ fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
 }
 
 fn public_patch_from_row(row: Row) -> Result<PublicPatchEntry, ApiError> {
+    let id: String = row.get(0);
     let best_patch_json: Value = row.get(10);
     let best_patch = serde_json::from_value::<PatchAttempt>(best_patch_json)
         .map(public_attempt_from_patch_attempt)
         .map_err(ApiError::internal)?;
     let last_seen: DateTime<Utc> = row.get(11);
     Ok(PublicPatchEntry {
-        id: row.get(0),
+        id: id.clone(),
         kind: row.get(1),
         title: row.get(2),
         summary: row.get(3),
@@ -3986,6 +4092,7 @@ fn public_patch_from_row(row: Row) -> Result<PublicPatchEntry, ApiError> {
         score: row.get(8),
         corroboration_count: row.get(9),
         last_seen: last_seen.to_rfc3339(),
+        best_patch_diff_url: public_best_patch_diff_url(&id, Some(&best_patch)),
         best_patch,
     })
 }
@@ -4015,6 +4122,7 @@ fn public_issue_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pub
 }
 
 fn public_patch_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicPatchEntry> {
+    let id: String = row.get(0)?;
     let best_patch = serde_json::from_str::<PatchAttempt>(&row.get::<_, String>(10)?)
         .map(public_attempt_from_patch_attempt)
         .map_err(|error| {
@@ -4025,7 +4133,7 @@ fn public_patch_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pub
             )
         })?;
     Ok(PublicPatchEntry {
-        id: row.get(0)?,
+        id: id.clone(),
         kind: row.get(1)?,
         title: row.get(2)?,
         summary: row.get(3)?,
@@ -4036,6 +4144,7 @@ fn public_patch_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pub
         score: row.get(8)?,
         corroboration_count: row.get(9)?,
         last_seen: row.get(11)?,
+        best_patch_diff_url: public_best_patch_diff_url(&id, Some(&best_patch)),
         best_patch,
     })
 }
@@ -4062,6 +4171,21 @@ fn public_attempt_from_patch_attempt(attempt: PatchAttempt) -> PublicAttempt {
         created_at: attempt.created_at,
         published_session,
     }
+}
+
+fn public_attempt_diff(attempt: &PublicAttempt) -> Option<&str> {
+    attempt
+        .published_session
+        .as_ref()
+        .and_then(|session| session.diff.as_deref())
+        .filter(|diff| !diff.trim().is_empty())
+}
+
+fn public_best_patch_diff_url(
+    issue_id: &str,
+    best_patch: Option<&PublicAttempt>,
+) -> Option<String> {
+    public_attempt_diff(best_patch?).map(|_| format!("/issues/{issue_id}/best.patch"))
 }
 
 #[derive(Debug, Clone)]
@@ -4491,6 +4615,7 @@ fn render_patches_page(patches: &[PublicPatchEntry]) -> String {
 }
 
 fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
+    let best_patch_markup = render_best_patch_panel(issue);
     let attempts_markup = if issue.attempts.is_empty() {
         "<p class=\"fine-print\">No public attempts have been published for this issue yet.</p>"
             .to_string()
@@ -4512,6 +4637,8 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
             <p class="fine-print">Last seen: {}. Public JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
         </section>
 
+        {}
+
         <section class="panel section">
             <h2>Published attempts</h2>
             <div class="issue-list">{}</div>
@@ -4532,6 +4659,7 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
         html_escape(&format_timestamp(&issue.last_seen)),
         issue.id,
         issue.id,
+        best_patch_markup,
         attempts_markup,
     );
     render_page(
@@ -4540,6 +4668,47 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
         NavPage::Issues,
         body,
         0,
+    )
+}
+
+fn render_best_patch_panel(issue: &PublicIssueDetail) -> String {
+    let Some(best_patch) = issue.best_patch.as_ref() else {
+        return String::new();
+    };
+    let Some(diff) = public_attempt_diff(best_patch) else {
+        return String::new();
+    };
+    let Some(diff_url) = issue.best_patch_diff_url.as_deref() else {
+        return String::new();
+    };
+    let validation = best_patch
+        .validation_status
+        .as_deref()
+        .map(|status| {
+            format!(
+                "<span class=\"tag\">validation: {}</span>",
+                html_escape(status)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"<section class="panel section patch-panel">
+            <h2>Pull-request-ready diff</h2>
+            <p class="fine-print">This is the current best public patch attempt for the issue. Use it as a PR starting point or apply it locally with <code>git apply -p1</code>.</p>
+            <div class="meta"><span class="tag patch">best patch</span><span class="tag">created: {}</span>{}</div>
+            <p class="issue-summary">{}</p>
+            <div class="hero-actions">
+                <a class="button primary" href="{}" download="fixer-{}.patch">Download .patch</a>
+                <a class="button" href="/patches">Browse successful patches</a>
+            </div>
+            <pre class="code-block"><code>{}</code></pre>
+        </section>"#,
+        html_escape(&format_timestamp(&best_patch.created_at)),
+        validation,
+        html_escape(&best_patch.summary),
+        diff_url,
+        issue.id,
+        html_escape(diff)
     )
 }
 
@@ -4673,6 +4842,14 @@ fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
             ));
         }
     }
+    let session_markup = if sections.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details class=\"attempt-session\"><summary>Published session</summary>{}</details>",
+            sections.join("")
+        )
+    };
 
     format!(
         r#"<article class="issue-card">
@@ -4697,12 +4874,22 @@ fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
                 html_escape(status)
             ))
             .unwrap_or_default(),
-        sections.join("")
+        session_markup
     )
 }
 
 fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
     let preview = render_patch_preview(entry.best_patch.published_session.as_ref());
+    let actions = entry
+        .best_patch_diff_url
+        .as_deref()
+        .map(|url| {
+            format!(
+                "<div class=\"hero-actions\"><a class=\"button primary\" href=\"{}\" download=\"fixer-{}.patch\">Download .patch</a></div>",
+                url, entry.id
+            )
+        })
+        .unwrap_or_default();
     let mut patch_tags = render_issue_tags(
         entry.kind.as_str(),
         entry.package_name.as_deref(),
@@ -4739,6 +4926,7 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
                 <p class="issue-summary">{}</p>
             </section>
             {}
+            {}
             <p class="fine-print">Full published attempt: <a href="/issues/{}">/issues/{}</a>. Issue JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
         </article>"#,
         entry.id,
@@ -4746,6 +4934,7 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
         html_escape(&entry.summary),
         patch_tags,
         html_escape(&entry.best_patch.summary),
+        actions,
         preview,
         entry.id,
         entry.id,
@@ -5019,7 +5208,7 @@ mod tests {
                 "published_session": {
                     "prompt": "Read ./evidence.json",
                     "response": "Patched ./workspace/src/file.c",
-                    "diff": "--- ./source/src/file.c\n+++ ./workspace/src/file.c\n",
+                    "diff": "--- a/src/file.c\n+++ b/src/file.c\n",
                 }
             }),
             created_at: "2026-03-29T00:00:00Z".to_string(),
@@ -5050,6 +5239,9 @@ mod tests {
             score: 106,
             corroboration_count: 2,
             last_seen: "2026-03-29T00:00:00Z".to_string(),
+            best_patch_diff_url: Some(
+                "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch".to_string(),
+            ),
             best_patch: PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -5059,15 +5251,57 @@ mod tests {
                 published_session: Some(PublishedAttemptSession {
                     prompt: "Read ./evidence.json".to_string(),
                     response: Some("Patched ./workspace/src/file.c".to_string()),
-                    diff: Some("--- ./source/src/file.c\n+++ ./workspace/src/file.c\n".to_string()),
+                    diff: Some("--- a/src/file.c\n+++ b/src/file.c\n".to_string()),
                 }),
             },
         });
 
         assert!(card.contains("successful patch"));
         assert!(card.contains("Diff Excerpt"));
+        assert!(card.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch"));
         assert!(card.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
         assert!(card.contains("/v1/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
+    }
+
+    #[test]
+    fn render_issue_detail_page_includes_best_patch_download() {
+        let issue = PublicIssueDetail {
+            id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for postgres".to_string(),
+            summary: "Postgres burned CPU across multiple hosts.".to_string(),
+            package_name: Some("postgresql-18".to_string()),
+            source_package: Some("postgresql-18".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 106,
+            corroboration_count: 2,
+            best_patch_available: true,
+            best_patch_diff_url: Some(
+                "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch".to_string(),
+            ),
+            best_patch: Some(PublicAttempt {
+                outcome: "patch".to_string(),
+                state: "ready".to_string(),
+                summary: "Patch proposal created locally.".to_string(),
+                validation_status: Some("ready".to_string()),
+                created_at: "2026-03-29T00:00:00Z".to_string(),
+                published_session: Some(PublishedAttemptSession {
+                    prompt: "Read ./evidence.json".to_string(),
+                    response: Some("Patched ./workspace/src/file.c".to_string()),
+                    diff: Some("--- a/src/file.c\n+++ b/src/file.c\n".to_string()),
+                }),
+            }),
+            last_seen: "2026-03-29T00:00:00Z".to_string(),
+            attempts: Vec::new(),
+        };
+
+        let markup = render_issue_detail_page(&issue);
+
+        assert!(markup.contains("Pull-request-ready diff"));
+        assert!(markup.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch"));
+        assert!(markup.contains("Download .patch"));
+        assert!(markup.contains("--- a/src/file.c"));
     }
 
     #[test]
