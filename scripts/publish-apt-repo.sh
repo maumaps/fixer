@@ -114,5 +114,7 @@ fi
 
 gpg --batch --yes --export "$SIGNING_KEY" >"$PUBLIC_DIR/fixer-archive-keyring.gpg"
 gpg --batch --yes --armor --export "$SIGNING_KEY" >"$PUBLIC_DIR/KEY.gpg.asc"
+find "$PUBLIC_DIR" -type d -exec chmod 755 {} +
+find "$PUBLIC_DIR" -type f -exec chmod 644 {} +
 
 printf 'published suites:\n%s\n' "$SUITES"
