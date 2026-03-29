@@ -20,7 +20,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration as StdDuration;
 
-const PERF_PROFILE_TARGET_LIMIT: usize = 3;
+// Keep a slightly wider target window so a single unexpectedly hot daemon does not
+// crowd out the next-most-interesting runaway candidate for the entire cycle.
+const PERF_PROFILE_TARGET_LIMIT: usize = 5;
 const PERF_TOP_HOTSPOTS_PER_TARGET: usize = 3;
 const PERF_REPORT_LIMIT: usize = 12;
 const RUNAWAY_INVESTIGATION_SUBSYSTEM: &str = "runaway-process";

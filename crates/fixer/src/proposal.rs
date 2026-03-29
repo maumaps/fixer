@@ -346,6 +346,7 @@ fn run_codex(
         cmd.arg("-a").arg(approval_policy);
     }
     cmd.arg("exec");
+    cmd.arg("--skip-git-repo-check");
     if let Some(model) = &config.patch.model {
         cmd.arg("-m").arg(model);
     }

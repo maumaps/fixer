@@ -1,8 +1,9 @@
 use crate::config::FixerConfig;
 use crate::models::{
-    ClientHello, FindingBundle, ImpossibleReason, InstallIdentity, ParticipationMode,
-    ParticipationState, PatchAttempt, ServerHello, SharedOpportunity, SubmissionEnvelope,
-    SubmissionReceipt, WorkOffer, WorkPullRequest, WorkerResultEnvelope,
+    ClientHello, FindingBundle, FindingInput, ImpossibleReason, InstallIdentity, ObservedArtifact,
+    OpportunityRecord, ParticipationMode, ParticipationState, PatchAttempt, ServerHello,
+    SharedOpportunity, SubmissionEnvelope, SubmissionReceipt, WorkOffer, WorkPullRequest,
+    WorkerResultEnvelope,
 };
 use crate::pow::{mine_pow, verify_pow};
 use crate::privacy::{consent_policy_digest, consent_policy_text, redact_string, redact_value};
@@ -186,7 +187,7 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
         });
     };
 
-    let opportunity = lease.issue.representative.opportunity.clone();
+    let opportunity = materialize_shared_opportunity(store, &lease.issue.representative)?;
     let supports_process_report = proposal::supports_process_investigation_report(&opportunity);
     if supports_process_report && process_investigation_prefers_report_only(&opportunity) {
         let report = proposal::create_process_investigation_report_proposal(
@@ -507,6 +508,68 @@ fn redact_shared_opportunity(
     }
 }
 
+fn materialize_shared_opportunity(
+    store: &Store,
+    item: &SharedOpportunity,
+) -> Result<OpportunityRecord> {
+    let artifact = if item.finding.artifact_name.is_some()
+        || item.finding.artifact_path.is_some()
+        || item.finding.package_name.is_some()
+        || item.finding.repo_root.is_some()
+        || item.finding.ecosystem.is_some()
+    {
+        Some(ObservedArtifact {
+            kind: "shared-artifact".to_string(),
+            name: item
+                .finding
+                .artifact_name
+                .clone()
+                .unwrap_or_else(|| item.finding.title.clone()),
+            path: item.finding.artifact_path.clone(),
+            package_name: item.finding.package_name.clone(),
+            repo_root: item
+                .finding
+                .repo_root
+                .clone()
+                .or_else(|| item.opportunity.repo_root.clone()),
+            ecosystem: item
+                .finding
+                .ecosystem
+                .clone()
+                .or_else(|| item.opportunity.ecosystem.clone()),
+            metadata: json!({
+                "source": "shared-opportunity",
+                "remote_local_opportunity_id": item.local_opportunity_id,
+                "remote_opportunity_id": item.opportunity.id,
+                "remote_finding_id": item.finding.id,
+            }),
+        })
+    } else {
+        None
+    };
+
+    let finding_id = store.record_finding(&FindingInput {
+        kind: item.finding.kind.clone(),
+        title: item.finding.title.clone(),
+        severity: item.finding.severity.clone(),
+        fingerprint: item.finding.fingerprint.clone(),
+        summary: item.finding.summary.clone(),
+        details: item.finding.details.clone(),
+        artifact,
+        repo_root: item
+            .finding
+            .repo_root
+            .clone()
+            .or_else(|| item.opportunity.repo_root.clone()),
+        ecosystem: item
+            .finding
+            .ecosystem
+            .clone()
+            .or_else(|| item.opportunity.ecosystem.clone()),
+    })?;
+    store.get_opportunity_by_finding(finding_id)
+}
+
 fn build_client_hello(
     store: &Store,
     _config: &FixerConfig,
@@ -684,6 +747,10 @@ pub fn verify_worker_pull_pow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{FindingRecord, OpportunityRecord};
+    use crate::storage::Store;
+    use serde_json::json;
+    use tempfile::tempdir;
 
     fn sample_server_hello() -> ServerHello {
         ServerHello {
@@ -733,5 +800,71 @@ mod tests {
             server_upgrade_message(&hello),
             Some(hello.upgrade_message.as_str())
         );
+    }
+
+    #[test]
+    fn materializing_shared_opportunities_uses_local_ids() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        let finding_id = store
+            .record_finding(&FindingInput {
+                kind: "investigation".to_string(),
+                title: "Runaway CPU investigation for packagekitd".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "shared-fingerprint".to_string(),
+                summary: "packagekitd is spinning".to_string(),
+                details: json!({"subsystem": "runaway-process"}),
+                artifact: Some(ObservedArtifact {
+                    kind: "binary".to_string(),
+                    name: "packagekitd".to_string(),
+                    path: Some("/usr/libexec/packagekitd".into()),
+                    package_name: Some("packagekit".to_string()),
+                    repo_root: None,
+                    ecosystem: None,
+                    metadata: json!({}),
+                }),
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let local = store.get_opportunity_by_finding(finding_id).unwrap();
+
+        let shared = SharedOpportunity {
+            local_opportunity_id: 594,
+            opportunity: OpportunityRecord {
+                id: 594,
+                finding_id: 594,
+                kind: "investigation".to_string(),
+                title: local.title.clone(),
+                score: 106,
+                state: "open".to_string(),
+                summary: local.summary.clone(),
+                evidence: local.evidence.clone(),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "2026-03-29T00:00:00Z".to_string(),
+                updated_at: "2026-03-29T00:00:00Z".to_string(),
+            },
+            finding: FindingRecord {
+                id: 594,
+                kind: "investigation".to_string(),
+                title: local.title.clone(),
+                severity: "high".to_string(),
+                fingerprint: "shared-fingerprint".to_string(),
+                summary: "packagekitd is spinning".to_string(),
+                details: json!({"subsystem": "runaway-process"}),
+                artifact_name: Some("packagekitd".to_string()),
+                artifact_path: Some("/usr/libexec/packagekitd".into()),
+                package_name: Some("packagekit".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "2026-03-29T00:00:00Z".to_string(),
+                last_seen: "2026-03-29T00:00:00Z".to_string(),
+            },
+        };
+
+        let materialized = materialize_shared_opportunity(&store, &shared).unwrap();
+        assert_eq!(materialized.id, local.id);
+        assert_ne!(materialized.id, shared.opportunity.id);
     }
 }

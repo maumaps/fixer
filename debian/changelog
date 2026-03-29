@@ -1,3 +1,11 @@
+fixer (0.14.0-1) unstable; urgency=medium
+
+  * Mirror leased issues into the local store before writing worker proposals.
+  * Let Codex patch Debian source trees that are not git checkouts.
+  * Widen runaway perf profiling so more live hot processes are investigated.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 18:49:04 +0400
+
 fixer (0.13.0-1) unstable; urgency=medium
 
   * Rank hotspot investigations by live CPU instead of process count.
