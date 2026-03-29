@@ -88,6 +88,8 @@ pub struct PatchConfig {
     #[serde(default)]
     pub extra_instructions: Option<String>,
     #[serde(default = "default_true")]
+    pub plan_before_patch: bool,
+    #[serde(default = "default_true")]
     pub review_after_patch: bool,
     #[serde(default = "default_review_fix_passes")]
     pub review_fix_passes: u32,
@@ -223,6 +225,7 @@ impl Default for PatchConfig {
             sandbox: Some("workspace-write".to_string()),
             approval_policy: Some("never".to_string()),
             extra_instructions: None,
+            plan_before_patch: true,
             review_after_patch: true,
             review_fix_passes: default_review_fix_passes(),
             auth_mode: CodexAuthMode::UserLease,

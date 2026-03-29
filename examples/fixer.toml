@@ -19,6 +19,7 @@ codex_args = []
 sandbox = "workspace-write"
 approval_policy = "never"
 extra_instructions = "Keep the change narrowly scoped and leave a concise summary in the final message."
+plan_before_patch = true
 review_after_patch = true
 review_fix_passes = 1
 

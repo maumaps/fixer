@@ -1,3 +1,12 @@
+fixer (0.22.0-1) unstable; urgency=medium
+
+  * Add an explicit planning pass before Codex patch generation.
+  * Require git-friendlier subject/body/issue-connection output from patch authoring.
+  * Tighten public patch rendering so subjects, rationale, and validation read cleanly.
+  * Prefer refreshing older public patches before taking unrelated fresh work.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 23:55:00 +0400
+
 fixer (0.21.0-1) unstable; urgency=medium
 
   * Add public possible-duplicate suggestions based on sanitized trigram and structured similarity.

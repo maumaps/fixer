@@ -478,8 +478,9 @@ struct PublishedAttemptSession {
 #[derive(Debug, Clone)]
 struct PublicPatchCover {
     subject: String,
+    commit_message: String,
     problem: String,
-    why: String,
+    issue_connection: String,
     changed_files: Vec<String>,
     validation_notes: Vec<String>,
 }
@@ -5232,16 +5233,36 @@ async fn next_issue_for_worker(
 fn select_worker_candidate(candidates: Vec<WorkerCandidate>) -> Option<IssueCluster> {
     candidates
         .iter()
-        .find(|candidate| {
-            candidate.has_foreign_reports && issue_is_available_for_worker(&candidate.issue)
-        })
+        .find(|candidate| candidate.has_foreign_reports && candidate_needs_patch_refresh(candidate))
         .map(|candidate| candidate.issue.clone())
         .or_else(|| {
             candidates
-                .into_iter()
-                .find(|candidate| issue_is_available_for_worker(&candidate.issue))
-                .map(|candidate| candidate.issue)
+                .iter()
+                .find(|candidate| {
+                    candidate.has_foreign_reports && issue_is_available_for_worker(&candidate.issue)
+                })
+                .map(|candidate| candidate.issue.clone())
         })
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|candidate| candidate_needs_patch_refresh(candidate))
+                .map(|candidate| candidate.issue.clone())
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|candidate| issue_is_available_for_worker(&candidate.issue))
+                .map(|candidate| candidate.issue.clone())
+        })
+}
+
+fn candidate_needs_patch_refresh(candidate: &WorkerCandidate) -> bool {
+    candidate
+        .issue
+        .best_patch
+        .as_ref()
+        .is_some_and(patch_attempt_needs_worker_refresh)
 }
 
 fn issue_is_available_for_worker(issue: &IssueCluster) -> bool {
@@ -6466,21 +6487,48 @@ fn build_public_patch_cover(
     let diff = public_attempt_diff(attempt)?;
     let changed_files = patch_changed_files(diff);
     let issue_phrase = concise_issue_phrase(summary, title);
-    let subject = patch_subject(package_name, source_package, &changed_files, &issue_phrase);
-    let why = patch_rationale(attempt, diff, &changed_files, &issue_phrase);
-    let validation_notes =
-        patch_validation_notes(corroboration_count, last_seen, attempt, &changed_files);
+    let response_metadata = attempt
+        .published_session
+        .as_ref()
+        .and_then(|session| session.response.as_deref())
+        .map(extract_patch_response_metadata)
+        .unwrap_or_default();
+    let subject = response_metadata
+        .subject
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            patch_subject(package_name, source_package, &changed_files, &issue_phrase)
+        });
+    let commit_message = response_metadata
+        .commit_message
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| patch_commit_message(attempt, diff, &changed_files, &issue_phrase));
+    let issue_connection = response_metadata
+        .issue_connection
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| patch_issue_connection(diff, &changed_files, &issue_phrase));
+    let validation_notes = patch_validation_notes(
+        corroboration_count,
+        last_seen,
+        attempt,
+        &changed_files,
+        &response_metadata.validation_notes,
+    );
     Some(PublicPatchCover {
         subject,
+        commit_message,
         problem: ensure_sentence(summary),
-        why,
+        issue_connection,
         changed_files,
         validation_notes,
     })
 }
 
 fn render_public_patch_email(issue: &PublicIssueDetail, attempt: &PublicAttempt) -> Option<String> {
-    let diff = public_attempt_diff(attempt)?;
+    let diff = normalize_published_diff(public_attempt_diff(attempt)?);
     let cover = build_public_patch_cover(
         &issue.title,
         &issue.summary,
@@ -6493,11 +6541,16 @@ fn render_public_patch_email(issue: &PublicIssueDetail, attempt: &PublicAttempt)
     let mut patch = String::new();
     let _ = write!(
         patch,
-        "From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\nFrom: Fixer <fixer@maumap.com>\nDate: {}\nSubject: [PATCH] {}\n\nProblem:\n{}\n\nWhy this patch is being proposed:\n{}\n",
+        "From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\nFrom: Fixer <fixer@maumap.com>\nDate: {}\nSubject: [PATCH] {}\n\nProblem:\n{}\n\nCommit message:\n{}\n",
         format_patch_email_date(&attempt.created_at),
         cover.subject,
         cover.problem,
-        cover.why
+        cover.commit_message
+    );
+    let _ = write!(
+        patch,
+        "\nHow this patch connects to the issue:\n{}\n",
+        cover.issue_connection
     );
     if !cover.changed_files.is_empty() {
         patch.push_str("\nFiles touched:\n");
@@ -6525,7 +6578,7 @@ fn patch_changed_files(diff: &str) -> Vec<String> {
         let Some(path) = line.strip_prefix("+++ b/") else {
             continue;
         };
-        let path = path.trim();
+        let path = strip_patch_header_metadata(path);
         if path.is_empty() || path == "/dev/null" {
             continue;
         }
@@ -6556,6 +6609,14 @@ fn patch_subject(
         format!("{package}: address {issue_phrase}")
     };
     truncate_patch_subject(&subject, 72)
+}
+
+#[derive(Debug, Default, Clone)]
+struct PatchResponseMetadata {
+    subject: Option<String>,
+    commit_message: Option<String>,
+    issue_connection: Option<String>,
+    validation_notes: Vec<String>,
 }
 
 fn concise_issue_phrase(summary: &str, title: &str) -> String {
@@ -6595,7 +6656,7 @@ fn concise_issue_phrase(summary: &str, title: &str) -> String {
         .to_string()
 }
 
-fn patch_rationale(
+fn patch_commit_message(
     attempt: &PublicAttempt,
     diff: &str,
     changed_files: &[String],
@@ -6608,6 +6669,8 @@ fn patch_rationale(
         .published_session
         .as_ref()
         .and_then(|session| session.response.as_deref())
+        .and_then(latest_patch_authoring_response)
+        .as_deref()
         .and_then(meaningful_patch_response)
     {
         return ensure_sentence(&response);
@@ -6626,11 +6689,32 @@ fn patch_rationale(
     ))
 }
 
+fn patch_issue_connection(diff: &str, changed_files: &[String], issue_phrase: &str) -> String {
+    let touched = if changed_files.is_empty() {
+        "the affected code path".to_string()
+    } else {
+        changed_files.join(", ")
+    };
+    if let Some(rationale) = extract_added_comment_rationale(diff) {
+        return ensure_sentence(&format!(
+            "Fixer observed {}. This patch updates {} so {}",
+            issue_phrase,
+            touched,
+            lower_sentence_fragment(&rationale)
+        ));
+    }
+    ensure_sentence(&format!(
+        "Fixer observed {}. This patch updates {} to remove or narrow the failing path behind that behavior",
+        issue_phrase, touched
+    ))
+}
+
 fn patch_validation_notes(
     corroboration_count: i64,
     last_seen: &str,
     attempt: &PublicAttempt,
     changed_files: &[String],
+    author_notes: &[String],
 ) -> Vec<String> {
     let mut notes = Vec::new();
     let status = attempt
@@ -6653,7 +6737,28 @@ fn patch_validation_notes(
             changed_files.join(", ")
         ));
     }
+    for note in author_notes {
+        if !note.trim().is_empty() {
+            notes.push(ensure_sentence(note));
+        }
+    }
     notes
+}
+
+fn extract_patch_response_metadata(response: &str) -> PatchResponseMetadata {
+    let authoring_response =
+        latest_patch_authoring_response(response).unwrap_or_else(|| response.trim().to_string());
+    let validation_notes = extract_markdown_section(&authoring_response, "Validation")
+        .map(|section| parse_validation_notes(&section))
+        .unwrap_or_default();
+    PatchResponseMetadata {
+        subject: extract_labeled_line(&authoring_response, "Subject:"),
+        commit_message: extract_markdown_section(&authoring_response, "Commit Message")
+            .map(|section| normalize_patch_response_text(&section)),
+        issue_connection: extract_markdown_section(&authoring_response, "Issue Connection")
+            .map(|section| normalize_patch_response_text(&section)),
+        validation_notes,
+    }
 }
 
 fn extract_added_comment_rationale(diff: &str) -> Option<String> {
@@ -6700,13 +6805,101 @@ fn extract_added_comment_rationale(diff: &str) -> Option<String> {
     }
 }
 
+fn strip_patch_header_metadata(path: &str) -> &str {
+    path.split('\t').next().unwrap_or(path).trim()
+}
+
+fn normalize_published_diff(diff: &str) -> String {
+    let mut normalized = diff
+        .lines()
+        .map(|line| {
+            if let Some(path) = line.strip_prefix("--- a/") {
+                format!("--- a/{}", strip_patch_header_metadata(path))
+            } else if let Some(path) = line.strip_prefix("+++ b/") {
+                format!("+++ b/{}", strip_patch_header_metadata(path))
+            } else if let Some(path) = line.strip_prefix("--- ") {
+                format!("--- {}", strip_patch_header_metadata(path))
+            } else if let Some(path) = line.strip_prefix("+++ ") {
+                format!("+++ {}", strip_patch_header_metadata(path))
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if diff.ends_with('\n') {
+        normalized.push('\n');
+    }
+    normalized
+}
+
 fn trim_added_comment_fragment(text: &str) -> String {
-    text.trim()
-        .trim_start_matches("/*")
-        .trim_start_matches('*')
-        .trim_end_matches("*/")
-        .trim()
-        .to_string()
+    let mut fragment = text.trim();
+    if matches!(fragment, "/*" | "*/") {
+        return String::new();
+    }
+    if let Some(rest) = fragment.strip_prefix("/*") {
+        fragment = rest.trim();
+    }
+    if let Some(rest) = fragment.strip_prefix('*') {
+        fragment = rest.trim();
+    }
+    if let Some(rest) = fragment.strip_suffix("*/") {
+        fragment = rest.trim();
+    }
+    if fragment == "/" {
+        String::new()
+    } else {
+        fragment.to_string()
+    }
+}
+
+fn latest_patch_authoring_response(response: &str) -> Option<String> {
+    let mut saw_heading = false;
+    let mut current_label: Option<String> = None;
+    let mut current_lines = Vec::new();
+    let mut selected: Option<String> = None;
+    let finalize_section =
+        |label: Option<&str>, lines: &mut Vec<String>, selected: &mut Option<String>| {
+            let content = lines.join("\n").trim().to_string();
+            if label.is_some_and(is_patch_authoring_stage) && !content.is_empty() {
+                *selected = Some(content);
+            }
+            lines.clear();
+        };
+    for line in response.lines() {
+        if let Some(label) = line.strip_prefix("## ") {
+            let label = label.trim();
+            if is_codex_stage_heading(label) {
+                saw_heading = true;
+                finalize_section(current_label.as_deref(), &mut current_lines, &mut selected);
+                current_label = Some(label.to_string());
+                continue;
+            }
+        }
+        current_lines.push(line.to_string());
+    }
+    finalize_section(current_label.as_deref(), &mut current_lines, &mut selected);
+    if selected.is_some() {
+        selected
+    } else if saw_heading {
+        None
+    } else {
+        let trimmed = response.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+}
+
+fn is_patch_authoring_stage(label: &str) -> bool {
+    label == "Patch Pass" || label.starts_with("Refinement Pass ")
+}
+
+fn is_codex_stage_heading(label: &str) -> bool {
+    label == "Plan Pass"
+        || label == "Patch Pass"
+        || label.starts_with("Review Pass ")
+        || label.starts_with("Refinement Pass ")
+        || label == "Workflow Note"
 }
 
 fn meaningful_patch_response(response: &str) -> Option<String> {
@@ -6719,8 +6912,89 @@ fn meaningful_patch_response(response: &str) -> Option<String> {
                 && !paragraph.starts_with("[Patch Pass]")
                 && !paragraph.starts_with("[Review Pass]")
                 && !paragraph.starts_with("[Refinement Pass]")
+                && !paragraph.starts_with("Subject:")
         })
         .map(str::to_string)
+}
+
+fn extract_labeled_line(text: &str, prefix: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn extract_markdown_section(text: &str, heading: &str) -> Option<String> {
+    let mut in_section = false;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if let Some(current_heading) = line.strip_prefix("## ") {
+            let current_heading = current_heading.trim();
+            if in_section {
+                break;
+            }
+            if current_heading == heading {
+                in_section = true;
+            }
+            continue;
+        }
+        if in_section {
+            lines.push(line);
+        }
+    }
+    let content = lines.join("\n");
+    let normalized = normalize_patch_response_text(&content);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn normalize_patch_response_text(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_validation_notes(section: &str) -> Vec<String> {
+    let bullet_notes = section
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            line.strip_prefix("- ")
+                .or_else(|| line.strip_prefix("* "))
+                .map(str::trim)
+        })
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if !bullet_notes.is_empty() {
+        bullet_notes
+    } else {
+        let normalized = normalize_patch_response_text(section);
+        if normalized.is_empty() {
+            Vec::new()
+        } else {
+            vec![normalized]
+        }
+    }
+}
+
+fn lower_sentence_fragment(text: &str) -> String {
+    let trimmed = text.trim().trim_end_matches('.');
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut lowered = first.to_lowercase().collect::<String>();
+    lowered.push_str(chars.as_str());
+    lowered
 }
 
 fn is_informative_patch_summary(summary: &str) -> bool {
@@ -7660,6 +7934,7 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
     let Some(diff) = public_attempt_diff(best_patch) else {
         return None;
     };
+    let diff = normalize_published_diff(diff);
     let Some(patch_url) = issue.best_patch_diff_url.as_deref() else {
         return None;
     };
@@ -7727,8 +8002,9 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
             <section class="patch-summary">
                 <h4>Suggested subject</h4>
                 <pre class="code-block"><code>{}</code></pre>
+                <p class="issue-summary"><strong>Commit message.</strong> {}</p>
                 <p class="issue-summary"><strong>Problem.</strong> {}</p>
-                <p class="issue-summary"><strong>Why this patch is being proposed.</strong> {}</p>
+                <p class="issue-summary"><strong>How this patch connects to the issue.</strong> {}</p>
             </section>
             {}
             {}
@@ -7743,14 +8019,15 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
         validation,
         html_escape(&best_patch.summary),
         html_escape(&cover.subject),
+        html_escape(&cover.commit_message),
         html_escape(&cover.problem),
-        html_escape(&cover.why),
+        html_escape(&cover.issue_connection),
         changed_files,
         validation_notes,
         patch_url,
         issue.id,
         raw_diff_button,
-        html_escape(diff)
+        html_escape(&diff)
     ))
 }
 
@@ -8093,9 +8370,10 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
         cover
             .as_ref()
             .map(|cover| format!(
-                "<section class=\"patch-summary\"><h4>Suggested subject</h4><pre class=\"code-block\"><code>{}</code></pre><p class=\"issue-summary\"><strong>Why.</strong> {}</p></section>",
+                "<section class=\"patch-summary\"><h4>Suggested subject</h4><pre class=\"code-block\"><code>{}</code></pre><p class=\"issue-summary\"><strong>Commit message.</strong> {}</p><p class=\"issue-summary\"><strong>Issue connection.</strong> {}</p></section>",
                 html_escape(&cover.subject),
-                html_escape(&cover.why)
+                html_escape(&cover.commit_message),
+                html_escape(&cover.issue_connection)
             ))
             .unwrap_or_default(),
         actions,
@@ -8845,7 +9123,8 @@ mod tests {
         assert!(markup.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.diff"));
         assert!(markup.contains("Download .patch"));
         assert!(markup.contains("Suggested subject"));
-        assert!(markup.contains("Why this patch is being proposed."));
+        assert!(markup.contains("Commit message."));
+        assert!(markup.contains("How this patch connects to the issue."));
         assert!(markup.contains("Avoid the retry loop on missing files."));
     }
 
@@ -8942,9 +9221,12 @@ mod tests {
                 created_at: "2026-03-29T00:00:00Z".to_string(),
                 published_session: Some(PublishedAttemptSession {
                     prompt: "Read ./evidence.json".to_string(),
-                    response: None,
+                    response: Some(
+                        "## Patch Pass\n\nSubject: postgresql-18: dfmgr: prefer DLSUFFIX path before fallback\n\n## Commit Message\nTry the suffixed library path before the historical unsuffixed lookup when MODULE_PATHNAME expands to \"$libdir/foo\".\n\n## Issue Connection\nThe sampled issue shows postgres burning CPU in a file-not-found retry loop while repeatedly touching the extension-loading path. Preferring the suffixed name removes one guaranteed failed probe while preserving the old fallback if only the legacy path exists.\n\n## Validation\n- Not run in this retained bundle.\n"
+                            .to_string(),
+                    ),
                     diff: Some(
-                        "--- a/src/backend/utils/fmgr/dfmgr.c\n+++ b/src/backend/utils/fmgr/dfmgr.c\n@@\n+/* Prefer the suffixed shared library name first to avoid a guaranteed failed probe. */\n"
+                        "--- a/src/backend/utils/fmgr/dfmgr.c\t2026-02-24 01:56:43.000000000 +0400\n+++ b/src/backend/utils/fmgr/dfmgr.c\t2026-03-29 20:11:53.195108902 +0400\n@@\n+/* Prefer the suffixed shared library name first to avoid a guaranteed failed probe. */\n"
                             .to_string(),
                     ),
                 }),
@@ -8960,15 +9242,18 @@ mod tests {
         let patch = render_public_patch_email(&issue, issue.best_patch.as_ref().unwrap()).unwrap();
 
         assert!(patch.contains(
-            "Subject: [PATCH] postgresql-18: update dfmgr.c for file not found retry loop"
+            "Subject: [PATCH] postgresql-18: dfmgr: prefer DLSUFFIX path before fallback"
         ));
         assert!(patch.contains("Problem:\npostgres is stuck in a likely file not found retry loop: repeated open/read/close churn."));
-        assert!(patch.contains("Why this patch is being proposed:\nPrefer the suffixed shared library name first to avoid a guaranteed failed probe."));
+        assert!(patch.contains("Commit message:\nTry the suffixed library path before the historical unsuffixed lookup when MODULE_PATHNAME expands to \"$libdir/foo\"."));
+        assert!(patch.contains("How this patch connects to the issue:\nThe sampled issue shows postgres burning CPU in a file-not-found retry loop while repeatedly touching the extension-loading path. Preferring the suffixed name removes one guaranteed failed probe while preserving the old fallback if only the legacy path exists."));
         assert!(patch.contains("Files touched:\n- src/backend/utils/fmgr/dfmgr.c"));
+        assert!(patch.contains("Validation:\n- Fixer marked this proposal `ready` on 2026-03-29 00:00 UTC.\n- The underlying issue cluster has 2 report(s) and was last seen 2026-03-29 00:00 UTC.\n- The published diff touches src/backend/utils/fmgr/dfmgr.c.\n- Not run in this retained bundle."));
         assert!(patch.contains(
             "Issue: https://fixer.maumap.com/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"
         ));
         assert!(patch.contains("--- a/src/backend/utils/fmgr/dfmgr.c"));
+        assert!(!patch.contains("src/backend/utils/fmgr/dfmgr.c\t2026-03-29"));
     }
 
     #[test]

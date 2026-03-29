@@ -335,12 +335,68 @@ fn prior_best_patch_diff(attempt: &PatchAttempt) -> Option<&str> {
 
 pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<CodexJobStatus> {
     let started_at = now_rfc3339();
-    let patch_prompt = read_text(&job.prompt_path)
+    let base_patch_prompt = read_text(&job.prompt_path)
         .with_context(|| format!("failed to read {}", job.prompt_path.display()))?;
     let source_workspace_root = source_workspace_root_from_bundle(&job.bundle_dir);
     let evidence_path = job.bundle_dir.join("evidence.json");
     let mut transcripts = Vec::new();
     let mut logs = Vec::new();
+    let mut patch_prompt = base_patch_prompt.clone();
+    let mut plan_output_path: Option<PathBuf> = None;
+
+    if config.patch.plan_before_patch {
+        let plan_prompt = build_plan_prompt(
+            &evidence_path,
+            &job.workspace,
+            source_workspace_root.as_deref(),
+        );
+        let plan_prompt_path = job.bundle_dir.join("plan-prompt.md");
+        let current_plan_output_path = job.bundle_dir.join("plan-output.txt");
+        let plan_stage = run_codex_stage(
+            config,
+            &job.workspace.repo_root,
+            &plan_prompt_path,
+            &current_plan_output_path,
+            "Plan Pass",
+            &plan_prompt,
+        )?;
+        logs.push(render_stage_log(&plan_stage));
+        transcripts.push(CodexStageTranscript {
+            label: plan_stage.label.to_string(),
+            prompt: plan_prompt,
+            response: plan_stage.output.clone(),
+        });
+        if !plan_stage.success {
+            let published_prompt = render_combined_prompt(&transcripts);
+            let published_output = render_combined_output(&transcripts, Some(&plan_stage.error));
+            fs::write(
+                job.bundle_dir.join("published-prompt.md"),
+                published_prompt.as_bytes(),
+            )?;
+            fs::write(&job.output_path, published_output.as_bytes())?;
+            let finished_at = now_rfc3339();
+            fs::write(
+                job.bundle_dir.join("codex-run.log"),
+                logs.join("\n\n").as_bytes(),
+            )?;
+            let status = CodexJobStatus {
+                job_id: job.job_id.clone(),
+                state: "failed".to_string(),
+                started_at,
+                finished_at,
+                output_path: job.output_path.exists().then(|| job.output_path.clone()),
+                failure_kind: Some(classify_codex_failure(&plan_stage.log)),
+                error: Some(plan_stage.error),
+            };
+            fs::write(
+                job.bundle_dir.join("status.json"),
+                serde_json::to_vec_pretty(&status)?,
+            )?;
+            return Ok(status);
+        }
+        patch_prompt = build_patch_prompt_with_plan(&base_patch_prompt, &current_plan_output_path);
+        plan_output_path = Some(current_plan_output_path);
+    }
 
     let patch_stage = run_codex_stage(
         config,
@@ -387,6 +443,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
 
     let mut workflow_failure: Option<(String, String)> = None;
     let patch_output_indicates_triage = stage_output_marks_successful_triage(&patch_stage.output);
+    let mut current_author_output_path = job.bundle_dir.join("patch-output.txt");
     if config.patch.review_after_patch && !patch_output_indicates_triage {
         let mut refinement_round = 0;
         loop {
@@ -395,6 +452,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                 &evidence_path,
                 &job.workspace,
                 source_workspace_root.as_deref(),
+                &current_author_output_path,
                 refinement_round,
             );
             let review_prompt_path = job
@@ -443,6 +501,8 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                         &evidence_path,
                         &job.workspace,
                         source_workspace_root.as_deref(),
+                        plan_output_path.as_deref(),
+                        &current_author_output_path,
                         &review_output_path,
                         refinement_round,
                     );
@@ -473,6 +533,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                         ));
                         break;
                     }
+                    current_author_output_path = refine_output_path;
                 }
                 None => {
                     workflow_failure = Some((
@@ -1227,13 +1288,44 @@ fn build_prompt(
         })
         .unwrap_or_default();
     format!(
-        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, run relevant tests if available, and summarize what changed.{}{} \n\n{}",
+        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, keep the change upstreamable, prefer the clearest control flow available, and do not keep avoidable `goto` when a simpler structure would read better. The final explanation must connect the observed issue evidence to the actual code change, not just paraphrase the diff.{}{} \n\n{}\n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
         investigation_hint,
         prior_patch_hint,
-        extra
+        extra,
+        patch_response_contract(),
+    )
+}
+
+fn build_plan_prompt(
+    evidence_path: &Path,
+    workspace: &PreparedWorkspace,
+    source_workspace_root: Option<&Path>,
+) -> String {
+    let source_hint = source_workspace_root
+        .map(|path| {
+            format!(
+                " The original pre-edit snapshot is available at `{}` if you need to inspect it.",
+                path.display()
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "You are planning a fixer patch before any edits happen.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`.{} Inspect the relevant code, but do not edit files in this pass.\n\nReturn a short markdown plan with these exact sections:\n\n## Problem\n## Proposed Subject\n## Patch Plan\n## Risks\n## Validation\n\nThe plan must explain how the proposed code change addresses the observed issue evidence, call out any prior Fixer patch that should be improved or replaced, and reject awkward control flow such as avoidable `goto` if there is a cleaner bounded alternative.",
+        evidence_path.display(),
+        workspace.repo_root.display(),
+        workspace.source_kind,
+        source_hint,
+    )
+}
+
+fn build_patch_prompt_with_plan(patch_prompt: &str, plan_output_path: &Path) -> String {
+    format!(
+        "{}\n\nBefore editing, read the plan at `{}` and follow it unless the code proves part of it wrong. If you change course, say so explicitly in the final write-up instead of silently drifting from the plan.",
+        patch_prompt,
+        plan_output_path.display()
     )
 }
 
@@ -1241,6 +1333,7 @@ fn build_review_prompt(
     evidence_path: &Path,
     workspace: &PreparedWorkspace,
     source_workspace_root: Option<&Path>,
+    latest_patch_output_path: &Path,
     refinement_round: u32,
 ) -> String {
     let source_hint = source_workspace_root
@@ -1257,12 +1350,13 @@ fn build_review_prompt(
         "Review the patch again after the latest refinement."
     };
     format!(
-        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{} Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, and anything that makes the patch less pull-request-ready.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
+        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{} The latest author response is at `{}`. Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, weak or non-gittable commit message text, and explanations that fail to connect the observed issue evidence to the code change.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
         round_hint,
         source_hint,
+        latest_patch_output_path.display(),
     )
 }
 
@@ -1270,6 +1364,8 @@ fn build_refinement_prompt(
     evidence_path: &Path,
     workspace: &PreparedWorkspace,
     source_workspace_root: Option<&Path>,
+    plan_output_path: Option<&Path>,
+    latest_patch_output_path: &Path,
     review_output_path: &Path,
     refinement_round: u32,
 ) -> String {
@@ -1281,15 +1377,30 @@ fn build_refinement_prompt(
             )
         })
         .unwrap_or_default();
+    let plan_hint = plan_output_path
+        .map(|path| {
+            format!(
+                " Re-read the planning pass at `{}` before editing.",
+                path.display()
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "You are refining a fixer patch after an explicit code review.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the review report at `{}`. This is refinement round {}.{} Address the review findings with the smallest reasonable follow-up changes. Keep the patch upstream-friendly, avoid awkward control flow when a simpler structure will do, run relevant tests if available, and summarize which review findings you addressed.",
+        "You are refining a fixer patch after an explicit code review.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the latest author response at `{}`. Read the review report at `{}`. This is refinement round {}.{}{} Address the review findings with the smallest reasonable follow-up changes. Keep the patch upstream-friendly, avoid awkward control flow when a simpler structure will do, keep the final response gittable, run relevant tests if available, and summarize which review findings you addressed.\n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
+        latest_patch_output_path.display(),
         review_output_path.display(),
         refinement_round,
         source_hint,
+        plan_hint,
+        patch_response_contract(),
     )
+}
+
+fn patch_response_contract() -> &'static str {
+    "In every authoring pass, your final response must start with `Subject: <single-line git commit subject>` and then include these markdown sections exactly:\n\n## Commit Message\nA short upstream-friendly explanation of what changed and why.\n\n## Issue Connection\nExplain how the code change addresses the observed issue evidence instead of merely paraphrasing the diff.\n\n## Validation\nList the checks you ran, or say clearly that you could not run them."
 }
 
 fn render_external_bug_report(
