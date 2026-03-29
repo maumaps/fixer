@@ -1,3 +1,11 @@
+fixer (0.11.0-1) unstable; urgency=medium
+
+  * Switch public server IDs to UUIDv7 and tighten public issue sanitization.
+  * Re-cluster repeated crashes and noisy warnings into stable issue families.
+  * Version the client/server protocol and signal recommended or required upgrades.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 17:04:21 +0400
+
 fixer (0.10.0-1) unstable; urgency=medium
 
   * Add `fixer complain` for freeform symptom intake and local triage plans.

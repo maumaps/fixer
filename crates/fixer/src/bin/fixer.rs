@@ -300,12 +300,19 @@ fn main() -> Result<()> {
         Commands::Sync => {
             let outcome = app.sync()?;
             println!("server_time: {}", outcome.hello.server_time);
+            println!(
+                "server_protocol_version: {}",
+                outcome.hello.server_protocol_version
+            );
             println!("items_uploaded: {}", outcome.items_uploaded);
             println!("submission_id: {}", outcome.receipt.submission_id);
             println!("duplicate: {}", outcome.receipt.duplicate);
             println!("quarantined: {}", outcome.receipt.quarantined);
             println!("promoted_clusters: {}", outcome.receipt.promoted_clusters);
             println!("message: {}", outcome.receipt.message);
+            if let Some(message) = fixer::network::server_upgrade_message(&outcome.hello) {
+                println!("upgrade: {message}");
+            }
             if !outcome.redactions.is_empty() {
                 println!("redactions: {}", outcome.redactions.join(", "));
             }
@@ -314,7 +321,14 @@ fn main() -> Result<()> {
             WorkerCommands::Run => {
                 let outcome = app.worker_once()?;
                 println!("server_time: {}", outcome.hello.server_time);
+                println!(
+                    "server_protocol_version: {}",
+                    outcome.hello.server_protocol_version
+                );
                 println!("message: {}", outcome.offer.message);
+                if let Some(message) = fixer::network::server_upgrade_message(&outcome.hello) {
+                    println!("upgrade: {message}");
+                }
                 if let Some(lease) = outcome.offer.lease {
                     println!("lease_id: {}", lease.lease_id);
                     println!("issue_id: {}", lease.issue.id);

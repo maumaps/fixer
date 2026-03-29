@@ -1162,7 +1162,9 @@ fn parse_key_value_fields(raw: &str) -> HashMap<String, String> {
 }
 
 fn is_low_signal_kernel_warning(line: &str) -> bool {
-    line.contains("kauditd_printk_skb:") && line.contains("callbacks suppressed")
+    (line.contains("kauditd_printk_skb:") && line.contains("callbacks suppressed"))
+        || ((line.contains("show_signal:") || line.contains("show_signal_msg:"))
+            && line.contains("callbacks suppressed"))
 }
 
 fn profile_display_name(profile: &str) -> Option<String> {
@@ -2176,6 +2178,16 @@ mod tests {
         extend_unique_log_lines(&mut lines, &mut seen, "a\nb\n");
         extend_unique_log_lines(&mut lines, &mut seen, "b\nc\n");
         assert_eq!(lines, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn low_signal_kernel_warning_filters_show_signal_callback_spam() {
+        assert!(is_low_signal_kernel_warning(
+            "Mar 29 14:50:11 nucat kernel: show_signal_msg: 666 callbacks suppressed"
+        ));
+        assert!(is_low_signal_kernel_warning(
+            "Mar 29 12:41:59 nucat kernel: show_signal: 666 callbacks suppressed"
+        ));
     }
 
     #[test]

@@ -1050,7 +1050,7 @@ impl Store {
             return Ok(existing);
         }
         let identity = InstallIdentity {
-            install_id: Uuid::new_v4().to_string(),
+            install_id: Uuid::now_v7().to_string(),
             created_at: now_rfc3339(),
         };
         self.set_local_state("install_identity", &identity)?;

@@ -138,11 +138,16 @@ impl App {
                 )
             {
                 match self.sync() {
-                    Ok(outcome) => tracing::info!(
-                        items_uploaded = outcome.items_uploaded,
-                        promoted_clusters = outcome.receipt.promoted_clusters,
-                        "completed sync cycle"
-                    ),
+                    Ok(outcome) => {
+                        if let Some(message) = network::server_upgrade_message(&outcome.hello) {
+                            tracing::warn!(message = %message, "server recommends upgrading fixer");
+                        }
+                        tracing::info!(
+                            items_uploaded = outcome.items_uploaded,
+                            promoted_clusters = outcome.receipt.promoted_clusters,
+                            "completed sync cycle"
+                        );
+                    }
                     Err(error) => tracing::warn!(error = %error, "sync cycle failed"),
                 }
             }
@@ -154,6 +159,9 @@ impl App {
             {
                 match self.worker_once() {
                     Ok(outcome) => {
+                        if let Some(message) = network::server_upgrade_message(&outcome.hello) {
+                            tracing::warn!(message = %message, "server recommends upgrading fixer");
+                        }
                         tracing::info!(message = %outcome.offer.message, "completed worker poll");
                     }
                     Err(error) => tracing::warn!(error = %error, "worker poll failed"),

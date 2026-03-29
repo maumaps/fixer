@@ -7,6 +7,7 @@ use crate::models::{
 use crate::pow::{mine_pow, verify_pow};
 use crate::privacy::{consent_policy_digest, consent_policy_text, redact_string, redact_value};
 use crate::proposal;
+use crate::protocol::{current_binary_version, default_protocol_version};
 use crate::storage::Store;
 use crate::util::{command_exists, hash_text, now_rfc3339, read_text};
 use crate::workspace::ensure_workspace_for_opportunity;
@@ -102,12 +103,11 @@ pub fn sync_once(store: &Store, config: &FixerConfig) -> Result<SyncOutcome> {
             "network participation is disabled; run `fixer opt-in --mode submitter` or `submitter+worker` first"
         ));
     }
+    let hello_request =
+        build_client_hello(store, config, &participation.identity, &participation.state)?;
 
-    let hello = post_json::<_, ServerHello>(
-        config,
-        "v1/install/hello",
-        &build_client_hello(store, config, &participation.identity, &participation.state)?,
-    )?;
+    let hello = post_json::<_, ServerHello>(config, "v1/install/hello", &hello_request)?;
+    ensure_server_hello_compatible(&hello)?;
     let bundle = build_submission_bundle(store, config, &participation)?;
     if bundle.items.is_empty() {
         return Err(anyhow!("no opportunities available for submission"));
@@ -121,7 +121,7 @@ pub fn sync_once(store: &Store, config: &FixerConfig) -> Result<SyncOutcome> {
             .max(config.network.submission_pow_difficulty),
     );
     let envelope = SubmissionEnvelope {
-        client: build_client_hello(store, config, &participation.identity, &participation.state)?,
+        client: hello_request,
         content_hash,
         proof_of_work: proof,
         bundle,
@@ -153,6 +153,7 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
     let hello_request =
         build_client_hello(store, config, &participation.identity, &participation.state)?;
     let hello = post_json::<_, ServerHello>(config, "v1/install/hello", &hello_request)?;
+    ensure_server_hello_compatible(&hello)?;
     if !hello.worker_allowed {
         return Ok(WorkerRunOutcome {
             hello,
@@ -344,7 +345,8 @@ fn build_client_hello(
         .collect::<Vec<_>>();
     Ok(ClientHello {
         install_id: identity.install_id.clone(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: current_binary_version().to_string(),
+        protocol_version: default_protocol_version(),
         mode: state.mode.clone(),
         hostname: current_hostname(),
         has_codex: capabilities.iter().any(|capability| capability == "codex"),
@@ -402,9 +404,26 @@ fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
         .with_context(|| format!("failed to parse {path} response"))
 }
 
+fn ensure_server_hello_compatible(hello: &ServerHello) -> Result<()> {
+    if hello.upgrade_required {
+        let message = server_upgrade_message(hello)
+            .unwrap_or("the server requires this client to upgrade before continuing");
+        return Err(anyhow!(message.to_string()));
+    }
+    Ok(())
+}
+
+pub fn server_upgrade_message(hello: &ServerHello) -> Option<&str> {
+    if !hello.upgrade_available && !hello.upgrade_required {
+        return None;
+    }
+    let message = hello.upgrade_message.trim();
+    (!message.is_empty()).then_some(message)
+}
+
 fn build_impossible_result(
     install_id: &str,
-    cluster_id: i64,
+    cluster_id: String,
     lease_id: &str,
     category: &str,
     summary: &str,
@@ -446,4 +465,59 @@ pub fn verify_worker_pull_pow(
         required_difficulty,
         30,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_server_hello() -> ServerHello {
+        ServerHello {
+            policy_version: "2026-03-29".to_string(),
+            submission_pow_difficulty: 1,
+            worker_pow_difficulty: 1,
+            server_protocol_version: 1,
+            min_supported_protocol_version: 1,
+            latest_client_version: crate::protocol::current_binary_version().to_string(),
+            upgrade_available: false,
+            upgrade_required: false,
+            upgrade_message: String::new(),
+            install_trust_score: 1,
+            quarantined: false,
+            worker_allowed: true,
+            message: "ok".to_string(),
+            server_time: "2026-03-29T12:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn compatible_server_hello_allows_work_to_continue() {
+        assert!(ensure_server_hello_compatible(&sample_server_hello()).is_ok());
+    }
+
+    #[test]
+    fn incompatible_server_hello_stops_the_client() {
+        let mut hello = sample_server_hello();
+        hello.upgrade_required = true;
+        hello.upgrade_message = "Upgrade fixer before syncing.".to_string();
+
+        let error = ensure_server_hello_compatible(&hello).unwrap_err();
+        assert!(error.to_string().contains("Upgrade fixer"));
+    }
+
+    #[test]
+    fn server_upgrade_message_only_surfaces_upgrade_notices() {
+        let mut hello = sample_server_hello();
+        assert!(server_upgrade_message(&hello).is_none());
+
+        hello.upgrade_available = true;
+        hello.upgrade_message = format!(
+            "Fixer {} is available.",
+            crate::protocol::current_binary_version()
+        );
+        assert_eq!(
+            server_upgrade_message(&hello),
+            Some(hello.upgrade_message.as_str())
+        );
+    }
 }

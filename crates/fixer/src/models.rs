@@ -1,3 +1,7 @@
+use crate::protocol::{
+    default_latest_client_version, default_min_supported_protocol_version,
+    default_protocol_version, default_server_protocol_version,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -256,6 +260,8 @@ pub struct SharedOpportunity {
 pub struct ClientHello {
     pub install_id: String,
     pub version: String,
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: u32,
     pub mode: ParticipationMode,
     pub hostname: Option<String>,
     pub capabilities: Vec<String>,
@@ -294,6 +300,18 @@ pub struct ServerHello {
     pub policy_version: String,
     pub submission_pow_difficulty: u32,
     pub worker_pow_difficulty: u32,
+    #[serde(default = "default_server_protocol_version")]
+    pub server_protocol_version: u32,
+    #[serde(default = "default_min_supported_protocol_version")]
+    pub min_supported_protocol_version: u32,
+    #[serde(default = "default_latest_client_version")]
+    pub latest_client_version: String,
+    #[serde(default)]
+    pub upgrade_available: bool,
+    #[serde(default)]
+    pub upgrade_required: bool,
+    #[serde(default)]
+    pub upgrade_message: String,
     pub install_trust_score: i64,
     pub quarantined: bool,
     pub worker_allowed: bool,
@@ -303,18 +321,18 @@ pub struct ServerHello {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmissionReceipt {
-    pub submission_id: i64,
+    pub submission_id: String,
     pub accepted: bool,
     pub duplicate: bool,
     pub quarantined: bool,
     pub promoted_clusters: usize,
-    pub issue_ids: Vec<i64>,
+    pub issue_ids: Vec<String>,
     pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueCluster {
-    pub id: i64,
+    pub id: String,
     pub cluster_key: String,
     pub kind: String,
     pub title: String,
@@ -354,7 +372,7 @@ pub struct WorkLease {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatchAttempt {
-    pub cluster_id: i64,
+    pub cluster_id: String,
     pub install_id: String,
     pub outcome: String,
     pub state: String,
@@ -375,7 +393,7 @@ pub struct ImpossibleReason {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceUpgradeRequest {
-    pub issue_id: i64,
+    pub issue_id: String,
     pub requested_by_install_id: Option<String>,
     pub reason: String,
     pub requested_fields: Vec<String>,

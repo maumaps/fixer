@@ -8,6 +8,7 @@ pub mod network;
 pub mod pow;
 pub mod privacy;
 pub mod proposal;
+pub mod protocol;
 pub mod server;
 pub mod storage;
 pub mod util;
