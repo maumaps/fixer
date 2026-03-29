@@ -1,3 +1,9 @@
+fixer (0.4.0-1) unstable; urgency=medium
+
+  * Fix public-server packaging and force explicit HTTPS serving on fixer.maumap.com.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 13:35:00 +0400
+
 fixer (0.3.0-1) unstable; urgency=medium
 
   * Ship the public HTTPS server, landing UI, and signed APT repository tooling.

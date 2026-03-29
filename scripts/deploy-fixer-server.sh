@@ -27,6 +27,7 @@ cp "$REPO_ROOT/deploy/Caddyfile" "$STAGE_DIR/Caddyfile"
 cp "$REPO_ROOT/deploy/fixer-server.toml" "$STAGE_DIR/fixer-server.toml"
 cp "$REPO_ROOT/deploy/apt/repo.env" "$STAGE_DIR/repo.env"
 cp "$REPO_ROOT/scripts/publish-apt-repo.sh" "$STAGE_DIR/publish-apt-repo.sh"
+cp "$REPO_ROOT/debian/fixer-server.service" "$STAGE_DIR/fixer-server.service"
 
 ssh "$HOST" "mkdir -p '$REMOTE_STAGE'"
 scp "$STAGE_DIR/"* "$HOST:$REMOTE_STAGE/"
@@ -76,6 +77,7 @@ sed "s|__POSTGRES_URL__|$POSTGRES_URL|g" "$REMOTE_STAGE/fixer-server.toml" >/etc
 install -D -m 0644 "$REMOTE_STAGE/Caddyfile" /etc/caddy/Caddyfile
 install -D -m 0644 "$REMOTE_STAGE/repo.env" /etc/fixer/apt-repo.env
 install -D -m 0755 "$REMOTE_STAGE/publish-apt-repo.sh" /usr/local/bin/publish-fixer-apt-repo
+install -D -m 0644 "$REMOTE_STAGE/fixer-server.service" /usr/lib/systemd/system/fixer-server.service
 
 mkdir -p /srv/fixer/public/apt /srv/fixer/reprepro /srv/fixer/gnupg
 FIXER_APT_CONFIG=/etc/fixer/apt-repo.env /usr/local/bin/publish-fixer-apt-repo "$REMOTE_STAGE/$PACKAGE_NAME"
@@ -84,5 +86,5 @@ systemctl daemon-reload
 systemctl enable --now fixer-server.service
 systemctl enable --now caddy.service
 systemctl restart fixer-server.service
-systemctl reload caddy.service
+systemctl restart caddy.service
 EOF

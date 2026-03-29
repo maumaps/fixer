@@ -1,8 +1,9 @@
-{
-	email packages@maumap.com
+http://fixer.maumap.com {
+	redir https://fixer.maumap.com{uri} permanent
 }
 
-fixer.maumap.com {
+https://fixer.maumap.com {
+	tls packages@maumap.com
 	encode zstd gzip
 
 	header {
