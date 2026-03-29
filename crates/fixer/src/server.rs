@@ -1085,7 +1085,7 @@ async fn pull_work(
         }));
     }
 
-    let Some(issue) = next_issue_for_worker(&state.db, &install_id)
+    let Some(mut issue) = next_issue_for_worker(&state.db, &install_id)
         .await
         .map_err(ApiError::internal)?
     else {
@@ -1094,6 +1094,11 @@ async fn pull_work(
             lease: None,
         }));
     };
+    if issue.best_patch.is_none() {
+        issue.best_patch = load_latest_patch_context_for_worker(&state.db, &issue.id)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     let lease_id = new_server_id();
     let leased_at = Utc::now();
     let expires_at = leased_at + Duration::seconds(state.config.server.lease_seconds as i64);
@@ -4719,13 +4724,99 @@ fn select_best_attempt(candidates: &[PatchAttempt], outcome: &str) -> Option<Pat
         .max_by(compare_attempt_created_at)
 }
 
+fn attempt_invalidates_patch(attempt: &PatchAttempt, patch: &PatchAttempt) -> bool {
+    if !attempt
+        .details
+        .get("invalidates_best_patch")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if let Some(created_at) = attempt
+        .details
+        .get("invalidates_patch_created_at")
+        .and_then(Value::as_str)
+    {
+        return created_at == patch.created_at;
+    }
+    compare_attempt_created_at(attempt, patch) != Ordering::Less
+}
+
+fn select_best_patch_attempt(candidates: &[PatchAttempt]) -> Option<PatchAttempt> {
+    let best_patch = select_best_attempt(candidates, "patch")?;
+    if candidates
+        .iter()
+        .any(|attempt| attempt_invalidates_patch(attempt, &best_patch))
+    {
+        None
+    } else {
+        Some(best_patch)
+    }
+}
+
 fn best_attempts_from_candidates(
     candidates: Vec<PatchAttempt>,
 ) -> (Option<PatchAttempt>, Option<PatchAttempt>) {
     (
-        select_best_attempt(&candidates, "patch"),
+        select_best_patch_attempt(&candidates),
         select_best_attempt(&candidates, "triage"),
     )
+}
+
+async fn load_latest_patch_context_for_worker(
+    db: &ServerDb,
+    cluster_id: &str,
+) -> Result<Option<PatchAttempt>> {
+    match db {
+        ServerDb::Postgres(db) => {
+            let rows = db
+                .query(
+                    "
+                SELECT bundle_json
+                FROM patch_attempts
+                WHERE cluster_id = $1
+                ORDER BY created_at DESC
+                LIMIT 64
+                ",
+                    &[&cluster_id],
+                )
+                .await?;
+            let candidates = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let bundle_json: Value = row.get(0);
+                    serde_json::from_value::<WorkerResultEnvelope>(bundle_json)
+                        .ok()
+                        .map(canonicalize_worker_result_envelope)
+                        .map(|envelope| envelope.attempt)
+                })
+                .collect::<Vec<_>>();
+            Ok(select_best_attempt(&candidates, "patch"))
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let mut stmt = connection.prepare(
+                "
+                SELECT bundle_json
+                FROM patch_attempts
+                WHERE cluster_id = ?1
+                ORDER BY created_at DESC
+                LIMIT 64
+                ",
+            )?;
+            let rows = stmt.query_map([cluster_id], |row| row.get::<_, String>(0))?;
+            let candidates = rows
+                .filter_map(|row| {
+                    row.ok()
+                        .and_then(|raw| serde_json::from_str::<WorkerResultEnvelope>(&raw).ok())
+                        .map(canonicalize_worker_result_envelope)
+                        .map(|envelope| envelope.attempt)
+                })
+                .collect::<Vec<_>>();
+            Ok(select_best_attempt(&candidates, "patch"))
+        }
+    }
 }
 
 async fn refresh_issue_cluster_best_results(db: &Client, cluster_id: &str) -> Result<()> {
@@ -8888,6 +8979,42 @@ mod tests {
         }
     }
 
+    fn insert_test_attempt(
+        connection: &Connection,
+        attempt_id: &str,
+        lease_id: &str,
+        attempt: &PatchAttempt,
+        created_at: &str,
+    ) {
+        insert_test_install(connection, &attempt.install_id, created_at);
+        let envelope = WorkerResultEnvelope {
+            lease_id: lease_id.to_string(),
+            attempt: attempt.clone(),
+            impossible_reason: None,
+            evidence_request: None,
+        };
+        connection
+            .execute(
+                "
+                INSERT INTO patch_attempts
+                    (id, cluster_id, lease_id, install_id, outcome, state, summary, bundle_json, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ",
+                rusqlite::params![
+                    attempt_id,
+                    attempt.cluster_id,
+                    lease_id,
+                    attempt.install_id,
+                    attempt.outcome,
+                    attempt.state,
+                    attempt.summary,
+                    serde_json::to_string(&envelope).unwrap(),
+                    created_at,
+                ],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn html_escape_handles_reserved_characters() {
         assert_eq!(
@@ -9382,6 +9509,135 @@ mod tests {
         };
 
         assert!(issue_is_available_for_worker(&issue));
+    }
+
+    #[test]
+    fn invalidation_report_clears_public_best_patch() {
+        let legacy_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Legacy patch proposal created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "legacy prompt",
+                    "response": "legacy response",
+                    "diff": "--- a/src/file.c\n+++ b/src/file.c\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let invalidation = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "reviewer-install".to_string(),
+            outcome: "report".to_string(),
+            state: "ready".to_string(),
+            summary: "Previous patch was re-reviewed and reopened.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("review-rejected".to_string()),
+            details: json!({
+                "invalidates_best_patch": true,
+                "invalidates_patch_created_at": legacy_patch.created_at.clone(),
+                "patch_refresh_failure_kind": "review",
+            }),
+            created_at: "2026-03-30T00:00:00Z".to_string(),
+        };
+
+        let (best_patch, best_triage) =
+            best_attempts_from_candidates(vec![legacy_patch, invalidation]);
+
+        assert!(best_patch.is_none());
+        assert!(best_triage.is_none());
+    }
+
+    #[test]
+    fn worker_context_keeps_latest_patch_after_public_invalidation() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "postgres",
+            "Top frame: internal_load_library [postgres]",
+            &["internal_load_library [postgres]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-1",
+            "cluster-1",
+            110,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["other-install"],
+        );
+        let legacy_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Legacy patch proposal created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "legacy prompt",
+                    "response": "legacy response",
+                    "diff": "--- a/src/backend/utils/fmgr/dfmgr.c\n+++ b/src/backend/utils/fmgr/dfmgr.c\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let invalidation = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "reviewer-install".to_string(),
+            outcome: "report".to_string(),
+            state: "ready".to_string(),
+            summary: "Previous patch was re-reviewed and reopened.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("review-rejected".to_string()),
+            details: json!({
+                "invalidates_best_patch": true,
+                "invalidates_patch_created_at": legacy_patch.created_at.clone(),
+                "patch_refresh_failure_kind": "review",
+            }),
+            created_at: "2026-03-30T00:00:00Z".to_string(),
+        };
+        insert_test_attempt(
+            &connection,
+            "attempt-patch",
+            "lease-patch",
+            &legacy_patch,
+            "2026-03-29T00:00:00Z",
+        );
+        insert_test_attempt(
+            &connection,
+            "attempt-report",
+            "lease-report",
+            &invalidation,
+            "2026-03-30T00:00:00Z",
+        );
+
+        refresh_issue_cluster_best_results_sqlite(&connection, "issue-1").unwrap();
+        let best_patch_json: Option<String> = connection
+            .query_row(
+                "SELECT best_patch_json FROM issue_clusters WHERE id = ?1",
+                ["issue-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(best_patch_json.is_none());
+
+        let worker_context = test_runtime()
+            .block_on(load_latest_patch_context_for_worker(&db, "issue-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(worker_context.summary, legacy_patch.summary);
+        assert_eq!(worker_context.created_at, legacy_patch.created_at);
     }
 
     #[test]

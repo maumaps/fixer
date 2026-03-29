@@ -1,3 +1,10 @@
+fixer (0.23.0-1) unstable; urgency=medium
+
+  * Reopen stale public patches when a refresh run fails review instead of leaving them advertised.
+  * Keep the most recent prior patch available as worker context even after public invalidation.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 30 Mar 2026 00:14:57 +0400
+
 fixer (0.22.0-1) unstable; urgency=medium
 
   * Add an explicit planning pass before Codex patch generation.

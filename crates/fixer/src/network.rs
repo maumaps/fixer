@@ -3,8 +3,8 @@ use crate::models::{
     ClientHello, CodexAuthLease, CodexAuthLeaseStatus, CodexAuthMode, CodexJobSpec, CodexJobStatus,
     CodexLeaseBudget, FindingBundle, FindingInput, ImpossibleReason, InstallIdentity,
     LeaseBudgetPreset, ObservedArtifact, OpportunityRecord, ParticipationMode, ParticipationState,
-    PatchAttempt, ServerHello, SharedOpportunity, SubmissionEnvelope, SubmissionReceipt, WorkOffer,
-    WorkPullRequest, WorkerResultEnvelope,
+    PatchAttempt, ProposalRecord, ServerHello, SharedOpportunity, SubmissionEnvelope,
+    SubmissionReceipt, WorkOffer, WorkPullRequest, WorkerResultEnvelope,
 };
 use crate::pow::{mine_pow, verify_pow};
 use crate::privacy::{consent_policy_digest, consent_policy_text, redact_string, redact_value};
@@ -899,6 +899,10 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                     }
                     let published_session = details.get("published_session").cloned();
                     let published_session_ref = published_session.as_ref();
+                    let invalidates_prior_patch = prior_patch_review_rejected_for_refresh(
+                        &local_proposal,
+                        lease.issue.best_patch.as_ref(),
+                    );
                     let is_triage_ready = local_proposal.state == "ready"
                         && !published_session_has_diff(published_session_ref)
                         && published_session_marks_successful_triage(published_session_ref);
@@ -912,6 +916,22 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                             worker_triage_handoff(&opportunity, published_session_ref),
                         );
                     }
+                    if let Some(status) = invalidates_prior_patch.as_ref() {
+                        details.insert("invalidates_best_patch".to_string(), json!(true));
+                        details.insert("report_only_reason".to_string(), json!("stale-best-patch"));
+                        if let Some(best_patch) = lease.issue.best_patch.as_ref() {
+                            details.insert(
+                                "invalidates_patch_created_at".to_string(),
+                                json!(best_patch.created_at.clone()),
+                            );
+                        }
+                        if let Some(kind) = status.failure_kind.as_deref() {
+                            details.insert("patch_refresh_failure_kind".to_string(), json!(kind));
+                        }
+                        if let Some(error) = status.error.as_deref() {
+                            details.insert("patch_refresh_error".to_string(), json!(error));
+                        }
+                    }
                     WorkerResultEnvelope {
                         lease_id: lease.lease_id.clone(),
                         attempt: PatchAttempt {
@@ -919,11 +939,27 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                             install_id: participation.identity.install_id.clone(),
                             outcome: if is_triage_ready {
                                 "triage".to_string()
+                            } else if invalidates_prior_patch.is_some() {
+                                "report".to_string()
                             } else {
                                 "patch".to_string()
                             },
-                            state: local_proposal.state.clone(),
-                            summary: if local_proposal.state == "ready" {
+                            state: if invalidates_prior_patch.is_some() {
+                                "ready".to_string()
+                            } else {
+                                local_proposal.state.clone()
+                            },
+                            summary: if invalidates_prior_patch.is_some() {
+                                if supports_process_report {
+                                    format!(
+                                        "{} Fixer re-reviewed the previous patch, found it stale or incorrect, and reopened the issue for another pass. No replacement patch survived review yet.",
+                                        process_investigation_worker_summary(&opportunity)
+                                    )
+                                } else {
+                                    "Fixer re-reviewed the previous patch, found it stale or incorrect, and reopened the issue for another pass. No replacement patch survived review yet."
+                                        .to_string()
+                                }
+                            } else if local_proposal.state == "ready" {
                                 if is_triage_ready {
                                     if supports_process_report {
                                         format!(
@@ -959,7 +995,11 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                                 .output_path
                                 .as_ref()
                                 .map(|path| path.display().to_string()),
-                            validation_status: Some(local_proposal.state.clone()),
+                            validation_status: Some(if invalidates_prior_patch.is_some() {
+                                "review-rejected".to_string()
+                            } else {
+                                local_proposal.state.clone()
+                            }),
                             details: Value::Object(details),
                             created_at: now_rfc3339(),
                         },
@@ -1371,6 +1411,17 @@ fn published_session_response(session: Option<&Value>) -> Option<&str> {
         .and_then(|value| value.get("response"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
+}
+
+fn prior_patch_review_rejected_for_refresh(
+    local_proposal: &ProposalRecord,
+    prior_best_patch: Option<&PatchAttempt>,
+) -> Option<CodexJobStatus> {
+    if prior_best_patch.is_none() || local_proposal.state == "ready" {
+        return None;
+    }
+    let status = read_codex_job_status(&local_proposal.bundle_path).ok()?;
+    (status.failure_kind.as_deref() == Some("review")).then_some(status)
 }
 
 fn published_session_marks_successful_triage(session: Option<&Value>) -> bool {
