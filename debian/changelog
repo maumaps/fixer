@@ -1,3 +1,10 @@
+fixer (0.27.0-1) unstable; urgency=medium
+
+  * Avoid crashing when pruning stale /proc artifacts that are still referenced by findings.
+  * Keep OOM-kill investigations flowing on hosts with older referenced process artifacts.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 30 Mar 2026 01:32:00 +0400
+
 fixer (0.26.0-1) unstable; urgency=medium
 
   * Report kernel OOM kills as first-class investigations instead of generic kernel warnings.

@@ -918,8 +918,15 @@ impl Store {
             .filter_map(|(id, path)| (!current_paths.contains(&path)).then_some(id))
             .collect::<Vec<_>>();
         for id in stale_ids {
-            self.conn
-                .execute("DELETE FROM artifacts WHERE id = ?1", params![id])?;
+            let referenced = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM findings WHERE artifact_id = ?1)",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if referenced == 0 {
+                self.conn
+                    .execute("DELETE FROM artifacts WHERE id = ?1", params![id])?;
+            }
         }
         Ok(())
     }
@@ -1516,6 +1523,47 @@ mod tests {
         let profiles = store.list_popular_binary_profiles(10).unwrap();
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].path, live_path);
+    }
+
+    #[test]
+    fn keeps_referenced_stale_proc_artifacts() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+        let stale_path = PathBuf::from("/usr/bin/old-hot-process");
+        store
+            .record_finding(&FindingInput {
+                kind: "investigation".to_string(),
+                title: "OOM kill investigation for old-hot-process".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "oom-old-hot-process".to_string(),
+                summary: "old-hot-process was killed by the kernel OOM killer".to_string(),
+                details: json!({"subsystem": "oom-kill"}),
+                artifact: Some(ObservedArtifact {
+                    kind: "binary".to_string(),
+                    name: "old-hot-process".to_string(),
+                    path: Some(stale_path.clone()),
+                    package_name: None,
+                    repo_root: None,
+                    ecosystem: None,
+                    metadata: json!({
+                        "source": "proc",
+                        "process_count": 1,
+                        "total_cpu_percent": 10.0,
+                        "max_cpu_percent": 10.0,
+                    }),
+                }),
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+
+        store.prune_proc_binary_artifacts(&[]).unwrap();
+
+        let artifact_count = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifacts WHERE path = ?1", [stale_path.to_string_lossy().to_string()], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(artifact_count, 1);
     }
 
     #[test]
