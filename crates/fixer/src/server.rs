@@ -23,7 +23,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -522,7 +522,48 @@ struct PublicIssueDetail {
     best_triage: Option<PublicAttempt>,
     best_triage_handoff: Option<PublicTriageHandoff>,
     last_seen: String,
+    possible_duplicates: Vec<PublicPossibleDuplicate>,
     attempts: Vec<PublicAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicPossibleDuplicate {
+    id: String,
+    kind: String,
+    title: String,
+    summary: String,
+    package_name: Option<String>,
+    source_package: Option<String>,
+    ecosystem: Option<String>,
+    severity: Option<String>,
+    score: i64,
+    corroboration_count: i64,
+    best_patch_available: bool,
+    best_triage_available: bool,
+    last_seen: String,
+    similarity_score: f64,
+    match_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DuplicateCandidateIssue {
+    issue: PublicIssue,
+    representative: SharedOpportunity,
+}
+
+#[derive(Debug, Clone)]
+struct DuplicateMatchFeatures {
+    kind: String,
+    normalized_title: String,
+    normalized_summary: String,
+    package_name: Option<String>,
+    source_package: Option<String>,
+    ecosystem: Option<String>,
+    subsystem: Option<String>,
+    classification: Option<String>,
+    wchan: Option<String>,
+    target_name: Option<String>,
+    primary_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5496,6 +5537,7 @@ async fn load_public_issue_detail(
     let best_patch = load_public_issue_best_patch(db, &id).await?;
     let best_triage = load_public_issue_best_triage(db, &id).await?;
     let best_patch_diff_url = public_best_patch_diff_url(&id, best_patch.as_ref());
+    let possible_duplicates = load_possible_duplicates(db, &id, &issue, 6).await?;
     let attempts = load_public_attempts(db, &id, 10).await?;
     Ok(PublicIssueDetail {
         id: issue.id,
@@ -5517,8 +5559,145 @@ async fn load_public_issue_detail(
             .and_then(|attempt| attempt.handoff.clone()),
         best_triage,
         last_seen: issue.last_seen,
+        possible_duplicates,
         attempts,
     })
+}
+
+async fn load_possible_duplicates(
+    db: &ServerDb,
+    id: &str,
+    issue: &PublicIssue,
+    limit: usize,
+) -> Result<Vec<PublicPossibleDuplicate>, ApiError> {
+    let target = load_duplicate_candidate_by_id(db, id).await?;
+    let target_features = duplicate_match_features(&target.issue, &target.representative);
+    let candidates = load_duplicate_candidates(db, &issue.kind, id, 256).await?;
+    let mut matches = candidates
+        .into_iter()
+        .filter_map(|candidate| build_possible_duplicate(&target_features, candidate))
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .similarity_score
+            .partial_cmp(&left.similarity_score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| right.corroboration_count.cmp(&left.corroboration_count))
+            .then_with(|| parse_timestamp(&right.last_seen).cmp(&parse_timestamp(&left.last_seen)))
+    });
+    matches.truncate(limit);
+    Ok(matches)
+}
+
+async fn load_duplicate_candidate_by_id(
+    db: &ServerDb,
+    id: &str,
+) -> Result<DuplicateCandidateIssue, ApiError> {
+    match db {
+        ServerDb::Postgres(db) => {
+            let row = db
+                .query_opt(
+                    "
+            SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
+                   severity, score, corroboration_count,
+                   (best_patch_json IS NOT NULL) AS best_patch_available,
+                   (best_triage_json IS NOT NULL) AS best_triage_available,
+                   last_seen, representative_json
+            FROM issue_clusters
+            WHERE id = $1 AND promoted = TRUE AND public_visible = TRUE
+            ",
+                    &[&id],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            let Some(row) = row else {
+                return Err(ApiError::new(StatusCode::NOT_FOUND, "issue not found"));
+            };
+            duplicate_candidate_from_row(row)
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            connection
+                .query_row(
+                    "
+            SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
+                   severity, score, corroboration_count,
+                   (best_patch_json IS NOT NULL) AS best_patch_available,
+                   (best_triage_json IS NOT NULL) AS best_triage_available,
+                   last_seen, representative_json
+            FROM issue_clusters
+            WHERE id = ?1 AND promoted = 1 AND public_visible = 1
+            ",
+                    [id],
+                    duplicate_candidate_from_sqlite_row,
+                )
+                .optional()
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "issue not found"))
+        }
+    }
+}
+
+async fn load_duplicate_candidates(
+    db: &ServerDb,
+    kind: &str,
+    exclude_id: &str,
+    limit: i64,
+) -> Result<Vec<DuplicateCandidateIssue>, ApiError> {
+    match db {
+        ServerDb::Postgres(db) => {
+            let rows = db
+                .query(
+                    "
+            SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
+                   severity, score, corroboration_count,
+                   (best_patch_json IS NOT NULL) AS best_patch_available,
+                   (best_triage_json IS NOT NULL) AS best_triage_available,
+                   last_seen, representative_json
+            FROM issue_clusters
+            WHERE promoted = TRUE
+              AND public_visible = TRUE
+              AND kind = $1
+              AND id <> $2
+            ORDER BY score DESC, last_seen DESC
+            LIMIT $3
+            ",
+                    &[&kind, &exclude_id, &limit],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            rows.into_iter().map(duplicate_candidate_from_row).collect()
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            let mut stmt = connection
+                .prepare(
+                    "
+            SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
+                   severity, score, corroboration_count,
+                   (best_patch_json IS NOT NULL) AS best_patch_available,
+                   (best_triage_json IS NOT NULL) AS best_triage_available,
+                   last_seen, representative_json
+            FROM issue_clusters
+            WHERE promoted = 1
+              AND public_visible = 1
+              AND kind = ?1
+              AND id <> ?2
+            ORDER BY score DESC, last_seen DESC
+            LIMIT ?3
+            ",
+                )
+                .map_err(ApiError::internal)?;
+            let rows = stmt
+                .query_map(
+                    params![kind, exclude_id, limit],
+                    duplicate_candidate_from_sqlite_row,
+                )
+                .map_err(ApiError::internal)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(ApiError::internal)
+        }
+    }
 }
 
 async fn load_public_issue_best_patch(
@@ -5890,6 +6069,282 @@ fn public_issue_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pub
         best_triage_available: row.get::<_, i64>(11)? != 0,
         last_seen: row.get(12)?,
     })
+}
+
+fn duplicate_candidate_from_row(row: Row) -> Result<DuplicateCandidateIssue, ApiError> {
+    let issue = public_issue_from_row(row.clone())?;
+    let representative = serde_json::from_value::<SharedOpportunity>(row.get::<_, Value>(13))
+        .map_err(ApiError::internal)?;
+    Ok(DuplicateCandidateIssue {
+        issue,
+        representative,
+    })
+}
+
+fn duplicate_candidate_from_sqlite_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DuplicateCandidateIssue> {
+    let issue = public_issue_from_sqlite_row(row)?;
+    let representative = serde_json::from_str::<SharedOpportunity>(&row.get::<_, String>(13)?)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    Ok(DuplicateCandidateIssue {
+        issue,
+        representative,
+    })
+}
+
+fn duplicate_match_features(
+    issue: &PublicIssue,
+    representative: &SharedOpportunity,
+) -> DuplicateMatchFeatures {
+    DuplicateMatchFeatures {
+        kind: issue.kind.clone(),
+        normalized_title: normalize_duplicate_match_text(&issue.title),
+        normalized_summary: normalize_duplicate_match_text(&issue.summary),
+        package_name: issue.package_name.clone(),
+        source_package: issue.source_package.clone(),
+        ecosystem: issue.ecosystem.clone(),
+        subsystem: representative
+            .finding
+            .details
+            .get("subsystem")
+            .and_then(Value::as_str)
+            .map(normalize_duplicate_field),
+        classification: representative
+            .finding
+            .details
+            .get("loop_classification")
+            .and_then(Value::as_str)
+            .map(normalize_duplicate_field),
+        wchan: representative
+            .finding
+            .details
+            .get("wchan")
+            .and_then(Value::as_str)
+            .map(normalize_duplicate_field),
+        target_name: Some(normalize_duplicate_field(
+            &normalized_investigation_target_name(representative),
+        )),
+        primary_signature: duplicate_primary_signature(representative),
+    }
+}
+
+fn duplicate_primary_signature(item: &SharedOpportunity) -> Option<String> {
+    match item.finding.kind.as_str() {
+        "crash" => normalized_primary_stack_signature(item),
+        "investigation" => {
+            let subsystem = item
+                .finding
+                .details
+                .get("subsystem")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            match subsystem {
+                "stuck-process" => item
+                    .finding
+                    .details
+                    .get("stack_excerpt")
+                    .and_then(Value::as_str)
+                    .and_then(|excerpt| excerpt.lines().next())
+                    .map(normalize_stack_frame)
+                    .filter(|value| !value.is_empty()),
+                "runaway-process" => item
+                    .finding
+                    .details
+                    .get("top_hot_symbols")
+                    .and_then(Value::as_array)
+                    .and_then(|symbols| symbols.first())
+                    .and_then(Value::as_str)
+                    .map(normalize_stack_frame)
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| {
+                        item.finding
+                            .details
+                            .get("hot_path_dso")
+                            .and_then(Value::as_str)
+                            .map(normalize_duplicate_field)
+                            .filter(|value| !value.is_empty())
+                    }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn build_possible_duplicate(
+    target: &DuplicateMatchFeatures,
+    candidate: DuplicateCandidateIssue,
+) -> Option<PublicPossibleDuplicate> {
+    let candidate_features = duplicate_match_features(&candidate.issue, &candidate.representative);
+    let (similarity_score, match_reasons) = duplicate_match_score(target, &candidate_features);
+    if similarity_score < 0.45 {
+        return None;
+    }
+    Some(PublicPossibleDuplicate {
+        id: candidate.issue.id,
+        kind: candidate.issue.kind,
+        title: candidate.issue.title,
+        summary: candidate.issue.summary,
+        package_name: candidate.issue.package_name,
+        source_package: candidate.issue.source_package,
+        ecosystem: candidate.issue.ecosystem,
+        severity: candidate.issue.severity,
+        score: candidate.issue.score,
+        corroboration_count: candidate.issue.corroboration_count,
+        best_patch_available: candidate.issue.best_patch_available,
+        best_triage_available: candidate.issue.best_triage_available,
+        last_seen: candidate.issue.last_seen,
+        similarity_score,
+        match_reasons,
+    })
+}
+
+fn duplicate_match_score(
+    target: &DuplicateMatchFeatures,
+    candidate: &DuplicateMatchFeatures,
+) -> (f64, Vec<String>) {
+    if target.kind != candidate.kind {
+        return (0.0, Vec::new());
+    }
+
+    let title_similarity =
+        trigram_similarity(&target.normalized_title, &candidate.normalized_title);
+    let summary_similarity =
+        trigram_similarity(&target.normalized_summary, &candidate.normalized_summary);
+    let strong_structured_match =
+        matching_optional_field(&target.package_name, &candidate.package_name)
+            || matching_optional_field(&target.source_package, &candidate.source_package)
+            || matching_optional_field(&target.wchan, &candidate.wchan)
+            || matching_optional_field(&target.target_name, &candidate.target_name)
+            || matching_optional_field(&target.primary_signature, &candidate.primary_signature);
+    let mut score = (title_similarity * 0.55) + (summary_similarity * 0.45);
+    let mut reasons = Vec::new();
+
+    if !strong_structured_match && title_similarity < 0.75 {
+        return (0.0, Vec::new());
+    }
+
+    if title_similarity >= 0.98 {
+        score += 0.08;
+        reasons.push("same public title".to_string());
+    }
+    if summary_similarity >= 0.75 {
+        score += 0.06;
+        reasons.push("very similar public summary".to_string());
+    }
+    if matching_optional_field(&target.package_name, &candidate.package_name) {
+        score += 0.10;
+        reasons.push("same package".to_string());
+    }
+    if matching_optional_field(&target.source_package, &candidate.source_package) {
+        score += 0.08;
+        reasons.push("same source package".to_string());
+    }
+    if matching_optional_field(&target.ecosystem, &candidate.ecosystem) {
+        score += 0.03;
+    }
+    if matching_optional_field(&target.subsystem, &candidate.subsystem) {
+        score += 0.08;
+        reasons.push("same subsystem".to_string());
+    }
+    if matching_optional_field(&target.classification, &candidate.classification) {
+        score += 0.08;
+        reasons.push("same classification".to_string());
+    }
+    if matching_optional_field(&target.wchan, &candidate.wchan) {
+        score += 0.09;
+        reasons.push("same wait site".to_string());
+    }
+    if matching_optional_field(&target.target_name, &candidate.target_name) {
+        score += 0.07;
+        reasons.push("same target".to_string());
+    }
+    if matching_optional_field(&target.primary_signature, &candidate.primary_signature) {
+        score += 0.12;
+        reasons.push("same stack or hot path signature".to_string());
+    }
+
+    if different_non_empty_field(&target.package_name, &candidate.package_name) {
+        score -= 0.04;
+    }
+    if different_non_empty_field(&target.subsystem, &candidate.subsystem) {
+        score -= 0.04;
+    }
+    if different_non_empty_field(&target.classification, &candidate.classification) {
+        score -= 0.03;
+    }
+
+    if title_similarity < 0.2 && summary_similarity < 0.2 {
+        return (0.0, Vec::new());
+    }
+
+    reasons.sort();
+    reasons.dedup();
+    (score.clamp(0.0, 0.99), reasons)
+}
+
+fn normalize_duplicate_match_text(raw: &str) -> String {
+    let sanitized = sanitize_public_text(raw);
+    let mut normalized = String::with_capacity(sanitized.len());
+    let mut previous_space = true;
+    for ch in sanitized.chars().flat_map(char::to_lowercase) {
+        let is_word = ch.is_alphanumeric();
+        if is_word {
+            normalized.push(ch);
+            previous_space = false;
+        } else if !previous_space {
+            normalized.push(' ');
+            previous_space = true;
+        }
+    }
+    normalized.trim().to_string()
+}
+
+fn normalize_duplicate_field(raw: &str) -> String {
+    normalize_duplicate_match_text(raw)
+}
+
+fn matching_optional_field(left: &Option<String>, right: &Option<String>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if !left.is_empty() && left == right)
+}
+
+fn different_non_empty_field(left: &Option<String>, right: &Option<String>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if !left.is_empty() && !right.is_empty() && left != right)
+}
+
+fn trigram_similarity(left: &str, right: &str) -> f64 {
+    let left_ngrams = trigram_set(left);
+    let right_ngrams = trigram_set(right);
+    if left_ngrams.is_empty() || right_ngrams.is_empty() {
+        return 0.0;
+    }
+    let intersection = left_ngrams.intersection(&right_ngrams).count() as f64;
+    let union = left_ngrams.union(&right_ngrams).count() as f64;
+    if union == 0.0 {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+fn trigram_set(raw: &str) -> HashSet<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return HashSet::new();
+    }
+    let padded = format!("  {trimmed}  ");
+    let chars = padded.chars().collect::<Vec<_>>();
+    chars
+        .windows(3)
+        .map(|window| window.iter().collect::<String>())
+        .collect()
 }
 
 fn public_patch_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicPatchEntry> {
@@ -7112,6 +7567,7 @@ fn render_patches_page(patches: &[PublicPatchEntry]) -> String {
 
 fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
     let best_result_markup = render_best_result_panel(issue);
+    let duplicates_markup = render_possible_duplicates_section(issue);
     let attempts_markup = if issue.attempts.is_empty() {
         "<p class=\"fine-print\">No public attempts have been published for this issue yet.</p>"
             .to_string()
@@ -7133,6 +7589,7 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
             <p class="fine-print">Last seen: {}. Public JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
         </section>
 
+        {}
         {}
 
         <section class="panel section">
@@ -7157,6 +7614,7 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
         issue.id,
         issue.id,
         best_result_markup,
+        duplicates_markup,
         attempts_markup,
     );
     render_page(
@@ -7173,6 +7631,26 @@ fn render_best_result_panel(issue: &PublicIssueDetail) -> String {
         return panel;
     }
     render_best_triage_panel(issue).unwrap_or_default()
+}
+
+fn render_possible_duplicates_section(issue: &PublicIssueDetail) -> String {
+    if issue.possible_duplicates.is_empty() {
+        return String::new();
+    }
+    let duplicate_markup = issue
+        .possible_duplicates
+        .iter()
+        .map(render_possible_duplicate_card)
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<section class="panel section">
+            <h2>Possible duplicates</h2>
+            <p class="fine-print">These are suggestions based on sanitized trigram similarity plus structured fields like package, subsystem, classification, and wait site. They are not auto-merged.</p>
+            <div class="issue-list">{}</div>
+        </section>"#,
+        duplicate_markup
+    )
 }
 
 fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
@@ -7710,6 +8188,50 @@ fn render_public_triage_card(entry: &PublicTriageEntry) -> String {
     )
 }
 
+fn render_possible_duplicate_card(issue: &PublicPossibleDuplicate) -> String {
+    let reasons = if issue.match_reasons.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"fine-print\">Why this looks related: {}</p>",
+            html_escape(&issue.match_reasons.join(", "))
+        )
+    };
+    format!(
+        r#"<article class="issue-card">
+            <div class="issue-topline">
+                <h3><a href="/issues/{}">{}</a></h3>
+                <span class="tag">possible duplicate</span>
+            </div>
+            <p class="issue-summary">{}</p>
+            <div class="meta">{}<span class="tag">similarity: {}%</span></div>
+            {}
+            <p class="fine-print">Last seen: {}. Public page: <a href="/issues/{}">/issues/{}</a>. Public JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
+        </article>"#,
+        issue.id,
+        html_escape(&issue.title),
+        html_escape(&issue.summary),
+        render_issue_tags(
+            issue.kind.as_str(),
+            issue.package_name.as_deref(),
+            issue.source_package.as_deref(),
+            issue.ecosystem.as_deref(),
+            issue.severity.as_deref(),
+            issue.score,
+            issue.corroboration_count,
+            issue.best_patch_available,
+            issue.best_triage_available,
+        ),
+        format_similarity_percent(issue.similarity_score),
+        reasons,
+        html_escape(&format_timestamp(&issue.last_seen)),
+        issue.id,
+        issue.id,
+        issue.id,
+        issue.id
+    )
+}
+
 fn render_patch_preview(session: Option<&PublishedAttemptSession>) -> String {
     let Some(session) = session else {
         return String::new();
@@ -7807,6 +8329,10 @@ fn format_timestamp(raw: &str) -> String {
     parse_timestamp(raw)
         .map(|value| value.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| raw.to_string())
+}
+
+fn format_similarity_percent(score: f64) -> u32 {
+    (score.clamp(0.0, 0.99) * 100.0).round() as u32
 }
 
 fn html_escape(value: &str) -> String {
@@ -7958,6 +8484,25 @@ mod tests {
                 first_seen: last_seen.to_string(),
                 last_seen: last_seen.to_string(),
             },
+        }
+    }
+
+    fn public_issue_for_test(id: &str, opportunity: &SharedOpportunity) -> PublicIssue {
+        let public = build_public_issue_fields(opportunity);
+        PublicIssue {
+            id: id.to_string(),
+            kind: opportunity.opportunity.kind.clone(),
+            title: public.title,
+            summary: public.summary,
+            package_name: opportunity.finding.package_name.clone(),
+            source_package: opportunity.finding.package_name.clone(),
+            ecosystem: opportunity.opportunity.ecosystem.clone(),
+            severity: Some(opportunity.finding.severity.clone()),
+            score: opportunity.opportunity.score,
+            corroboration_count: 1,
+            best_patch_available: false,
+            best_triage_available: false,
+            last_seen: opportunity.finding.last_seen.clone(),
         }
     }
 
@@ -8289,6 +8834,7 @@ mod tests {
             best_triage: None,
             best_triage_handoff: None,
             last_seen: "2026-03-29T00:00:00Z".to_string(),
+            possible_duplicates: Vec::new(),
             attempts: Vec::new(),
         };
 
@@ -8301,6 +8847,73 @@ mod tests {
         assert!(markup.contains("Suggested subject"));
         assert!(markup.contains("Why this patch is being proposed."));
         assert!(markup.contains("Avoid the retry loop on missing files."));
+    }
+
+    #[test]
+    fn render_issue_detail_page_includes_possible_duplicates() {
+        let issue = PublicIssueDetail {
+            id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for postgres".to_string(),
+            summary: "Postgres burned CPU across multiple hosts.".to_string(),
+            package_name: Some("postgresql-18".to_string()),
+            source_package: Some("postgresql-18".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 106,
+            corroboration_count: 2,
+            best_patch_available: false,
+            best_triage_available: true,
+            best_patch_diff_url: None,
+            best_patch: None,
+            best_triage: Some(PublicAttempt {
+                outcome: "triage".to_string(),
+                state: "ready".to_string(),
+                summary: "A diagnosis and external handoff were created locally.".to_string(),
+                validation_status: Some("ready".to_string()),
+                created_at: "2026-03-29T00:00:00Z".to_string(),
+                published_session: None,
+                handoff: Some(PublicTriageHandoff {
+                    reason: "likely-external-root-cause".to_string(),
+                    target: "module `h3_postgis.so` or the workload driving it".to_string(),
+                    report_url: None,
+                    next_steps: vec!["Capture a fresh backend sample.".to_string()],
+                }),
+            }),
+            best_triage_handoff: Some(PublicTriageHandoff {
+                reason: "likely-external-root-cause".to_string(),
+                target: "module `h3_postgis.so` or the workload driving it".to_string(),
+                report_url: None,
+                next_steps: vec!["Capture a fresh backend sample.".to_string()],
+            }),
+            last_seen: "2026-03-29T00:00:00Z".to_string(),
+            possible_duplicates: vec![PublicPossibleDuplicate {
+                id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f9".to_string(),
+                kind: "investigation".to_string(),
+                title: "Runaway CPU investigation for postgres".to_string(),
+                summary: "postgres is stuck in a likely busy poll loop via do_epoll_wait."
+                    .to_string(),
+                package_name: Some("postgresql-18".to_string()),
+                source_package: Some("postgresql-18".to_string()),
+                ecosystem: Some("debian".to_string()),
+                severity: Some("high".to_string()),
+                score: 106,
+                corroboration_count: 1,
+                best_patch_available: false,
+                best_triage_available: true,
+                last_seen: "2026-03-29T00:10:00Z".to_string(),
+                similarity_score: 0.82,
+                match_reasons: vec!["same package".to_string(), "same wait site".to_string()],
+            }],
+            attempts: Vec::new(),
+        };
+
+        let markup = render_issue_detail_page(&issue);
+
+        assert!(markup.contains("Possible duplicates"));
+        assert!(markup.contains("similarity: 82%"));
+        assert!(markup.contains("same package, same wait site"));
+        assert!(markup.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f9"));
     }
 
     #[test]
@@ -8340,6 +8953,7 @@ mod tests {
             best_triage: None,
             best_triage_handoff: None,
             last_seen: "2026-03-29T00:00:00Z".to_string(),
+            possible_duplicates: Vec::new(),
             attempts: Vec::new(),
         };
 
@@ -8355,6 +8969,53 @@ mod tests {
             "Issue: https://fixer.maumap.com/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"
         ));
         assert!(patch.contains("--- a/src/backend/utils/fmgr/dfmgr.c"));
+    }
+
+    #[test]
+    fn possible_duplicate_matching_prefers_nearby_investigation_family() {
+        let target = sample_stuck_process_investigation(
+            "kworker/u33:0+i915_flip",
+            152,
+            "2026-03-29T17:52:00Z",
+        );
+        let duplicate = sample_stuck_process_investigation(
+            "kworker/u33:3+i915_flip",
+            2141,
+            "2026-03-29T17:52:30Z",
+        );
+        let mut unrelated =
+            sample_stuck_process_investigation("jbd2/sda3-8", 592299, "2026-03-29T18:42:59Z");
+        unrelated.opportunity.summary =
+            "jbd2/sda3-8 has 1 process(es) stuck in `D` state for at least 592299s, likely blocked in unknown uninterruptible wait via kjournald2.".to_string();
+        unrelated.finding.summary = unrelated.opportunity.summary.clone();
+        unrelated.finding.details["wchan"] = json!("kjournald2");
+        unrelated.finding.details["stack_excerpt"] = json!("kjournald2\n__schedule");
+
+        let target_features =
+            duplicate_match_features(&public_issue_for_test("issue-a", &target), &target);
+        let duplicate_match = build_possible_duplicate(
+            &target_features,
+            DuplicateCandidateIssue {
+                issue: public_issue_for_test("issue-b", &duplicate),
+                representative: duplicate.clone(),
+            },
+        )
+        .unwrap();
+        let unrelated_match = build_possible_duplicate(
+            &target_features,
+            DuplicateCandidateIssue {
+                issue: public_issue_for_test("issue-c", &unrelated),
+                representative: unrelated.clone(),
+            },
+        );
+
+        assert!(duplicate_match.similarity_score >= 0.45);
+        assert!(
+            duplicate_match
+                .match_reasons
+                .contains(&"same wait site".to_string())
+        );
+        assert!(unrelated_match.is_none());
     }
 
     #[test]

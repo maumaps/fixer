@@ -1,3 +1,10 @@
+fixer (0.21.0-1) unstable; urgency=medium
+
+  * Add public possible-duplicate suggestions based on sanitized trigram and structured similarity.
+  * Show likely duplicate issue families on issue detail pages without auto-merging them.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 23:16:00 +0400
+
 fixer (0.20.0-1) unstable; urgency=medium
 
   * Split successful triage from successful patches and add a public triage view.
