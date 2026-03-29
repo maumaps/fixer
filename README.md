@@ -14,13 +14,14 @@ The current tree also includes a client/server federation model:
 - Rust workspace with a shared library and two binaries: `fixer` and `fixerd`
 - SQLite-backed inventory of capabilities, artifacts, findings, opportunities, validations, and proposals
 - Collectors for process/package usage, watched repos, `coredumpctl`, warning logs, kernel warnings, optional `perf`, and optional `bpftrace`
-- PostgreSQL collation mismatch detection for local clusters, with deterministic remediation proposals that spell out `REINDEX DATABASE` plus `ALTER DATABASE ... REFRESH COLLATION VERSION`
+- PostgreSQL collation mismatch detection for local clusters, with deterministic remediation proposals that start with `pg_amcheck`, then target only the affected indexes before refreshing the recorded collation version
 - Crash ingestion now requires an actual stack trace, then runs a best-effort symbolization pass with local binaries and debug-package hints before ranking the result
 - If a package has no patchable source workspace, deterministic proposals fall back to a precise external bug report with package versions, update availability, vendor/support routing, environment details, crash evidence, and a share-safe redacted command line
 - Pluggable repo adapters for Debian, npm, pip, and PGXN metadata/validation
 - Automatic workspace hydration for Debian-backed opportunities: use an existing repo when present, try `apt-get source` when `deb-src` is configured, otherwise fall back to cloning the package homepage when it is a cloneable upstream repo
 - Debian packaging for a local `.deb` install with a systemd service and default config
 - A new `fixer-server` binary for central or siloed deployments
+- Public deployment assets for `https://fixer.maumap.com`, including a landing page, a light public issues UI, a signed APT repository publisher, and deploy scripts for the canonical server
 - Explicit participation modes: `local-only`, `submitter`, and `submitter+worker`
 - Anonymous install identity, proof-of-work, quarantine, rate limits, and issue clustering for basic anti-spam and anti-abuse handling
 
@@ -82,6 +83,13 @@ cargo run -p fixer -- --config ./fixer.toml worker run
 cargo run -p fixer --bin fixer-server -- --config ./fixer.toml serve
 ```
 
+10. Build and publish release packages into a signed APT repo:
+
+```bash
+scripts/build-release-debs.sh
+scripts/publish-apt-repo.sh dist/packages/*/*/fixer_*_*.deb
+```
+
 ## Packaging
 
 Build an installable Debian package from the repo root:
@@ -94,7 +102,7 @@ For the simplest user install, prefer APT over `dpkg -i` so recommended
 helper tools are pulled in automatically:
 
 ```bash
-sudo apt install ../fixer_0.1.0-1_amd64.deb
+sudo apt install ../fixer_*.deb
 ```
 
 The resulting package installs:
@@ -104,6 +112,9 @@ The resulting package installs:
 - `/usr/bin/fixer-server`
 - `/etc/fixer/fixer.toml`
 - `/usr/lib/systemd/system/fixer.service`
+- `/usr/lib/systemd/system/fixer-server.service`
+
+The canonical public endpoint is `https://fixer.maumap.com`, and the public APT repository is expected at `https://fixer.maumap.com/apt/`.
 
 ## Privacy and participation
 

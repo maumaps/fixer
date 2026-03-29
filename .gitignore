@@ -12,4 +12,5 @@
 /debian/tmp/
 /.cargo-home
 /state
+/dist
 /doc/local/

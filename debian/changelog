@@ -1,3 +1,9 @@
+fixer (0.3.0-1) unstable; urgency=medium
+
+  * Ship the public HTTPS server, landing UI, and signed APT repository tooling.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 13:20:00 +0400
+
 fixer (0.2.0-1) unstable; urgency=medium
 
   * Federated collection, PostgreSQL collation handling, and remote aggregation improvements.

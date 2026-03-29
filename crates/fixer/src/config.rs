@@ -288,7 +288,7 @@ fn default_codex_command() -> String {
 }
 
 fn default_server_url() -> String {
-    "https://fixer.maumaps.org".to_string()
+    "https://fixer.maumap.com".to_string()
 }
 
 fn default_sync_interval() -> u64 {
@@ -316,11 +316,11 @@ fn default_policy_version() -> String {
 }
 
 fn default_listen_addr() -> String {
-    "0.0.0.0:8080".to_string()
+    "127.0.0.1:8080".to_string()
 }
 
 fn default_postgres_url() -> String {
-    "postgres://fixer@localhost/fixer".to_string()
+    "postgres://fixer@127.0.0.1/fixer".to_string()
 }
 
 fn default_max_payload_bytes() -> usize {
