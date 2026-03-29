@@ -1,9 +1,10 @@
 use crate::config::FixerConfig;
 use crate::models::{
-    ClientHello, FindingBundle, FindingInput, ImpossibleReason, InstallIdentity, ObservedArtifact,
-    OpportunityRecord, ParticipationMode, ParticipationState, PatchAttempt, ServerHello,
-    SharedOpportunity, SubmissionEnvelope, SubmissionReceipt, WorkOffer, WorkPullRequest,
-    WorkerResultEnvelope,
+    ClientHello, CodexAuthLease, CodexAuthLeaseStatus, CodexAuthMode, CodexJobSpec, CodexJobStatus,
+    CodexLeaseBudget, FindingBundle, FindingInput, ImpossibleReason, InstallIdentity,
+    LeaseBudgetPreset, ObservedArtifact, OpportunityRecord, ParticipationMode, ParticipationState,
+    PatchAttempt, ServerHello, SharedOpportunity, SubmissionEnvelope, SubmissionReceipt, WorkOffer,
+    WorkPullRequest, WorkerResultEnvelope,
 };
 use crate::pow::{mine_pow, verify_pow};
 use crate::privacy::{consent_policy_digest, consent_policy_text, redact_string, redact_value};
@@ -13,12 +14,23 @@ use crate::storage::Store;
 use crate::util::{command_exists, hash_text, now_rfc3339, read_text};
 use crate::workspace::ensure_workspace_for_opportunity;
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 use url::Url;
+
+#[derive(Debug, Clone)]
+struct LocalUserAccount {
+    user: String,
+    uid: u32,
+    home: PathBuf,
+    shell: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParticipationSnapshot {
@@ -41,6 +53,559 @@ pub struct WorkerRunOutcome {
     pub hello: ServerHello,
     pub offer: WorkOffer,
     pub result: Option<WorkerResultEnvelope>,
+}
+
+pub fn bootstrap_codex_auth_user(
+    store: &Store,
+    config: &FixerConfig,
+    user: &str,
+    enable_linger: bool,
+) -> Result<CodexAuthLeaseStatus> {
+    require_local_admin_tools()?;
+    if enable_linger {
+        let status = Command::new("loginctl")
+            .args(["enable-linger", user])
+            .status()
+            .with_context(|| format!("failed to enable linger for {user}"))?;
+        if !status.success() {
+            return Err(anyhow!("failed to enable linger for {user}"));
+        }
+    }
+    let uid = lookup_uid(user)?;
+    probe_user_codex_environment(user, uid)?;
+    codex_auth_lease_status(store, config)
+}
+
+pub fn grant_codex_auth_lease(
+    store: &Store,
+    _config: &FixerConfig,
+    user: &str,
+    ttl_seconds: u64,
+    budget_preset: LeaseBudgetPreset,
+    allow_kernel: bool,
+) -> Result<CodexAuthLease> {
+    require_local_admin_tools()?;
+    let uid = lookup_uid(user)?;
+    probe_user_codex_environment(user, uid)?;
+    let now = Utc::now();
+    let lease = CodexAuthLease {
+        user: user.to_string(),
+        uid,
+        granted_at: now.to_rfc3339(),
+        expires_at: (now + ChronoDuration::seconds(ttl_seconds as i64)).to_rfc3339(),
+        budget_preset: budget_preset.clone(),
+        budget: lease_budget_for_preset(&budget_preset),
+        allow_kernel,
+        paused_reason: None,
+        revoked_at: None,
+        active_jobs: 0,
+        jobs_started_day: now.format("%Y-%m-%d").to_string(),
+        jobs_started_today: 0,
+        recent_failures: Vec::new(),
+    };
+    store.save_codex_auth_lease(&lease)?;
+    Ok(lease)
+}
+
+pub fn codex_auth_lease_status(
+    store: &Store,
+    config: &FixerConfig,
+) -> Result<CodexAuthLeaseStatus> {
+    let lease = store.load_codex_auth_lease()?;
+    let mut notes = Vec::new();
+    if config.patch.auth_mode != crate::models::CodexAuthMode::UserLease {
+        notes.push("patch.auth_mode is not `user-lease`".to_string());
+    }
+    if let Some(lease) = &lease {
+        if is_lease_revoked(lease) {
+            notes.push("lease has been revoked".to_string());
+        }
+        if is_lease_expired(lease) {
+            notes.push("lease has expired".to_string());
+        }
+        if let Some(reason) = lease.paused_reason.as_deref() {
+            notes.push(format!("lease is paused: {reason}"));
+        }
+        if lease.budget_preset == LeaseBudgetPreset::Off {
+            notes.push("lease budget preset is `off`".to_string());
+        }
+        match probe_user_codex_environment(&lease.user, lease.uid) {
+            Ok(()) => {}
+            Err(error) => notes.push(error.to_string()),
+        }
+    } else {
+        notes.push("no active Codex auth lease is configured".to_string());
+    }
+    Ok(CodexAuthLeaseStatus {
+        ready: notes.is_empty(),
+        lease,
+        notes,
+    })
+}
+
+pub fn revoke_codex_auth_lease(store: &Store) -> Result<Option<CodexAuthLease>> {
+    let Some(mut lease) = store.load_codex_auth_lease()? else {
+        return Ok(None);
+    };
+    lease.revoked_at = Some(now_rfc3339());
+    lease.paused_reason = Some("revoked by operator".to_string());
+    lease.active_jobs = 0;
+    store.save_codex_auth_lease(&lease)?;
+    Ok(Some(lease))
+}
+
+fn require_local_admin_tools() -> Result<()> {
+    for tool in ["runuser", "systemd-run", "getent", "chown"] {
+        if !command_exists(tool) {
+            return Err(anyhow!(
+                "required local helper `{tool}` is not available for user-leased Codex jobs"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn lookup_user_account(user: &str) -> Result<LocalUserAccount> {
+    let output = Command::new("getent")
+        .args(["passwd", user])
+        .output()
+        .with_context(|| format!("failed to look up user `{user}`"))?;
+    if !output.status.success() {
+        return Err(anyhow!("could not find local user `{user}`"));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let line = raw
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow!("`getent passwd {user}` returned no rows"))?;
+    let mut fields = line.split(':');
+    let account_name = fields.next().unwrap_or_default().to_string();
+    let _password = fields.next();
+    let uid = fields
+        .next()
+        .ok_or_else(|| anyhow!("passwd entry for `{user}` is missing a uid"))?
+        .parse::<u32>()
+        .with_context(|| format!("passwd entry for `{user}` has an invalid uid"))?;
+    let _gid = fields.next();
+    let _gecos = fields.next();
+    let home = fields
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("passwd entry for `{user}` is missing a home directory"))?;
+    let shell = fields
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("/bin/sh")
+        .to_string();
+    Ok(LocalUserAccount {
+        user: account_name,
+        uid,
+        home,
+        shell,
+    })
+}
+
+fn lookup_uid(user: &str) -> Result<u32> {
+    Ok(lookup_user_account(user)?.uid)
+}
+
+fn user_runtime_dir(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/run/user/{uid}"))
+}
+
+fn default_user_path(home: &Path) -> String {
+    format!("{}/.local/bin:/usr/local/bin:/usr/bin:/bin", home.display())
+}
+
+fn resolve_user_login_path(account: &LocalUserAccount) -> Result<String> {
+    let output = Command::new("runuser")
+        .args([
+            "-u",
+            &account.user,
+            "--",
+            &account.shell,
+            "-lc",
+            "printf '%s' \"$PATH\"",
+        ])
+        .output()
+        .with_context(|| format!("failed to resolve login PATH for {}", account.user))?;
+    if !output.status.success() {
+        return Ok(default_user_path(&account.home));
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        Ok(default_user_path(&account.home))
+    } else {
+        Ok(path)
+    }
+}
+
+fn probe_user_codex_environment(user: &str, uid: u32) -> Result<()> {
+    let account = lookup_user_account(user)?;
+    if account.uid != uid {
+        return Err(anyhow!(
+            "lease for `{user}` expected uid {uid}, but the local account is {}",
+            account.uid
+        ));
+    }
+    let auth_path = account.home.join(".codex").join("auth.json");
+    if !auth_path.exists() {
+        return Err(anyhow!(
+            "Codex auth was not found at {}; log in as `{}` before granting a lease",
+            auth_path.display(),
+            user
+        ));
+    }
+    let runtime_dir = user_runtime_dir(uid);
+    let bus_path = runtime_dir.join("bus");
+    if !bus_path.exists() {
+        return Err(anyhow!(
+            "the user systemd manager for `{user}` is not available; log in as that user or enable linger"
+        ));
+    }
+    let status = Command::new("runuser")
+        .args(["-u", user, "--", "env"])
+        .arg(format!("XDG_RUNTIME_DIR={}", runtime_dir.display()))
+        .arg(format!(
+            "DBUS_SESSION_BUS_ADDRESS=unix:path={}",
+            bus_path.display()
+        ))
+        .arg("systemd-run")
+        .args([
+            "--user",
+            "--wait",
+            "--collect",
+            "--pipe",
+            "--quiet",
+            "/usr/bin/true",
+        ])
+        .status()
+        .with_context(|| format!("failed to probe the user systemd manager for `{user}`"))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "the user systemd manager for `{user}` is not ready to launch transient jobs"
+        ));
+    }
+    Ok(())
+}
+
+fn lease_budget_for_preset(preset: &LeaseBudgetPreset) -> CodexLeaseBudget {
+    match preset {
+        LeaseBudgetPreset::Off => CodexLeaseBudget {
+            max_active_jobs: 0,
+            max_jobs_per_day: 0,
+            job_timeout_seconds: 0,
+        },
+        LeaseBudgetPreset::Conservative => CodexLeaseBudget {
+            max_active_jobs: 1,
+            max_jobs_per_day: 6,
+            job_timeout_seconds: 30 * 60,
+        },
+        LeaseBudgetPreset::Balanced => CodexLeaseBudget {
+            max_active_jobs: 2,
+            max_jobs_per_day: 18,
+            job_timeout_seconds: 45 * 60,
+        },
+        LeaseBudgetPreset::Aggressive => CodexLeaseBudget {
+            max_active_jobs: 4,
+            max_jobs_per_day: 48,
+            job_timeout_seconds: 60 * 60,
+        },
+    }
+}
+
+fn is_lease_revoked(lease: &CodexAuthLease) -> bool {
+    lease.revoked_at.is_some()
+}
+
+fn is_lease_expired(lease: &CodexAuthLease) -> bool {
+    DateTime::parse_from_rfc3339(&lease.expires_at)
+        .map(|expires| expires.with_timezone(&Utc) <= Utc::now())
+        .unwrap_or(true)
+}
+
+fn current_lease_day() -> String {
+    Utc::now().format("%Y-%m-%d").to_string()
+}
+
+fn reset_daily_budget_if_needed(lease: &mut CodexAuthLease) {
+    let today = current_lease_day();
+    if lease.jobs_started_day != today {
+        lease.jobs_started_day = today;
+        lease.jobs_started_today = 0;
+    }
+}
+
+fn prune_recent_failures(lease: &mut CodexAuthLease, window_seconds: u64) {
+    let cutoff = Utc::now() - ChronoDuration::seconds(window_seconds as i64);
+    lease.recent_failures.retain(|failure| {
+        DateTime::parse_from_rfc3339(&failure.occurred_at)
+            .map(|time| time.with_timezone(&Utc) >= cutoff)
+            .unwrap_or(false)
+    });
+}
+
+fn begin_codex_auth_job(store: &Store) -> Result<CodexAuthLease> {
+    let mut lease = store
+        .load_codex_auth_lease()?
+        .ok_or_else(|| anyhow!("no active Codex auth lease is configured"))?;
+    if is_lease_revoked(&lease) {
+        return Err(anyhow!("the current Codex auth lease has been revoked"));
+    }
+    if is_lease_expired(&lease) {
+        return Err(anyhow!("the current Codex auth lease has expired"));
+    }
+    if let Some(reason) = lease.paused_reason.as_deref() {
+        return Err(anyhow!("the current Codex auth lease is paused: {reason}"));
+    }
+    reset_daily_budget_if_needed(&mut lease);
+    if lease.budget.max_active_jobs == 0 || lease.budget.max_jobs_per_day == 0 {
+        return Err(anyhow!(
+            "the current Codex auth lease budget is disabled (`{}`)",
+            lease.budget_preset.as_str()
+        ));
+    }
+    if lease.active_jobs >= lease.budget.max_active_jobs {
+        return Err(anyhow!(
+            "the current Codex auth lease is already using {} active jobs",
+            lease.active_jobs
+        ));
+    }
+    if lease.jobs_started_today >= lease.budget.max_jobs_per_day {
+        return Err(anyhow!(
+            "the current Codex auth lease has exhausted its daily budget ({})",
+            lease.budget.max_jobs_per_day
+        ));
+    }
+    lease.active_jobs += 1;
+    lease.jobs_started_today += 1;
+    store.save_codex_auth_lease(&lease)?;
+    Ok(lease)
+}
+
+fn complete_codex_auth_job(
+    store: &Store,
+    config: &FixerConfig,
+    status: Option<&CodexJobStatus>,
+    command_failure: Option<&str>,
+) -> Result<()> {
+    let Some(mut lease) = store.load_codex_auth_lease()? else {
+        return Ok(());
+    };
+    lease.active_jobs = lease.active_jobs.saturating_sub(1);
+    prune_recent_failures(&mut lease, config.patch.lease_failure_pause_window_seconds);
+    if let Some(status) = status {
+        if let Some(kind) = status.failure_kind.as_deref() {
+            lease
+                .recent_failures
+                .push(crate::models::CodexLeaseFailure {
+                    occurred_at: now_rfc3339(),
+                    kind: kind.to_string(),
+                    message: status
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Codex job failed".to_string()),
+                });
+        } else {
+            lease.recent_failures.clear();
+        }
+    } else if let Some(message) = command_failure {
+        lease
+            .recent_failures
+            .push(crate::models::CodexLeaseFailure {
+                occurred_at: now_rfc3339(),
+                kind: "dispatch".to_string(),
+                message: message.to_string(),
+            });
+    }
+    prune_recent_failures(&mut lease, config.patch.lease_failure_pause_window_seconds);
+    if lease.recent_failures.len() >= config.patch.lease_failure_pause_threshold as usize {
+        lease.paused_reason = Some(format!(
+            "auto-paused after {} recent Codex failures",
+            lease.recent_failures.len()
+        ));
+    }
+    store.save_codex_auth_lease(&lease)?;
+    Ok(())
+}
+
+fn chown_path_recursive(user: &str, path: &Path) -> Result<()> {
+    let ownership = format!("{user}:{user}");
+    let status = Command::new("chown")
+        .args(["-R", &ownership])
+        .arg(path)
+        .status()
+        .with_context(|| format!("failed to hand {} to {}", path.display(), user))?;
+    if !status.success() {
+        return Err(anyhow!("failed to hand {} to {}", path.display(), user));
+    }
+    Ok(())
+}
+
+fn sanitize_unit_name(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '-',
+        })
+        .collect()
+}
+
+fn read_codex_job_status(bundle_dir: &Path) -> Result<CodexJobStatus> {
+    let path = bundle_dir.join("status.json");
+    let raw = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&raw).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn render_command_failure(output: &std::process::Output) -> String {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let trimmed = combined.trim();
+    if trimmed.is_empty() {
+        format!("exit status {}", output.status)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn run_codex_job_as_user(
+    store: &Store,
+    config: &FixerConfig,
+    job: &CodexJobSpec,
+) -> Result<CodexJobStatus> {
+    require_local_admin_tools()?;
+    let lease = begin_codex_auth_job(store)?;
+    let result = (|| -> Result<CodexJobStatus> {
+        let account = lookup_user_account(&lease.user)?;
+        if account.uid != lease.uid {
+            return Err(anyhow!(
+                "lease for `{}` points at uid {}, but the local account resolved to {}",
+                lease.user,
+                lease.uid,
+                account.uid
+            ));
+        }
+        probe_user_codex_environment(&account.user, account.uid)?;
+        chown_path_recursive(&account.user, &job.bundle_dir)?;
+        let login_path = resolve_user_login_path(&account)?;
+        let runtime_dir = user_runtime_dir(account.uid);
+        let bus_path = runtime_dir.join("bus");
+        let executable =
+            std::env::current_exe().context("failed to resolve the fixer binary path")?;
+        let auth_paths = [
+            account.home.join(".codex"),
+            account.home.join(".cache").join("codex"),
+            account.home.join(".local").join("share").join("codex"),
+        ];
+
+        let mut command = Command::new("runuser");
+        command.args(["-u", &account.user, "--", "env"]);
+        command.arg(format!("XDG_RUNTIME_DIR={}", runtime_dir.display()));
+        command.arg(format!(
+            "DBUS_SESSION_BUS_ADDRESS=unix:path={}",
+            bus_path.display()
+        ));
+        command.arg("systemd-run");
+        command.args(["--user", "--wait", "--collect", "--pipe", "--quiet"]);
+        command.arg(format!(
+            "--unit=fixer-codex-{}",
+            sanitize_unit_name(&job.job_id)
+        ));
+        command.arg(format!("--setenv=HOME={}", account.home.display()));
+        command.arg(format!("--setenv=PATH={login_path}"));
+        command.arg(format!(
+            "--setenv=XDG_RUNTIME_DIR={}",
+            runtime_dir.display()
+        ));
+        command.arg("-p").arg("NoNewPrivileges=yes");
+        command.arg("-p").arg("PrivateTmp=yes");
+        command.arg("-p").arg("ProtectSystem=strict");
+        command.arg("-p").arg("ProtectHome=read-only");
+        command.arg("-p").arg("RestrictSUIDSGID=yes");
+        command.arg("-p").arg("ProtectControlGroups=yes");
+        command.arg("-p").arg("ProtectKernelTunables=yes");
+        command.arg("-p").arg("LockPersonality=yes");
+        command.arg("-p").arg("UMask=0077");
+        command.arg("-p").arg(format!(
+            "WorkingDirectory={}",
+            job.workspace.repo_root.display()
+        ));
+        command.arg("-p").arg(format!(
+            "RuntimeMaxSec={}",
+            lease.budget.job_timeout_seconds
+        ));
+        command
+            .arg("-p")
+            .arg(format!("ReadWritePaths={}", job.bundle_dir.display()));
+        for path in auth_paths {
+            command
+                .arg("-p")
+                .arg(format!("ReadWritePaths={}", path.display()));
+        }
+        command.arg(executable);
+        command.arg("auth");
+        command.arg("exec-job");
+        command.arg("--job");
+        command.arg(&job.bundle_dir);
+        let output = command
+            .output()
+            .context("failed to launch the transient user-scoped Codex job")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "the transient user-scoped Codex job failed: {}",
+                render_command_failure(&output)
+            ));
+        }
+        read_codex_job_status(&job.bundle_dir)
+    })();
+
+    match result {
+        Ok(status) => {
+            complete_codex_auth_job(store, config, Some(&status), None)?;
+            Ok(status)
+        }
+        Err(error) => {
+            complete_codex_auth_job(store, config, None, Some(&error.to_string()))?;
+            Err(error)
+        }
+    }
+}
+
+fn create_worker_codex_proposal(
+    store: &Store,
+    config: &FixerConfig,
+    opportunity: &OpportunityRecord,
+    workspace: &crate::models::PreparedWorkspace,
+) -> Result<crate::models::ProposalRecord> {
+    match config.patch.auth_mode {
+        CodexAuthMode::RootDirect => {
+            proposal::create_proposal(store, config, opportunity, workspace, "codex")
+        }
+        CodexAuthMode::UserLease => {
+            let lease = store
+                .load_codex_auth_lease()?
+                .ok_or_else(|| anyhow!("no active Codex auth lease is configured"))?;
+            let job = proposal::prepare_codex_job(
+                config,
+                opportunity,
+                workspace,
+                &lease.user,
+                lease.allow_kernel,
+            )?;
+            let status = run_codex_job_as_user(store, config, &job)?;
+            store.create_proposal(
+                opportunity.id,
+                "codex",
+                &status.state,
+                &job.bundle_dir,
+                status.output_path.as_deref(),
+            )
+        }
+    }
 }
 
 pub fn opt_in(
@@ -145,7 +710,9 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
             "worker participation is disabled; run `fixer opt-in --mode submitter+worker` first"
         ));
     }
-    if !store.capability_available("codex")? || !command_exists(&config.patch.codex_command) {
+    if config.patch.auth_mode == CodexAuthMode::RootDirect
+        && (!store.capability_available("codex")? || !command_exists(&config.patch.codex_command))
+    {
         return Err(anyhow!(
             "Codex is not available on this host, so it cannot accept worker leases"
         ));
@@ -250,7 +817,7 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
             } else {
                 None
             };
-            match proposal::create_proposal(store, config, &opportunity, &workspace, "codex") {
+            match create_worker_codex_proposal(store, config, &opportunity, &workspace) {
                 Ok(local_proposal) => {
                     let submission_bundle =
                         proposal::prepare_submission(store, local_proposal.id).ok();
@@ -771,6 +1338,24 @@ mod tests {
         }
     }
 
+    fn sample_lease(expires_at: &str) -> CodexAuthLease {
+        CodexAuthLease {
+            user: "kom".to_string(),
+            uid: 1000,
+            granted_at: "2026-03-29T12:00:00Z".to_string(),
+            expires_at: expires_at.to_string(),
+            budget_preset: LeaseBudgetPreset::Conservative,
+            budget: lease_budget_for_preset(&LeaseBudgetPreset::Conservative),
+            allow_kernel: false,
+            paused_reason: None,
+            revoked_at: None,
+            active_jobs: 0,
+            jobs_started_day: "2026-03-29".to_string(),
+            jobs_started_today: 0,
+            recent_failures: Vec::new(),
+        }
+    }
+
     #[test]
     fn compatible_server_hello_allows_work_to_continue() {
         assert!(ensure_server_hello_compatible(&sample_server_hello()).is_ok());
@@ -800,6 +1385,23 @@ mod tests {
             server_upgrade_message(&hello),
             Some(hello.upgrade_message.as_str())
         );
+    }
+
+    #[test]
+    fn lease_expiration_detects_past_due_leases() {
+        let expired = sample_lease("2000-01-01T00:00:00Z");
+        let active = sample_lease("2999-01-01T00:00:00Z");
+
+        assert!(is_lease_expired(&expired));
+        assert!(!is_lease_expired(&active));
+    }
+
+    #[test]
+    fn conservative_budget_is_bounded() {
+        let budget = lease_budget_for_preset(&LeaseBudgetPreset::Conservative);
+        assert_eq!(budget.max_active_jobs, 1);
+        assert!(budget.max_jobs_per_day > 0);
+        assert!(budget.job_timeout_seconds >= 30 * 60);
     }
 
     #[test]

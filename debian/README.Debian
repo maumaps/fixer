@@ -39,3 +39,25 @@ yet pulled in automatically by the `.deb`.
 
 Codex itself is not packaged here; install it separately if you want the
 `fixer propose-fix --engine codex` workflow.
+
+The packaged worker defaults to `patch.auth_mode = "user-lease"`. That keeps
+the root-owned `fixerd` service responsible for collection, leasing, and the
+SQLite state, while Codex patch generation is dispatched into a transient user
+systemd unit that uses the chosen user's existing Codex login.
+
+Bootstrap and manage that lease explicitly:
+
+  sudo fixer auth lease bootstrap <user>
+  sudo fixer auth lease grant <user> --ttl 8h --budget conservative
+  sudo fixer auth lease status
+  sudo fixer auth lease revoke
+
+`bootstrap` checks that the target user has a working systemd user manager and
+an existing `~/.codex/auth.json`. `grant` stores only lease metadata and usage
+budget; it does not copy the user's auth into `/root` or the root service
+environment.
+
+Autonomous worker jobs run inside an isolated per-job workspace snapshot under
+`/var/lib/fixer/proposals/...`, and the transient user unit is constrained with
+`ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=yes`, and a narrow
+set of writable paths for the bundle and Codex state directories.

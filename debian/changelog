@@ -1,3 +1,11 @@
+fixer (0.15.0-1) unstable; urgency=medium
+
+  * Lease Codex worker auth from an explicit user session instead of root.
+  * Dispatch Codex patch jobs through transient user systemd units with budgets.
+  * Run autonomous Codex jobs in isolated per-job workspace snapshots.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 19:58:28 +0400
+
 fixer (0.14.0-1) unstable; urgency=medium
 
   * Mirror leased issues into the local store before writing worker proposals.

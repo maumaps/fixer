@@ -3,7 +3,8 @@ use crate::capabilities::detect_capabilities;
 use crate::collectors::{CollectReport, collect_once};
 use crate::config::FixerConfig;
 use crate::models::{
-    ComplaintCollectionReport, ComplaintOutcome, ParticipationMode, SharedOpportunity,
+    CodexAuthLease, CodexAuthLeaseStatus, ComplaintCollectionReport, ComplaintOutcome,
+    LeaseBudgetPreset, ParticipationMode, SharedOpportunity,
 };
 use crate::network::{self, ParticipationSnapshot, SyncOutcome, WorkerRunOutcome};
 use crate::proposal;
@@ -296,6 +297,39 @@ impl App {
         self.store
             .set_local_state("last_worker_run_at", &Utc::now().to_rfc3339())?;
         Ok(outcome)
+    }
+
+    pub fn auth_lease_bootstrap(
+        &self,
+        user: &str,
+        enable_linger: bool,
+    ) -> Result<CodexAuthLeaseStatus> {
+        network::bootstrap_codex_auth_user(&self.store, &self.config, user, enable_linger)
+    }
+
+    pub fn auth_lease_grant(
+        &self,
+        user: &str,
+        ttl_seconds: u64,
+        budget: LeaseBudgetPreset,
+        allow_kernel: bool,
+    ) -> Result<CodexAuthLease> {
+        network::grant_codex_auth_lease(
+            &self.store,
+            &self.config,
+            user,
+            ttl_seconds,
+            budget,
+            allow_kernel,
+        )
+    }
+
+    pub fn auth_lease_status(&self) -> Result<CodexAuthLeaseStatus> {
+        network::codex_auth_lease_status(&self.store, &self.config)
+    }
+
+    pub fn auth_lease_revoke(&self) -> Result<Option<CodexAuthLease>> {
+        network::revoke_codex_auth_lease(&self.store)
     }
 
     fn should_run_network_task(&self, key: &str, interval_seconds: u64) -> bool {

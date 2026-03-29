@@ -1,3 +1,4 @@
+use crate::models::{CodexAuthMode, LeaseBudgetPreset};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -86,6 +87,18 @@ pub struct PatchConfig {
     pub approval_policy: Option<String>,
     #[serde(default)]
     pub extra_instructions: Option<String>,
+    #[serde(default)]
+    pub auth_mode: CodexAuthMode,
+    #[serde(default = "default_lease_budget_preset")]
+    pub lease_budget_preset: LeaseBudgetPreset,
+    #[serde(default = "default_lease_default_ttl")]
+    pub lease_default_ttl_seconds: u64,
+    #[serde(default = "default_lease_failure_pause_threshold")]
+    pub lease_failure_pause_threshold: u32,
+    #[serde(default = "default_lease_failure_pause_window")]
+    pub lease_failure_pause_window_seconds: u64,
+    #[serde(default = "default_true")]
+    pub lease_bootstrap_enable_linger: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +219,12 @@ impl Default for PatchConfig {
             sandbox: Some("workspace-write".to_string()),
             approval_policy: Some("never".to_string()),
             extra_instructions: None,
+            auth_mode: CodexAuthMode::UserLease,
+            lease_budget_preset: default_lease_budget_preset(),
+            lease_default_ttl_seconds: default_lease_default_ttl(),
+            lease_failure_pause_threshold: default_lease_failure_pause_threshold(),
+            lease_failure_pause_window_seconds: default_lease_failure_pause_window(),
+            lease_bootstrap_enable_linger: true,
         }
     }
 }
@@ -365,6 +384,22 @@ fn default_bpftrace_timeout() -> u64 {
 
 fn default_codex_command() -> String {
     "codex".to_string()
+}
+
+fn default_lease_budget_preset() -> LeaseBudgetPreset {
+    LeaseBudgetPreset::Conservative
+}
+
+fn default_lease_default_ttl() -> u64 {
+    8 * 60 * 60
+}
+
+fn default_lease_failure_pause_threshold() -> u32 {
+    3
+}
+
+fn default_lease_failure_pause_window() -> u64 {
+    30 * 60
 }
 
 fn default_server_url() -> String {

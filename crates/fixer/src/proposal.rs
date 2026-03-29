@@ -1,7 +1,7 @@
 use crate::config::FixerConfig;
 use crate::models::{
-    ComplaintCollectionReport, InstalledPackageMetadata, OpportunityRecord, PreparedWorkspace,
-    ProposalRecord, SharedOpportunity,
+    CodexJobSpec, CodexJobStatus, ComplaintCollectionReport, InstalledPackageMetadata,
+    OpportunityRecord, PreparedWorkspace, ProposalRecord, SharedOpportunity,
 };
 use crate::storage::Store;
 use crate::util::{command_exists, command_output, now_rfc3339, read_text};
@@ -64,17 +64,118 @@ pub fn create_proposal(
                 Some(&summary_path),
             )
         }
-        "codex" => run_codex(
-            store,
-            config,
-            opportunity,
-            workspace,
-            &bundle_dir,
-            &output_path,
-            &prompt,
-        ),
+        "codex" => {
+            let job = write_codex_job_spec(
+                config,
+                opportunity,
+                workspace,
+                &bundle_dir,
+                &prompt_path,
+                &output_path,
+            )?;
+            let status = execute_codex_job(config, &job)?;
+            store.create_proposal(
+                opportunity.id,
+                "codex",
+                &status.state,
+                &bundle_dir,
+                Some(&output_path),
+            )
+        }
         other => Err(anyhow!("unknown proposal engine `{other}`")),
     }
+}
+
+pub fn prepare_codex_job(
+    config: &FixerConfig,
+    opportunity: &OpportunityRecord,
+    workspace: &PreparedWorkspace,
+    run_as_user: &str,
+    allow_kernel: bool,
+) -> Result<CodexJobSpec> {
+    let bundle_dir = config.service.state_dir.join("proposals").join(format!(
+        "{}-{}",
+        opportunity.id,
+        now_rfc3339().replace(':', "-")
+    ));
+    fs::create_dir_all(&bundle_dir)?;
+    let job_workspace = snapshot_workspace_for_job(workspace, &bundle_dir)?;
+    let evidence_path = bundle_dir.join("evidence.json");
+    let prompt_path = bundle_dir.join("prompt.md");
+    let output_path = bundle_dir.join("codex-output.txt");
+
+    let evidence = json!({
+        "opportunity": opportunity,
+        "workspace": job_workspace,
+        "source_workspace": workspace,
+    });
+    fs::write(&evidence_path, serde_json::to_vec_pretty(&evidence)?)?;
+
+    let prompt = build_prompt(
+        opportunity,
+        &fs::canonicalize(&evidence_path).unwrap_or_else(|_| evidence_path.clone()),
+        &job_workspace,
+        config,
+    );
+    fs::write(&prompt_path, prompt.as_bytes())?;
+
+    let mut job = write_codex_job_spec(
+        config,
+        opportunity,
+        &job_workspace,
+        &bundle_dir,
+        &prompt_path,
+        &output_path,
+    )?;
+    job.run_as_user = run_as_user.to_string();
+    job.allow_kernel = allow_kernel;
+    fs::write(
+        bundle_dir.join("job.json"),
+        serde_json::to_vec_pretty(&job)?,
+    )?;
+    Ok(job)
+}
+
+pub fn load_codex_job(job_dir: &std::path::Path) -> Result<CodexJobSpec> {
+    let job_path = job_dir.join("job.json");
+    let raw =
+        fs::read(&job_path).with_context(|| format!("failed to read {}", job_path.display()))?;
+    serde_json::from_slice(&raw).with_context(|| format!("failed to parse {}", job_path.display()))
+}
+
+pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<CodexJobStatus> {
+    let started_at = now_rfc3339();
+    let prompt = read_text(&job.prompt_path)
+        .with_context(|| format!("failed to read {}", job.prompt_path.display()))?;
+    let outcome = run_codex_process(config, &job.workspace.repo_root, &job.output_path, &prompt)?;
+    let finished_at = now_rfc3339();
+    let log_path = job.bundle_dir.join("codex-run.log");
+    if !outcome.log.is_empty() {
+        fs::write(&log_path, outcome.log.as_bytes())?;
+    }
+    let error = if outcome.success {
+        None
+    } else {
+        Some(summarize_failure_log(&outcome.log))
+    };
+    let status = CodexJobStatus {
+        job_id: job.job_id.clone(),
+        state: if outcome.success {
+            "ready".to_string()
+        } else {
+            "failed".to_string()
+        },
+        started_at,
+        finished_at,
+        output_path: job.output_path.exists().then(|| job.output_path.clone()),
+        failure_kind: (!outcome.success).then(|| classify_codex_failure(&outcome.log)),
+        error,
+    };
+    fs::write(
+        job.bundle_dir.join("status.json"),
+        serde_json::to_vec_pretty(&status)?,
+    )?;
+    Ok(status)
 }
 
 pub fn create_external_report_proposal(
@@ -324,23 +425,98 @@ pub fn prepare_submission(store: &Store, proposal_id: i64) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn run_codex(
-    store: &Store,
+fn write_codex_job_spec(
     config: &FixerConfig,
     opportunity: &OpportunityRecord,
     workspace: &PreparedWorkspace,
     bundle_dir: &std::path::Path,
+    prompt_path: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<CodexJobSpec> {
+    let job = CodexJobSpec {
+        job_id: format!("{}-{}", opportunity.id, now_rfc3339().replace(':', "-")),
+        opportunity_id: opportunity.id,
+        run_as_user: String::new(),
+        workspace: workspace.clone(),
+        bundle_dir: bundle_dir.to_path_buf(),
+        prompt_path: prompt_path.to_path_buf(),
+        output_path: output_path.to_path_buf(),
+        failure_pause_threshold: config.patch.lease_failure_pause_threshold,
+        failure_pause_window_seconds: config.patch.lease_failure_pause_window_seconds,
+        allow_kernel: false,
+    };
+    fs::write(
+        bundle_dir.join("job.json"),
+        serde_json::to_vec_pretty(&job)?,
+    )?;
+    Ok(job)
+}
+
+fn snapshot_workspace_for_job(
+    workspace: &PreparedWorkspace,
+    bundle_dir: &std::path::Path,
+) -> Result<PreparedWorkspace> {
+    let target = bundle_dir.join("workspace");
+    copy_directory_recursively(&workspace.repo_root, &target)?;
+    let mut job_workspace = workspace.clone();
+    job_workspace.repo_root = target;
+    job_workspace.acquisition_note = format!(
+        "{} Fixer created an isolated job snapshot for autonomous Codex execution.",
+        workspace.acquisition_note
+    );
+    Ok(job_workspace)
+}
+
+fn copy_directory_recursively(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<()> {
+    if destination.exists() {
+        fs::remove_dir_all(destination).with_context(|| {
+            format!(
+                "failed to clear existing workspace snapshot {}",
+                destination.display()
+            )
+        })?;
+    }
+    let status = Command::new("cp")
+        .args(["-a"])
+        .arg(source)
+        .arg(destination)
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to create workspace snapshot from {}",
+                source.display()
+            )
+        })?;
+    if !status.success() {
+        return Err(anyhow!(
+            "failed to snapshot workspace {} into {}",
+            source.display(),
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
+struct CodexProcessOutcome {
+    success: bool,
+    log: String,
+}
+
+fn run_codex_process(
+    config: &FixerConfig,
+    repo_root: &std::path::Path,
     output_path: &std::path::Path,
     prompt: &str,
-) -> Result<ProposalRecord> {
+) -> Result<CodexProcessOutcome> {
     if !command_exists(&config.patch.codex_command) {
         return Err(anyhow!(
             "Codex CLI `{}` was not found in PATH",
             config.patch.codex_command
         ));
     }
-    let repo_root = workspace.repo_root.clone();
-
     let mut cmd = Command::new(&config.patch.codex_command);
     if let Some(approval_policy) = &config.patch.approval_policy {
         cmd.arg("-a").arg(approval_policy);
@@ -359,8 +535,8 @@ fn run_codex(
     }
     cmd.arg("-")
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
@@ -368,15 +544,46 @@ fn run_codex(
     if let Some(stdin) = child.stdin.as_mut() {
         stdin.write_all(prompt.as_bytes())?;
     }
-    let status = child.wait()?;
-    let proposal_state = if status.success() { "ready" } else { "failed" };
-    store.create_proposal(
-        opportunity.id,
-        "codex",
-        proposal_state,
-        bundle_dir,
-        Some(output_path),
-    )
+    let output = child.wait_with_output()?;
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(CodexProcessOutcome {
+        success: output.status.success(),
+        log,
+    })
+}
+
+fn classify_codex_failure(log: &str) -> String {
+    let lower = log.to_ascii_lowercase();
+    if lower.contains("401 unauthorized") || lower.contains("missing bearer") {
+        "auth".to_string()
+    } else if lower.contains("500 internal server error")
+        || lower.contains("failed to connect to websocket")
+    {
+        "api".to_string()
+    } else {
+        "execution".to_string()
+    }
+}
+
+fn summarize_failure_log(log: &str) -> String {
+    let summary = log
+        .lines()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if summary.trim().is_empty() {
+        "codex execution failed without additional output".to_string()
+    } else {
+        summary
+    }
 }
 
 fn build_prompt(

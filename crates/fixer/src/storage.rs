@@ -1,5 +1,5 @@
 use crate::models::{
-    Capability, FindingInput, FindingRecord, InstallIdentity, OpportunityRecord,
+    Capability, CodexAuthLease, FindingInput, FindingRecord, InstallIdentity, OpportunityRecord,
     ParticipationState, PopularBinaryProfile, ProposalRecord, SharedOpportunity, StatusSnapshot,
     TopEntry, ValidationRecord,
 };
@@ -1075,6 +1075,20 @@ impl Store {
 
     pub fn save_participation_state(&self, state: &ParticipationState) -> Result<()> {
         self.set_local_state("participation_state", state)
+    }
+
+    pub fn load_codex_auth_lease(&self) -> Result<Option<CodexAuthLease>> {
+        self.get_local_state("codex_auth_lease")
+    }
+
+    pub fn save_codex_auth_lease(&self, lease: &CodexAuthLease) -> Result<()> {
+        self.set_local_state("codex_auth_lease", lease)
+    }
+
+    pub fn clear_codex_auth_lease(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM local_state WHERE key = 'codex_auth_lease'", [])?;
+        Ok(())
     }
 
     pub fn list_submission_candidates(&self, limit: usize) -> Result<Vec<SharedOpportunity>> {

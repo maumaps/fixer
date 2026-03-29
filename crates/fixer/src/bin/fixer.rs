@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use fixer::app::App;
-use fixer::models::{FindingRecord, ParticipationMode};
+use fixer::config::FixerConfig;
+use fixer::models::{FindingRecord, LeaseBudgetPreset, ParticipationMode};
+use fixer::proposal;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -65,6 +67,10 @@ enum Commands {
         #[command(subcommand)]
         command: WorkerCommands,
     },
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
     Participation,
 }
 
@@ -93,6 +99,58 @@ enum WorkerCommands {
     Run,
 }
 
+#[derive(Subcommand)]
+enum AuthCommands {
+    Lease {
+        #[command(subcommand)]
+        command: LeaseCommands,
+    },
+    #[command(hide = true)]
+    ExecJob {
+        #[arg(long)]
+        job: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum LeaseCommands {
+    Bootstrap {
+        user: String,
+        #[arg(long)]
+        enable_linger: bool,
+    },
+    Grant {
+        user: String,
+        #[arg(long)]
+        ttl: Option<String>,
+        #[arg(long)]
+        budget: Option<LeaseBudgetKind>,
+        #[arg(long)]
+        allow_kernel: bool,
+    },
+    Status,
+    Revoke,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum LeaseBudgetKind {
+    Off,
+    Conservative,
+    Balanced,
+    Aggressive,
+}
+
+impl From<LeaseBudgetKind> for LeaseBudgetPreset {
+    fn from(value: LeaseBudgetKind) -> Self {
+        match value {
+            LeaseBudgetKind::Off => LeaseBudgetPreset::Off,
+            LeaseBudgetKind::Conservative => LeaseBudgetPreset::Conservative,
+            LeaseBudgetKind::Balanced => LeaseBudgetPreset::Balanced,
+            LeaseBudgetKind::Aggressive => LeaseBudgetPreset::Aggressive,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -100,6 +158,26 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Commands::Auth {
+        command: AuthCommands::ExecJob { job },
+    } = &cli.command
+    {
+        let config = FixerConfig::load(cli.config.as_deref())?;
+        let job_spec = proposal::load_codex_job(job)?;
+        let status = proposal::execute_codex_job(&config, &job_spec)?;
+        println!("job_id: {}", status.job_id);
+        println!("state: {}", status.state);
+        if let Some(path) = status.output_path {
+            println!("output_path: {}", path.display());
+        }
+        if let Some(kind) = status.failure_kind {
+            println!("failure_kind: {kind}");
+        }
+        if let Some(error) = status.error {
+            println!("error: {error}");
+        }
+        return Ok(());
+    }
     let app = App::load(cli.config.as_deref())?;
 
     match cli.command {
@@ -345,6 +423,63 @@ fn main() -> Result<()> {
                 }
             }
         },
+        Commands::Auth { command } => match command {
+            AuthCommands::Lease { command } => match command {
+                LeaseCommands::Bootstrap {
+                    user,
+                    enable_linger,
+                } => {
+                    let status = app.auth_lease_bootstrap(
+                        &user,
+                        enable_linger || app.config.patch.lease_bootstrap_enable_linger,
+                    )?;
+                    print_lease_status(&status);
+                }
+                LeaseCommands::Grant {
+                    user,
+                    ttl,
+                    budget,
+                    allow_kernel,
+                } => {
+                    let ttl_seconds = ttl
+                        .as_deref()
+                        .map(parse_duration_seconds)
+                        .transpose()?
+                        .unwrap_or(app.config.patch.lease_default_ttl_seconds);
+                    let budget = budget
+                        .map(LeaseBudgetPreset::from)
+                        .unwrap_or_else(|| app.config.patch.lease_budget_preset.clone());
+                    let lease = app.auth_lease_grant(&user, ttl_seconds, budget, allow_kernel)?;
+                    println!("user: {}", lease.user);
+                    println!("uid: {}", lease.uid);
+                    println!("granted_at: {}", lease.granted_at);
+                    println!("expires_at: {}", lease.expires_at);
+                    println!("budget: {}", lease.budget_preset.as_str());
+                    println!("allow_kernel: {}", lease.allow_kernel);
+                    println!(
+                        "limits: active={} daily={} timeout={}s",
+                        lease.budget.max_active_jobs,
+                        lease.budget.max_jobs_per_day,
+                        lease.budget.job_timeout_seconds
+                    );
+                }
+                LeaseCommands::Status => {
+                    let status = app.auth_lease_status()?;
+                    print_lease_status(&status);
+                }
+                LeaseCommands::Revoke => match app.auth_lease_revoke()? {
+                    Some(lease) => {
+                        println!("user: {}", lease.user);
+                        println!("revoked_at: {}", lease.revoked_at.unwrap_or_default());
+                        if let Some(reason) = lease.paused_reason {
+                            println!("reason: {reason}");
+                        }
+                    }
+                    None => println!("no active Codex auth lease"),
+                },
+            },
+            AuthCommands::ExecJob { .. } => unreachable!("handled before app startup"),
+        },
         Commands::Participation => {
             let snapshot = app.participation()?;
             println!("install_id: {}", snapshot.identity.install_id);
@@ -370,6 +505,65 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_lease_status(status: &fixer::models::CodexAuthLeaseStatus) {
+    println!("ready: {}", status.ready);
+    if let Some(lease) = &status.lease {
+        println!("user: {}", lease.user);
+        println!("uid: {}", lease.uid);
+        println!("granted_at: {}", lease.granted_at);
+        println!("expires_at: {}", lease.expires_at);
+        println!("budget: {}", lease.budget_preset.as_str());
+        println!("allow_kernel: {}", lease.allow_kernel);
+        println!("active_jobs: {}", lease.active_jobs);
+        println!(
+            "jobs_today: {}/{}",
+            lease.jobs_started_today, lease.budget.max_jobs_per_day
+        );
+        println!("jobs_day: {}", lease.jobs_started_day);
+        println!("timeout_seconds: {}", lease.budget.job_timeout_seconds);
+        if let Some(reason) = lease.paused_reason.as_deref() {
+            println!("paused_reason: {reason}");
+        }
+        if let Some(revoked_at) = lease.revoked_at.as_deref() {
+            println!("revoked_at: {revoked_at}");
+        }
+        if !lease.recent_failures.is_empty() {
+            println!("recent_failures: {}", lease.recent_failures.len());
+            for failure in &lease.recent_failures {
+                println!(
+                    "  [{}] {}: {}",
+                    failure.occurred_at, failure.kind, failure.message
+                );
+            }
+        }
+    }
+    for note in &status.notes {
+        println!("note: {note}");
+    }
+}
+
+fn parse_duration_seconds(raw: &str) -> Result<u64> {
+    let value = raw.trim();
+    if value.is_empty() {
+        anyhow::bail!("duration must not be empty");
+    }
+    let split = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (amount, suffix) = value.split_at(split);
+    let amount: u64 = amount
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid duration `{raw}`"))?;
+    let multiplier = match suffix {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        other => anyhow::bail!("unsupported duration suffix `{other}`"),
+    };
+    Ok(amount.saturating_mul(multiplier))
 }
 
 fn print_findings(items: Vec<FindingRecord>) {

@@ -85,6 +85,100 @@ pub struct ProposalRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexAuthMode {
+    RootDirect,
+    #[default]
+    UserLease,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LeaseBudgetPreset {
+    Off,
+    #[default]
+    Conservative,
+    Balanced,
+    Aggressive,
+}
+
+impl LeaseBudgetPreset {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Conservative => "conservative",
+            Self::Balanced => "balanced",
+            Self::Aggressive => "aggressive",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexLeaseBudget {
+    pub max_active_jobs: u32,
+    pub max_jobs_per_day: u32,
+    pub job_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexLeaseFailure {
+    pub occurred_at: String,
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexAuthLease {
+    pub user: String,
+    pub uid: u32,
+    pub granted_at: String,
+    pub expires_at: String,
+    pub budget_preset: LeaseBudgetPreset,
+    pub budget: CodexLeaseBudget,
+    pub allow_kernel: bool,
+    pub paused_reason: Option<String>,
+    pub revoked_at: Option<String>,
+    pub active_jobs: u32,
+    pub jobs_started_day: String,
+    pub jobs_started_today: u32,
+    #[serde(default)]
+    pub recent_failures: Vec<CodexLeaseFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexAuthLeaseStatus {
+    pub lease: Option<CodexAuthLease>,
+    pub ready: bool,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexJobSpec {
+    pub job_id: String,
+    pub opportunity_id: i64,
+    pub run_as_user: String,
+    pub workspace: PreparedWorkspace,
+    pub bundle_dir: PathBuf,
+    pub prompt_path: PathBuf,
+    pub output_path: PathBuf,
+    pub failure_pause_threshold: u32,
+    pub failure_pause_window_seconds: u64,
+    pub allow_kernel: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexJobStatus {
+    pub job_id: String,
+    pub state: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub output_path: Option<PathBuf>,
+    pub error: Option<String>,
+    pub failure_kind: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComplaintCollectionReport {
     pub capabilities_seen: usize,
@@ -164,7 +258,7 @@ pub struct RepoInsight {
     pub metadata: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PreparedWorkspace {
     pub repo_root: PathBuf,
     pub ecosystem: Option<String>,
