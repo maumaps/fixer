@@ -48,7 +48,6 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
 
 mkdir -p "$REMOTE_STAGE"
 DEBIAN_FRONTEND=noninteractive apt-get install -y "$REMOTE_STAGE/$PACKAGE_NAME"
-systemctl disable --now fixer || true
 
 DB_PASSWORD_FILE=/etc/fixer/fixer-server-db-password
 if [ ! -f "$DB_PASSWORD_FILE" ]; then
@@ -83,9 +82,12 @@ install -d -m 0755 /srv/fixer /srv/fixer/public /srv/fixer/public/apt /srv/fixer
 install -d -m 0700 /srv/fixer/gnupg
 FIXER_APT_CONFIG=/etc/fixer/apt-repo.env /usr/local/bin/publish-fixer-apt-repo "$REMOTE_STAGE/$PACKAGE_NAME"
 
+/usr/bin/fixer --config /etc/fixer/fixer.toml opt-in --mode submitter >/dev/null
 systemctl daemon-reload
+systemctl enable --now fixer.service
 systemctl enable --now fixer-server.service
 systemctl enable --now caddy.service
+systemctl restart fixer.service
 systemctl restart fixer-server.service
 systemctl restart caddy.service
 EOF
