@@ -1127,7 +1127,7 @@ async fn ensure_install(
         &[
             &request.install_id,
             &now,
-            &serde_json::to_value(&request.mode)?,
+            &request.mode.as_str(),
             &request.hostname,
             &request.version,
             &request.has_codex,

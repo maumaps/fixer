@@ -174,6 +174,14 @@ pub enum ParticipationMode {
 }
 
 impl ParticipationMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LocalOnly => "local-only",
+            Self::Submitter => "submitter",
+            Self::SubmitterWorker => "submitter-worker",
+        }
+    }
+
     pub fn can_submit(&self) -> bool {
         !matches!(self, Self::LocalOnly)
     }
