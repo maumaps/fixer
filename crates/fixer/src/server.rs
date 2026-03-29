@@ -253,6 +253,15 @@ code, pre {
     background: rgba(255, 255, 255, 0.58);
 }
 
+.patch-card {
+    border-color: rgba(36, 92, 45, 0.2);
+    background: linear-gradient(
+        180deg,
+        rgba(255, 255, 255, 0.82),
+        rgba(238, 247, 239, 0.82)
+    );
+}
+
 .issue-topline {
     display: flex;
     justify-content: space-between;
@@ -267,6 +276,23 @@ code, pre {
 
 .issue-summary {
     margin: 0.55rem 0 0.8rem;
+}
+
+.patch-summary,
+.patch-preview {
+    margin-top: 0.9rem;
+}
+
+.patch-summary {
+    padding: 0.9rem 1rem;
+    border-radius: 16px;
+    border: 1px solid rgba(36, 92, 45, 0.18);
+    background: rgba(36, 92, 45, 0.06);
+}
+
+.patch-summary h4,
+.patch-preview h4 {
+    margin: 0 0 0.55rem;
 }
 
 .meta {
@@ -450,6 +476,22 @@ struct PublicIssueDetail {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct PublicPatchEntry {
+    id: String,
+    kind: String,
+    title: String,
+    summary: String,
+    package_name: Option<String>,
+    source_package: Option<String>,
+    ecosystem: Option<String>,
+    severity: Option<String>,
+    score: i64,
+    corroboration_count: i64,
+    last_seen: String,
+    best_patch: PublicAttempt,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct Healthz {
     status: &'static str,
     database: &'static str,
@@ -532,6 +574,7 @@ pub async fn serve(config: FixerConfig) -> Result<()> {
     let app = Router::new()
         .route("/", get(landing_page))
         .route("/issues", get(public_issues_page))
+        .route("/patches", get(public_patches_page))
         .route("/issues/{id}", get(public_issue_detail_page))
         .route("/healthz", get(healthz))
         .route("/assets/app.css", get(stylesheet))
@@ -540,6 +583,7 @@ pub async fn serve(config: FixerConfig) -> Result<()> {
         .route("/v1/work/pull", post(pull_work))
         .route("/v1/work/{lease_id}/result", post(submit_work_result))
         .route("/v1/issues", get(list_issues))
+        .route("/v1/patches", get(list_patches))
         .route("/v1/issues/{id}", get(get_issue))
         .route(
             "/v1/evidence-requests/{id}/respond",
@@ -571,6 +615,13 @@ async fn public_issues_page(
 ) -> Result<Html<String>, ApiError> {
     let issues = load_public_issues(&state.db, 100).await?;
     Ok(Html(render_issues_page(&issues)))
+}
+
+async fn public_patches_page(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Html<String>, ApiError> {
+    let patches = load_public_patches(&state.db, 100).await?;
+    Ok(Html(render_patches_page(&patches)))
 }
 
 async fn public_issue_detail_page(
@@ -964,6 +1015,13 @@ async fn list_issues(
 ) -> Result<Json<Vec<PublicIssue>>, ApiError> {
     let issues = load_public_issues(&state.db, 100).await?;
     Ok(Json(issues))
+}
+
+async fn list_patches(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<Vec<PublicPatchEntry>>, ApiError> {
+    let patches = load_public_patches(&state.db, 100).await?;
+    Ok(Json(patches))
 }
 
 async fn get_issue(
@@ -3794,6 +3852,60 @@ async fn load_public_issue_detail(
     })
 }
 
+async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatchEntry>, ApiError> {
+    let mut patches = match db {
+        ServerDb::Postgres(db) => {
+            let rows = db
+                .query(
+                    "
+            SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
+                   severity, score, corroboration_count, best_patch_json, last_seen
+            FROM issue_clusters
+            WHERE promoted = TRUE
+              AND public_visible = TRUE
+              AND best_patch_json IS NOT NULL
+            ORDER BY last_seen DESC, score DESC
+            LIMIT $1
+            ",
+                    &[&limit],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            rows.into_iter()
+                .map(public_patch_from_row)
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            let mut stmt = connection
+                .prepare(
+                    "
+            SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
+                   severity, score, corroboration_count, best_patch_json, last_seen
+            FROM issue_clusters
+            WHERE promoted = 1
+              AND public_visible = 1
+              AND best_patch_json IS NOT NULL
+            ORDER BY last_seen DESC, score DESC
+            LIMIT ?1
+            ",
+                )
+                .map_err(ApiError::internal)?;
+            let rows = stmt
+                .query_map([limit], public_patch_from_sqlite_row)
+                .map_err(ApiError::internal)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(ApiError::internal)?
+        }
+    };
+    patches.sort_by(|left, right| {
+        parse_timestamp(&right.best_patch.created_at)
+            .cmp(&parse_timestamp(&left.best_patch.created_at))
+            .then_with(|| right.score.cmp(&left.score))
+    });
+    Ok(patches)
+}
+
 async fn load_public_attempts(
     db: &ServerDb,
     cluster_id: &str,
@@ -3856,6 +3968,28 @@ fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
     })
 }
 
+fn public_patch_from_row(row: Row) -> Result<PublicPatchEntry, ApiError> {
+    let best_patch_json: Value = row.get(10);
+    let best_patch = serde_json::from_value::<PatchAttempt>(best_patch_json)
+        .map(public_attempt_from_patch_attempt)
+        .map_err(ApiError::internal)?;
+    let last_seen: DateTime<Utc> = row.get(11);
+    Ok(PublicPatchEntry {
+        id: row.get(0),
+        kind: row.get(1),
+        title: row.get(2),
+        summary: row.get(3),
+        package_name: row.get(4),
+        source_package: row.get(5),
+        ecosystem: row.get(6),
+        severity: row.get(7),
+        score: row.get(8),
+        corroboration_count: row.get(9),
+        last_seen: last_seen.to_rfc3339(),
+        best_patch,
+    })
+}
+
 fn public_attempt_from_row(row: Row) -> Result<PublicAttempt, ApiError> {
     let bundle_json: Value = row.get(0);
     let envelope =
@@ -3877,6 +4011,32 @@ fn public_issue_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pub
         corroboration_count: row.get(9)?,
         best_patch_available: row.get::<_, i64>(10)? != 0,
         last_seen: row.get(11)?,
+    })
+}
+
+fn public_patch_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicPatchEntry> {
+    let best_patch = serde_json::from_str::<PatchAttempt>(&row.get::<_, String>(10)?)
+        .map(public_attempt_from_patch_attempt)
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    Ok(PublicPatchEntry {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        title: row.get(2)?,
+        summary: row.get(3)?,
+        package_name: row.get(4)?,
+        source_package: row.get(5)?,
+        ecosystem: row.get(6)?,
+        severity: row.get(7)?,
+        score: row.get(8)?,
+        corroboration_count: row.get(9)?,
+        last_seen: row.get(11)?,
+        best_patch,
     })
 }
 
@@ -4193,6 +4353,7 @@ sudo apt install fixer"
             <p class="lede">Hosts with no Codex can still upload findings. Willing participants with Codex can pull promoted issues, attempt a patch, or explain why a patch is not honest yet. When Fixer produces a patch, it nudges the user to review it and send it upstream.</p>
             <div class="hero-actions">
                 <a class="button primary" href="/issues">Browse promoted issues</a>
+                <a class="button" href="/patches">Successful patches</a>
                 <a class="button" href="{github_url}">GitHub</a>
                 <a class="button" href="{apt_repo_url}">APT repository</a>
             </div>
@@ -4294,6 +4455,41 @@ fn render_issues_page(issues: &[PublicIssue]) -> String {
     )
 }
 
+fn render_patches_page(patches: &[PublicPatchEntry]) -> String {
+    let patch_markup = if patches.is_empty() {
+        "<p class=\"fine-print\">No successful public patch attempts are available yet.</p>"
+            .to_string()
+    } else {
+        patches
+            .iter()
+            .map(render_public_patch_card)
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let body = format!(
+        r#"
+        <section class="hero">
+            <p class="tag">Public patch board</p>
+            <h1>Successful patches</h1>
+            <p class="lede">These are the promoted issues with a ready public patch attempt. Each card points back to the issue detail page so you can inspect the full published session, prompt, and sanitized artifacts.</p>
+            <p class="fine-print">Public JSON: <a href="/v1/patches">/v1/patches</a></p>
+        </section>
+
+        <section class="panel section">
+            <h2>Ready patch attempts</h2>
+            <div class="issue-list">{patch_markup}</div>
+        </section>
+        "#
+    );
+    render_page(
+        "Fixer Patches",
+        "Ready public Fixer patch attempts",
+        NavPage::Patches,
+        body,
+        0,
+    )
+}
+
 fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
     let attempts_markup = if issue.attempts.is_empty() {
         "<p class=\"fine-print\">No public attempts have been published for this issue yet.</p>"
@@ -4364,6 +4560,11 @@ fn render_page(
     } else {
         ""
     };
+    let patches_class = if matches!(nav_page, NavPage::Patches) {
+        "active"
+    } else {
+        ""
+    };
     let footer_note = if quarantined_count > 0 {
         format!(
             "{} issue clusters are still quarantined while they wait for corroboration or a trusted submitter.",
@@ -4389,6 +4590,7 @@ fn render_page(
             <div class="nav-links">
                 <a class="{}" href="/">Overview</a>
                 <a class="{}" href="/issues">Issues</a>
+                <a class="{}" href="/patches">Patches</a>
                 <span class="nav-status" id="health-indicator" aria-live="polite" title="Health: checking">⚪ Health</span>
                 <a href="https://github.com/maumaps/fixer">GitHub</a>
                 <a href="/apt/">APT</a>
@@ -4404,6 +4606,7 @@ fn render_page(
         html_escape(description),
         home_class,
         issues_class,
+        patches_class,
         body,
         html_escape(&footer_note),
         HEALTH_INDICATOR_SCRIPT
@@ -4498,6 +4701,93 @@ fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
     )
 }
 
+fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
+    let preview = render_patch_preview(entry.best_patch.published_session.as_ref());
+    let mut patch_tags = render_issue_tags(
+        entry.kind.as_str(),
+        entry.package_name.as_deref(),
+        entry.source_package.as_deref(),
+        entry.ecosystem.as_deref(),
+        entry.severity.as_deref(),
+        entry.score,
+        entry.corroboration_count,
+        true,
+    );
+    let _ = write!(
+        patch_tags,
+        "<span class=\"tag patch\">patched: {}</span>",
+        html_escape(&format_timestamp(&entry.best_patch.created_at))
+    );
+    if let Some(status) = entry.best_patch.validation_status.as_deref() {
+        let _ = write!(
+            patch_tags,
+            "<span class=\"tag\">validation: {}</span>",
+            html_escape(status)
+        );
+    }
+
+    format!(
+        r#"<article class="issue-card patch-card">
+            <div class="issue-topline">
+                <h3><a href="/issues/{}">{}</a></h3>
+                <span class="tag patch">successful patch</span>
+            </div>
+            <p class="issue-summary">{}</p>
+            <div class="meta">{}</div>
+            <section class="patch-summary">
+                <h4>Attempt Summary</h4>
+                <p class="issue-summary">{}</p>
+            </section>
+            {}
+            <p class="fine-print">Full published attempt: <a href="/issues/{}">/issues/{}</a>. Issue JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
+        </article>"#,
+        entry.id,
+        html_escape(&entry.title),
+        html_escape(&entry.summary),
+        patch_tags,
+        html_escape(&entry.best_patch.summary),
+        preview,
+        entry.id,
+        entry.id,
+        entry.id,
+        entry.id
+    )
+}
+
+fn render_patch_preview(session: Option<&PublishedAttemptSession>) -> String {
+    let Some(session) = session else {
+        return String::new();
+    };
+    let (label, content) =
+        if let Some(diff) = session.diff.as_deref().filter(|value| !value.is_empty()) {
+            ("Diff Excerpt", diff)
+        } else if let Some(response) = session
+            .response
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            ("Published Session Excerpt", response)
+        } else {
+            ("Prompt Excerpt", session.prompt.as_str())
+        };
+    format!(
+        "<section class=\"patch-preview\"><h4>{}</h4><pre class=\"code-block\"><code>{}</code></pre></section>",
+        html_escape(label),
+        html_escape(&truncate_patch_preview(content, 2400))
+    )
+}
+
+fn truncate_patch_preview(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        return text.to_string();
+    }
+    let mut boundary = max_len;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}\n\n[truncated]", &text[..boundary])
+}
+
 fn render_issue_tags(
     _kind: &str,
     package_name: Option<&str>,
@@ -4578,6 +4868,7 @@ fn html_escape(value: &str) -> String {
 enum NavPage {
     Home,
     Issues,
+    Patches,
 }
 
 struct ApiError {
@@ -4698,6 +4989,19 @@ mod tests {
     }
 
     #[test]
+    fn render_page_marks_patches_nav_active() {
+        let markup = render_page(
+            "Fixer Patches",
+            "Ready public Fixer patch attempts",
+            NavPage::Patches,
+            "<section>body</section>".to_string(),
+            0,
+        );
+
+        assert!(markup.contains("<a class=\"active\" href=\"/patches\">Patches</a>"));
+    }
+
+    #[test]
     fn public_attempt_uses_published_session_only() {
         let public_attempt = public_attempt_from_patch_attempt(PatchAttempt {
             cluster_id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
@@ -4730,6 +5034,40 @@ mod tests {
                 .and_then(|session| session.response.as_deref()),
             Some("Patched ./workspace/src/file.c")
         );
+    }
+
+    #[test]
+    fn render_public_patch_card_includes_preview_and_issue_links() {
+        let card = render_public_patch_card(&PublicPatchEntry {
+            id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for postgres".to_string(),
+            summary: "Postgres burned CPU across multiple hosts.".to_string(),
+            package_name: Some("postgresql-18".to_string()),
+            source_package: Some("postgresql-18".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 106,
+            corroboration_count: 2,
+            last_seen: "2026-03-29T00:00:00Z".to_string(),
+            best_patch: PublicAttempt {
+                outcome: "patch".to_string(),
+                state: "ready".to_string(),
+                summary: "Patch proposal created locally.".to_string(),
+                validation_status: Some("ready".to_string()),
+                created_at: "2026-03-29T00:00:00Z".to_string(),
+                published_session: Some(PublishedAttemptSession {
+                    prompt: "Read ./evidence.json".to_string(),
+                    response: Some("Patched ./workspace/src/file.c".to_string()),
+                    diff: Some("--- ./source/src/file.c\n+++ ./workspace/src/file.c\n".to_string()),
+                }),
+            },
+        });
+
+        assert!(card.contains("successful patch"));
+        assert!(card.contains("Diff Excerpt"));
+        assert!(card.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
+        assert!(card.contains("/v1/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
     }
 
     #[test]

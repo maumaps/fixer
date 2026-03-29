@@ -1,3 +1,10 @@
+fixer (0.18.0-1) unstable; urgency=medium
+
+  * Add a public successful-patches page and JSON feed.
+  * Surface ready patch attempts in a dedicated board with issue links and previews.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 21:10:00 +0400
+
 fixer (0.17.0-1) unstable; urgency=medium
 
   * Show a live non-clickable health indicator in the public site navigation.
