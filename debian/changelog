@@ -1,3 +1,11 @@
+fixer (0.24.0-1) unstable; urgency=medium
+
+  * Make the public landing page friendlier and more polished.
+  * Rank perf investigation targets from live proc observations instead of stale perf artifacts.
+  * Prune stale proc binary snapshots so hot daemons like kdeconnectd stay visible.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 30 Mar 2026 00:37:59 +0400
+
 fixer (0.23.0-1) unstable; urgency=medium
 
   * Reopen stale public patches when a refresh run fails review instead of leaving them advertised.

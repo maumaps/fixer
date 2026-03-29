@@ -96,6 +96,7 @@ fn collect_process_artifacts(store: &Store) -> Result<usize> {
     }
 
     let total = seen.len();
+    let current_paths = seen.keys().cloned().collect::<Vec<_>>();
     for (path, stats) in seen {
         let canonical = maybe_canonicalize(&path);
         let package_name = map_path_to_package(&canonical);
@@ -120,6 +121,7 @@ fn collect_process_artifacts(store: &Store) -> Result<usize> {
         };
         let _ = store.upsert_artifact(&artifact)?;
     }
+    store.prune_proc_binary_artifacts(&current_paths)?;
     Ok(total)
 }
 
@@ -1506,11 +1508,11 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
     let mut current_investigation_fingerprints = Vec::new();
     let mut investigation_budget = config.service.hotspot_investigation_limit;
 
-    for target in targets
-        .into_iter()
-        .filter(is_profile_candidate)
-        .take(PERF_PROFILE_TARGET_LIMIT)
-    {
+    let mut profiled_targets = 0usize;
+    for target in targets.into_iter().filter(is_profile_candidate) {
+        if profiled_targets >= PERF_PROFILE_TARGET_LIMIT {
+            break;
+        }
         let sampled_pids = running_pids_for_binary(&target.path);
         if sampled_pids.is_empty() {
             continue;
@@ -1519,6 +1521,7 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
         else {
             continue;
         };
+        profiled_targets += 1;
         let target_path = target.path.to_string_lossy().to_string();
         assessed_targets.push(target_path);
         for (index, hot_path) in profile

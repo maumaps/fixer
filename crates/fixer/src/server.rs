@@ -173,6 +173,132 @@ code, pre {
     margin-top: 1.5rem;
 }
 
+.hero-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.9fr);
+    gap: 1.2rem;
+    align-items: stretch;
+}
+
+.home-hero {
+    background:
+        radial-gradient(circle at top right, rgba(255, 255, 255, 0.62), transparent 36%),
+        linear-gradient(135deg, rgba(255, 250, 242, 0.92), rgba(241, 250, 248, 0.92));
+}
+
+.home-hero::before {
+    content: "";
+    position: absolute;
+    inset: 1rem auto auto 52%;
+    width: 12rem;
+    height: 12rem;
+    border-radius: 2.4rem;
+    border: 1px solid rgba(11, 122, 117, 0.1);
+    background: linear-gradient(180deg, rgba(11, 122, 117, 0.06), rgba(11, 122, 117, 0));
+    transform: rotate(18deg);
+}
+
+.hero-copy,
+.live-board {
+    position: relative;
+    z-index: 1;
+}
+
+.hero-copy h1 {
+    max-width: 9.5ch;
+}
+
+.hero-copy .lede {
+    font-size: 1.12rem;
+    max-width: 62ch;
+}
+
+.mini-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.7rem;
+    margin-top: 1.15rem;
+}
+
+.mini-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.55rem 0.8rem;
+    border-radius: 999px;
+    border: 1px solid rgba(94, 70, 34, 0.14);
+    background: rgba(255, 255, 255, 0.66);
+    color: var(--muted);
+    font-size: 0.94rem;
+}
+
+.mini-badge strong {
+    color: var(--text);
+}
+
+.live-board {
+    padding: 1.15rem;
+    border-radius: 20px;
+    border: 1px solid rgba(94, 70, 34, 0.12);
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(245, 250, 249, 0.84));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65);
+}
+
+.eyebrow {
+    margin: 0 0 0.45rem;
+    color: var(--accent-strong);
+    font-size: 0.9rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.live-board h2 {
+    margin: 0;
+    font-size: 1.25rem;
+}
+
+.live-board p {
+    margin-top: 0.45rem;
+}
+
+.snapshot-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.8rem;
+    margin-top: 1rem;
+}
+
+.snapshot-stat {
+    padding: 0.95rem;
+    border-radius: 16px;
+    border: 1px solid rgba(94, 70, 34, 0.12);
+    background: rgba(255, 255, 255, 0.78);
+}
+
+.snapshot-stat strong {
+    display: block;
+    margin-bottom: 0.2rem;
+    font-size: 1.55rem;
+    line-height: 1;
+}
+
+.snapshot-stat span {
+    color: var(--muted);
+    font-size: 0.94rem;
+}
+
+.snapshot-foot {
+    margin-top: 1rem;
+    padding-top: 0.95rem;
+    border-top: 1px solid rgba(94, 70, 34, 0.12);
+}
+
+.snapshot-foot p {
+    margin: 0.2rem 0;
+}
+
 .button {
     display: inline-flex;
     align-items: center;
@@ -194,6 +320,11 @@ code, pre {
 
 .button.primary:hover {
     background: var(--accent-strong);
+}
+
+.button.soft {
+    background: rgba(11, 122, 117, 0.08);
+    border-color: rgba(11, 122, 117, 0.15);
 }
 
 .grid {
@@ -240,6 +371,63 @@ code, pre {
 
 .columns {
     grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+}
+
+.feature-grid {
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.feature-card {
+    padding: 1.15rem;
+    border-radius: 18px;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.62);
+}
+
+.feature-card h3 {
+    margin: 0 0 0.45rem;
+    font-size: 1.02rem;
+}
+
+.feature-card p {
+    margin: 0;
+}
+
+.journey-list {
+    display: grid;
+    gap: 0.8rem;
+    margin-top: 1rem;
+}
+
+.journey-step {
+    padding: 0.95rem 1rem;
+    border-radius: 18px;
+    border: 1px solid rgba(94, 70, 34, 0.12);
+    background: rgba(255, 255, 255, 0.6);
+}
+
+.journey-step strong {
+    display: block;
+    margin-bottom: 0.3rem;
+    font-size: 1rem;
+}
+
+.section-intro {
+    margin: 0 0 1rem;
+    color: var(--muted);
+    max-width: 62ch;
+}
+
+.callout {
+    margin-top: 1rem;
+    padding: 0.9rem 1rem;
+    border-radius: 18px;
+    border: 1px solid rgba(11, 122, 117, 0.14);
+    background: rgba(11, 122, 117, 0.06);
+}
+
+.callout p {
+    margin: 0;
 }
 
 .issue-list {
@@ -392,6 +580,14 @@ code, pre {
 
     .issue-topline {
         flex-direction: column;
+    }
+
+    .hero-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .snapshot-grid {
+        grid-template-columns: 1fr 1fr;
     }
 }
 "#;
@@ -7733,6 +7929,15 @@ sudo apt install fixer"
         .as_deref()
         .map(format_timestamp)
         .unwrap_or_else(|| "No submissions yet".to_string());
+    let queue_tagline = if snapshot.promoted_issue_count == 0 {
+        "The shared queue is quiet right now."
+    } else if snapshot.ready_patch_count > 0 {
+        "There is live work in the queue and at least one diff-ready attempt."
+    } else if snapshot.ready_triage_count > 0 {
+        "The queue is active and some issues already have clean public handoffs."
+    } else {
+        "The queue is active and waiting for the next solid patch attempt."
+    };
     let top_issue_markup = if snapshot.top_issues.is_empty() {
         "<p class=\"fine-print\">No promoted issues yet. Once at least two opted-in hosts corroborate the same failure, it moves into the shared worker queue.</p>".to_string()
     } else {
@@ -7746,76 +7951,128 @@ sudo apt install fixer"
 
     let body = format!(
         r#"
-        <section class="hero">
-            <p class="tag">Opt-in federation for Linux failures</p>
-            <h1>Fixer turns corroborated breakage into patchable work.</h1>
-            <p class="lede">Hosts with no Codex can still upload findings. Willing participants with Codex can pull promoted issues, attempt a patch, or explain why a patch is not honest yet. When Fixer produces a patch, it nudges the user to review it and send it upstream.</p>
-            <div class="hero-actions">
-                <a class="button primary" href="/issues">Browse promoted issues</a>
-                <a class="button" href="/patches">Successful patches</a>
-                <a class="button" href="/triage">Successful triage</a>
-                <a class="button" href="{github_url}">GitHub</a>
-                <a class="button" href="{apt_repo_url}">APT repository</a>
+        <section class="hero home-hero">
+            <div class="hero-grid">
+                <div class="hero-copy">
+                    <p class="tag">Crowd-mode Linux repair, but opt-in and honest</p>
+                    <h1>Fix real breakage together, not one machine at a time.</h1>
+                    <p class="lede">Fixer turns recurring Linux failures into shared repair work. Quiet participants can submit sanitized evidence. Codex-capable workers can investigate, ship a diff when there really is one, or publish a clean handoff when pretending to have a patch would be dishonest.</p>
+                    <div class="hero-actions">
+                        <a class="button primary" href="/issues">Browse promoted issues</a>
+                        <a class="button soft" href="/patches">See successful patches</a>
+                        <a class="button soft" href="/triage">See successful triage</a>
+                        <a class="button" href="{apt_repo_url}">Install from APT</a>
+                        <a class="button" href="{github_url}">Read the code</a>
+                    </div>
+                    <div class="mini-badges">
+                        <span class="mini-badge"><strong>Default:</strong> local-only until the user opts in</span>
+                        <span class="mini-badge"><strong>Public:</strong> sanitized issue families, not raw host evidence</span>
+                        <span class="mini-badge"><strong>Outputs:</strong> real diffs or explicit triage</span>
+                    </div>
+                </div>
+                <aside class="live-board">
+                    <p class="eyebrow">Live network snapshot</p>
+                    <h2>{}</h2>
+                    <p class="fine-print">This front page is the public, sanitized layer. Internal evidence can stay private while the shared queue stays useful.</p>
+                    <div class="snapshot-grid">
+                        <div class="snapshot-stat">
+                            <strong>{}</strong>
+                            <span>opted-in installs seen</span>
+                        </div>
+                        <div class="snapshot-stat">
+                            <strong>{}</strong>
+                            <span>submission bundles processed</span>
+                        </div>
+                        <div class="snapshot-stat">
+                            <strong>{}</strong>
+                            <span>promoted issue families</span>
+                        </div>
+                        <div class="snapshot-stat">
+                            <strong>{}</strong>
+                            <span>diff-ready patch attempts</span>
+                        </div>
+                        <div class="snapshot-stat">
+                            <strong>{}</strong>
+                            <span>successful public triage handoffs</span>
+                        </div>
+                        <div class="snapshot-stat">
+                            <strong>{}</strong>
+                            <span>still quarantined against spam</span>
+                        </div>
+                    </div>
+                    <div class="snapshot-foot">
+                        <p><strong>Last submission:</strong> {last_submission}</p>
+                        <p class="fine-print">Fixer promotes corroborated or trusted issues, then lets workers pull from the public queue.</p>
+                    </div>
+                </aside>
             </div>
         </section>
 
-        <section class="grid stats section">
-            <article class="panel stat">
-                <div class="stat-value">{}</div>
-                <div class="stat-label">Opted-in installs seen</div>
+        <section class="grid feature-grid section">
+            <article class="feature-card">
+                <h3>Shared queue, not private guessing</h3>
+                <p>When multiple hosts hit the same failure, the work can converge in one public issue family instead of being rediscovered from scratch.</p>
             </article>
-            <article class="panel stat">
-                <div class="stat-value">{}</div>
-                <div class="stat-label">Submission bundles processed</div>
+            <article class="feature-card">
+                <h3>Better than fake certainty</h3>
+                <p>If a patch would be hand-wavy or wrong, Fixer can publish triage, handoff targets, and next steps instead of pretending the diff is ready.</p>
             </article>
-            <article class="panel stat">
-                <div class="stat-value">{}</div>
-                <div class="stat-label">Promoted issue clusters</div>
-            </article>
-            <article class="panel stat">
-                <div class="stat-value">{}</div>
-                <div class="stat-label">Ready patch attempts</div>
-            </article>
-            <article class="panel stat">
-                <div class="stat-value">{}</div>
-                <div class="stat-label">Successful triage handoffs</div>
+            <article class="feature-card">
+                <h3>Upstream-friendly by design</h3>
+                <p>Patches are pushed toward plan-first reasoning, review, and git-friendly writeups so the result is easier to understand and submit upstream.</p>
             </article>
         </section>
 
         <section class="grid columns section">
             <article class="panel">
-                <h2>Privacy and consent</h2>
-                <p>{}</p>
-                <p class="fine-print">Network participation is disabled until the user explicitly opts in. Public pages and public issue JSON only expose aggregate sanitized metadata, never hostnames, install IDs, raw command lines, or evidence bundles.</p>
+                <h2>How crowd mode works</h2>
+                <p class="section-intro">The system tries to stay useful without being creepy, noisy, or overconfident.</p>
+                <div class="journey-list">
+                    <div class="journey-step">
+                        <strong>1. Collect locally first.</strong>
+                        Hosts collect findings on their own machine. Nothing joins the network until the user explicitly opts in.
+                    </div>
+                    <div class="journey-step">
+                        <strong>2. Promote only the believable stuff.</strong>
+                        New clusters start quarantined. Corroborated or trusted submissions move into the shared queue where other workers can see them.
+                    </div>
+                    <div class="journey-step">
+                        <strong>3. Produce a patch or an honest handoff.</strong>
+                        Workers with Codex can attempt a fix, review it, improve it, or publish a strong diagnosis when the source tree is not the real owner.
+                    </div>
+                </div>
             </article>
             <article class="panel">
-                <h2>How the network works</h2>
-                <p>1. Hosts collect findings locally and opt in before uploading.</p>
-                <p>2. The server quarantines new issue clusters and promotes only corroborated or trusted submissions.</p>
-                <p>3. Volunteer workers with Codex pull promoted work, produce a patch or a reason it is not patchable yet, and affected users are encouraged to submit the result upstream.</p>
-                <p class="fine-print">Last submission processed: {last_submission}</p>
+                <h2>Install first, opt in later</h2>
+                <p class="section-intro">The package can live quietly on a machine before anyone decides to join the network. Local mode stays the default.</p>
+                <pre class="code-block"><code>{}</code></pre>
+                <div class="callout">
+                    <p><strong>APT repo:</strong> <a href="{apt_repo_url}">{apt_repo_url}</a><br><strong>Signing key:</strong> <a href="{repo_key_url}">{repo_key_url}</a></p>
+                </div>
             </article>
         </section>
 
         <section class="panel section">
-            <h2>Install from APT</h2>
-            <p>Add the public Fixer repository and install the package with normal APT tooling.</p>
-            <pre class="code-block"><code>{}</code></pre>
-            <p class="fine-print">The repository lives at <a href="{apt_repo_url}">{apt_repo_url}</a>. The public signing key is published at <a href="{repo_key_url}">{repo_key_url}</a>.</p>
+            <h2>Privacy and consent</h2>
+            <p class="section-intro">{}</p>
+            <p class="fine-print">Public pages and public issue JSON expose only aggregate sanitized metadata. They do not expose hostnames, install IDs, raw command lines, or private evidence bundles.</p>
         </section>
 
         <section class="panel section">
             <h2>Promoted issues right now</h2>
+            <p class="section-intro">This is the work that already made it through quarantine and into the public queue.</p>
             <div class="issue-list">{top_issue_markup}</div>
         </section>
         "#,
+        html_escape(queue_tagline),
         snapshot.install_count,
         snapshot.submission_count,
         snapshot.promoted_issue_count,
         snapshot.ready_patch_count,
         snapshot.ready_triage_count,
-        html_escape(PRIVACY_WARNING),
+        snapshot.quarantined_issue_count,
         html_escape(&apt_snippet),
+        html_escape(PRIVACY_WARNING),
     );
 
     render_page(
@@ -9088,6 +9345,28 @@ mod tests {
         );
 
         assert!(markup.contains("<a class=\"active\" href=\"/triage\">Triage</a>"));
+    }
+
+    #[test]
+    fn landing_page_highlights_live_snapshot_and_install_flow() {
+        let mut config = FixerConfig::default();
+        config.network.server_url = "https://fixer.maumap.com".to_string();
+        let snapshot = DashboardSnapshot {
+            install_count: 4,
+            submission_count: 27,
+            promoted_issue_count: 9,
+            quarantined_issue_count: 3,
+            ready_patch_count: 2,
+            ready_triage_count: 1,
+            last_submission_at: Some("2026-03-30T00:00:00Z".to_string()),
+            top_issues: Vec::new(),
+        };
+
+        let markup = render_landing_page(&config, &snapshot);
+        assert!(markup.contains("Live network snapshot"));
+        assert!(markup.contains("Install first, opt in later"));
+        assert!(markup.contains("Shared queue, not private guessing"));
+        assert!(markup.contains("sanitized issue families, not raw host evidence"));
     }
 
     #[test]

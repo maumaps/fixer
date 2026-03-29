@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -875,6 +876,7 @@ impl Store {
             FROM artifacts
             WHERE kind = 'binary'
               AND path IS NOT NULL
+              AND COALESCE(json_extract(metadata_json, '$.source'), '') = 'proc'
             ORDER BY max_cpu_percent DESC, total_cpu_percent DESC, process_count DESC, updated_at DESC, name ASC
             LIMIT ?1
             ",
@@ -891,6 +893,35 @@ impl Store {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn prune_proc_binary_artifacts(&self, current_paths: &[PathBuf]) -> Result<()> {
+        let current_paths = current_paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<HashSet<_>>();
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, path
+            FROM artifacts
+            WHERE kind = 'binary'
+              AND path IS NOT NULL
+              AND COALESCE(json_extract(metadata_json, '$.source'), '') = 'proc'
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let stale_ids = rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(id, path)| (!current_paths.contains(&path)).then_some(id))
+            .collect::<Vec<_>>();
+        for id in stale_ids {
+            self.conn
+                .execute("DELETE FROM artifacts WHERE id = ?1", params![id])?;
+        }
+        Ok(())
     }
 
     pub fn list_repo_owners(&self) -> Result<Vec<(String, String, String)>> {
@@ -1404,6 +1435,86 @@ mod tests {
         assert_eq!(profiles[0].package_name.as_deref(), Some("bash"));
         assert_eq!(profiles[0].process_count, 2);
         assert_eq!(profiles[0].total_cpu_percent, 12.5);
+    }
+
+    #[test]
+    fn popular_binary_profiles_ignore_perf_artifacts() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+        store
+            .upsert_artifact(&ObservedArtifact {
+                kind: "binary".to_string(),
+                name: "libc.so.6".to_string(),
+                path: Some(PathBuf::from("/usr/lib/x86_64-linux-gnu/libc.so.6")),
+                package_name: Some("libc6".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                metadata: json!({
+                    "source": "perf",
+                    "process_count": 40,
+                    "total_cpu_percent": 150.0,
+                    "max_cpu_percent": 120.0,
+                }),
+            })
+            .unwrap();
+        store
+            .upsert_artifact(&ObservedArtifact {
+                kind: "binary".to_string(),
+                name: "kdeconnectd".to_string(),
+                path: Some(PathBuf::from("/usr/bin/kdeconnectd")),
+                package_name: Some("kdeconnect".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                metadata: json!({
+                    "source": "proc",
+                    "process_count": 1,
+                    "total_cpu_percent": 18.5,
+                    "max_cpu_percent": 18.5,
+                }),
+            })
+            .unwrap();
+
+        let profiles = store.list_popular_binary_profiles(5).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "kdeconnectd");
+    }
+
+    #[test]
+    fn prunes_proc_binary_artifacts_that_are_no_longer_current() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+        let live_path = PathBuf::from("/usr/bin/kdeconnectd");
+        let stale_path = PathBuf::from("/usr/bin/old-hot-process");
+        for path in [live_path.clone(), stale_path.clone()] {
+            store
+                .upsert_artifact(&ObservedArtifact {
+                    kind: "binary".to_string(),
+                    name: path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap()
+                        .to_string(),
+                    path: Some(path),
+                    package_name: None,
+                    repo_root: None,
+                    ecosystem: None,
+                    metadata: json!({
+                        "source": "proc",
+                        "process_count": 1,
+                        "total_cpu_percent": 10.0,
+                        "max_cpu_percent": 10.0,
+                    }),
+                })
+                .unwrap();
+        }
+
+        store
+            .prune_proc_binary_artifacts(std::slice::from_ref(&live_path))
+            .unwrap();
+
+        let profiles = store.list_popular_binary_profiles(10).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].path, live_path);
     }
 
     #[test]
