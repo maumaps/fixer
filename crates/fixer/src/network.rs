@@ -214,6 +214,61 @@ fn user_runtime_dir(uid: u32) -> PathBuf {
     PathBuf::from(format!("/run/user/{uid}"))
 }
 
+fn codex_state_dir_paths(home: &Path) -> [PathBuf; 2] {
+    [
+        home.join(".cache").join("codex"),
+        home.join(".local").join("share").join("codex"),
+    ]
+}
+
+fn running_as_root() -> bool {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|raw| {
+            raw.lines().find_map(|line| {
+                let suffix = line.strip_prefix("Uid:")?;
+                suffix.split_whitespace().next()?.parse::<u32>().ok()
+            })
+        })
+        == Some(0)
+}
+
+fn ensure_user_owned_dir_chain(user: &str, root: &Path, target: &Path) -> Result<()> {
+    let relative = target.strip_prefix(root).with_context(|| {
+        format!(
+            "failed to prepare Codex state path {} outside {}",
+            target.display(),
+            root.display()
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        if current.exists() {
+            if current.is_dir() {
+                continue;
+            }
+            return Err(anyhow!(
+                "Codex state path {} exists but is not a directory",
+                current.display()
+            ));
+        }
+        fs::create_dir(&current)
+            .with_context(|| format!("failed to create {}", current.display()))?;
+        if running_as_root() {
+            chown_path_recursive(user, &current)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_codex_state_dirs(account: &LocalUserAccount) -> Result<()> {
+    for path in codex_state_dir_paths(&account.home) {
+        ensure_user_owned_dir_chain(&account.user, &account.home, &path)?;
+    }
+    Ok(())
+}
+
 fn default_user_path(home: &Path) -> String {
     format!("{}/.local/bin:/usr/local/bin:/usr/bin:/bin", home.display())
 }
@@ -249,6 +304,7 @@ fn probe_user_codex_environment(user: &str, uid: u32) -> Result<()> {
             account.uid
         ));
     }
+    ensure_codex_state_dirs(&account)?;
     let auth_path = account.home.join(".codex").join("auth.json");
     if !auth_path.exists() {
         return Err(anyhow!(
@@ -494,17 +550,18 @@ fn run_codex_job_as_user(
         let login_path = resolve_user_login_path(&account)?;
         let runtime_dir = user_runtime_dir(account.uid);
         let bus_path = runtime_dir.join("bus");
+        let cache_home = account.home.join(".cache");
+        let data_home = account.home.join(".local").join("share");
+        let [cache_dir, data_dir] = codex_state_dir_paths(&account.home);
         let executable =
             std::env::current_exe().context("failed to resolve the fixer binary path")?;
-        let auth_paths = [
-            account.home.join(".codex"),
-            account.home.join(".cache").join("codex"),
-            account.home.join(".local").join("share").join("codex"),
-        ];
+        let auth_paths = [account.home.join(".codex"), cache_dir, data_dir];
 
         let mut command = Command::new("runuser");
         command.args(["-u", &account.user, "--", "env"]);
         command.arg(format!("XDG_RUNTIME_DIR={}", runtime_dir.display()));
+        command.arg(format!("XDG_CACHE_HOME={}", cache_home.display()));
+        command.arg(format!("XDG_DATA_HOME={}", data_home.display()));
         command.arg(format!(
             "DBUS_SESSION_BUS_ADDRESS=unix:path={}",
             bus_path.display()
@@ -521,6 +578,8 @@ fn run_codex_job_as_user(
             "--setenv=XDG_RUNTIME_DIR={}",
             runtime_dir.display()
         ));
+        command.arg(format!("--setenv=XDG_CACHE_HOME={}", cache_home.display()));
+        command.arg(format!("--setenv=XDG_DATA_HOME={}", data_home.display()));
         command.arg("-p").arg("NoNewPrivileges=yes");
         command.arg("-p").arg("PrivateTmp=yes");
         command.arg("-p").arg("ProtectSystem=strict");
@@ -1549,6 +1608,7 @@ mod tests {
     use crate::models::{FindingRecord, OpportunityRecord};
     use crate::storage::Store;
     use serde_json::json;
+    use std::fs;
     use tempfile::tempdir;
 
     fn sample_server_hello() -> ServerHello {
@@ -1634,6 +1694,28 @@ mod tests {
         assert_eq!(budget.max_active_jobs, 1);
         assert!(budget.max_jobs_per_day > 0);
         assert!(budget.job_timeout_seconds >= 30 * 60);
+    }
+
+    #[test]
+    fn codex_state_dir_paths_use_standard_xdg_locations() {
+        let home = Path::new("/home/alice");
+        let paths = codex_state_dir_paths(home);
+        assert_eq!(paths[0], Path::new("/home/alice/.cache/codex"));
+        assert_eq!(paths[1], Path::new("/home/alice/.local/share/codex"));
+    }
+
+    #[test]
+    fn ensure_user_owned_dir_chain_creates_missing_parents() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let target = home.join(".local").join("share").join("codex");
+
+        ensure_user_owned_dir_chain("root", &home, &target).unwrap();
+
+        assert!(home.join(".local").is_dir());
+        assert!(home.join(".local/share").is_dir());
+        assert!(target.is_dir());
     }
 
     #[test]

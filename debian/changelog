@@ -1,3 +1,10 @@
+fixer (0.25.0-1) unstable; urgency=medium
+
+  * Create per-user Codex cache and state directories automatically for leased jobs.
+  * Export standard XDG cache/data paths into transient user-scoped Codex runs.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 30 Mar 2026 00:57:22 +0400
+
 fixer (0.24.0-1) unstable; urgency=medium
 
   * Make the public landing page friendlier and more polished.
