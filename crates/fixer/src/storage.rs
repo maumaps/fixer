@@ -1,7 +1,7 @@
 use crate::models::{
     Capability, FindingInput, FindingRecord, InstallIdentity, OpportunityRecord,
-    ParticipationState, ProposalRecord, SharedOpportunity, StatusSnapshot, TopEntry,
-    ValidationRecord,
+    ParticipationState, PopularBinaryProfile, ProposalRecord, SharedOpportunity, StatusSnapshot,
+    TopEntry, ValidationRecord,
 };
 use crate::util::now_rfc3339;
 use anyhow::{Context, Result};
@@ -814,6 +814,33 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn list_popular_binary_profiles(&self, limit: usize) -> Result<Vec<PopularBinaryProfile>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT
+                name,
+                path,
+                package_name,
+                CAST(COALESCE(json_extract(metadata_json, '$.process_count'), 0) AS INTEGER) AS process_count
+            FROM artifacts
+            WHERE kind = 'binary'
+              AND path IS NOT NULL
+            ORDER BY process_count DESC, updated_at DESC, name ASC
+            LIMIT ?1
+            ",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok(PopularBinaryProfile {
+                name: row.get(0)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
+                package_name: row.get(2)?,
+                process_count: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn list_repo_owners(&self) -> Result<Vec<(String, String, String)>> {
         let mut stmt = self.conn.prepare(
             "
@@ -1083,6 +1110,36 @@ impl Store {
             })
             .map_err(Into::into)
     }
+
+    pub fn prune_perf_hotspot_findings(
+        &self,
+        assessed_targets: &[String],
+        current_fingerprints: &[String],
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, fingerprint
+            FROM findings
+            WHERE kind = 'hotspot'
+              AND json_extract(details_json, '$.subsystem') = 'perf-hotspot'
+              AND COALESCE(json_extract(details_json, '$.profile_target.path'), '') = ?1
+            ",
+        )?;
+
+        for target_path in assessed_targets {
+            let rows = stmt.query_map([target_path], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let findings = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            for (finding_id, fingerprint) in findings {
+                if current_fingerprints.iter().any(|item| item == &fingerprint) {
+                    continue;
+                }
+                self.delete_finding_cascade(finding_id)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn score_for(kind: &str, severity: &str, has_repo: bool, has_ecosystem: bool) -> i64 {
@@ -1106,8 +1163,9 @@ fn score_for(kind: &str, severity: &str, has_repo: bool, has_ecosystem: bool) ->
 #[cfg(test)]
 mod tests {
     use super::Store;
-    use crate::models::FindingInput;
+    use crate::models::{FindingInput, ObservedArtifact};
     use serde_json::json;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[test]
@@ -1130,6 +1188,46 @@ mod tests {
         let status = store.status().unwrap();
         assert_eq!(status.findings, 1);
         assert_eq!(status.opportunities, 1);
+    }
+
+    #[test]
+    fn lists_popular_binary_profiles_from_artifacts() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+        store
+            .upsert_artifact(&ObservedArtifact {
+                kind: "binary".to_string(),
+                name: "firefox".to_string(),
+                path: Some(PathBuf::from("/usr/bin/firefox")),
+                package_name: Some("firefox".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                metadata: json!({
+                    "source": "proc",
+                    "process_count": 9,
+                }),
+            })
+            .unwrap();
+        store
+            .upsert_artifact(&ObservedArtifact {
+                kind: "binary".to_string(),
+                name: "bash".to_string(),
+                path: Some(PathBuf::from("/usr/bin/bash")),
+                package_name: Some("bash".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                metadata: json!({
+                    "source": "proc",
+                    "process_count": 2,
+                }),
+            })
+            .unwrap();
+
+        let profiles = store.list_popular_binary_profiles(1).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "firefox");
+        assert_eq!(profiles[0].package_name.as_deref(), Some("firefox"));
+        assert_eq!(profiles[0].process_count, 9);
     }
 
     #[test]

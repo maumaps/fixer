@@ -13,7 +13,7 @@ The current tree also includes a client/server federation model:
 
 - Rust workspace with a shared library and two binaries: `fixer` and `fixerd`
 - SQLite-backed inventory of capabilities, artifacts, findings, opportunities, validations, and proposals
-- Collectors for process/package usage, watched repos, `coredumpctl`, warning logs, kernel warnings, optional `perf`, and optional `bpftrace`
+- Collectors for process/package usage, watched repos, `coredumpctl`, warning logs, kernel warnings, targeted background `perf` profiling of the busiest binaries, and optional `bpftrace`
 - PostgreSQL collation mismatch detection for local clusters, with deterministic remediation proposals that start with `pg_amcheck`, then target only the affected indexes before refreshing the recorded collation version
 - Crash ingestion now requires an actual stack trace, then runs a best-effort symbolization pass with local binaries and debug-package hints before ranking the result
 - If a package has no patchable source workspace, deterministic proposals fall back to a precise external bug report with package versions, update availability, vendor/support routing, environment details, crash evidence, and a share-safe redacted command line
@@ -24,6 +24,8 @@ The current tree also includes a client/server federation model:
 - Public deployment assets for `https://fixer.maumap.com`, including a landing page, a light public issues UI, a signed APT repository publisher, and deploy scripts for the canonical server
 - Explicit participation modes: `local-only`, `submitter`, and `submitter+worker`
 - Anonymous install identity, proof-of-work, quarantine, rate limits, and issue clustering for basic anti-spam and anti-abuse handling
+
+When `perf` is available, the daemon now profiles the busiest running binaries in the background instead of recording one anonymous system-wide sample. The resulting hotspot findings keep the hot symbol, the sampled process, the resolved DSO path, and the owning Debian package together so they can be reviewed later as real opportunities.
 
 ## Quick start
 
@@ -170,7 +172,7 @@ The public/no-config path is:
 
 - Debian-available helper tools now ship as package recommendations, so a normal `apt install ./fixer...deb` will usually pull in `perf`, `bpftrace`, `cargo`, `nodejs`, `npm`, `python3-pip`, and `postgresql-client`.
 - `pip-audit` is still not bundled through Debian packaging here because there is no native Debian package for it in this environment.
-- Optional tools are detected at runtime. Missing `npm`, `pip-audit`, `perf`, or `bpftrace` reduce features but do not block startup.
+- Optional tools are detected at runtime. Missing `npm`, `pip-audit`, `perf`, or `bpftrace` reduce features but do not block startup. When `perf` is present, the packaged daemon config enables targeted hotspot profiling by default.
 - Automated Debian source retrieval prefers `apt-get source`, but if the machine has no `deb-src` entries configured, Fixer now falls back to cloning a package homepage when it points at a real upstream repository.
 - The packaged service currently runs as root so it can access system-wide telemetry. Hardening and privilege separation are the next major step.
 - The new federation mode uses SQLite on clients and also defaults the server to SQLite for local installs. Public and larger shared deployments can switch the same server binary to Postgres through config or `FIXER_SERVER_POSTGRES_URL`.

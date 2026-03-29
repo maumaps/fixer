@@ -1,7 +1,7 @@
 use crate::adapters::{inspect_repo, resolve_repo_root};
 use crate::capabilities::detect_capabilities;
 use crate::config::FixerConfig;
-use crate::models::{FindingInput, ObservedArtifact};
+use crate::models::{FindingInput, ObservedArtifact, PopularBinaryProfile};
 use crate::storage::Store;
 use crate::util::{
     command_exists, command_output, command_output_os, find_postgres_binary, hash_text,
@@ -15,6 +15,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const PERF_PROFILE_TARGET_LIMIT: usize = 3;
+const PERF_TOP_HOTSPOTS_PER_TARGET: usize = 3;
+const PERF_REPORT_LIMIT: usize = 12;
 
 #[derive(Debug, Default, Clone)]
 pub struct CollectReport {
@@ -1200,72 +1204,403 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
     if !store.capability_available("perf")? {
         return Ok(0);
     }
+    let targets = store.list_popular_binary_profiles(PERF_PROFILE_TARGET_LIMIT * 2)?;
+    if targets.is_empty() {
+        return Ok(0);
+    }
     let perf_dir = config.service.state_dir.join("perf");
     fs::create_dir_all(&perf_dir)?;
+    let mut count = 0;
+    let mut assessed_targets = Vec::new();
+    let mut current_fingerprints = Vec::new();
+
+    for target in targets
+        .into_iter()
+        .filter(is_profile_candidate)
+        .take(PERF_PROFILE_TARGET_LIMIT)
+    {
+        let sampled_pids = running_pids_for_binary(&target.path);
+        if sampled_pids.is_empty() {
+            continue;
+        }
+        let Some(profile) = profile_popular_binary(config, &perf_dir, &target, &sampled_pids)?
+        else {
+            continue;
+        };
+        let target_path = target.path.to_string_lossy().to_string();
+        assessed_targets.push(target_path);
+        for (index, hot_path) in profile
+            .hot_paths
+            .iter()
+            .take(PERF_TOP_HOTSPOTS_PER_TARGET)
+            .enumerate()
+        {
+            let artifact_path = hot_path
+                .dso_path
+                .clone()
+                .unwrap_or_else(|| target.path.clone());
+            let artifact = ObservedArtifact {
+                kind: "binary".to_string(),
+                name: artifact_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or(&target.name)
+                    .to_string(),
+                path: Some(artifact_path.clone()),
+                package_name: hot_path
+                    .package_name
+                    .clone()
+                    .or_else(|| target.package_name.clone()),
+                repo_root: None,
+                ecosystem: None,
+                metadata: json!({
+                    "source": "perf",
+                    "profile_target_name": target.name,
+                    "profile_target_path": target.path,
+                    "profile_target_package_name": target.package_name,
+                    "process_count": target.process_count,
+                    "sampled_pids": profile.sampled_pids,
+                }),
+            };
+            let dso_display = hot_path
+                .dso_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| hot_path.dso.clone());
+            let title = format!(
+                "CPU hotspot in {}: {}",
+                target.name,
+                summarize_hot_symbol(&hot_path.symbol)
+            );
+            let summary = format!(
+                "{:.2}% of sampled CPU in {} went through {} ({})",
+                hot_path.percent, target.name, hot_path.symbol, dso_display
+            );
+            let fingerprint = hash_text(format!(
+                "perf-hotspot:{}:{}:{}",
+                target.path.display(),
+                hot_path
+                    .dso_path
+                    .as_ref()
+                    .unwrap_or(&PathBuf::from(&hot_path.dso))
+                    .display(),
+                hot_path.symbol
+            ));
+            current_fingerprints.push(fingerprint.clone());
+            let finding = FindingInput {
+                kind: "hotspot".to_string(),
+                title,
+                severity: "medium".to_string(),
+                fingerprint,
+                summary,
+                details: json!({
+                    "subsystem": "perf-hotspot",
+                    "profile_scope": "popular-binary",
+                    "profile_duration_seconds": config.service.perf_duration_seconds,
+                    "perf_data": profile.data_path,
+                    "profile_target": {
+                        "name": target.name,
+                        "path": target.path,
+                        "package_name": target.package_name,
+                        "process_count": target.process_count,
+                    },
+                    "sampled_pids": profile.sampled_pids,
+                    "sampled_pid_count": profile.sampled_pids.len(),
+                    "hot_path_rank": index + 1,
+                    "hot_path_percent": hot_path.percent,
+                    "hot_path_comm": hot_path.comm,
+                    "hot_path_symbol": hot_path.symbol,
+                    "hot_path_dso": hot_path.dso,
+                    "hot_path_dso_path": hot_path.dso_path,
+                    "hot_path_package_name": hot_path.package_name,
+                    "hot_paths": profile.hot_paths,
+                }),
+                artifact: Some(artifact),
+                repo_root: None,
+                ecosystem: None,
+            };
+            let _ = store.record_finding(&finding)?;
+            count += 1;
+        }
+    }
+    if !assessed_targets.is_empty() {
+        store.prune_perf_hotspot_findings(&assessed_targets, &current_fingerprints)?;
+    }
+    Ok(count)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PerfHotPath {
+    percent: f64,
+    comm: String,
+    dso: String,
+    dso_path: Option<PathBuf>,
+    package_name: Option<String>,
+    symbol: String,
+}
+
+#[derive(Debug, Clone)]
+struct PerfProfileCapture {
+    data_path: PathBuf,
+    sampled_pids: Vec<i32>,
+    hot_paths: Vec<PerfHotPath>,
+}
+
+fn is_profile_candidate(target: &PopularBinaryProfile) -> bool {
+    target.process_count > 0
+        && !matches!(
+            target.name.as_str(),
+            "perf" | "fixer" | "fixerd" | "fixer-server"
+        )
+}
+
+fn running_pids_for_binary(target_path: &Path) -> Vec<i32> {
+    let mut pids = Vec::new();
+    let canonical_target = maybe_canonicalize(target_path);
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return pids;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        let exe_link = entry.path().join("exe");
+        let Ok(path) = fs::read_link(&exe_link) else {
+            continue;
+        };
+        if maybe_canonicalize(&path) == canonical_target {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids
+}
+
+fn profile_popular_binary(
+    config: &FixerConfig,
+    perf_dir: &Path,
+    target: &PopularBinaryProfile,
+    sampled_pids: &[i32],
+) -> Result<Option<PerfProfileCapture>> {
     let timestamp = now_rfc3339().replace(':', "-");
-    let data_path = perf_dir.join(format!("{timestamp}.data"));
-    let status = Command::new("perf")
+    let safe_name = safe_perf_name(&target.name);
+    let data_path = perf_dir.join(format!("{timestamp}-{safe_name}.data"));
+    let pid_list = sampled_pids
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let record = Command::new("perf")
+        .env("LC_ALL", "C")
         .args([
             "record",
-            "-a",
             "-g",
             "-o",
             data_path.to_string_lossy().as_ref(),
+            "-p",
+            pid_list.as_str(),
             "--",
             "sleep",
             &config.service.perf_duration_seconds.to_string(),
         ])
-        .status()?;
-    if !status.success() {
-        return Ok(0);
+        .output()?;
+    if !record.status.success() {
+        return Ok(None);
     }
-    let report = command_output(
-        "perf",
-        &[
+
+    let report = Command::new("perf")
+        .env("LC_ALL", "C")
+        .args([
             "report",
             "--stdio",
             "-i",
             data_path.to_string_lossy().as_ref(),
             "--sort",
-            "comm,symbol,dso",
+            "comm,dso,symbol",
             "--percent-limit",
             "1",
-        ],
-    )?;
-    let mut count = 0;
-    for line in report.lines().take(200) {
+            "--no-children",
+        ])
+        .output()?;
+    if !report.status.success() {
+        return Ok(None);
+    }
+    let dso_paths = observed_dso_paths(sampled_pids, &target.path);
+    let hot_paths =
+        parse_perf_hot_paths(&String::from_utf8_lossy(&report.stdout), target, &dso_paths);
+    if hot_paths.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PerfProfileCapture {
+        data_path,
+        sampled_pids: sampled_pids.to_vec(),
+        hot_paths,
+    }))
+}
+
+fn observed_dso_paths(sampled_pids: &[i32], target_path: &Path) -> HashMap<String, PathBuf> {
+    let mut paths = HashMap::new();
+    remember_dso_path(&mut paths, target_path);
+    for pid in sampled_pids {
+        let maps_path = PathBuf::from(format!("/proc/{pid}/maps"));
+        let Ok(raw) = fs::read_to_string(&maps_path) else {
+            continue;
+        };
+        for line in raw.lines() {
+            let Some(candidate) = line.split_whitespace().last() else {
+                continue;
+            };
+            if !candidate.starts_with('/') {
+                continue;
+            }
+            remember_dso_path(&mut paths, Path::new(candidate));
+        }
+    }
+    paths
+}
+
+fn remember_dso_path(paths: &mut HashMap<String, PathBuf>, candidate: &Path) {
+    let canonical = maybe_canonicalize(candidate);
+    let full = canonical.to_string_lossy().to_string();
+    paths.entry(full).or_insert_with(|| canonical.clone());
+    if let Some(name) = canonical.file_name().and_then(|value| value.to_str()) {
+        paths.entry(name.to_string()).or_insert(canonical);
+    }
+}
+
+fn parse_perf_hot_paths(
+    report: &str,
+    target: &PopularBinaryProfile,
+    dso_paths: &HashMap<String, PathBuf>,
+) -> Vec<PerfHotPath> {
+    let mut hot_paths = Vec::new();
+    for line in report.lines() {
         let trimmed = line.trim();
-        if !trimmed.contains('%') || trimmed.starts_with('#') {
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         let parts = trimmed.split_whitespace().collect::<Vec<_>>();
-        if parts.len() < 4 {
+        if parts.len() < 4 || !parts[0].ends_with('%') {
             continue;
         }
-        let finding = FindingInput {
-            kind: "hotspot".to_string(),
-            title: format!(
-                "Perf hotspot: {}",
-                parts.get(1).copied().unwrap_or("unknown")
-            ),
-            severity: "medium".to_string(),
-            fingerprint: hash_text(format!("hotspot:{trimmed}")),
-            summary: trimmed.to_string(),
-            details: json!({
-                "perf_line": trimmed,
-                "perf_data": data_path,
-            }),
-            artifact: None,
-            repo_root: None,
-            ecosystem: None,
+        let Ok(percent) = parts[0].trim_end_matches('%').parse::<f64>() else {
+            continue;
         };
-        let _ = store.record_finding(&finding)?;
-        count += 1;
-        if count >= 10 {
-            break;
+        let comm = parts[1].to_string();
+        let dso = parts[2].to_string();
+        let symbol_index = if parts
+            .get(3)
+            .is_some_and(|value| value.starts_with('[') && value.ends_with(']'))
+        {
+            4
+        } else {
+            3
+        };
+        if symbol_index >= parts.len() {
+            continue;
         }
+        let symbol = normalize_perf_symbol(&parts[symbol_index..].join(" "));
+        if symbol.is_empty() {
+            continue;
+        }
+        let (dso_path, package_name) = resolve_perf_dso_owner(dso.as_str(), dso_paths, target);
+        hot_paths.push(PerfHotPath {
+            percent,
+            comm,
+            dso,
+            dso_path,
+            package_name,
+            symbol,
+        });
     }
-    Ok(count)
+    hot_paths.sort_by(|left, right| right.percent.total_cmp(&left.percent));
+    hot_paths.dedup_by(|left, right| left.dso == right.dso && left.symbol == right.symbol);
+    hot_paths.truncate(PERF_REPORT_LIMIT);
+    hot_paths
+}
+
+fn normalize_perf_symbol(symbol: &str) -> String {
+    let mut normalized = symbol.split_whitespace().collect::<Vec<_>>().join(" ");
+    while let Some(stripped) = normalized.strip_suffix(" - -") {
+        normalized = stripped.trim_end().to_string();
+    }
+    normalized
+}
+
+fn resolve_perf_dso_owner(
+    dso: &str,
+    dso_paths: &HashMap<String, PathBuf>,
+    target: &PopularBinaryProfile,
+) -> (Option<PathBuf>, Option<String>) {
+    if dso == "[kernel.kallsyms]" {
+        if let Some(release) = running_kernel_release() {
+            return (
+                kernel_reference_path(&release),
+                Some(format!("linux-image-{release}")),
+            );
+        }
+        return (None, None);
+    }
+    let dso_path = resolve_perf_dso_path(dso, dso_paths, &target.path);
+    let package_name = dso_path
+        .as_deref()
+        .and_then(map_path_to_package)
+        .or_else(|| target.package_name.clone());
+    (dso_path, package_name)
+}
+
+fn resolve_perf_dso_path(
+    dso: &str,
+    dso_paths: &HashMap<String, PathBuf>,
+    target_path: &Path,
+) -> Option<PathBuf> {
+    if dso.starts_with('/') {
+        return Some(maybe_canonicalize(Path::new(dso)));
+    }
+    dso_paths.get(dso).cloned().or_else(|| {
+        target_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| *value == dso)
+            .map(|_| target_path.to_path_buf())
+    })
+}
+
+fn running_kernel_release() -> Option<String> {
+    fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn kernel_reference_path(release: &str) -> Option<PathBuf> {
+    let boot_image = PathBuf::from(format!("/boot/vmlinuz-{release}"));
+    if boot_image.exists() {
+        return Some(boot_image);
+    }
+    let modules_dir = PathBuf::from(format!("/lib/modules/{release}"));
+    modules_dir.exists().then_some(modules_dir)
+}
+
+fn safe_perf_name(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>();
+    sanitized.trim_matches('-').to_string()
+}
+
+fn summarize_hot_symbol(symbol: &str) -> String {
+    let compact = symbol.trim();
+    if compact.chars().count() <= 64 {
+        return compact.to_string();
+    }
+    let shortened = compact.chars().take(61).collect::<String>();
+    format!("{shortened}...")
 }
 
 fn collect_bpftrace(config: &FixerConfig, store: &Store) -> Result<usize> {
@@ -1772,13 +2107,15 @@ fn frame_is_useful(frame: &str) -> bool {
 mod tests {
     use super::{
         apparmor_finding_from_kernel_line, extend_unique_log_lines, is_low_signal_kernel_warning,
-        kernel_module_lookup_names, kernel_module_package_hint, kernel_warning_module_candidates,
-        looks_like_warning, parse_apparmor_denial, parse_coredump_info, parse_dkms_status_line,
-        parse_postgres_collation_mismatch_rows,
+        is_profile_candidate, kernel_module_lookup_names, kernel_module_package_hint,
+        kernel_warning_module_candidates, looks_like_warning, normalize_perf_symbol,
+        parse_apparmor_denial, parse_coredump_info, parse_dkms_status_line, parse_perf_hot_paths,
+        parse_postgres_collation_mismatch_rows, safe_perf_name,
     };
+    use crate::models::PopularBinaryProfile;
     use serde_json::Value;
-    use std::collections::BTreeSet;
-    use std::path::Path;
+    use std::collections::{BTreeSet, HashMap};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn warning_detection_handles_common_keywords() {
@@ -1987,5 +2324,82 @@ Stack trace of thread 222:\n\
         assert_eq!(parsed.total_stack_frame_count, 3);
         assert_eq!(parsed.useful_stack_frame_count, 2);
         assert_eq!(parsed.primary_stack[0], "n/a [/opt/zoom/cef/libcef.so]");
+    }
+
+    #[test]
+    fn perf_report_parser_extracts_hot_paths_for_profiled_binary() {
+        let report = "\
+  37.42%  chrome  libc.so.6  [.] memcpy\n\
+  18.10%  chrome  chrome     [.] Blink::run\n\
+";
+        let target = PopularBinaryProfile {
+            name: "chrome".to_string(),
+            path: PathBuf::from("/opt/google/chrome/chrome"),
+            package_name: Some("google-chrome-stable".to_string()),
+            process_count: 9,
+        };
+        let mut dso_paths = HashMap::new();
+        dso_paths.insert(
+            "chrome".to_string(),
+            PathBuf::from("/opt/google/chrome/chrome"),
+        );
+        dso_paths.insert(
+            "libc.so.6".to_string(),
+            PathBuf::from("/usr/lib/x86_64-linux-gnu/libc.so.6"),
+        );
+
+        let hot_paths = parse_perf_hot_paths(report, &target, &dso_paths);
+        assert_eq!(hot_paths.len(), 2);
+        assert_eq!(hot_paths[0].comm, "chrome");
+        assert_eq!(hot_paths[0].symbol, "memcpy");
+        assert_eq!(
+            hot_paths[0].dso_path.as_deref(),
+            Some(Path::new("/usr/lib/x86_64-linux-gnu/libc.so.6"))
+        );
+        assert_eq!(hot_paths[1].symbol, "Blink::run");
+        assert_eq!(
+            hot_paths[1].dso_path.as_deref(),
+            Some(Path::new("/opt/google/chrome/chrome"))
+        );
+    }
+
+    #[test]
+    fn profile_candidates_skip_fixer_binaries_and_zero_counts() {
+        assert!(!is_profile_candidate(&PopularBinaryProfile {
+            name: "fixerd".to_string(),
+            path: PathBuf::from("/usr/bin/fixerd"),
+            package_name: Some("fixer".to_string()),
+            process_count: 1,
+        }));
+        assert!(!is_profile_candidate(&PopularBinaryProfile {
+            name: "firefox".to_string(),
+            path: PathBuf::from("/usr/bin/firefox"),
+            package_name: Some("firefox-esr".to_string()),
+            process_count: 0,
+        }));
+        assert!(is_profile_candidate(&PopularBinaryProfile {
+            name: "firefox".to_string(),
+            path: PathBuf::from("/usr/bin/firefox"),
+            package_name: Some("firefox-esr".to_string()),
+            process_count: 3,
+        }));
+    }
+
+    #[test]
+    fn safe_perf_name_normalizes_binary_names() {
+        assert_eq!(
+            safe_perf_name("google-chrome-stable"),
+            "google-chrome-stable"
+        );
+        assert_eq!(safe_perf_name("code - oss"), "code---oss");
+    }
+
+    #[test]
+    fn normalize_perf_symbol_trims_trailing_perf_source_markers() {
+        assert_eq!(normalize_perf_symbol("memcpy - -"), "memcpy");
+        assert_eq!(
+            normalize_perf_symbol("std::__foo<int> - - - -"),
+            "std::__foo<int>"
+        );
     }
 }

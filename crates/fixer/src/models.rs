@@ -107,6 +107,14 @@ pub struct TopEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PopularBinaryProfile {
+    pub name: String,
+    pub path: PathBuf,
+    pub package_name: Option<String>,
+    pub process_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationCommand {
     pub program: String,
     pub args: Vec<String>,

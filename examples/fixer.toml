@@ -5,7 +5,7 @@ poll_interval_seconds = 300
 collect_processes = true
 collect_crashes = true
 collect_warnings = true
-collect_perf = false
+collect_perf = true
 collect_bpftrace = false
 perf_duration_seconds = 3
 coredump_limit = 10
@@ -33,7 +33,7 @@ mode = "local-only"
 richer_evidence_allowed = false
 
 [privacy]
-policy_version = "2026-03-28"
+policy_version = "2026-03-29"
 redact_known_secrets = true
 require_opt_in_for_upload = true
 require_secondary_opt_in_for_richer_evidence = true

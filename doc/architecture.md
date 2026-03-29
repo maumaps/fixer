@@ -46,7 +46,7 @@ The shared application logic lives in `crates/fixer/src/`.
   - Detects optional helper tools at runtime.
   - This lets the package stay installable even when optional integrations are absent.
 - `collectors.rs`
-  - Collects process/package usage, watched repos, crashes, warning logs, kernel warnings, optional perf hotspots, and optional `bpftrace` output.
+  - Collects process/package usage, watched repos, crashes, warning logs, kernel warnings, targeted perf hotspots for the busiest binaries, and optional `bpftrace` output.
   - Crash collection only keeps coredumps that include stack frames, chooses the most informative thread when multiple thread stacks are present, and runs a best-effort local symbolization pass on unresolved frames.
 - `adapters.rs`
   - Repo-level ecosystem detection and metadata/validation lookup for Debian, Cargo, npm, pip, and PGXN.
@@ -112,7 +112,7 @@ Each collection cycle follows this order:
    - Prefer the thread with the highest number of useful frames for summaries and evidence.
    - Try to improve `n/a (object + offset)` frames through local symbolizers and package/debug-symbol hints before storing the crash.
 6. Ingest warning lines from configured logs and kernel warnings from `journalctl`.
-7. Optionally sample hotspots with `perf`.
+7. If `perf` is available, sample the busiest running binaries and turn their hottest symbols plus owning packages into hotspot findings.
 8. Optionally capture a short `bpftrace` run.
 9. Normalize each observation into a finding fingerprint.
 10. Upsert or refresh the corresponding opportunity.
@@ -230,6 +230,5 @@ The next meaningful architecture steps are:
 - enrich artifact ownership from package metadata to source package and upstream trackers
 - add Debian source-index management and build-dependency bootstrap for fully hands-off package rebuilds
 - add better finding deduplication for warnings and crashes
-- improve hotspot collection so it is less expensive and more targeted
 - add validation profiles for each ecosystem beyond the current generic commands
 - expand proposal bundles with adjacent-code slicing instead of only opportunity metadata
