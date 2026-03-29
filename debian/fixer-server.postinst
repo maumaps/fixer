@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+#DEBHELPER#
+
+if [ "$1" = "configure" ] && [ -z "${2:-}" ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl --system enable fixer-server.service >/dev/null || true
+        systemctl --system start fixer-server.service >/dev/null || true
+    fi
+fi

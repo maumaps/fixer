@@ -14,11 +14,14 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use tokio_postgres::{Client, NoTls, Row};
 use uuid::Uuid;
 
@@ -331,7 +334,13 @@ code, pre {
 #[derive(Clone)]
 struct ServerState {
     config: FixerConfig,
-    db: Arc<Client>,
+    db: ServerDb,
+}
+
+#[derive(Clone)]
+enum ServerDb {
+    Postgres(Arc<Client>),
+    Sqlite(PathBuf),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -368,7 +377,35 @@ struct DashboardSnapshot {
     top_issues: Vec<PublicIssue>,
 }
 
-pub async fn serve(config: FixerConfig) -> Result<()> {
+fn sqlite_path_from_url(url: &str) -> Option<PathBuf> {
+    let rest = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))?;
+    let path = if rest.starts_with('/') {
+        PathBuf::from(rest)
+    } else {
+        PathBuf::from(format!("./{rest}"))
+    };
+    Some(path)
+}
+
+fn sqlite_connection(path: &Path) -> Result<Connection> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let connection =
+        Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    connection
+        .busy_timeout(StdDuration::from_secs(5))
+        .context("failed to configure sqlite busy timeout")?;
+    Ok(connection)
+}
+
+async fn open_server_db(config: &FixerConfig) -> Result<ServerDb> {
+    if let Some(path) = sqlite_path_from_url(&config.server.postgres_url) {
+        return Ok(ServerDb::Sqlite(path));
+    }
     let (client, connection) = tokio_postgres::connect(&config.server.postgres_url, NoTls)
         .await
         .with_context(|| format!("failed to connect to {}", config.server.postgres_url))?;
@@ -377,10 +414,29 @@ pub async fn serve(config: FixerConfig) -> Result<()> {
             tracing::error!(?error, "postgres connection failed");
         }
     });
-    init_db(&client).await?;
+    Ok(ServerDb::Postgres(Arc::new(client)))
+}
+
+async fn db_ping(db: &ServerDb) -> Result<()> {
+    match db {
+        ServerDb::Postgres(client) => {
+            let _: i32 = client.query_one("SELECT 1", &[]).await?.get(0);
+            Ok(())
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let _: i64 = connection.query_row("SELECT 1", [], |row| row.get(0))?;
+            Ok(())
+        }
+    }
+}
+
+pub async fn serve(config: FixerConfig) -> Result<()> {
+    let db = open_server_db(&config).await?;
+    init_db(&db).await?;
     let state = Arc::new(ServerState {
         config: config.clone(),
-        db: Arc::new(client),
+        db,
     });
 
     let app = Router::new()
@@ -415,24 +471,19 @@ pub async fn serve(config: FixerConfig) -> Result<()> {
 }
 
 async fn landing_page(State(state): State<Arc<ServerState>>) -> Result<Html<String>, ApiError> {
-    let snapshot = load_dashboard_snapshot(state.db.as_ref()).await?;
+    let snapshot = load_dashboard_snapshot(&state.db).await?;
     Ok(Html(render_landing_page(&state.config, &snapshot)))
 }
 
 async fn public_issues_page(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Html<String>, ApiError> {
-    let issues = load_public_issues(state.db.as_ref(), 100).await?;
+    let issues = load_public_issues(&state.db, 100).await?;
     Ok(Html(render_issues_page(&issues)))
 }
 
 async fn healthz(State(state): State<Arc<ServerState>>) -> Result<Json<Healthz>, ApiError> {
-    let _: i32 = state
-        .db
-        .query_one("SELECT 1", &[])
-        .await
-        .map_err(ApiError::internal)?
-        .get(0);
+    db_ping(&state.db).await.map_err(ApiError::internal)?;
     Ok(Json(Healthz {
         status: "ok",
         database: "ok",
@@ -452,13 +503,12 @@ async fn install_hello(
     let remote_ip = remote_addr.ip().to_string();
     let install_id = request.install_id.clone();
     let config = state.config.clone();
-    ensure_install(state.db.as_ref(), &request, remote_ip, &config)
+    ensure_install(&state.db, &request, remote_ip, &config)
         .await
         .map_err(ApiError::internal)?;
-    let (submission_trust, worker_trust, banned_until) =
-        install_trust(state.db.as_ref(), &install_id)
-            .await
-            .map_err(ApiError::internal)?;
+    let (submission_trust, worker_trust, banned_until) = install_trust(&state.db, &install_id)
+        .await
+        .map_err(ApiError::internal)?;
     if banned_until.map(|ts| ts > Utc::now()).unwrap_or(false) {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -519,31 +569,21 @@ async fn submit_bundle(
         state.config.server.submission_pow_difficulty,
         30,
     ) {
-        record_abuse(
-            state.db.as_ref(),
-            &install_id,
-            "invalid-submission-pow",
-            &config,
-        )
-        .await
-        .map_err(ApiError::internal)?;
+        record_abuse(&state.db, &install_id, "invalid-submission-pow", &config)
+            .await
+            .map_err(ApiError::internal)?;
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "invalid or stale proof-of-work",
         ));
     }
 
-    ensure_install(
-        state.db.as_ref(),
-        &envelope.client,
-        remote_ip.clone(),
-        &config,
-    )
-    .await
-    .map_err(ApiError::internal)?;
+    ensure_install(&state.db, &envelope.client, remote_ip.clone(), &config)
+        .await
+        .map_err(ApiError::internal)?;
 
     let rate_limited_submission = rate_limited(
-        state.db.as_ref(),
+        &state.db,
         "submission",
         &install_id,
         &remote_ip,
@@ -552,14 +592,9 @@ async fn submit_bundle(
     .await
     .map_err(ApiError::internal)?;
     if rate_limited_submission {
-        record_abuse(
-            state.db.as_ref(),
-            &install_id,
-            "submission-rate-limit",
-            &config,
-        )
-        .await
-        .map_err(ApiError::internal)?;
+        record_abuse(&state.db, &install_id, "submission-rate-limit", &config)
+            .await
+            .map_err(ApiError::internal)?;
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "submission rate limit exceeded",
@@ -569,15 +604,9 @@ async fn submit_bundle(
     let bundle_json = serde_json::to_value(&envelope.bundle).map_err(ApiError::internal)?;
     let payload_hash = envelope.proof_of_work.payload_hash.clone();
     let content_hash = envelope.content_hash.clone();
-    if let Some(existing_id) = state
-        .db
-        .query_opt(
-            "SELECT id FROM submissions WHERE content_hash = $1",
-            &[&content_hash],
-        )
+    if let Some(existing_id) = find_submission_by_content_hash(&state.db, &content_hash)
         .await
         .map_err(ApiError::internal)?
-        .map(|row| row.get::<_, i64>(0))
     {
         return Ok(Json(SubmissionReceipt {
             submission_id: existing_id,
@@ -591,45 +620,25 @@ async fn submit_bundle(
     }
 
     let received_at = Utc::now();
-    let submission_id: i64 = state
-        .db
-        .query_one(
-            "
-            INSERT INTO submissions (install_id, content_hash, payload_hash, received_at, remote_addr, quarantined, bundle_json)
-            VALUES ($1, $2, $3, $4, $5, TRUE, $6)
-            RETURNING id
-            ",
-            &[
-                &install_id,
-                &content_hash,
-                &payload_hash,
-                &received_at,
-                &remote_ip,
-                &bundle_json,
-            ],
-        )
-        .await
-        .map_err(ApiError::internal)?
-        .get(0);
-
-    state
-        .db
-        .execute(
-            "
-            UPDATE installs
-            SET submission_count = submission_count + 1,
-                last_seen = $2
-            WHERE install_id = $1
-            ",
-            &[&install_id, &received_at],
-        )
+    let submission_id = insert_submission(
+        &state.db,
+        &install_id,
+        &content_hash,
+        &payload_hash,
+        received_at,
+        &remote_ip,
+        &bundle_json,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    mark_submission_received(&state.db, &install_id, received_at)
         .await
         .map_err(ApiError::internal)?;
-    note_rate_event(state.db.as_ref(), "submission", &install_id, &remote_ip)
+    note_rate_event(&state.db, "submission", &install_id, &remote_ip)
         .await
         .map_err(ApiError::internal)?;
 
-    let submission_trust = install_trust(state.db.as_ref(), &install_id)
+    let submission_trust = install_trust(&state.db, &install_id)
         .await
         .map_err(ApiError::internal)?
         .0;
@@ -638,7 +647,7 @@ async fn submit_bundle(
     for item in &envelope.bundle.items {
         let cluster_key = cluster_key_for(item);
         let issue_id = upsert_issue_cluster(
-            state.db.as_ref(),
+            &state.db,
             item,
             &cluster_key,
             submission_id,
@@ -648,31 +657,16 @@ async fn submit_bundle(
         )
         .await
         .map_err(ApiError::internal)?;
-        let promoted: bool = state
-            .db
-            .query_one(
-                "SELECT promoted FROM issue_clusters WHERE id = $1",
-                &[&issue_id],
-            )
+        let promoted = is_issue_promoted(&state.db, issue_id)
             .await
-            .map_err(ApiError::internal)?
-            .get(0);
+            .map_err(ApiError::internal)?;
         if promoted {
             promoted_clusters += 1;
         }
         issue_ids.push(issue_id);
     }
     if promoted_clusters > 0 {
-        state
-            .db
-            .execute(
-                "
-                UPDATE installs
-                SET submission_trust_score = submission_trust_score + 1
-                WHERE install_id = $1
-                ",
-                &[&install_id],
-            )
+        bump_submission_trust(&state.db, &install_id)
             .await
             .map_err(ApiError::internal)?;
     }
@@ -714,31 +708,21 @@ async fn pull_work(
         &request,
         state.config.server.worker_pow_difficulty,
     ) {
-        record_abuse(
-            state.db.as_ref(),
-            &install_id,
-            "invalid-worker-pow",
-            &config,
-        )
-        .await
-        .map_err(ApiError::internal)?;
+        record_abuse(&state.db, &install_id, "invalid-worker-pow", &config)
+            .await
+            .map_err(ApiError::internal)?;
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "invalid or stale worker proof-of-work",
         ));
     }
 
-    ensure_install(
-        state.db.as_ref(),
-        &request.client,
-        remote_ip.clone(),
-        &config,
-    )
-    .await
-    .map_err(ApiError::internal)?;
+    ensure_install(&state.db, &request.client, remote_ip.clone(), &config)
+        .await
+        .map_err(ApiError::internal)?;
 
     let rate_limited_pull = rate_limited(
-        state.db.as_ref(),
+        &state.db,
         "work-pull",
         &install_id,
         &remote_ip,
@@ -747,7 +731,7 @@ async fn pull_work(
     .await
     .map_err(ApiError::internal)?;
     if rate_limited_pull {
-        record_abuse(state.db.as_ref(), &install_id, "worker-rate-limit", &config)
+        record_abuse(&state.db, &install_id, "worker-rate-limit", &config)
             .await
             .map_err(ApiError::internal)?;
         return Err(ApiError::new(
@@ -756,13 +740,12 @@ async fn pull_work(
         ));
     }
 
-    note_rate_event(state.db.as_ref(), "work-pull", &install_id, &remote_ip)
+    note_rate_event(&state.db, "work-pull", &install_id, &remote_ip)
         .await
         .map_err(ApiError::internal)?;
-    let (submission_trust, worker_trust, banned_until) =
-        install_trust(state.db.as_ref(), &install_id)
-            .await
-            .map_err(ApiError::internal)?;
+    let (submission_trust, worker_trust, banned_until) = install_trust(&state.db, &install_id)
+        .await
+        .map_err(ApiError::internal)?;
     if banned_until
         .map(|value| value > Utc::now())
         .unwrap_or(false)
@@ -783,7 +766,7 @@ async fn pull_work(
         }));
     }
 
-    let Some(issue) = next_issue_for_worker(state.db.as_ref())
+    let Some(issue) = next_issue_for_worker(&state.db)
         .await
         .map_err(ApiError::internal)?
     else {
@@ -801,24 +784,16 @@ async fn pull_work(
         expires_at: expires_at.to_rfc3339(),
         issue: issue.clone(),
     };
-    state
-        .db
-        .execute(
-            "
-            INSERT INTO worker_leases (id, cluster_id, install_id, state, leased_at, expires_at, work_json)
-            VALUES ($1, $2, $3, 'leased', $4, $5, $6)
-            ",
-            &[
-                &lease_id,
-                &issue.id,
-                &install_id,
-                &leased_at,
-                &expires_at,
-                &serde_json::to_value(&lease).map_err(ApiError::internal)?,
-            ],
-        )
-        .await
-        .map_err(ApiError::internal)?;
+    insert_worker_lease(
+        &state.db,
+        &lease,
+        &install_id,
+        issue.id,
+        leased_at,
+        expires_at,
+    )
+    .await
+    .map_err(ApiError::internal)?;
 
     let result = WorkOffer {
         message: "lease granted".to_string(),
@@ -840,16 +815,7 @@ async fn submit_work_result(
         ));
     }
     let result_clone = result.clone();
-    let lease_row = state
-        .db
-        .query_opt(
-            "
-            SELECT cluster_id, install_id, expires_at
-            FROM worker_leases
-            WHERE id = $1 AND state = 'leased'
-            ",
-            &[&lease_id],
-        )
+    let lease_row = active_worker_lease(&state.db, &lease_id)
         .await
         .map_err(ApiError::internal)?;
     let Some(lease_row) = lease_row else {
@@ -858,9 +824,7 @@ async fn submit_work_result(
             "lease was not found or is no longer active",
         ));
     };
-    let cluster_id: i64 = lease_row.get(0);
-    let install_id: String = lease_row.get(1);
-    let expires_at: DateTime<Utc> = lease_row.get(2);
+    let (cluster_id, install_id, expires_at) = lease_row;
     if install_id != result.attempt.install_id {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -874,84 +838,11 @@ async fn submit_work_result(
         ));
     }
 
-    state
-        .db
-        .execute(
-            "
-            INSERT INTO patch_attempts (cluster_id, lease_id, install_id, outcome, state, summary, bundle_json, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            ",
-            &[
-                &cluster_id,
-                &lease_id,
-                &result.attempt.install_id,
-                &result.attempt.outcome,
-                &result.attempt.state,
-                &result.attempt.summary,
-                &serde_json::to_value(&result).map_err(ApiError::internal)?,
-                &Utc::now(),
-            ],
-        )
+    store_worker_result(&state.db, cluster_id, &result)
         .await
         .map_err(ApiError::internal)?;
-    state
-        .db
-        .execute(
-            "
-            UPDATE worker_leases
-            SET state = 'completed'
-            WHERE id = $1
-            ",
-            &[&lease_id],
-        )
-        .await
-        .map_err(ApiError::internal)?;
-    if result.attempt.outcome == "patch" && result.attempt.state == "ready" {
-        state
-            .db
-            .execute(
-                "
-                UPDATE issue_clusters
-                SET best_patch_json = $2
-                WHERE id = $1
-                ",
-                &[
-                    &cluster_id,
-                    &serde_json::to_value(&result.attempt).map_err(ApiError::internal)?,
-                ],
-            )
-            .await
-            .map_err(ApiError::internal)?;
-        state
-            .db
-            .execute(
-                "
-                UPDATE installs
-                SET worker_trust_score = worker_trust_score + 1,
-                    worker_result_count = worker_result_count + 1
-                WHERE install_id = $1
-                ",
-                &[&result.attempt.install_id],
-            )
-            .await
-            .map_err(ApiError::internal)?;
-    }
     if let Some(request) = &result.evidence_request {
-        state
-            .db
-            .execute(
-                "
-                INSERT INTO evidence_requests (issue_id, requested_by_install_id, reason, requested_fields_json, requested_at)
-                VALUES ($1, $2, $3, $4, $5)
-                ",
-                &[
-                    &request.issue_id,
-                    &request.requested_by_install_id,
-                    &request.reason,
-                    &serde_json::to_value(&request.requested_fields).map_err(ApiError::internal)?,
-                    &parse_timestamp(&request.requested_at).unwrap_or_else(Utc::now),
-                ],
-            )
+        store_evidence_request(&state.db, request)
             .await
             .map_err(ApiError::internal)?;
     }
@@ -961,7 +852,7 @@ async fn submit_work_result(
 async fn list_issues(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<Vec<PublicIssue>>, ApiError> {
-    let issues = load_public_issues(state.db.as_ref(), 100).await?;
+    let issues = load_public_issues(&state.db, 100).await?;
     Ok(Json(issues))
 }
 
@@ -969,7 +860,7 @@ async fn get_issue(
     State(state): State<Arc<ServerState>>,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Json<PublicIssue>, ApiError> {
-    let issue = load_public_issue(state.db.as_ref(), id).await?;
+    let issue = load_public_issue(&state.db, id).await?;
     Ok(Json(issue))
 }
 
@@ -978,19 +869,10 @@ async fn respond_evidence_request(
     AxumPath(id): AxumPath<i64>,
     Json(response): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let updated = state
-        .db
-        .execute(
-            "
-            UPDATE evidence_requests
-            SET response_json = $2
-            WHERE id = $1
-            ",
-            &[&id, &response],
-        )
+    let updated = respond_evidence_request_storage(&state.db, id, &response)
         .await
         .map_err(ApiError::internal)?;
-    if updated == 0 {
+    if !updated {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "evidence request not found",
@@ -999,10 +881,12 @@ async fn respond_evidence_request(
     Ok(Json(json!({"id": id, "stored": true})))
 }
 
-async fn init_db(client: &Client) -> Result<()> {
-    client
-        .batch_execute(
-            "
+async fn init_db(db: &ServerDb) -> Result<()> {
+    match db {
+        ServerDb::Postgres(client) => {
+            client
+                .batch_execute(
+                    "
         CREATE TABLE IF NOT EXISTS installs (
             install_id TEXT PRIMARY KEY,
             first_seen TIMESTAMPTZ NOT NULL,
@@ -1099,20 +983,126 @@ async fn init_db(client: &Client) -> Result<()> {
             created_at TIMESTAMPTZ NOT NULL
         );
         ",
-        )
-        .await?;
+                )
+                .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            connection.execute_batch(
+                "
+        CREATE TABLE IF NOT EXISTS installs (
+            install_id TEXT PRIMARY KEY,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            hostname TEXT,
+            version TEXT NOT NULL,
+            has_codex INTEGER NOT NULL DEFAULT 0,
+            capabilities_json TEXT NOT NULL DEFAULT '[]',
+            last_ip TEXT,
+            submission_trust_score INTEGER NOT NULL DEFAULT 0,
+            worker_trust_score INTEGER NOT NULL DEFAULT 0,
+            submission_count INTEGER NOT NULL DEFAULT 0,
+            worker_result_count INTEGER NOT NULL DEFAULT 0,
+            abuse_events INTEGER NOT NULL DEFAULT 0,
+            banned_until TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            install_id TEXT NOT NULL REFERENCES installs(install_id),
+            content_hash TEXT NOT NULL UNIQUE,
+            payload_hash TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            remote_addr TEXT,
+            quarantined INTEGER NOT NULL DEFAULT 1,
+            bundle_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS issue_clusters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cluster_key TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            package_name TEXT,
+            source_package TEXT,
+            ecosystem TEXT,
+            severity TEXT,
+            score INTEGER NOT NULL DEFAULT 0,
+            corroboration_count INTEGER NOT NULL DEFAULT 0,
+            quarantined INTEGER NOT NULL DEFAULT 1,
+            promoted INTEGER NOT NULL DEFAULT 0,
+            representative_json TEXT NOT NULL,
+            best_patch_json TEXT,
+            last_seen TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS cluster_reports (
+            cluster_id INTEGER NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
+            install_id TEXT NOT NULL REFERENCES installs(install_id),
+            submission_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (cluster_id, install_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS worker_leases (
+            id TEXT PRIMARY KEY,
+            cluster_id INTEGER NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
+            install_id TEXT NOT NULL REFERENCES installs(install_id),
+            state TEXT NOT NULL,
+            leased_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            work_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS patch_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cluster_id INTEGER NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
+            lease_id TEXT REFERENCES worker_leases(id),
+            install_id TEXT NOT NULL REFERENCES installs(install_id),
+            outcome TEXT NOT NULL,
+            state TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            bundle_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS evidence_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_id INTEGER NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
+            requested_by_install_id TEXT,
+            reason TEXT NOT NULL,
+            requested_fields_json TEXT NOT NULL,
+            requested_at TEXT NOT NULL,
+            response_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS rate_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope_kind TEXT NOT NULL,
+            scope_value TEXT NOT NULL,
+            event_kind TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        ",
+            )?;
+        }
+    }
     Ok(())
 }
 
 async fn ensure_install(
-    db: &Client,
+    db: &ServerDb,
     request: &ClientHello,
     remote_addr: String,
     _config: &FixerConfig,
 ) -> Result<()> {
     let now = Utc::now();
-    db.execute(
-        "
+    match db {
+        ServerDb::Postgres(db) => {
+            db.execute(
+                "
         INSERT INTO installs (install_id, first_seen, last_seen, mode, hostname, version, has_codex, capabilities_json, last_ip)
         VALUES ($1, $2, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (install_id) DO UPDATE SET
@@ -1124,107 +1114,209 @@ async fn ensure_install(
             capabilities_json = EXCLUDED.capabilities_json,
             last_ip = EXCLUDED.last_ip
         ",
-        &[
-            &request.install_id,
-            &now,
-            &request.mode.as_str(),
-            &request.hostname,
-            &request.version,
-            &request.has_codex,
-            &serde_json::to_value(&request.capabilities)?,
-            &remote_addr,
-        ],
-    )
-    .await?;
+                &[
+                    &request.install_id,
+                    &now,
+                    &request.mode.as_str(),
+                    &request.hostname,
+                    &request.version,
+                    &request.has_codex,
+                    &serde_json::to_value(&request.capabilities)?,
+                    &remote_addr,
+                ],
+            )
+            .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            connection.execute(
+                "
+        INSERT INTO installs (install_id, first_seen, last_seen, mode, hostname, version, has_codex, capabilities_json, last_ip)
+        VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(install_id) DO UPDATE SET
+            last_seen = excluded.last_seen,
+            mode = excluded.mode,
+            hostname = excluded.hostname,
+            version = excluded.version,
+            has_codex = excluded.has_codex,
+            capabilities_json = excluded.capabilities_json,
+            last_ip = excluded.last_ip
+        ",
+                params![
+                    request.install_id,
+                    now.to_rfc3339(),
+                    request.mode.as_str(),
+                    request.hostname,
+                    request.version,
+                    request.has_codex,
+                    serde_json::to_string(&request.capabilities)?,
+                    remote_addr,
+                ],
+            )?;
+        }
+    }
     Ok(())
 }
 
-async fn install_trust(db: &Client, install_id: &str) -> Result<(i64, i64, Option<DateTime<Utc>>)> {
-    let row = db
-        .query_one(
-            "
+async fn install_trust(
+    db: &ServerDb,
+    install_id: &str,
+) -> Result<(i64, i64, Option<DateTime<Utc>>)> {
+    match db {
+        ServerDb::Postgres(db) => {
+            let row = db
+                .query_one(
+                    "
         SELECT submission_trust_score, worker_trust_score, banned_until
         FROM installs
         WHERE install_id = $1
         ",
-            &[&install_id],
-        )
-        .await?;
-    Ok((row.get(0), row.get(1), row.get(2)))
+                    &[&install_id],
+                )
+                .await?;
+            Ok((row.get(0), row.get(1), row.get(2)))
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let row = connection.query_row(
+                "
+        SELECT submission_trust_score, worker_trust_score, banned_until
+        FROM installs
+        WHERE install_id = ?1
+        ",
+                [install_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )?;
+            Ok((row.0, row.1, row.2.as_deref().and_then(parse_timestamp)))
+        }
+    }
 }
 
 async fn rate_limited(
-    db: &Client,
+    db: &ServerDb,
     event_kind: &str,
     install_id: &str,
     remote_addr: &str,
     limit: i64,
 ) -> Result<bool> {
     let window_start = Utc::now() - Duration::hours(1);
-    let install_count: i64 = db
-        .query_one(
-            "
+    match db {
+        ServerDb::Postgres(db) => {
+            let install_count: i64 = db
+                .query_one(
+                    "
         SELECT COUNT(*) FROM rate_events
         WHERE event_kind = $1 AND scope_kind = 'install' AND scope_value = $2 AND created_at >= $3
         ",
-            &[&event_kind, &install_id, &window_start],
-        )
-        .await?
-        .get(0);
-    if install_count >= limit {
-        return Ok(true);
-    }
-    let ip_count: i64 = db
-        .query_one(
-            "
+                    &[&event_kind, &install_id, &window_start],
+                )
+                .await?
+                .get(0);
+            if install_count >= limit {
+                return Ok(true);
+            }
+            let ip_count: i64 = db
+                .query_one(
+                    "
         SELECT COUNT(*) FROM rate_events
         WHERE event_kind = $1 AND scope_kind = 'ip' AND scope_value = $2 AND created_at >= $3
         ",
-            &[&event_kind, &remote_addr, &window_start],
-        )
-        .await?
-        .get(0);
-    Ok(ip_count >= limit)
+                    &[&event_kind, &remote_addr, &window_start],
+                )
+                .await?
+                .get(0);
+            Ok(ip_count >= limit)
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let window_start = window_start.to_rfc3339();
+            let install_count: i64 = connection.query_row(
+                "
+        SELECT COUNT(*) FROM rate_events
+        WHERE event_kind = ?1 AND scope_kind = 'install' AND scope_value = ?2 AND created_at >= ?3
+        ",
+                params![event_kind, install_id, window_start],
+                |row| row.get(0),
+            )?;
+            if install_count >= limit {
+                return Ok(true);
+            }
+            let ip_count: i64 = connection.query_row(
+                "
+        SELECT COUNT(*) FROM rate_events
+        WHERE event_kind = ?1 AND scope_kind = 'ip' AND scope_value = ?2 AND created_at >= ?3
+        ",
+                params![event_kind, remote_addr, window_start],
+                |row| row.get(0),
+            )?;
+            Ok(ip_count >= limit)
+        }
+    }
 }
 
 async fn note_rate_event(
-    db: &Client,
+    db: &ServerDb,
     event_kind: &str,
     install_id: &str,
     remote_addr: &str,
 ) -> Result<()> {
     let now = Utc::now();
-    for (scope_kind, scope_value) in [("install", install_id), ("ip", remote_addr)] {
-        db.execute(
-            "
+    match db {
+        ServerDb::Postgres(db) => {
+            for (scope_kind, scope_value) in [("install", install_id), ("ip", remote_addr)] {
+                db.execute(
+                    "
             INSERT INTO rate_events (scope_kind, scope_value, event_kind, created_at)
             VALUES ($1, $2, $3, $4)
             ",
-            &[&scope_kind, &scope_value, &event_kind, &now],
-        )
-        .await?;
+                    &[&scope_kind, &scope_value, &event_kind, &now],
+                )
+                .await?;
+            }
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let now = now.to_rfc3339();
+            for (scope_kind, scope_value) in [("install", install_id), ("ip", remote_addr)] {
+                connection.execute(
+                    "
+            INSERT INTO rate_events (scope_kind, scope_value, event_kind, created_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ",
+                    params![scope_kind, scope_value, event_kind, now],
+                )?;
+            }
+        }
     }
     Ok(())
 }
 
 async fn record_abuse(
-    db: &Client,
+    db: &ServerDb,
     install_id: &str,
     reason: &str,
     config: &FixerConfig,
 ) -> Result<()> {
     let now = Utc::now();
-    db.execute(
-        "
+    match db {
+        ServerDb::Postgres(db) => {
+            db.execute(
+                "
         INSERT INTO installs (install_id, first_seen, last_seen, mode, hostname, version, has_codex, capabilities_json, last_ip)
         VALUES ($1, $2, $2, 'local-only', NULL, 'unknown', FALSE, '[]'::jsonb, NULL)
         ON CONFLICT (install_id) DO NOTHING
         ",
-        &[&install_id, &now],
-    )
-    .await?;
-    db.execute(
-        "
+                &[&install_id, &now],
+            )
+            .await?;
+            db.execute(
+                "
         UPDATE installs
         SET abuse_events = abuse_events + 1,
             banned_until = CASE
@@ -1233,19 +1325,477 @@ async fn record_abuse(
             END
         WHERE install_id = $1
         ",
-        &[
-            &install_id,
-            &config.server.max_abuse_events_before_ban,
-            &(now + Duration::hours(1)),
-        ],
-    )
-    .await?;
+                &[
+                    &install_id,
+                    &config.server.max_abuse_events_before_ban,
+                    &(now + Duration::hours(1)),
+                ],
+            )
+            .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let mut connection = sqlite_connection(path)?;
+            let tx = connection.transaction()?;
+            tx.execute(
+                "
+        INSERT INTO installs (install_id, first_seen, last_seen, mode, hostname, version, has_codex, capabilities_json, last_ip)
+        VALUES (?1, ?2, ?2, 'local-only', NULL, 'unknown', 0, '[]', NULL)
+        ON CONFLICT(install_id) DO NOTHING
+        ",
+                params![install_id, now.to_rfc3339()],
+            )?;
+            let existing_abuse: i64 = tx.query_row(
+                "SELECT abuse_events FROM installs WHERE install_id = ?1",
+                [install_id],
+                |row| row.get(0),
+            )?;
+            let updated_abuse = existing_abuse + 1;
+            let banned_until = if updated_abuse >= config.server.max_abuse_events_before_ban {
+                Some((now + Duration::hours(1)).to_rfc3339())
+            } else {
+                None
+            };
+            tx.execute(
+                "
+        UPDATE installs
+        SET abuse_events = ?2,
+            banned_until = COALESCE(?3, banned_until)
+        WHERE install_id = ?1
+        ",
+                params![install_id, updated_abuse, banned_until],
+            )?;
+            tx.commit()?;
+        }
+    }
     tracing::warn!(install_id, reason, "recorded abusive request");
     Ok(())
 }
 
+async fn find_submission_by_content_hash(db: &ServerDb, content_hash: &str) -> Result<Option<i64>> {
+    match db {
+        ServerDb::Postgres(db) => Ok(db
+            .query_opt(
+                "SELECT id FROM submissions WHERE content_hash = $1",
+                &[&content_hash],
+            )
+            .await?
+            .map(|row| row.get::<_, i64>(0))),
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            connection
+                .query_row(
+                    "SELECT id FROM submissions WHERE content_hash = ?1",
+                    [content_hash],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(Into::into)
+        }
+    }
+}
+
+async fn insert_submission(
+    db: &ServerDb,
+    install_id: &str,
+    content_hash: &str,
+    payload_hash: &str,
+    received_at: DateTime<Utc>,
+    remote_ip: &str,
+    bundle_json: &Value,
+) -> Result<i64> {
+    match db {
+        ServerDb::Postgres(db) => Ok(db
+            .query_one(
+                "
+            INSERT INTO submissions (install_id, content_hash, payload_hash, received_at, remote_addr, quarantined, bundle_json)
+            VALUES ($1, $2, $3, $4, $5, TRUE, $6)
+            RETURNING id
+            ",
+                &[
+                    &install_id,
+                    &content_hash,
+                    &payload_hash,
+                    &received_at,
+                    &remote_ip,
+                    bundle_json,
+                ],
+            )
+            .await?
+            .get(0)),
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            connection.execute(
+                "
+            INSERT INTO submissions (install_id, content_hash, payload_hash, received_at, remote_addr, quarantined, bundle_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)
+            ",
+                params![
+                    install_id,
+                    content_hash,
+                    payload_hash,
+                    received_at.to_rfc3339(),
+                    remote_ip,
+                    serde_json::to_string(bundle_json)?,
+                ],
+            )?;
+            Ok(connection.last_insert_rowid())
+        }
+    }
+}
+
+async fn mark_submission_received(
+    db: &ServerDb,
+    install_id: &str,
+    received_at: DateTime<Utc>,
+) -> Result<()> {
+    match db {
+        ServerDb::Postgres(db) => {
+            db.execute(
+                "
+            UPDATE installs
+            SET submission_count = submission_count + 1,
+                last_seen = $2
+            WHERE install_id = $1
+            ",
+                &[&install_id, &received_at],
+            )
+            .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            connection.execute(
+                "
+            UPDATE installs
+            SET submission_count = submission_count + 1,
+                last_seen = ?2
+            WHERE install_id = ?1
+            ",
+                params![install_id, received_at.to_rfc3339()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+async fn is_issue_promoted(db: &ServerDb, issue_id: i64) -> Result<bool> {
+    match db {
+        ServerDb::Postgres(db) => Ok(db
+            .query_one(
+                "SELECT promoted FROM issue_clusters WHERE id = $1",
+                &[&issue_id],
+            )
+            .await?
+            .get(0)),
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let promoted: i64 = connection.query_row(
+                "SELECT promoted FROM issue_clusters WHERE id = ?1",
+                [issue_id],
+                |row| row.get(0),
+            )?;
+            Ok(promoted != 0)
+        }
+    }
+}
+
+async fn bump_submission_trust(db: &ServerDb, install_id: &str) -> Result<()> {
+    match db {
+        ServerDb::Postgres(db) => {
+            db.execute(
+                "
+                UPDATE installs
+                SET submission_trust_score = submission_trust_score + 1
+                WHERE install_id = $1
+                ",
+                &[&install_id],
+            )
+            .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            connection.execute(
+                "
+                UPDATE installs
+                SET submission_trust_score = submission_trust_score + 1
+                WHERE install_id = ?1
+                ",
+                [install_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+async fn insert_worker_lease(
+    db: &ServerDb,
+    lease: &WorkLease,
+    install_id: &str,
+    cluster_id: i64,
+    leased_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> Result<()> {
+    match db {
+        ServerDb::Postgres(db) => {
+            db.execute(
+                "
+            INSERT INTO worker_leases (id, cluster_id, install_id, state, leased_at, expires_at, work_json)
+            VALUES ($1, $2, $3, 'leased', $4, $5, $6)
+            ",
+                &[
+                    &lease.lease_id,
+                    &cluster_id,
+                    &install_id,
+                    &leased_at,
+                    &expires_at,
+                    &serde_json::to_value(lease)?,
+                ],
+            )
+            .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            connection.execute(
+                "
+            INSERT INTO worker_leases (id, cluster_id, install_id, state, leased_at, expires_at, work_json)
+            VALUES (?1, ?2, ?3, 'leased', ?4, ?5, ?6)
+            ",
+                params![
+                    lease.lease_id,
+                    cluster_id,
+                    install_id,
+                    leased_at.to_rfc3339(),
+                    expires_at.to_rfc3339(),
+                    serde_json::to_string(lease)?,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+async fn active_worker_lease(
+    db: &ServerDb,
+    lease_id: &str,
+) -> Result<Option<(i64, String, DateTime<Utc>)>> {
+    match db {
+        ServerDb::Postgres(db) => Ok(db
+            .query_opt(
+                "
+            SELECT cluster_id, install_id, expires_at
+            FROM worker_leases
+            WHERE id = $1 AND state = 'leased'
+            ",
+                &[&lease_id],
+            )
+            .await?
+            .map(|row| (row.get(0), row.get(1), row.get(2)))),
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let row = connection
+                .query_row(
+                    "
+            SELECT cluster_id, install_id, expires_at
+            FROM worker_leases
+            WHERE id = ?1 AND state = 'leased'
+            ",
+                    [lease_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            Ok(row.and_then(|(cluster_id, install_id, expires_at)| {
+                parse_timestamp(&expires_at).map(|ts| (cluster_id, install_id, ts))
+            }))
+        }
+    }
+}
+
+async fn store_worker_result(
+    db: &ServerDb,
+    cluster_id: i64,
+    result: &WorkerResultEnvelope,
+) -> Result<()> {
+    match db {
+        ServerDb::Postgres(db) => {
+            db.execute(
+                "
+            INSERT INTO patch_attempts (cluster_id, lease_id, install_id, outcome, state, summary, bundle_json, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ",
+                &[
+                    &cluster_id,
+                    &result.lease_id,
+                    &result.attempt.install_id,
+                    &result.attempt.outcome,
+                    &result.attempt.state,
+                    &result.attempt.summary,
+                    &serde_json::to_value(result)?,
+                    &Utc::now(),
+                ],
+            )
+            .await?;
+            db.execute(
+                "
+            UPDATE worker_leases
+            SET state = 'completed'
+            WHERE id = $1
+            ",
+                &[&result.lease_id],
+            )
+            .await?;
+            if result.attempt.outcome == "patch" && result.attempt.state == "ready" {
+                db.execute(
+                    "
+                UPDATE issue_clusters
+                SET best_patch_json = $2
+                WHERE id = $1
+                ",
+                    &[&cluster_id, &serde_json::to_value(&result.attempt)?],
+                )
+                .await?;
+                db.execute(
+                    "
+                UPDATE installs
+                SET worker_trust_score = worker_trust_score + 1,
+                    worker_result_count = worker_result_count + 1
+                WHERE install_id = $1
+                ",
+                    &[&result.attempt.install_id],
+                )
+                .await?;
+            }
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            connection.execute(
+                "
+            INSERT INTO patch_attempts (cluster_id, lease_id, install_id, outcome, state, summary, bundle_json, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ",
+                params![
+                    cluster_id,
+                    result.lease_id,
+                    result.attempt.install_id,
+                    result.attempt.outcome,
+                    result.attempt.state,
+                    result.attempt.summary,
+                    serde_json::to_string(result)?,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            connection.execute(
+                "
+            UPDATE worker_leases
+            SET state = 'completed'
+            WHERE id = ?1
+            ",
+                [result.lease_id.as_str()],
+            )?;
+            if result.attempt.outcome == "patch" && result.attempt.state == "ready" {
+                connection.execute(
+                    "
+                UPDATE issue_clusters
+                SET best_patch_json = ?2
+                WHERE id = ?1
+                ",
+                    params![cluster_id, serde_json::to_string(&result.attempt)?],
+                )?;
+                connection.execute(
+                    "
+                UPDATE installs
+                SET worker_trust_score = worker_trust_score + 1,
+                    worker_result_count = worker_result_count + 1
+                WHERE install_id = ?1
+                ",
+                    [result.attempt.install_id.as_str()],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn store_evidence_request(
+    db: &ServerDb,
+    request: &crate::models::EvidenceUpgradeRequest,
+) -> Result<()> {
+    match db {
+        ServerDb::Postgres(db) => {
+            db.execute(
+                "
+                INSERT INTO evidence_requests (issue_id, requested_by_install_id, reason, requested_fields_json, requested_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ",
+                &[
+                    &request.issue_id,
+                    &request.requested_by_install_id,
+                    &request.reason,
+                    &serde_json::to_value(&request.requested_fields)?,
+                    &parse_timestamp(&request.requested_at).unwrap_or_else(Utc::now),
+                ],
+            )
+            .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            connection.execute(
+                "
+                INSERT INTO evidence_requests (issue_id, requested_by_install_id, reason, requested_fields_json, requested_at)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+                params![
+                    request.issue_id,
+                    request.requested_by_install_id,
+                    request.reason,
+                    serde_json::to_string(&request.requested_fields)?,
+                    parse_timestamp(&request.requested_at)
+                        .unwrap_or_else(Utc::now)
+                        .to_rfc3339(),
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+async fn respond_evidence_request_storage(
+    db: &ServerDb,
+    id: i64,
+    response: &Value,
+) -> Result<bool> {
+    match db {
+        ServerDb::Postgres(db) => Ok(db
+            .execute(
+                "
+            UPDATE evidence_requests
+            SET response_json = $2
+            WHERE id = $1
+            ",
+                &[&id, response],
+            )
+            .await?
+            > 0),
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            Ok(connection.execute(
+                "
+            UPDATE evidence_requests
+            SET response_json = ?2
+            WHERE id = ?1
+            ",
+                params![id, serde_json::to_string(response)?],
+            )? > 0)
+        }
+    }
+}
+
 async fn upsert_issue_cluster(
-    db: &Client,
+    db: &ServerDb,
     item: &SharedOpportunity,
     cluster_key: &str,
     submission_id: i64,
@@ -1262,16 +1812,18 @@ async fn upsert_issue_cluster(
         .get("source_package")
         .and_then(Value::as_str)
         .map(ToString::to_string);
-    let existing_id = db
-        .query_opt(
-            "SELECT id FROM issue_clusters WHERE cluster_key = $1",
-            &[&cluster_key],
-        )
-        .await?
-        .map(|row| row.get::<_, i64>(0));
-    let issue_id = if let Some(existing_id) = existing_id {
-        db.execute(
-            "
+    match db {
+        ServerDb::Postgres(db) => {
+            let existing_id = db
+                .query_opt(
+                    "SELECT id FROM issue_clusters WHERE cluster_key = $1",
+                    &[&cluster_key],
+                )
+                .await?
+                .map(|row| row.get::<_, i64>(0));
+            let issue_id = if let Some(existing_id) = existing_id {
+                db.execute(
+                    "
             UPDATE issue_clusters
             SET title = $2,
                 summary = $3,
@@ -1287,24 +1839,24 @@ async fn upsert_issue_cluster(
                 last_seen = $10
             WHERE id = $1
             ",
-            &[
-                &existing_id,
-                &item.opportunity.title,
-                &item.opportunity.summary,
-                &package_name,
-                &source_package,
-                &item.opportunity.ecosystem,
-                &Some(item.finding.severity.clone()),
-                &item.opportunity.score,
-                &representative_json,
-                &now,
-            ],
-        )
-        .await?;
-        existing_id
-    } else {
-        db.query_one(
-            "
+                    &[
+                        &existing_id,
+                        &item.opportunity.title,
+                        &item.opportunity.summary,
+                        &package_name,
+                        &source_package,
+                        &item.opportunity.ecosystem,
+                        &Some(item.finding.severity.clone()),
+                        &item.opportunity.score,
+                        &representative_json,
+                        &now,
+                    ],
+                )
+                .await?;
+                existing_id
+            } else {
+                db.query_one(
+                    "
             INSERT INTO issue_clusters
                 (cluster_key, kind, title, summary, package_name, source_package, ecosystem, severity,
                  score, corroboration_count, quarantined, promoted, representative_json, last_seen)
@@ -1324,48 +1876,146 @@ async fn upsert_issue_cluster(
                 &representative_json,
                 &now,
             ],
-        )
-        .await?
-        .get(0)
-    };
-    db.execute(
-        "
+                )
+                .await?
+                .get(0)
+            };
+            db.execute(
+                "
         INSERT INTO cluster_reports (cluster_id, install_id, submission_id, created_at)
         VALUES ($1, $2, $3, $4)
         ON CONFLICT (cluster_id, install_id) DO NOTHING
         ",
-        &[&issue_id, &install_id, &submission_id, &now],
-    )
-    .await?;
-    let corroboration_count: i64 = db
-        .query_one(
-            "
+                &[&issue_id, &install_id, &submission_id, &now],
+            )
+            .await?;
+            let corroboration_count: i64 = db
+                .query_one(
+                    "
             SELECT COUNT(*) FROM cluster_reports WHERE cluster_id = $1
             ",
-            &[&issue_id],
-        )
-        .await?
-        .get(0);
-    let promoted = corroboration_count >= config.server.quarantine_corroboration_threshold
-        || submission_trust >= config.server.quarantine_corroboration_threshold;
-    db.execute(
-        "
+                    &[&issue_id],
+                )
+                .await?
+                .get(0);
+            let promoted = corroboration_count >= config.server.quarantine_corroboration_threshold
+                || submission_trust >= config.server.quarantine_corroboration_threshold;
+            db.execute(
+                "
         UPDATE issue_clusters
         SET corroboration_count = $2,
             promoted = $3,
             quarantined = NOT $3
         WHERE id = $1
         ",
-        &[&issue_id, &corroboration_count, &promoted],
-    )
-    .await?;
-    Ok(issue_id)
+                &[&issue_id, &corroboration_count, &promoted],
+            )
+            .await?;
+            Ok(issue_id)
+        }
+        ServerDb::Sqlite(path) => {
+            let mut connection = sqlite_connection(path)?;
+            let tx = connection.transaction()?;
+            let existing_id = tx
+                .query_row(
+                    "SELECT id FROM issue_clusters WHERE cluster_key = ?1",
+                    [cluster_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            let issue_id = if let Some(existing_id) = existing_id {
+                tx.execute(
+                    "
+            UPDATE issue_clusters
+            SET title = ?2,
+                summary = ?3,
+                package_name = COALESCE(?4, package_name),
+                source_package = COALESCE(?5, source_package),
+                ecosystem = COALESCE(?6, ecosystem),
+                severity = COALESCE(?7, severity),
+                score = MAX(score, ?8),
+                representative_json = CASE
+                    WHEN ?8 >= score THEN ?9
+                    ELSE representative_json
+                END,
+                last_seen = ?10
+            WHERE id = ?1
+            ",
+                    params![
+                        existing_id,
+                        item.opportunity.title,
+                        item.opportunity.summary,
+                        package_name,
+                        source_package,
+                        item.opportunity.ecosystem,
+                        item.finding.severity,
+                        item.opportunity.score,
+                        serde_json::to_string(&representative_json)?,
+                        now.to_rfc3339(),
+                    ],
+                )?;
+                existing_id
+            } else {
+                tx.execute(
+                    "
+            INSERT INTO issue_clusters
+                (cluster_key, kind, title, summary, package_name, source_package, ecosystem, severity,
+                 score, corroboration_count, quarantined, promoted, representative_json, last_seen)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 1, 0, ?10, ?11)
+            ",
+                    params![
+                        cluster_key,
+                        item.opportunity.kind,
+                        item.opportunity.title,
+                        item.opportunity.summary,
+                        package_name,
+                        source_package,
+                        item.opportunity.ecosystem,
+                        item.finding.severity,
+                        item.opportunity.score,
+                        serde_json::to_string(&representative_json)?,
+                        now.to_rfc3339(),
+                    ],
+                )?;
+                tx.last_insert_rowid()
+            };
+            tx.execute(
+                "
+        INSERT INTO cluster_reports (cluster_id, install_id, submission_id, created_at)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(cluster_id, install_id) DO NOTHING
+        ",
+                params![issue_id, install_id, submission_id, now.to_rfc3339()],
+            )?;
+            let corroboration_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM cluster_reports WHERE cluster_id = ?1",
+                [issue_id],
+                |row| row.get(0),
+            )?;
+            let promoted = corroboration_count >= config.server.quarantine_corroboration_threshold
+                || submission_trust >= config.server.quarantine_corroboration_threshold;
+            tx.execute(
+                "
+        UPDATE issue_clusters
+        SET corroboration_count = ?2,
+            promoted = ?3,
+            quarantined = CASE WHEN ?3 THEN 0 ELSE 1 END
+        WHERE id = ?1
+        ",
+                params![issue_id, corroboration_count, promoted],
+            )?;
+            tx.commit()?;
+            Ok(issue_id)
+        }
+    }
 }
 
-async fn next_issue_for_worker(db: &Client) -> Result<Option<IssueCluster>> {
-    let row = db
-        .query_opt(
-            "
+async fn next_issue_for_worker(db: &ServerDb) -> Result<Option<IssueCluster>> {
+    match db {
+        ServerDb::Postgres(db) => {
+            let row = db
+                .query_opt(
+                    "
         SELECT id, cluster_key, kind, title, summary, package_name, source_package, ecosystem,
                severity, score, corroboration_count, quarantined, promoted, representative_json,
                best_patch_json, last_seen
@@ -1381,10 +2031,39 @@ async fn next_issue_for_worker(db: &Client) -> Result<Option<IssueCluster>> {
         ORDER BY (best_patch_json IS NOT NULL) ASC, score DESC, last_seen DESC
         LIMIT 1
         ",
-            &[],
-        )
-        .await?;
-    row.map(issue_from_row).transpose()
+                    &[],
+                )
+                .await?;
+            row.map(issue_from_row).transpose()
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let now = Utc::now().to_rfc3339();
+            let row = connection
+                .query_row(
+                    "
+        SELECT id, cluster_key, kind, title, summary, package_name, source_package, ecosystem,
+               severity, score, corroboration_count, quarantined, promoted, representative_json,
+               best_patch_json, last_seen
+        FROM issue_clusters issue
+        WHERE promoted = 1
+          AND NOT EXISTS (
+                SELECT 1
+                FROM worker_leases lease
+                WHERE lease.cluster_id = issue.id
+                  AND lease.state = 'leased'
+                  AND lease.expires_at > ?1
+          )
+        ORDER BY CASE WHEN best_patch_json IS NOT NULL THEN 1 ELSE 0 END ASC, score DESC, last_seen DESC
+        LIMIT 1
+        ",
+                    [now],
+                    issue_from_sqlite_row,
+                )
+                .optional()?;
+            Ok(row)
+        }
+    }
 }
 
 fn issue_from_row(row: Row) -> Result<IssueCluster> {
@@ -1414,10 +2093,52 @@ fn issue_from_row(row: Row) -> Result<IssueCluster> {
     })
 }
 
-async fn load_dashboard_snapshot(db: &Client) -> Result<DashboardSnapshot, ApiError> {
-    let row = db
-        .query_one(
-            "
+fn issue_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IssueCluster> {
+    let representative: SharedOpportunity =
+        serde_json::from_str::<SharedOpportunity>(&row.get::<_, String>(13)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let best_patch = row
+        .get::<_, Option<String>>(14)?
+        .map(|value| serde_json::from_str::<PatchAttempt>(&value))
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                14,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    Ok(IssueCluster {
+        id: row.get(0)?,
+        cluster_key: row.get(1)?,
+        kind: row.get(2)?,
+        title: row.get(3)?,
+        summary: row.get(4)?,
+        package_name: row.get(5)?,
+        source_package: row.get(6)?,
+        ecosystem: row.get(7)?,
+        severity: row.get(8)?,
+        score: row.get(9)?,
+        corroboration_count: row.get(10)?,
+        quarantined: row.get::<_, i64>(11)? != 0,
+        promoted: row.get::<_, i64>(12)? != 0,
+        representative,
+        best_patch,
+        last_seen: row.get(15)?,
+    })
+}
+
+async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, ApiError> {
+    match db {
+        ServerDb::Postgres(client) => {
+            let row = client
+                .query_one(
+                    "
             SELECT
                 (SELECT COUNT(*) FROM installs),
                 (SELECT COUNT(*) FROM submissions),
@@ -1426,28 +2147,78 @@ async fn load_dashboard_snapshot(db: &Client) -> Result<DashboardSnapshot, ApiEr
                 (SELECT COUNT(*) FROM issue_clusters WHERE best_patch_json IS NOT NULL),
                 (SELECT MAX(received_at) FROM submissions)
             ",
-            &[],
-        )
-        .await
-        .map_err(ApiError::internal)?;
-    let last_submission_at = row
-        .get::<_, Option<DateTime<Utc>>>(5)
-        .map(|value| value.to_rfc3339());
-    Ok(DashboardSnapshot {
-        install_count: row.get(0),
-        submission_count: row.get(1),
-        promoted_issue_count: row.get(2),
-        quarantined_issue_count: row.get(3),
-        ready_patch_count: row.get(4),
-        last_submission_at,
-        top_issues: load_public_issues(db, 8).await?,
-    })
+                    &[],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            let last_submission_at = row
+                .get::<_, Option<DateTime<Utc>>>(5)
+                .map(|value| value.to_rfc3339());
+            Ok(DashboardSnapshot {
+                install_count: row.get(0),
+                submission_count: row.get(1),
+                promoted_issue_count: row.get(2),
+                quarantined_issue_count: row.get(3),
+                ready_patch_count: row.get(4),
+                last_submission_at,
+                top_issues: load_public_issues(db, 8).await?,
+            })
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            let install_count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM installs", [], |row| row.get(0))
+                .map_err(ApiError::internal)?;
+            let submission_count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM submissions", [], |row| row.get(0))
+                .map_err(ApiError::internal)?;
+            let promoted_issue_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM issue_clusters WHERE promoted = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
+            let quarantined_issue_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM issue_clusters WHERE promoted = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
+            let ready_patch_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM issue_clusters WHERE best_patch_json IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
+            let last_submission_at = connection
+                .query_row("SELECT MAX(received_at) FROM submissions", [], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .optional()
+                .map_err(ApiError::internal)?
+                .flatten();
+            Ok(DashboardSnapshot {
+                install_count,
+                submission_count,
+                promoted_issue_count,
+                quarantined_issue_count,
+                ready_patch_count,
+                last_submission_at,
+                top_issues: load_public_issues(db, 8).await?,
+            })
+        }
+    }
 }
 
-async fn load_public_issues(db: &Client, limit: i64) -> Result<Vec<PublicIssue>, ApiError> {
-    let rows = db
-        .query(
-            "
+async fn load_public_issues(db: &ServerDb, limit: i64) -> Result<Vec<PublicIssue>, ApiError> {
+    match db {
+        ServerDb::Postgres(db) => {
+            let rows = db
+                .query(
+                    "
             SELECT id, kind, title, summary, package_name, source_package, ecosystem,
                    severity, score, corroboration_count, (best_patch_json IS NOT NULL) AS best_patch_available,
                    last_seen
@@ -1456,31 +2227,76 @@ async fn load_public_issues(db: &Client, limit: i64) -> Result<Vec<PublicIssue>,
             ORDER BY score DESC, last_seen DESC
             LIMIT $1
             ",
-            &[&limit],
-        )
-        .await
-        .map_err(ApiError::internal)?;
-    rows.into_iter().map(public_issue_from_row).collect()
+                    &[&limit],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            rows.into_iter().map(public_issue_from_row).collect()
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            let mut stmt = connection
+                .prepare(
+                    "
+            SELECT id, kind, title, summary, package_name, source_package, ecosystem,
+                   severity, score, corroboration_count, (best_patch_json IS NOT NULL) AS best_patch_available,
+                   last_seen
+            FROM issue_clusters
+            WHERE promoted = 1
+            ORDER BY score DESC, last_seen DESC
+            LIMIT ?1
+            ",
+                )
+                .map_err(ApiError::internal)?;
+            let rows = stmt
+                .query_map([limit], public_issue_from_sqlite_row)
+                .map_err(ApiError::internal)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(ApiError::internal)
+        }
+    }
 }
 
-async fn load_public_issue(db: &Client, id: i64) -> Result<PublicIssue, ApiError> {
-    let row = db
-        .query_opt(
-            "
+async fn load_public_issue(db: &ServerDb, id: i64) -> Result<PublicIssue, ApiError> {
+    match db {
+        ServerDb::Postgres(db) => {
+            let row = db
+                .query_opt(
+                    "
             SELECT id, kind, title, summary, package_name, source_package, ecosystem,
                    severity, score, corroboration_count, (best_patch_json IS NOT NULL) AS best_patch_available,
                    last_seen
             FROM issue_clusters
             WHERE id = $1 AND promoted = TRUE
             ",
-            &[&id],
-        )
-        .await
-        .map_err(ApiError::internal)?;
-    let Some(row) = row else {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "issue not found"));
-    };
-    public_issue_from_row(row)
+                    &[&id],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            let Some(row) = row else {
+                return Err(ApiError::new(StatusCode::NOT_FOUND, "issue not found"));
+            };
+            public_issue_from_row(row)
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            let row = connection
+                .query_row(
+                    "
+            SELECT id, kind, title, summary, package_name, source_package, ecosystem,
+                   severity, score, corroboration_count, (best_patch_json IS NOT NULL) AS best_patch_available,
+                   last_seen
+            FROM issue_clusters
+            WHERE id = ?1 AND promoted = 1
+            ",
+                    [id],
+                    public_issue_from_sqlite_row,
+                )
+                .optional()
+                .map_err(ApiError::internal)?;
+            row.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "issue not found"))
+        }
+    }
 }
 
 fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
@@ -1498,6 +2314,23 @@ fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
         corroboration_count: row.get(9),
         best_patch_available: row.get(10),
         last_seen: last_seen.to_rfc3339(),
+    })
+}
+
+fn public_issue_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicIssue> {
+    Ok(PublicIssue {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        title: row.get(2)?,
+        summary: row.get(3)?,
+        package_name: row.get(4)?,
+        source_package: row.get(5)?,
+        ecosystem: row.get(6)?,
+        severity: row.get(7)?,
+        score: row.get(8)?,
+        corroboration_count: row.get(9)?,
+        best_patch_available: row.get::<_, i64>(10)? != 0,
+        last_seen: row.get(11)?,
     })
 }
 

@@ -1,15 +1,19 @@
 [Unit]
 Description=Fixer aggregation server
 Documentation=https://github.com/maumaps/fixer
-After=network-online.target postgresql.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 DynamicUser=yes
-ExecStart=/usr/bin/fixer-server --config /etc/fixer/fixer.toml serve
+EnvironmentFile=-/etc/fixer/fixer-server.env
+ExecStart=/usr/bin/fixer-server --config /etc/fixer/fixer-server.toml serve
 Restart=on-failure
 RestartSec=5
+WorkingDirectory=/var/lib/fixer-server
+StateDirectory=fixer-server
+StateDirectoryMode=0750
 AmbientCapabilities=
 CapabilityBoundingSet=
 LockPersonality=yes
@@ -26,7 +30,6 @@ ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectProc=invisible
 ProtectSystem=strict
-ReadOnlyPaths=/etc/fixer
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes

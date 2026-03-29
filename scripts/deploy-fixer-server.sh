@@ -7,32 +7,38 @@ HOST=${FIXER_DEPLOY_HOST:-root@fixer.maumap.com}
 SITE=${FIXER_SITE_NAME:-fixer.maumap.com}
 VERSION=$(dpkg-parsechangelog -SVersion)
 ARCH=$(dpkg --print-architecture)
-PACKAGE=${FIXER_PACKAGE_PATH:-"$REPO_ROOT/dist/packages/$VERSION/$ARCH/fixer_${VERSION}_${ARCH}.deb"}
+FIXER_PACKAGE=${FIXER_PACKAGE_PATH:-"$REPO_ROOT/dist/packages/$VERSION/$ARCH/fixer_${VERSION}_${ARCH}.deb"}
+FIXER_SERVER_PACKAGE=${FIXER_SERVER_PACKAGE_PATH:-"$REPO_ROOT/dist/packages/$VERSION/$ARCH/fixer-server_${VERSION}_${ARCH}.deb"}
 REMOTE_STAGE=/root/fixer-deploy
 
-if [ ! -f "$PACKAGE" ]; then
+if [ ! -f "$FIXER_PACKAGE" ] || [ ! -f "$FIXER_SERVER_PACKAGE" ]; then
     "$SCRIPT_DIR/build-release-debs.sh" >/dev/null
 fi
 
-if [ ! -f "$PACKAGE" ]; then
-    echo "package not found: $PACKAGE" >&2
+if [ ! -f "$FIXER_PACKAGE" ]; then
+    echo "package not found: $FIXER_PACKAGE" >&2
+    exit 1
+fi
+
+if [ ! -f "$FIXER_SERVER_PACKAGE" ]; then
+    echo "package not found: $FIXER_SERVER_PACKAGE" >&2
     exit 1
 fi
 
 STAGE_DIR=$(mktemp -d)
 trap 'rm -rf "$STAGE_DIR"' EXIT
 
-cp "$PACKAGE" "$STAGE_DIR/"
+cp "$FIXER_PACKAGE" "$STAGE_DIR/"
+cp "$FIXER_SERVER_PACKAGE" "$STAGE_DIR/"
 cp "$REPO_ROOT/deploy/Caddyfile" "$STAGE_DIR/Caddyfile"
 cp "$REPO_ROOT/deploy/fixer-server.toml" "$STAGE_DIR/fixer-server.toml"
 cp "$REPO_ROOT/deploy/apt/repo.env" "$STAGE_DIR/repo.env"
 cp "$REPO_ROOT/scripts/publish-apt-repo.sh" "$STAGE_DIR/publish-apt-repo.sh"
-cp "$REPO_ROOT/debian/fixer-server.service" "$STAGE_DIR/fixer-server.service"
 
 ssh "$HOST" "mkdir -p '$REMOTE_STAGE'"
 scp "$STAGE_DIR/"* "$HOST:$REMOTE_STAGE/"
 
-ssh "$HOST" "SITE='$SITE' REMOTE_STAGE='$REMOTE_STAGE' VERSION='$VERSION' PACKAGE_NAME='$(basename "$PACKAGE")' sh -s" <<'EOF'
+ssh "$HOST" "SITE='$SITE' REMOTE_STAGE='$REMOTE_STAGE' VERSION='$VERSION' FIXER_PACKAGE_NAME='$(basename "$FIXER_PACKAGE")' FIXER_SERVER_PACKAGE_NAME='$(basename "$FIXER_SERVER_PACKAGE")' sh -s" <<'EOF'
 set -eu
 
 apt-get update
@@ -47,7 +53,9 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     distro-info
 
 mkdir -p "$REMOTE_STAGE"
-DEBIAN_FRONTEND=noninteractive apt-get install -y "$REMOTE_STAGE/$PACKAGE_NAME"
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    "$REMOTE_STAGE/$FIXER_PACKAGE_NAME" \
+    "$REMOTE_STAGE/$FIXER_SERVER_PACKAGE_NAME"
 
 DB_PASSWORD_FILE=/etc/fixer/fixer-server-db-password
 if [ ! -f "$DB_PASSWORD_FILE" ]; then
@@ -71,16 +79,23 @@ runuser -u postgres -- psql -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_database W
     runuser -u postgres -- createdb -O fixer_server fixer
 
 POSTGRES_URL="postgres://fixer_server:$DB_PASSWORD@127.0.0.1/fixer"
-sed "s|__POSTGRES_URL__|$POSTGRES_URL|g" "$REMOTE_STAGE/fixer-server.toml" >/etc/fixer/fixer.toml
+install -D -m 0644 "$REMOTE_STAGE/fixer-server.toml" /etc/fixer/fixer-server.toml
+umask 027
+cat >/etc/fixer/fixer-server.env <<ENV
+FIXER_SERVER_POSTGRES_URL=$POSTGRES_URL
+FIXER_NETWORK_SERVER_URL=https://$SITE
+ENV
+chmod 0640 /etc/fixer/fixer-server.env
 
 install -D -m 0644 "$REMOTE_STAGE/Caddyfile" /etc/caddy/Caddyfile
 install -D -m 0644 "$REMOTE_STAGE/repo.env" /etc/fixer/apt-repo.env
 install -D -m 0755 "$REMOTE_STAGE/publish-apt-repo.sh" /usr/local/bin/publish-fixer-apt-repo
-install -D -m 0644 "$REMOTE_STAGE/fixer-server.service" /usr/lib/systemd/system/fixer-server.service
 
 install -d -m 0755 /srv/fixer /srv/fixer/public /srv/fixer/public/apt /srv/fixer/reprepro
 install -d -m 0700 /srv/fixer/gnupg
-FIXER_APT_CONFIG=/etc/fixer/apt-repo.env /usr/local/bin/publish-fixer-apt-repo "$REMOTE_STAGE/$PACKAGE_NAME"
+FIXER_APT_CONFIG=/etc/fixer/apt-repo.env /usr/local/bin/publish-fixer-apt-repo \
+    "$REMOTE_STAGE/$FIXER_PACKAGE_NAME" \
+    "$REMOTE_STAGE/$FIXER_SERVER_PACKAGE_NAME"
 
 /usr/bin/fixer --config /etc/fixer/fixer.toml opt-in --mode submitter >/dev/null
 systemctl daemon-reload

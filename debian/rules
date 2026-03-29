@@ -17,10 +17,10 @@ override_dh_auto_test:
 override_dh_auto_install:
 	install -D -m 0755 target/release/fixer $(CURDIR)/debian/fixer/usr/bin/fixer
 	install -D -m 0755 target/release/fixerd $(CURDIR)/debian/fixer/usr/bin/fixerd
-	install -D -m 0755 target/release/fixer-server $(CURDIR)/debian/fixer/usr/bin/fixer-server
 	install -D -m 0644 debian/fixer.toml $(CURDIR)/debian/fixer/etc/fixer/fixer.toml
-	install -D -m 0644 debian/fixer-server.service $(CURDIR)/debian/fixer/usr/lib/systemd/system/fixer-server.service
+	install -D -m 0755 target/release/fixer-server $(CURDIR)/debian/fixer-server/usr/bin/fixer-server
+	install -D -m 0644 debian/fixer-server.toml $(CURDIR)/debian/fixer-server/etc/fixer/fixer-server.toml
 
 override_dh_installsystemd:
-	dh_installsystemd --no-enable --no-start fixer-server.service
-	dh_installsystemd fixer.service
+	dh_installsystemd -pfixer fixer.service
+	dh_installsystemd -pfixer-server fixer-server.service

@@ -16,7 +16,7 @@ fi
 ARCHIVE_DIR=${APT_REPO_ARCHIVE_DIR:-/srv/fixer/reprepro}
 PUBLIC_DIR=${APT_REPO_PUBLIC_DIR:-/srv/fixer/public/apt}
 GNUPG_HOME=${APT_REPO_GNUPG_HOME:-/srv/fixer/gnupg}
-SIGNING_NAME=${APT_REPO_SIGNING_NAME:-"Fixer Archive Signing Key <packages@maumap.com>"}
+SIGNING_NAME=${APT_REPO_SIGNING_NAME:-"Fixer Archive Signing Key <hello@maumap.com>"}
 ORIGIN=${APT_REPO_ORIGIN:-Fixer}
 LABEL=${APT_REPO_LABEL:-Fixer}
 DESCRIPTION=${APT_REPO_DESCRIPTION:-Fixer package repository}

@@ -34,3 +34,27 @@ Description: local evidence engine for Linux maintenance opportunities
  .
  The package installs both the command-line client and the systemd
  service, along with a default configuration file under /etc/fixer.
+
+Package: fixer-server
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ systemd
+Recommends:
+ postgresql,
+ caddy
+Breaks:
+ fixer (<< 0.9.0-1)
+Replaces:
+ fixer (<< 0.9.0-1)
+Description: standalone Fixer aggregation server
+ fixer-server accepts opted-in Fixer submissions, clusters repeated
+ findings, manages quarantine and worker leases, and serves a small
+ landing page plus JSON API.
+ .
+ The package is configured to work immediately on a local Debian host:
+ it binds to 127.0.0.1:8080 and stores server state in a local SQLite
+ database under /var/lib/fixer-server. Public deployments can switch to
+ PostgreSQL by setting FIXER_SERVER_POSTGRES_URL in
+ /etc/fixer/fixer-server.env.

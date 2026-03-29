@@ -14,7 +14,9 @@ cd "$REPO_ROOT"
 dpkg-buildpackage -us -uc -b
 
 find "$PARENT_DIR" -maxdepth 1 -type f \
-    \( -name "fixer_${VERSION}_${ARCH}.deb" -o -name "fixer-dbgsym_${VERSION}_${ARCH}.deb" \) \
+    \( -name "fixer_${VERSION}_${ARCH}.deb" -o -name "fixer-dbgsym_${VERSION}_${ARCH}.deb" -o -name "fixer-server_${VERSION}_${ARCH}.deb" -o -name "fixer-server-dbgsym_${VERSION}_${ARCH}.deb" \) \
     -exec cp -f {} "$OUTPUT_DIR/$VERSION/$ARCH/" \;
 
-printf '%s\n' "$OUTPUT_DIR/$VERSION/$ARCH/fixer_${VERSION}_${ARCH}.deb"
+printf '%s\n' \
+    "$OUTPUT_DIR/$VERSION/$ARCH/fixer_${VERSION}_${ARCH}.deb" \
+    "$OUTPUT_DIR/$VERSION/$ARCH/fixer-server_${VERSION}_${ARCH}.deb"

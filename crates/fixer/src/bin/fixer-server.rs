@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use fixer::config::FixerConfig;
 use fixer::server;
+use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -28,7 +29,11 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = FixerConfig::load(cli.config.as_deref())?;
+    let config_path = cli
+        .config
+        .as_deref()
+        .or(Some(Path::new("/etc/fixer/fixer-server.toml")));
+    let config = FixerConfig::load(config_path)?;
     match cli.command {
         Command::Serve => server::serve(config).await,
     }

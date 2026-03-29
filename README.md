@@ -5,7 +5,7 @@
 The current tree also includes a client/server federation model:
 
 - `fixerd` stays the local collector and SQLite store
-- `fixer-server` aggregates opted-in findings in Postgres
+- `fixer-server` runs out of the box with local SQLite, and can switch to Postgres for shared/public deployments
 - hosts without Codex can submit findings
 - opted-in Codex-capable hosts can volunteer as workers, pull promoted issues, and either produce a patch proposal or explain why a patch is not currently possible
 
@@ -80,7 +80,7 @@ cargo run -p fixer -- --config ./fixer.toml worker run
 9. Run the server:
 
 ```bash
-cargo run -p fixer --bin fixer-server -- --config ./fixer.toml serve
+cargo run -p fixer --bin fixer-server -- --config ./fixer-server.toml serve
 ```
 
 10. Build and publish release packages into a signed APT repo:
@@ -92,27 +92,50 @@ scripts/publish-apt-repo.sh dist/packages/*/*/fixer_*_*.deb
 
 ## Packaging
 
-Build an installable Debian package from the repo root:
+Build installable Debian packages from the repo root:
 
 ```bash
 dpkg-buildpackage -us -uc -b
 ```
 
-For the simplest user install, prefer APT over `dpkg -i` so recommended
+That produces two main packages:
+
+- `fixer`: the CLI plus local collector daemon
+- `fixer-server`: the standalone aggregation server
+
+For the collector/client package, prefer APT over `dpkg -i` so recommended
 helper tools are pulled in automatically:
 
 ```bash
 sudo apt install ../fixer_*.deb
 ```
 
-The resulting package installs:
+For a standalone local server, plain `dpkg -i` is enough on a normal Debian
+system because the package defaults to loopback plus local SQLite:
+
+```bash
+sudo dpkg -i ../fixer-server_*.deb
+systemctl status fixer-server.service
+curl http://127.0.0.1:8080/healthz
+```
+
+The collector package installs:
 
 - `/usr/bin/fixer`
 - `/usr/bin/fixerd`
-- `/usr/bin/fixer-server`
 - `/etc/fixer/fixer.toml`
 - `/usr/lib/systemd/system/fixer.service`
+
+The server package installs:
+
+- `/usr/bin/fixer-server`
+- `/etc/fixer/fixer-server.toml`
 - `/usr/lib/systemd/system/fixer-server.service`
+
+The packaged standalone server binds to `127.0.0.1:8080` and stores its local
+state in `/var/lib/fixer-server/fixer-server.sqlite3`. Public deployments can
+override the database DSN through `/etc/fixer/fixer-server.env` with
+`FIXER_SERVER_POSTGRES_URL=...`.
 
 The canonical public endpoint is `https://fixer.maumap.com`, and the public APT repository is expected at `https://fixer.maumap.com/apt/`.
 
@@ -150,4 +173,4 @@ The public/no-config path is:
 - Optional tools are detected at runtime. Missing `npm`, `pip-audit`, `perf`, or `bpftrace` reduce features but do not block startup.
 - Automated Debian source retrieval prefers `apt-get source`, but if the machine has no `deb-src` entries configured, Fixer now falls back to cloning a package homepage when it points at a real upstream repository.
 - The packaged service currently runs as root so it can access system-wide telemetry. Hardening and privilege separation are the next major step.
-- The new federation mode uses SQLite on clients and Postgres on the server. The same server binary is meant to work both for a public central deployment and for a siloed corporate/local deployment with a config override for `network.server_url`.
+- The new federation mode uses SQLite on clients and also defaults the server to SQLite for local installs. Public and larger shared deployments can switch the same server binary to Postgres through config or `FIXER_SERVER_POSTGRES_URL`.

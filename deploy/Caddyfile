@@ -3,7 +3,7 @@ http://fixer.maumap.com {
 }
 
 https://fixer.maumap.com {
-	tls packages@maumap.com
+	tls hello@maumap.com
 	encode zstd gzip
 
 	header {

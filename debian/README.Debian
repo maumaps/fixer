@@ -12,6 +12,22 @@ Optional integrations are still detected at runtime. Missing helper
 tools reduce capability surface but do not block startup or package
 installation.
 
+The aggregation server is split into its own package:
+
+  sudo dpkg -i ./fixer-server_<version>_<arch>.deb
+
+That package is meant to work immediately on a local Debian system. It
+starts `fixer-server.service`, listens on `127.0.0.1:8080`, and stores
+its state in `/var/lib/fixer-server/fixer-server.sqlite3`.
+
+To switch the packaged server to PostgreSQL, put a DSN in:
+
+  /etc/fixer/fixer-server.env
+
+using:
+
+  FIXER_SERVER_POSTGRES_URL=postgres://...
+
 For Debian-backed opportunities without an attached repo, Fixer now
 tries to hydrate a workspace automatically. It prefers `apt-get source`
 when `deb-src` is configured and otherwise falls back to cloning the

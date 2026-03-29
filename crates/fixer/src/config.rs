@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -237,11 +238,16 @@ impl FixerConfig {
     pub fn load(path: Option<&Path>) -> Result<Self> {
         let path = path.unwrap_or_else(|| Path::new("/etc/fixer/fixer.toml"));
         if !path.exists() {
-            return Ok(Self::default());
+            let mut config = Self::default();
+            config.apply_env_overrides();
+            return Ok(config);
         }
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read config at {}", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
+        let mut config: Self =
+            toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+        config.apply_env_overrides();
+        Ok(config)
     }
 
     pub fn ensure_parent_dirs(&self) -> Result<()> {
@@ -252,6 +258,24 @@ impl FixerConfig {
         fs::create_dir_all(&self.service.state_dir)
             .with_context(|| format!("failed to create {}", self.service.state_dir.display()))?;
         Ok(())
+    }
+
+    fn apply_env_overrides(&mut self) {
+        if let Ok(url) = env::var("FIXER_SERVER_POSTGRES_URL") {
+            if !url.trim().is_empty() {
+                self.server.postgres_url = url;
+            }
+        }
+        if let Ok(listen) = env::var("FIXER_SERVER_LISTEN") {
+            if !listen.trim().is_empty() {
+                self.server.listen = listen;
+            }
+        }
+        if let Ok(server_url) = env::var("FIXER_NETWORK_SERVER_URL") {
+            if !server_url.trim().is_empty() {
+                self.network.server_url = server_url;
+            }
+        }
     }
 }
 
@@ -312,7 +336,7 @@ fn default_max_submission_items() -> usize {
 }
 
 fn default_policy_version() -> String {
-    "2026-03-28".to_string()
+    "2026-03-29".to_string()
 }
 
 fn default_listen_addr() -> String {
@@ -320,7 +344,7 @@ fn default_listen_addr() -> String {
 }
 
 fn default_postgres_url() -> String {
-    "postgres://fixer@127.0.0.1/fixer".to_string()
+    "sqlite:///var/lib/fixer-server/fixer-server.sqlite3".to_string()
 }
 
 fn default_max_payload_bytes() -> usize {
