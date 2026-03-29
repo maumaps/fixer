@@ -791,6 +791,46 @@ impl Store {
         ).map_err(Into::into)
     }
 
+    pub fn get_opportunity_by_finding(&self, finding_id: i64) -> Result<OpportunityRecord> {
+        self.conn
+            .query_row(
+                "SELECT id, finding_id, kind, title, score, state, summary, evidence_json, repo_root, ecosystem, created_at, updated_at
+                 FROM opportunities WHERE finding_id = ?1",
+                [finding_id],
+                |row| {
+                    Ok(OpportunityRecord {
+                        id: row.get(0)?,
+                        finding_id: row.get(1)?,
+                        kind: row.get(2)?,
+                        title: row.get(3)?,
+                        score: row.get(4)?,
+                        state: row.get(5)?,
+                        summary: row.get(6)?,
+                        evidence: serde_json::from_str(&row.get::<_, String>(7)?)
+                            .unwrap_or_else(|_| json!({})),
+                        repo_root: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
+                        ecosystem: row.get(9)?,
+                        created_at: row.get(10)?,
+                        updated_at: row.get(11)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn set_opportunity_state(&self, id: i64, state: &str) -> Result<()> {
+        self.conn.execute(
+            "
+            UPDATE opportunities
+            SET state = ?2,
+                updated_at = ?3
+            WHERE id = ?1
+            ",
+            params![id, state, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     pub fn list_top(&self, kind: &str) -> Result<Vec<TopEntry>> {
         let sql = match kind {
             "package" => {
@@ -1147,6 +1187,7 @@ fn score_for(kind: &str, severity: &str, has_repo: bool, has_ecosystem: bool) ->
         "crash" => 90,
         "hotspot" => 75,
         "warning" => 60,
+        "complaint" => 50,
         "repo" => 35,
         _ => 25,
     };
@@ -1188,6 +1229,31 @@ mod tests {
         let status = store.status().unwrap();
         assert_eq!(status.findings, 1);
         assert_eq!(status.opportunities, 1);
+    }
+
+    #[test]
+    fn can_update_opportunity_state() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        let finding_id = store
+            .record_finding(&FindingInput {
+                kind: "complaint".to_string(),
+                title: "User complaint".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "complaint-1".to_string(),
+                summary: "App feels broken".to_string(),
+                details: json!({"subsystem": "user-complaint"}),
+                artifact: None,
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let opportunity = store.get_opportunity_by_finding(finding_id).unwrap();
+        store
+            .set_opportunity_state(opportunity.id, "local-only")
+            .unwrap();
+        let updated = store.get_opportunity(opportunity.id).unwrap();
+        assert_eq!(updated.state, "local-only");
     }
 
     #[test]

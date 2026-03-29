@@ -1,3 +1,11 @@
+fixer (0.10.0-1) unstable; urgency=medium
+
+  * Add `fixer complain` for freeform symptom intake and local triage plans.
+  * Fall back to a per-user complaint workspace when the system database is
+    read-only for the invoking user.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 15:20:00 +0400
+
 fixer (0.9.0-1) unstable; urgency=medium
 
   * Split out a standalone fixer-server package with local default config.

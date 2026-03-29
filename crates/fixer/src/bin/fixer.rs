@@ -24,6 +24,12 @@ enum Commands {
     Crashes,
     Warnings,
     Hotspots,
+    Complain {
+        #[arg(long)]
+        no_collect: bool,
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        description: Vec<String>,
+    },
     Owners,
     Opportunities {
         #[arg(long)]
@@ -135,6 +141,42 @@ fn main() -> Result<()> {
         Commands::Crashes => print_findings(app.store.list_findings("crash")?),
         Commands::Warnings => print_findings(app.store.list_findings("warning")?),
         Commands::Hotspots => print_findings(app.store.list_findings("hotspot")?),
+        Commands::Complain {
+            no_collect,
+            description,
+        } => {
+            let outcome = app.complain(&description.join(" "), !no_collect)?;
+            println!("complaint opportunity #{}", outcome.opportunity.id);
+            println!("state: {}", outcome.opportunity.state);
+            if let Some(report) = outcome.collection_report {
+                println!(
+                    "collected: {} capabilities, {} artifacts, {} findings",
+                    report.capabilities_seen, report.artifacts_seen, report.findings_seen
+                );
+            } else {
+                println!("collected: skipped");
+            }
+            println!("plan proposal #{}", outcome.proposal.id);
+            println!("plan: {}", outcome.proposal.bundle_path.display());
+            println!("workspace: {}", outcome.workspace_root.display());
+            if outcome.used_overlay {
+                println!("workspace mode: local overlay");
+            }
+            if let Some(path) = outcome.proposal.output_path {
+                println!("output: {}", path.display());
+            }
+            if !outcome.related_opportunity_ids.is_empty() {
+                println!(
+                    "related opportunities: {}",
+                    outcome
+                        .related_opportunity_ids
+                        .iter()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
         Commands::Owners => {
             for (name, repo_root, owners) in app.store.list_repo_owners()? {
                 println!("{name}");

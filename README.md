@@ -54,6 +54,12 @@ cargo run -p fixer -- --config ./fixer.toml status
 cargo run -p fixer -- --config ./fixer.toml opportunities
 ```
 
+If something feels wrong before Fixer has a crisp finding yet, describe it in plain language and let it build a local triage plan:
+
+```bash
+cargo run -p fixer -- --config ./fixer.toml complain "chrome is slow when opening tabs"
+```
+
 5. Run the daemon loop:
 
 ```bash
@@ -161,6 +167,8 @@ The public/no-config path is:
 - each install creates an anonymous install ID locally
 - submissions and worker pulls require proof-of-work
 - new installs and new issue clusters stay quarantined until corroborated or trusted
+
+`fixer complain` is intentionally local-only. When the main daemon database is owned by the system service, the CLI falls back to a per-user complaint workspace under `~/.local/state/fixer/complaints/` so a normal user can still describe a problem, correlate it with collected evidence, and get a plan without mutating the shared system database.
 
 ## Documentation
 

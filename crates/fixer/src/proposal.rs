@@ -1,6 +1,7 @@
 use crate::config::FixerConfig;
 use crate::models::{
-    InstalledPackageMetadata, OpportunityRecord, PreparedWorkspace, ProposalRecord,
+    ComplaintCollectionReport, InstalledPackageMetadata, OpportunityRecord, PreparedWorkspace,
+    ProposalRecord, SharedOpportunity,
 };
 use crate::storage::Store;
 use crate::util::{command_exists, command_output, now_rfc3339, read_text};
@@ -176,6 +177,50 @@ pub fn create_local_remediation_proposal(
     store.create_proposal(
         opportunity.id,
         "deterministic",
+        "ready",
+        &bundle_dir,
+        Some(&summary_path),
+    )
+}
+
+pub fn create_complaint_plan_proposal(
+    store: &Store,
+    config: &FixerConfig,
+    opportunity: &OpportunityRecord,
+    complaint_text: &str,
+    collection_report: Option<&ComplaintCollectionReport>,
+    related: &[SharedOpportunity],
+) -> Result<ProposalRecord> {
+    let bundle_dir = config.service.state_dir.join("proposals").join(format!(
+        "{}-{}",
+        opportunity.id,
+        now_rfc3339().replace(':', "-")
+    ));
+    fs::create_dir_all(&bundle_dir)?;
+
+    let evidence_path = bundle_dir.join("evidence.json");
+    let summary_path = bundle_dir.join("plan.md");
+    let evidence = json!({
+        "report_kind": "complaint-plan",
+        "opportunity": opportunity,
+        "complaint_text": complaint_text,
+        "collection_report": collection_report,
+        "related_opportunities": related,
+    });
+    fs::write(&evidence_path, serde_json::to_vec_pretty(&evidence)?)?;
+    fs::write(
+        &summary_path,
+        render_complaint_plan(
+            opportunity,
+            complaint_text,
+            collection_report,
+            related,
+            &evidence_path,
+        ),
+    )?;
+    store.create_proposal(
+        opportunity.id,
+        "planner",
         "ready",
         &bundle_dir,
         Some(&summary_path),
@@ -806,6 +851,105 @@ fn render_local_remediation_report(
         remediation_sql_path.display(),
     ));
     Ok(body)
+}
+
+fn render_complaint_plan(
+    opportunity: &OpportunityRecord,
+    complaint_text: &str,
+    collection_report: Option<&ComplaintCollectionReport>,
+    related: &[SharedOpportunity],
+    evidence_path: &std::path::Path,
+) -> String {
+    let mut body = String::new();
+    body.push_str("# Complaint Triage Plan\n\n");
+    body.push_str("## Complaint\n\n");
+    body.push_str(complaint_text.trim());
+    body.push_str("\n\n");
+
+    body.push_str("## Local Intake\n\n");
+    body.push_str(&format!(
+        "- Complaint opportunity: `#{}`\n- State: `{}`\n- Score: `{}`\n",
+        opportunity.id, opportunity.state, opportunity.score
+    ));
+    if let Some(report) = collection_report {
+        body.push_str(&format!(
+            "- Immediate collection: `{}` capabilities, `{}` artifacts, `{}` findings\n",
+            report.capabilities_seen, report.artifacts_seen, report.findings_seen
+        ));
+    } else {
+        body.push_str("- Immediate collection: skipped\n");
+    }
+
+    if related.is_empty() {
+        body.push_str("\n## Related Local Evidence\n\n");
+        body.push_str("Fixer did not find any strong local matches for this complaint yet.\n\n");
+        body.push_str("## Suggested Next Steps\n\n");
+        body.push_str("1. Reproduce the issue while `fixerd` is running.\n");
+        body.push_str("2. Run `fixer collect` again right after reproduction.\n");
+        body.push_str(
+            "3. Check `fixer crashes`, `fixer warnings`, and `fixer hotspots` for new evidence.\n",
+        );
+        body.push_str("4. Re-run `fixer complain ...` with more concrete wording such as package names, commands, or symptoms.\n");
+    } else {
+        body.push_str("\n## Related Local Evidence\n\n");
+        for item in related.iter().take(8) {
+            body.push_str(&format!(
+                "- Opportunity `#{}` [{}] score `{}`: {}",
+                item.opportunity.id,
+                item.opportunity.kind,
+                item.opportunity.score,
+                item.opportunity.title
+            ));
+            if let Some(package_name) = item.finding.package_name.as_deref() {
+                body.push_str(&format!(" (package `{package_name}`)"));
+            }
+            body.push_str(&format!("\n  Summary: {}\n", item.opportunity.summary));
+        }
+
+        let crash_count = related
+            .iter()
+            .filter(|item| item.opportunity.kind == "crash")
+            .count();
+        let warning_count = related
+            .iter()
+            .filter(|item| item.opportunity.kind == "warning")
+            .count();
+        let hotspot_count = related
+            .iter()
+            .filter(|item| item.opportunity.kind == "hotspot")
+            .count();
+
+        body.push_str("\n## Suggested Next Steps\n\n");
+        let mut step = 1;
+        if crash_count > 0 {
+            body.push_str(&format!(
+                "{step}. Inspect the matched crash opportunities first with `fixer inspect <id>` because they are the strongest evidence for this complaint.\n"
+            ));
+            step += 1;
+        }
+        if warning_count > 0 {
+            body.push_str(&format!(
+                "{step}. Review the matched warnings to see whether they explain the symptom or point at the owning package/service.\n"
+            ));
+            step += 1;
+        }
+        if hotspot_count > 0 {
+            body.push_str(&format!(
+                "{step}. Review the matched hotspots for hot functions and owning packages, then decide whether this is a performance regression or expected workload.\n"
+            ));
+            step += 1;
+        }
+        body.push_str(&format!(
+            "{step}. If one of the matched opportunities is the real issue, run `fixer propose-fix <id> --engine deterministic` first, then escalate to `--engine codex` only when there is a patchable repo.\n"
+        ));
+    }
+
+    body.push_str("\n## Evidence Bundle\n\n");
+    body.push_str(&format!(
+        "Full local evidence: `{}`\n",
+        evidence_path.display()
+    ));
+    body
 }
 
 fn collect_system_context() -> Value {

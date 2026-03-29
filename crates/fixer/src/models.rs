@@ -82,6 +82,23 @@ pub struct ProposalRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplaintCollectionReport {
+    pub capabilities_seen: usize,
+    pub artifacts_seen: usize,
+    pub findings_seen: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplaintOutcome {
+    pub opportunity: OpportunityRecord,
+    pub proposal: ProposalRecord,
+    pub collection_report: Option<ComplaintCollectionReport>,
+    pub related_opportunity_ids: Vec<i64>,
+    pub workspace_root: PathBuf,
+    pub used_overlay: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationRecord {
     pub id: i64,
     pub opportunity_id: i64,
