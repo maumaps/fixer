@@ -577,10 +577,18 @@ impl Store {
             ))
         })?;
 
-        let score = score_for(&kind, &severity, repo_root.is_some(), ecosystem.is_some());
+        let parsed_details =
+            serde_json::from_str::<Value>(&details_json).unwrap_or_else(|_| json!({}));
+        let score = score_for(
+            &kind,
+            &severity,
+            repo_root.is_some(),
+            ecosystem.is_some(),
+            &parsed_details,
+        );
         let now = now_rfc3339();
         let evidence = json!({
-            "details": serde_json::from_str::<Value>(&details_json).unwrap_or_else(|_| json!({})),
+            "details": parsed_details,
             "artifact_name": artifact_name,
             "artifact_path": artifact_path,
             "package_name": package_name,
@@ -861,11 +869,13 @@ impl Store {
                 name,
                 path,
                 package_name,
-                CAST(COALESCE(json_extract(metadata_json, '$.process_count'), 0) AS INTEGER) AS process_count
+                CAST(COALESCE(json_extract(metadata_json, '$.process_count'), 0) AS INTEGER) AS process_count,
+                CAST(COALESCE(json_extract(metadata_json, '$.total_cpu_percent'), 0) AS REAL) AS total_cpu_percent,
+                CAST(COALESCE(json_extract(metadata_json, '$.max_cpu_percent'), 0) AS REAL) AS max_cpu_percent
             FROM artifacts
             WHERE kind = 'binary'
               AND path IS NOT NULL
-            ORDER BY process_count DESC, updated_at DESC, name ASC
+            ORDER BY max_cpu_percent DESC, total_cpu_percent DESC, process_count DESC, updated_at DESC, name ASC
             LIMIT ?1
             ",
         )?;
@@ -875,6 +885,8 @@ impl Store {
                 path: PathBuf::from(row.get::<_, String>(1)?),
                 package_name: row.get(2)?,
                 process_count: row.get(3)?,
+                total_cpu_percent: row.get(4)?,
+                max_cpu_percent: row.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1192,7 +1204,11 @@ impl Store {
             FROM findings
             WHERE kind = 'investigation'
               AND json_extract(details_json, '$.subsystem') = 'runaway-process'
-              AND COALESCE(json_extract(details_json, '$.source_hotspot_fingerprint'), '') = ?1
+              AND COALESCE(
+                    json_extract(details_json, '$.source_profile_fingerprint'),
+                    json_extract(details_json, '$.source_hotspot_fingerprint'),
+                    ''
+                  ) = ?1
             ",
         )?;
 
@@ -1242,7 +1258,13 @@ impl Store {
     }
 }
 
-fn score_for(kind: &str, severity: &str, has_repo: bool, has_ecosystem: bool) -> i64 {
+fn score_for(
+    kind: &str,
+    severity: &str,
+    has_repo: bool,
+    has_ecosystem: bool,
+    details: &Value,
+) -> i64 {
     let base = match kind {
         "crash" => 90,
         "investigation" => 82,
@@ -1259,7 +1281,15 @@ fn score_for(kind: &str, severity: &str, has_repo: bool, has_ecosystem: bool) ->
         "low" => 1,
         _ => 0,
     };
-    base + severity_boost + i64::from(has_repo) * 5 + i64::from(has_ecosystem) * 3
+    let detail_boost = match kind {
+        "investigation" => match details.get("subsystem").and_then(Value::as_str) {
+            Some("stuck-process") => 20,
+            Some("runaway-process") => 16,
+            _ => 12,
+        },
+        _ => 0,
+    };
+    base + severity_boost + detail_boost + i64::from(has_repo) * 5 + i64::from(has_ecosystem) * 3
 }
 
 #[cfg(test)]
@@ -1332,6 +1362,8 @@ mod tests {
                 metadata: json!({
                     "source": "proc",
                     "process_count": 9,
+                    "total_cpu_percent": 4.0,
+                    "max_cpu_percent": 4.0,
                 }),
             })
             .unwrap();
@@ -1346,15 +1378,56 @@ mod tests {
                 metadata: json!({
                     "source": "proc",
                     "process_count": 2,
+                    "total_cpu_percent": 12.5,
+                    "max_cpu_percent": 11.0,
                 }),
             })
             .unwrap();
 
         let profiles = store.list_popular_binary_profiles(1).unwrap();
         assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].name, "firefox");
-        assert_eq!(profiles[0].package_name.as_deref(), Some("firefox"));
-        assert_eq!(profiles[0].process_count, 9);
+        assert_eq!(profiles[0].name, "bash");
+        assert_eq!(profiles[0].package_name.as_deref(), Some("bash"));
+        assert_eq!(profiles[0].process_count, 2);
+        assert_eq!(profiles[0].total_cpu_percent, 12.5);
+    }
+
+    #[test]
+    fn investigations_score_above_plain_crashes() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        let crash_finding = store
+            .record_finding(&FindingInput {
+                kind: "crash".to_string(),
+                title: "Crash".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "crash-score".to_string(),
+                summary: "crash summary".to_string(),
+                details: json!({"signal": "SEGV"}),
+                artifact: None,
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let investigation_finding = store
+            .record_finding(&FindingInput {
+                kind: "investigation".to_string(),
+                title: "Investigation".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "investigation-score".to_string(),
+                summary: "investigation summary".to_string(),
+                details: json!({"subsystem": "runaway-process"}),
+                artifact: None,
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+
+        let crash = store.get_opportunity_by_finding(crash_finding).unwrap();
+        let investigation = store
+            .get_opportunity_by_finding(investigation_finding)
+            .unwrap();
+        assert!(investigation.score > crash.score);
     }
 
     #[test]

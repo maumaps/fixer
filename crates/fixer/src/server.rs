@@ -3387,7 +3387,16 @@ async fn next_issue_for_worker(db: &ServerDb) -> Result<Option<IssueCluster>> {
                   AND lease.state = 'leased'
                   AND lease.expires_at > NOW()
           )
-        ORDER BY (best_patch_json IS NOT NULL) ASC, score DESC, last_seen DESC
+        ORDER BY
+            (best_patch_json IS NOT NULL) ASC,
+            CASE kind
+                WHEN 'investigation' THEN 0
+                WHEN 'crash' THEN 1
+                WHEN 'warning' THEN 2
+                ELSE 3
+            END ASC,
+            score DESC,
+            last_seen DESC
         LIMIT 1
         ",
                     &[],
@@ -3414,7 +3423,16 @@ async fn next_issue_for_worker(db: &ServerDb) -> Result<Option<IssueCluster>> {
                   AND lease.state = 'leased'
                   AND lease.expires_at > ?1
           )
-        ORDER BY CASE WHEN best_patch_json IS NOT NULL THEN 1 ELSE 0 END ASC, score DESC, last_seen DESC
+        ORDER BY
+            CASE WHEN best_patch_json IS NOT NULL THEN 1 ELSE 0 END ASC,
+            CASE kind
+                WHEN 'investigation' THEN 0
+                WHEN 'crash' THEN 1
+                WHEN 'warning' THEN 2
+                ELSE 3
+            END ASC,
+            score DESC,
+            last_seen DESC
         LIMIT 1
         ",
                     [now],

@@ -69,7 +69,8 @@ pub fn collect_once(config: &FixerConfig, store: &Store) -> Result<CollectReport
 }
 
 fn collect_process_artifacts(store: &Store) -> Result<usize> {
-    let mut seen = BTreeMap::<PathBuf, usize>::new();
+    let cpu_percents = current_process_cpu_percents();
+    let mut seen = BTreeMap::<PathBuf, ProcessArtifactStats>::new();
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
         let file_name = entry.file_name();
@@ -79,14 +80,21 @@ fn collect_process_artifacts(store: &Store) -> Result<usize> {
         if !name.chars().all(|ch| ch.is_ascii_digit()) {
             continue;
         }
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
         let exe_link = entry.path().join("exe");
         if let Ok(path) = fs::read_link(&exe_link) {
-            *seen.entry(path).or_insert(0) += 1;
+            let stats = seen.entry(path).or_default();
+            stats.process_count += 1;
+            let cpu_percent = cpu_percents.get(&pid).copied().unwrap_or_default();
+            stats.total_cpu_percent += cpu_percent;
+            stats.max_cpu_percent = stats.max_cpu_percent.max(cpu_percent);
         }
     }
 
     let total = seen.len();
-    for (path, count) in seen {
+    for (path, stats) in seen {
         let canonical = maybe_canonicalize(&path);
         let package_name = map_path_to_package(&canonical);
         let artifact = ObservedArtifact {
@@ -102,13 +110,46 @@ fn collect_process_artifacts(store: &Store) -> Result<usize> {
             ecosystem: None,
             metadata: json!({
                 "source": "proc",
-                "process_count": count,
+                "process_count": stats.process_count,
+                "total_cpu_percent": stats.total_cpu_percent,
+                "max_cpu_percent": stats.max_cpu_percent,
                 "collected_at": now_rfc3339(),
             }),
         };
         let _ = store.upsert_artifact(&artifact)?;
     }
     Ok(total)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ProcessArtifactStats {
+    process_count: usize,
+    total_cpu_percent: f64,
+    max_cpu_percent: f64,
+}
+
+fn current_process_cpu_percents() -> HashMap<i32, f64> {
+    let mut percents = HashMap::new();
+    let output = match Command::new("ps")
+        .env("LC_ALL", "C")
+        .args(["-eo", "pid=,pcpu="])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return percents,
+    };
+    let raw = String::from_utf8_lossy(&output.stdout);
+    for line in raw.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next().and_then(|value| value.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Some(cpu_percent) = parts.next().and_then(|value| value.parse::<f64>().ok()) else {
+            continue;
+        };
+        percents.insert(pid, cpu_percent.max(0.0));
+    }
+    percents
 }
 
 #[derive(Debug, Clone)]
@@ -1494,6 +1535,8 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
                     "profile_target_path": target.path,
                     "profile_target_package_name": target.package_name,
                     "process_count": target.process_count,
+                    "total_cpu_percent": target.total_cpu_percent,
+                    "max_cpu_percent": target.max_cpu_percent,
                     "sampled_pids": profile.sampled_pids,
                 }),
             };
@@ -1538,6 +1581,8 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
                         "path": target.path,
                         "package_name": target.package_name,
                         "process_count": target.process_count,
+                        "total_cpu_percent": target.total_cpu_percent,
+                        "max_cpu_percent": target.max_cpu_percent,
                     },
                     "sampled_pids": profile.sampled_pids,
                     "sampled_pid_count": profile.sampled_pids.len(),
@@ -1556,27 +1601,28 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
             };
             let _ = store.record_finding(&finding)?;
             count += 1;
-
-            if config.service.auto_investigate_hotspots && strace_available {
-                let source_hotspot_fingerprint = finding.fingerprint.clone();
-                if investigation_budget > 0 {
-                    assessed_investigation_sources.push(source_hotspot_fingerprint.clone());
-                    if let Some(outcome) = maybe_record_runaway_investigation(
-                        config,
-                        store,
-                        &investigations_dir,
-                        &target,
-                        &profile,
-                        hot_path,
-                        &source_hotspot_fingerprint,
-                        richer_evidence_allowed,
-                    )? {
-                        current_investigation_fingerprints.push(outcome.finding_fingerprint);
-                        if outcome.created {
-                            count += 1;
-                            investigation_budget = investigation_budget.saturating_sub(1);
-                        }
-                    }
+        }
+        if config.service.auto_investigate_hotspots && strace_available && investigation_budget > 0
+        {
+            let Some(primary_hot_path) = profile.hot_paths.first() else {
+                continue;
+            };
+            let source_profile_fingerprint = runaway_investigation_source_fingerprint(&target);
+            assessed_investigation_sources.push(source_profile_fingerprint.clone());
+            if let Some(outcome) = maybe_record_runaway_investigation(
+                config,
+                store,
+                &investigations_dir,
+                &target,
+                &profile,
+                primary_hot_path,
+                &source_profile_fingerprint,
+                richer_evidence_allowed,
+            )? {
+                current_investigation_fingerprints.push(outcome.finding_fingerprint);
+                if outcome.created {
+                    count += 1;
+                    investigation_budget = investigation_budget.saturating_sub(1);
                 }
             }
         }
@@ -1707,10 +1753,10 @@ fn maybe_record_runaway_investigation(
     target: &PopularBinaryProfile,
     profile: &PerfProfileCapture,
     hot_path: &PerfHotPath,
-    source_hotspot_fingerprint: &str,
+    source_profile_fingerprint: &str,
     include_richer_evidence: bool,
 ) -> Result<Option<RunawayInvestigationOutcome>> {
-    let state_key = runaway_investigation_state_key(source_hotspot_fingerprint);
+    let state_key = runaway_investigation_state_key(source_profile_fingerprint);
     if let Some(checkpoint) = store.get_local_state::<RunawayInvestigationCheckpoint>(&state_key)? {
         if investigation_cooldown_active(
             &checkpoint.captured_at,
@@ -1731,7 +1777,7 @@ fn maybe_record_runaway_investigation(
         "{}-{}-{}",
         capture_timestamp.replace(':', "-"),
         safe_perf_name(&target.name),
-        abbreviated_hash(source_hotspot_fingerprint)
+        abbreviated_hash(source_profile_fingerprint)
     ));
     fs::create_dir_all(&capture_dir)?;
 
@@ -1750,13 +1796,18 @@ fn maybe_record_runaway_investigation(
     let top_syscalls = summarize_top_syscalls(&syscall_names);
     let dominant_sequence = dominant_syscall_sequence(&syscall_names);
     let hypothesis = classify_runaway_loop(&strace_lines, &top_syscalls, &top_hot_symbols);
-    let package_name = hot_path
-        .package_name
-        .clone()
-        .or_else(|| target.package_name.clone());
+    let package_name = target.package_name.clone();
     let package_metadata = package_name
         .as_deref()
         .and_then(resolve_installed_package_metadata_for_investigation);
+    let implicated_package_names = profile
+        .hot_paths
+        .iter()
+        .filter_map(|path| path.package_name.clone())
+        .filter(|name| Some(name.as_str()) != target.package_name.as_deref())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
 
     let investigation = build_runaway_investigation_summary(
         sampled_pid,
@@ -1772,7 +1823,6 @@ fn maybe_record_runaway_investigation(
     );
     let fingerprint = runaway_investigation_fingerprint(
         target,
-        hot_path,
         &investigation.top_hot_symbols,
         &investigation.top_syscalls,
         &investigation.dominant_sequence,
@@ -1790,13 +1840,14 @@ fn maybe_record_runaway_investigation(
             "source": "runaway-process-investigation",
             "profile_target_name": target.name,
             "profile_target_path": target.path,
+            "profile_target_package_name": target.package_name,
             "sampled_pids": profile.sampled_pids,
         }),
     };
     let details = json!({
         "subsystem": RUNAWAY_INVESTIGATION_SUBSYSTEM,
-        "source_hotspot_fingerprint": source_hotspot_fingerprint,
-        "source_hotspot_kind": "perf-hotspot",
+        "source_profile_fingerprint": source_profile_fingerprint,
+        "source_hotspot_kind": "perf-profile",
         "profile_duration_seconds": config.service.perf_duration_seconds,
         "strace_duration_seconds": config.service.hotspot_investigation_strace_seconds,
         "profile_target": {
@@ -1804,6 +1855,8 @@ fn maybe_record_runaway_investigation(
             "path": target.path,
             "package_name": target.package_name,
             "process_count": target.process_count,
+            "total_cpu_percent": target.total_cpu_percent,
+            "max_cpu_percent": target.max_cpu_percent,
         },
         "sampled_pids": profile.sampled_pids,
         "sampled_pid_count": profile.sampled_pids.len(),
@@ -1811,6 +1864,7 @@ fn maybe_record_runaway_investigation(
         "hot_path_symbol": hot_path.symbol,
         "hot_path_dso": hot_path.dso,
         "hot_path_percent": hot_path.percent,
+        "implicated_package_names": implicated_package_names,
         "top_hot_symbols": investigation.top_hot_symbols,
         "top_syscalls": investigation.top_syscalls,
         "dominant_sequence": investigation.dominant_sequence,
@@ -2240,16 +2294,21 @@ fn parse_strace_syscall_names(lines: &[String]) -> Vec<String> {
 
 fn parse_strace_syscall_name(line: &str) -> Option<String> {
     let mut text = line.trim();
-    if let Some(rest) = text.strip_prefix("[pid ") {
-        text = rest.split_once(']')?.1.trim_start();
-    }
-    if let Some((prefix, rest)) = text.split_once(' ') {
-        if prefix
-            .chars()
-            .all(|ch| ch.is_ascii_digit() || ch == ':' || ch == '.')
-        {
-            text = rest.trim_start();
+    loop {
+        if let Some(rest) = text.strip_prefix("[pid ") {
+            text = rest.split_once(']')?.1.trim_start();
+            continue;
         }
+        if let Some((prefix, rest)) = text.split_once(' ') {
+            if prefix
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || ch == ':' || ch == '.')
+            {
+                text = rest.trim_start();
+                continue;
+            }
+        }
+        break;
     }
     let name_end = text.find('(')?;
     let name = text[..name_end].trim();
@@ -2659,21 +2718,27 @@ fn stuck_process_investigation_summary_line(
     )
 }
 
+fn runaway_investigation_source_fingerprint(target: &PopularBinaryProfile) -> String {
+    hash_text(format!(
+        "runaway-process-source:{}:{}:{}",
+        target.name,
+        target.path.display(),
+        target.package_name.as_deref().unwrap_or("unknown"),
+    ))
+}
+
 fn runaway_investigation_fingerprint(
     target: &PopularBinaryProfile,
-    hot_path: &PerfHotPath,
     top_hot_symbols: &[String],
     top_syscalls: &[RunawaySyscallStat],
     dominant_sequence: &[String],
     hypothesis: &RunawayHypothesis,
 ) -> String {
     hash_text(format!(
-        "runaway-process:{}:{}:{}:{}:{}:{}",
+        "runaway-process:{}:{}:{}:{}:{}:{}:{}",
         target.name,
-        target
-            .package_name
-            .as_deref()
-            .unwrap_or_else(|| hot_path.package_name.as_deref().unwrap_or("unknown")),
+        target.path.display(),
+        target.package_name.as_deref().unwrap_or("unknown"),
         top_hot_symbols
             .iter()
             .take(3)
@@ -3783,6 +3848,8 @@ Stack trace of thread 222:\n\
             path: PathBuf::from("/opt/google/chrome/chrome"),
             package_name: Some("google-chrome-stable".to_string()),
             process_count: 9,
+            total_cpu_percent: 23.4,
+            max_cpu_percent: 19.8,
         };
         let mut dso_paths = HashMap::new();
         dso_paths.insert(
@@ -3816,18 +3883,24 @@ Stack trace of thread 222:\n\
             path: PathBuf::from("/usr/bin/fixerd"),
             package_name: Some("fixer".to_string()),
             process_count: 1,
+            total_cpu_percent: 1.0,
+            max_cpu_percent: 1.0,
         }));
         assert!(!is_profile_candidate(&PopularBinaryProfile {
             name: "firefox".to_string(),
             path: PathBuf::from("/usr/bin/firefox"),
             package_name: Some("firefox-esr".to_string()),
             process_count: 0,
+            total_cpu_percent: 0.0,
+            max_cpu_percent: 0.0,
         }));
         assert!(is_profile_candidate(&PopularBinaryProfile {
             name: "firefox".to_string(),
             path: PathBuf::from("/usr/bin/firefox"),
             package_name: Some("firefox-esr".to_string()),
             process_count: 3,
+            total_cpu_percent: 15.0,
+            max_cpu_percent: 15.0,
         }));
     }
 
@@ -3856,6 +3929,12 @@ Stack trace of thread 222:\n\
                 "[pid 12454] 12:00:01.123456 recvmsg(8, 0x7ffc, 0) = 48 <0.000012>"
             ),
             Some("recvmsg".to_string())
+        );
+        assert_eq!(
+            parse_strace_syscall_name(
+                "2047604 18:19:19.100524 clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, {tv_sec=1, tv_nsec=2}, NULL) = 0 <0.432673>"
+            ),
+            Some("clock_nanosleep".to_string())
         );
         assert_eq!(
             parse_strace_syscall_name(

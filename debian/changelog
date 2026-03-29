@@ -1,3 +1,12 @@
+fixer (0.13.0-1) unstable; urgency=medium
+
+  * Rank hotspot investigations by live CPU instead of process count.
+  * Collapse runaway investigations to one issue per target process.
+  * Prefer investigation work over old crash leases in the shared worker queue.
+  * Fix strace syscall parsing so loop classification sees real syscall names.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 29 Mar 2026 18:55:00 +0400
+
 fixer (0.12.0-1) unstable; urgency=medium
 
   * Escalate runaway CPU hotspots into autonomous process investigations.

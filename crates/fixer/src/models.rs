@@ -133,6 +133,8 @@ pub struct PopularBinaryProfile {
     pub path: PathBuf,
     pub package_name: Option<String>,
     pub process_count: i64,
+    pub total_cpu_percent: f64,
+    pub max_cpu_percent: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
