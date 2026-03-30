@@ -1,3 +1,12 @@
+fixer (0.36.0-1) unstable; urgency=medium
+
+  * Make the public issues board more humane by explaining likely user impact
+    in plain language instead of leading with internal queue jargon.
+  * Sort public issues by likely user pain first, then corroboration and
+    fixability, so disruptive desktop and app breakage rises above background noise.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 31 Mar 2026 13:20:00 +0400
+
 fixer (0.35.0-1) unstable; urgency=medium
 
   * Let workers acquire Debian source trees directly from `source_package` hints

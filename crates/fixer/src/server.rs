@@ -467,6 +467,19 @@ code, pre {
     margin: 0.55rem 0 0.8rem;
 }
 
+.impact-summary {
+    margin: 0 0 0.85rem;
+    padding: 0.8rem 0.9rem;
+    border-radius: 14px;
+    border: 1px solid rgba(11, 122, 117, 0.12);
+    background: rgba(11, 122, 117, 0.06);
+    color: var(--text);
+}
+
+.impact-summary strong {
+    color: var(--accent-strong);
+}
+
 .patch-summary,
 .patch-preview {
     margin-top: 0.9rem;
@@ -514,6 +527,24 @@ code, pre {
     background: rgba(36, 92, 45, 0.1);
     border-color: rgba(36, 92, 45, 0.16);
     color: var(--good);
+}
+
+.tag.impact-high {
+    background: rgba(177, 76, 34, 0.12);
+    border-color: rgba(177, 76, 34, 0.22);
+    color: var(--warm);
+}
+
+.tag.impact-medium {
+    background: rgba(163, 118, 25, 0.12);
+    border-color: rgba(163, 118, 25, 0.22);
+    color: #8b5f00;
+}
+
+.tag.impact-low {
+    background: rgba(11, 122, 117, 0.08);
+    border-color: rgba(11, 122, 117, 0.16);
+    color: var(--accent-strong);
 }
 
 .tag.triage {
@@ -755,6 +786,14 @@ struct DuplicateCandidateIssue {
 }
 
 #[derive(Debug, Clone)]
+struct IssueHumanContext {
+    kind_label: String,
+    impact_label: String,
+    impact_class: String,
+    impact_summary: String,
+}
+
+#[derive(Debug, Clone)]
 struct DuplicateMatchFeatures {
     kind: String,
     normalized_title: String,
@@ -930,7 +969,7 @@ async fn landing_page(State(state): State<Arc<ServerState>>) -> Result<Html<Stri
 async fn public_issues_page(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Html<String>, ApiError> {
-    let issues = load_public_issues(&state.db, 100).await?;
+    let issues = load_public_issue_candidates(&state.db, 100).await?;
     Ok(Html(render_issues_page(&issues)))
 }
 
@@ -5870,6 +5909,14 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
 }
 
 async fn load_public_issues(db: &ServerDb, limit: i64) -> Result<Vec<PublicIssue>, ApiError> {
+    let issues = load_public_issue_candidates(db, limit).await?;
+    Ok(issues.into_iter().map(|entry| entry.issue).collect())
+}
+
+async fn load_public_issue_candidates(
+    db: &ServerDb,
+    limit: i64,
+) -> Result<Vec<DuplicateCandidateIssue>, ApiError> {
     let fetch_limit = (limit.max(32) * 4).clamp(64, 512);
     match db {
         ServerDb::Postgres(db) => {
@@ -5896,7 +5943,7 @@ async fn load_public_issues(db: &ServerDb, limit: i64) -> Result<Vec<PublicIssue
                 .collect::<Result<Vec<_>, _>>()?;
             issues.sort_by(compare_public_issue_priority);
             issues.truncate(limit.max(0) as usize);
-            Ok(issues.into_iter().map(|entry| entry.issue).collect())
+            Ok(issues)
         }
         ServerDb::Sqlite(path) => {
             let connection = sqlite_connection(path).map_err(ApiError::internal)?;
@@ -5923,7 +5970,7 @@ async fn load_public_issues(db: &ServerDb, limit: i64) -> Result<Vec<PublicIssue
                 .map_err(ApiError::internal)?;
             issues.sort_by(compare_public_issue_priority);
             issues.truncate(limit.max(0) as usize);
-            Ok(issues.into_iter().map(|entry| entry.issue).collect())
+            Ok(issues)
         }
     }
 }
@@ -6502,29 +6549,229 @@ fn compare_public_issue_priority(
     left: &DuplicateCandidateIssue,
     right: &DuplicateCandidateIssue,
 ) -> Ordering {
-    compare_issue_priority(
-        &left.issue.kind,
-        left.issue.package_name.as_deref(),
-        left.issue.source_package.as_deref(),
-        left.issue.score,
-        left.issue.corroboration_count,
-        left.issue.best_patch_available,
-        left.issue.best_triage_available,
-        &left.issue.last_seen,
-        &left.representative,
-        &right.issue.kind,
-        right.issue.package_name.as_deref(),
-        right.issue.source_package.as_deref(),
-        right.issue.score,
-        right.issue.corroboration_count,
-        right.issue.best_patch_available,
-        right.issue.best_triage_available,
-        &right.issue.last_seen,
-        &right.representative,
+    let left_impact = issue_user_impact_score(&left.issue, &left.representative);
+    let right_impact = issue_user_impact_score(&right.issue, &right.representative);
+    right_impact
+        .cmp(&left_impact)
+        .then_with(|| right.issue.corroboration_count.cmp(&left.issue.corroboration_count))
+        .then_with(|| {
+            compare_issue_priority(
+                &left.issue.kind,
+                left.issue.package_name.as_deref(),
+                left.issue.source_package.as_deref(),
+                left.issue.score,
+                left.issue.corroboration_count,
+                left.issue.best_patch_available,
+                left.issue.best_triage_available,
+                &left.issue.last_seen,
+                &left.representative,
+                &right.issue.kind,
+                right.issue.package_name.as_deref(),
+                right.issue.source_package.as_deref(),
+                right.issue.score,
+                right.issue.corroboration_count,
+                right.issue.best_patch_available,
+                right.issue.best_triage_available,
+                &right.issue.last_seen,
+                &right.representative,
+            )
+        })
+}
+
+fn issue_user_impact_score(issue: &PublicIssue, representative: &SharedOpportunity) -> i64 {
+    let subsystem = representative_subsystem(representative);
+    let target_name = representative_fixability_target_name(representative);
+    let kernelish_target = target_name
+        .as_deref()
+        .is_some_and(is_kernelish_target_name);
+    let mut score = match issue.kind.as_str() {
+        "crash" => 92,
+        "hotspot" => 44,
+        "warning" => 18,
+        "investigation" => match subsystem {
+            Some("desktop-resume") => 100,
+            Some("oom-kill") => 88,
+            Some("runaway-process") => 82,
+            Some("stuck-process") if kernelish_target => 68,
+            Some("stuck-process") => 78,
+            _ => 62,
+        },
+        _ => 50,
+    };
+    score += match issue.severity.as_deref() {
+        Some("critical") => 8,
+        Some("high") => 6,
+        Some("medium" | "moderate") => 3,
+        _ => 0,
+    };
+    score += (issue.corroboration_count.saturating_sub(1)).min(3) * 4;
+    if issue.kind == "hotspot" && kernelish_target {
+        score -= 8;
+    }
+    if issue.kind == "investigation"
+        && subsystem != Some("desktop-resume")
+        && issue
+            .source_package
+            .as_deref()
+            .or(issue.package_name.as_deref())
+            .is_some_and(is_kernelish_package_name)
+    {
+        score -= 6;
+    }
+    score
+}
+
+fn issue_human_context(issue: &PublicIssue, representative: &SharedOpportunity) -> IssueHumanContext {
+    let impact_score = issue_user_impact_score(issue, representative);
+    let subsystem = representative_subsystem(representative);
+    let target = representative_fixability_target_name(representative)
+        .unwrap_or_else(|| issue.title.clone());
+    let kind_label = match (issue.kind.as_str(), subsystem) {
+        ("crash", _) => "App crash",
+        ("hotspot", _) => "High CPU hotspot",
+        ("warning", _) => "System warning",
+        ("investigation", Some("runaway-process")) => "Runaway CPU",
+        ("investigation", Some("oom-kill")) => "Out of memory kill",
+        ("investigation", Some("desktop-resume")) => "Wake-from-sleep failure",
+        ("investigation", Some("stuck-process")) => "Hung process",
+        ("investigation", _) => "System investigation",
+        _ => "Issue",
+    }
+    .to_string();
+    let (impact_label, impact_class) = if impact_score >= 92 {
+        ("very disruptive", "impact-high")
+    } else if impact_score >= 76 {
+        ("disruptive", "impact-medium")
+    } else if impact_score >= 52 {
+        ("noticeable", "impact-low")
+    } else {
+        ("background", "impact-low")
+    };
+    let impact_summary = match (issue.kind.as_str(), subsystem) {
+        ("crash", _) => format!(
+            "{} likely crashed or disappeared unexpectedly.",
+            humanize_target_name(&target)
+        ),
+        ("investigation", Some("desktop-resume")) => {
+            "After wake-from-sleep, the desktop likely came back blank, broken, or dropped the user back to login."
+                .to_string()
+        }
+        ("investigation", Some("oom-kill")) => format!(
+            "The system likely ran out of memory and killed {}, so work in that app or task may have vanished.",
+            humanize_target_name(&target)
+        ),
+        ("investigation", Some("runaway-process")) => format!(
+            "{} likely made the app or machine feel hot, loud, or sluggish by burning CPU continuously.",
+            humanize_target_name(&target)
+        ),
+        ("investigation", Some("stuck-process"))
+            if is_kernelish_target_name(&target) =>
+        {
+            "The machine likely felt hung, stalled, or slow to recover while the kernel waited on something it could not finish."
+                .to_string()
+        }
+        ("investigation", Some("stuck-process")) => format!(
+            "{} likely looked hung or stopped making progress.",
+            humanize_target_name(&target)
+        ),
+        ("hotspot", _) => {
+            "This likely shows up as wasted CPU, fan noise, heat, or sluggishness even if nothing visibly crashes."
+                .to_string()
+        }
+        ("warning", _) => {
+            "This is probably less visible to users unless they are already hitting the affected subsystem."
+                .to_string()
+        }
+        _ => "This looks user-visible enough that it may affect normal day-to-day use.".to_string(),
+    };
+    IssueHumanContext {
+        kind_label,
+        impact_label: impact_label.to_string(),
+        impact_class: impact_class.to_string(),
+        impact_summary,
+    }
+}
+
+fn humanize_target_name(raw: &str) -> String {
+    match raw.trim() {
+        "" => "this process".to_string(),
+        "python" | "python3" | "python3.13" => "a Python workload".to_string(),
+        "postgres" => "PostgreSQL".to_string(),
+        "plasmashell" => "Plasma Shell".to_string(),
+        "Xorg" => "Xorg".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn issue_seen_summary(corroboration_count: i64) -> String {
+    match corroboration_count {
+        1 => "seen on 1 host".to_string(),
+        count => format!("seen on {count} hosts"),
+    }
+}
+
+fn render_issue_queue_tags(issue: &PublicIssue, context: &IssueHumanContext) -> String {
+    let mut tags = vec![format!(
+        "<span class=\"tag {}\">impact: {}</span>",
+        html_escape(&context.impact_class),
+        html_escape(&context.impact_label)
+    )];
+    tags.push(format!(
+        "<span class=\"tag\">{}</span>",
+        html_escape(&issue_seen_summary(issue.corroboration_count))
+    ));
+    if let Some(package_name) = issue.package_name.as_deref() {
+        tags.push(format!(
+            "<span class=\"tag\">package: {}</span>",
+            html_escape(package_name)
+        ));
+    }
+    if let Some(source_package) = issue.source_package.as_deref() {
+        tags.push(format!(
+            "<span class=\"tag\">source: {}</span>",
+            html_escape(source_package)
+        ));
+    }
+    if issue.best_patch_available {
+        tags.push("<span class=\"tag patch\">patch ready</span>".to_string());
+    }
+    if issue.best_triage_available {
+        tags.push("<span class=\"tag triage\">triage ready</span>".to_string());
+    }
+    tags.join("")
+}
+
+fn render_issue_queue_card(entry: &DuplicateCandidateIssue) -> String {
+    let issue = &entry.issue;
+    let context = issue_human_context(issue, &entry.representative);
+    format!(
+        r#"<article class="issue-card">
+            <div class="issue-topline">
+                <div>
+                    <p class="eyebrow">{}</p>
+                    <h3><a href="/issues/{}">{}</a></h3>
+                </div>
+                <span class="tag {}">{}</span>
+            </div>
+            <p class="issue-summary">{}</p>
+            <p class="impact-summary"><strong>Likely user impact.</strong> {}</p>
+            <div class="meta">{}</div>
+            <p class="fine-print">Last seen {}. <a href="/issues/{}">Details</a> · <a href="/v1/issues/{}">JSON</a></p>
+        </article>"#,
+        html_escape(&context.kind_label),
+        issue.id,
+        html_escape(&issue.title),
+        html_escape(&context.impact_class),
+        html_escape(&context.impact_label),
+        html_escape(&issue.summary),
+        html_escape(&context.impact_summary),
+        render_issue_queue_tags(issue, &context),
+        html_escape(&format_timestamp(&issue.last_seen)),
+        issue.id,
+        issue.id
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn compare_issue_priority(
     left_kind: &str,
     left_package_name: Option<&str>,
@@ -8566,26 +8813,27 @@ fn render_triage_page(entries: &[PublicTriageEntry]) -> String {
     )
 }
 
-fn render_issues_page(issues: &[PublicIssue]) -> String {
+fn render_issues_page(issues: &[DuplicateCandidateIssue]) -> String {
     let issue_markup = if issues.is_empty() {
-        "<p class=\"fine-print\">There are no promoted issues yet.</p>".to_string()
+        "<p class=\"fine-print\">There are no public issues yet.</p>".to_string()
     } else {
         issues
             .iter()
-            .map(render_issue_card)
+            .map(render_issue_queue_card)
             .collect::<Vec<_>>()
             .join("")
     };
     let body = format!(
         r#"
         <section class="hero">
-            <p class="tag">Public aggregate view</p>
-            <h1>Promoted Fixer issues</h1>
-            <p class="lede">Only sanitized aggregate data is shown here. Raw evidence, hostnames, install identities, and richer artifacts stay out of the public surface.</p>
+            <p class="tag">Public issue board</p>
+            <h1>Problems people are most likely to feel first</h1>
+            <p class="lede">This page is sorted by likely user impact first, then by corroboration and fixability. The goal is to answer the human question before the technical one: what probably broke, how bad it feels, and whether there is already a patch or triage result.</p>
+            <p class="fine-print">Only sanitized aggregate data is shown here. Raw evidence, hostnames, install identities, and richer artifacts stay out of the public surface.</p>
         </section>
 
         <section class="panel section">
-            <h2>Current queue</h2>
+            <h2>Current issues</h2>
             <div class="issue-list">{issue_markup}</div>
         </section>
         "#
@@ -9913,6 +10161,58 @@ mod tests {
         assert!(markup.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
         assert!(markup.contains("/v1/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
         assert!(!markup.contains("representative_json"));
+    }
+
+    #[test]
+    fn humane_issue_queue_card_explains_user_impact() {
+        let candidate = duplicate_candidate_for_test(
+            "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8",
+            &sample_desktop_resume_investigation(
+                "radeon",
+                &["plasmashell", "Xorg"],
+                "2026-03-30T01:39:07Z",
+            ),
+        );
+
+        let markup = render_issue_queue_card(&candidate);
+        assert!(markup.contains("Wake-from-sleep failure"));
+        assert!(markup.contains("Likely user impact."));
+        assert!(markup.contains("very disruptive"));
+        assert!(markup.contains("Details"));
+        assert!(markup.contains("JSON"));
+    }
+
+    #[test]
+    fn issues_page_mentions_user_impact_sorting() {
+        let candidate = duplicate_candidate_for_test(
+            "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8",
+            &sample_runaway_investigation("kdeconnectd", Some("kdeconnect")),
+        );
+
+        let markup = render_issues_page(&[candidate]);
+        assert!(markup.contains("sorted by likely user impact first"));
+        assert!(markup.contains("human question before the technical one"));
+    }
+
+    #[test]
+    fn public_issue_sort_prefers_desktop_breakage_over_fixable_cpu_loop() {
+        let desktop = duplicate_candidate_for_test(
+            "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8",
+            &sample_desktop_resume_investigation(
+                "radeon",
+                &["plasmashell", "Xorg"],
+                "2026-03-30T01:39:07Z",
+            ),
+        );
+        let runaway = duplicate_candidate_for_test(
+            "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f9",
+            &sample_runaway_investigation("htop", Some("htop")),
+        );
+
+        assert_eq!(
+            compare_public_issue_priority(&desktop, &runaway),
+            Ordering::Less
+        );
     }
 
     #[test]
