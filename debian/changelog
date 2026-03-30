@@ -1,3 +1,12 @@
+fixer (0.30.0-1) unstable; urgency=medium
+
+  * Overfetch and rank coredumps so real desktop crashes like plasmashell are not crowded
+    out by DrKonqi and other crash-helper noise.
+  * Deduplicate repeated crash bursts by executable before applying the configured crash
+    limit, keeping the newest representative crash per process family.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 30 Mar 2026 20:52:38 +0400
+
 fixer (0.29.0-1) unstable; urgency=medium
 
   * Stop advertising worker Codex availability when a user lease is missing, expired,

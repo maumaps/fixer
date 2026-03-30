@@ -26,6 +26,9 @@ use std::time::Duration as StdDuration;
 const PERF_PROFILE_TARGET_LIMIT: usize = 5;
 const PERF_TOP_HOTSPOTS_PER_TARGET: usize = 3;
 const PERF_REPORT_LIMIT: usize = 12;
+const COREDUMP_FETCH_MIN: usize = 50;
+const COREDUMP_FETCH_MAX: usize = 200;
+const COREDUMP_FETCH_MULTIPLIER: usize = 8;
 const RUNAWAY_INVESTIGATION_SUBSYSTEM: &str = "runaway-process";
 const STUCK_PROCESS_INVESTIGATION_SUBSYSTEM: &str = "stuck-process";
 const DESKTOP_RESUME_INVESTIGATION_SUBSYSTEM: &str = "desktop-resume";
@@ -492,6 +495,7 @@ fn collect_crashes(config: &FixerConfig, store: &Store) -> Result<usize> {
         return Ok(0);
     }
     store.prune_stackless_crash_findings()?;
+    let fetch_limit = expanded_coredump_fetch_limit(config.service.coredump_limit);
     let output = command_output(
         "coredumpctl",
         &[
@@ -499,13 +503,14 @@ fn collect_crashes(config: &FixerConfig, store: &Store) -> Result<usize> {
             "--json=short",
             "--no-pager",
             "-n",
-            &config.service.coredump_limit.to_string(),
+            &fetch_limit.to_string(),
         ],
     )?;
     if output.trim().is_empty() {
         return Ok(0);
     }
     let events: Vec<Value> = serde_json::from_str(&output).unwrap_or_default();
+    let events = prioritize_coredump_events(events, config.service.coredump_limit);
     let mut count = 0;
     for event in events {
         let Some(pid) = event.get("pid").and_then(Value::as_i64) else {
@@ -613,6 +618,140 @@ fn collect_crashes(config: &FixerConfig, store: &Store) -> Result<usize> {
         count += 1;
     }
     Ok(count)
+}
+
+fn expanded_coredump_fetch_limit(limit: usize) -> usize {
+    let limit = limit.max(1);
+    limit
+        .saturating_mul(COREDUMP_FETCH_MULTIPLIER)
+        .max(COREDUMP_FETCH_MIN)
+        .min(COREDUMP_FETCH_MAX)
+}
+
+#[derive(Debug, Clone)]
+struct RankedCoredumpEvent {
+    event: Value,
+    dedupe_key: String,
+    helper: bool,
+    desktop_shell: bool,
+    event_time: i64,
+}
+
+fn prioritize_coredump_events(events: Vec<Value>, limit: usize) -> Vec<Value> {
+    if events.len() <= limit {
+        return events;
+    }
+
+    let mut ranked = events
+        .into_iter()
+        .map(|event| {
+            let executable = crash_event_executable(&event);
+            let process_name = crash_event_process_name(&event);
+            let label = crash_event_label(executable.as_deref(), process_name.as_deref());
+            RankedCoredumpEvent {
+                dedupe_key: label.clone(),
+                helper: is_crash_reporter_helper(&label),
+                desktop_shell: is_desktop_shell_process(&label),
+                event_time: event
+                    .get("time")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+                event,
+            }
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.desktop_shell
+            .cmp(&a.desktop_shell)
+            .then_with(|| a.helper.cmp(&b.helper))
+            .then_with(|| b.event_time.cmp(&a.event_time))
+            .then_with(|| a.dedupe_key.cmp(&b.dedupe_key))
+    });
+
+    let mut prioritized = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut duplicates = Vec::new();
+    for candidate in ranked {
+        if seen.insert(candidate.dedupe_key.clone()) {
+            prioritized.push(candidate.event);
+        } else {
+            duplicates.push(candidate.event);
+        }
+        if prioritized.len() == limit {
+            return prioritized;
+        }
+    }
+    prioritized.extend(
+        duplicates
+            .into_iter()
+            .take(limit.saturating_sub(prioritized.len())),
+    );
+    prioritized
+}
+
+fn crash_event_executable(event: &Value) -> Option<String> {
+    event
+        .get("exe")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            event
+                .get("cmdline")
+                .and_then(Value::as_str)
+                .and_then(|cmdline| {
+                    cmdline
+                        .split_whitespace()
+                        .next()
+                        .filter(|value| value.starts_with('/'))
+                        .map(ToString::to_string)
+                })
+        })
+}
+
+fn crash_event_process_name(event: &Value) -> Option<String> {
+    event
+        .get("comm")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            event
+                .get("exe")
+                .and_then(Value::as_str)
+                .map(executable_basename)
+        })
+}
+
+fn crash_event_label(executable: Option<&str>, process_name: Option<&str>) -> String {
+    executable
+        .map(executable_basename)
+        .or_else(|| process_name.map(normalize_crash_process_label))
+        .unwrap_or_else(|| "process".to_string())
+}
+
+fn executable_basename(executable: &str) -> String {
+    Path::new(executable)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(normalize_crash_process_label)
+        .unwrap_or_else(|| normalize_crash_process_label(executable))
+}
+
+fn normalize_crash_process_label(label: &str) -> String {
+    label.trim().trim_matches('"').to_ascii_lowercase()
+}
+
+fn is_crash_reporter_helper(label: &str) -> bool {
+    matches!(
+        normalize_crash_process_label(label).as_str(),
+        "drkonqi" | "drkonqi-coredump-processor" | "drkonqi-coredump-launcher" | "systemd-coredump"
+    )
+}
+
+fn is_desktop_shell_process(label: &str) -> bool {
+    matches!(
+        normalize_crash_process_label(label).as_str(),
+        "plasmashell" | "kwin_x11" | "kwin_wayland" | "xorg" | "sddm" | "kscreen_osd_service"
+    )
 }
 
 fn collect_warning_logs(config: &FixerConfig, store: &Store) -> Result<usize> {
@@ -4263,6 +4402,7 @@ mod tests {
     use super::{
         RunawayHypothesis, StuckProcessGroup, StuckProcessInvestigationSummary,
         apparmor_finding_from_kernel_line, classify_runaway_loop, classify_stuck_process,
+        crash_event_executable, crash_event_label, crash_event_process_name,
         dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
         is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
         kernel_module_package_hint, kernel_warning_module_candidates, looks_like_warning,
@@ -4270,11 +4410,12 @@ mod tests {
         normalize_stuck_process_target_name, parse_apparmor_denial, parse_coredump_info,
         parse_dkms_status_line, parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
         parse_perf_hot_paths, parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
-        process_runtime_seconds, safe_perf_name, stuck_process_investigation_fingerprint,
-        stuck_process_source_fingerprint, summarize_top_syscalls, system_uptime_seconds,
+        prioritize_coredump_events, process_runtime_seconds, safe_perf_name,
+        stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
+        summarize_top_syscalls, system_uptime_seconds,
     };
     use crate::models::PopularBinaryProfile;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
 
@@ -4635,6 +4776,46 @@ Stack trace of thread 222:\n\
         assert_eq!(parsed.total_stack_frame_count, 3);
         assert_eq!(parsed.useful_stack_frame_count, 2);
         assert_eq!(parsed.primary_stack[0], "n/a [/opt/zoom/cef/libcef.so]");
+    }
+
+    #[test]
+    fn prioritize_coredumps_prefers_desktop_shells_over_helper_noise() {
+        let events = vec![
+            json!({"pid": 1, "time": 100, "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi", "comm": "drkonqi"}),
+            json!({"pid": 2, "time": 101, "exe": "/usr/bin/plasmashell", "comm": "plasmashell"}),
+            json!({"pid": 3, "time": 102, "exe": "/usr/bin/kwin_x11", "comm": "kwin_x11"}),
+            json!({"pid": 4, "time": 103, "exe": "/usr/lib/x86_64-linux-gnu/libexec/drkonqi", "comm": "drkonqi"}),
+        ];
+
+        let prioritized = prioritize_coredump_events(events, 2);
+        let labels = prioritized
+            .iter()
+            .map(|event| {
+                crash_event_label(
+                    crash_event_executable(event).as_deref(),
+                    crash_event_process_name(event).as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec!["kwin_x11".to_string(), "plasmashell".to_string()]
+        );
+    }
+
+    #[test]
+    fn prioritize_coredumps_dedupes_same_executable_to_newest_event() {
+        let events = vec![
+            json!({"pid": 10, "time": 100, "exe": "/usr/bin/plasmashell", "comm": "plasmashell"}),
+            json!({"pid": 11, "time": 200, "exe": "/usr/bin/plasmashell", "comm": "plasmashell"}),
+            json!({"pid": 12, "time": 150, "exe": "/usr/bin/kded6", "comm": "kded6"}),
+        ];
+
+        let prioritized = prioritize_coredump_events(events, 2);
+        assert_eq!(prioritized.len(), 2);
+        assert_eq!(prioritized[0].get("pid").and_then(Value::as_i64), Some(11));
+        assert_eq!(prioritized[1].get("pid").and_then(Value::as_i64), Some(12));
     }
 
     #[test]
