@@ -27,41 +27,48 @@ pub fn ensure_workspace_for_opportunity(
         });
     }
 
-    let package_name = package_name_from_opportunity(opportunity).ok_or_else(|| {
-        anyhow!(
-            "opportunity {} has no repo root or package name",
-            opportunity.id
-        )
-    })?;
-    let metadata = resolve_installed_package_metadata(&package_name)?;
+    let package_name = package_name_from_opportunity(opportunity);
+    let source_package_hint = source_package_from_opportunity(opportunity);
+    let metadata = package_name
+        .as_deref()
+        .and_then(|name| resolve_installed_package_metadata(name).ok());
+    let source_package = source_package_hint
+        .or_else(|| metadata.as_ref().map(|pkg| pkg.source_package.clone()))
+        .or(package_name.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "opportunity {} has no repo root, package name, or source package",
+                opportunity.id
+            )
+        })?;
 
     if deb_src_enabled() {
-        if let Ok(repo_root) = ensure_debian_source_tree(config, &metadata.source_package) {
+        if let Ok(repo_root) = ensure_debian_source_tree(config, &source_package) {
             let repo_root = maybe_canonicalize(&repo_root);
             let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
             return Ok(PreparedWorkspace {
                 repo_root,
                 ecosystem,
                 source_kind: "debian-source".to_string(),
-                package_name: Some(package_name),
-                source_package: Some(metadata.source_package),
-                homepage: metadata.homepage,
+                package_name,
+                source_package: Some(source_package),
+                homepage: metadata.as_ref().and_then(|pkg| pkg.homepage.clone()),
                 acquisition_note: "Fetched Debian source package via apt-get source.".to_string(),
             });
         }
     }
 
-    if let Some(homepage) = metadata.homepage.clone() {
+    if let Some(homepage) = metadata.as_ref().and_then(|pkg| pkg.homepage.clone()) {
         if is_cloneable_repo_url(&homepage) {
-            let repo_root = ensure_upstream_clone(config, &metadata.source_package, &homepage)?;
+            let repo_root = ensure_upstream_clone(config, &source_package, &homepage)?;
             let repo_root = maybe_canonicalize(&repo_root);
             let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
             return Ok(PreparedWorkspace {
                 repo_root,
                 ecosystem,
                 source_kind: "upstream-git".to_string(),
-                package_name: Some(package_name),
-                source_package: Some(metadata.source_package),
+                package_name,
+                source_package: Some(source_package),
                 homepage: Some(homepage),
                 acquisition_note: "Cloned upstream repository from package homepage because Debian source indexes are unavailable.".to_string(),
             });
@@ -69,8 +76,8 @@ pub fn ensure_workspace_for_opportunity(
     }
 
     Err(anyhow!(
-        "could not acquire a workspace for package {}; enable deb-src or provide a cloneable homepage",
-        package_name
+        "could not acquire a workspace for {}; enable deb-src or provide a cloneable homepage",
+        source_package
     ))
 }
 
@@ -302,6 +309,16 @@ fn package_name_from_opportunity(opportunity: &OpportunityRecord) -> Option<Stri
         .map(ToString::to_string)
 }
 
+fn source_package_from_opportunity(opportunity: &OpportunityRecord) -> Option<String> {
+    opportunity
+        .evidence
+        .get("source_package")
+        .or_else(|| opportunity.evidence.get("details")?.get("source_package"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+}
+
 fn normalize_patchable_source_package(package_name: &str, source_package: &str) -> String {
     if package_name.starts_with("linux-image-")
         && source_package.starts_with("linux-signed")
@@ -371,8 +388,10 @@ fn deb_src_enabled() -> bool {
 mod tests {
     use super::{
         is_cloneable_repo_url, normalize_patchable_source_package, parse_apt_origins,
-        parse_maintainer_url, sanitize_dir_name,
+        parse_maintainer_url, sanitize_dir_name, source_package_from_opportunity,
     };
+    use crate::models::OpportunityRecord;
+    use serde_json::json;
 
     #[test]
     fn detects_cloneable_urls() {
@@ -428,5 +447,29 @@ zoom:\n\
             normalize_patchable_source_package("htop", "htop"),
             "htop"
         );
+    }
+
+    #[test]
+    fn reads_source_package_hint_from_opportunity_evidence() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "kernel issue".to_string(),
+            score: 100,
+            state: "open".to_string(),
+            summary: "summary".to_string(),
+            evidence: json!({
+                "source_package": "linux",
+                "details": {
+                    "source_package": "linux-ignored"
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+            updated_at: "2026-03-31T00:00:00Z".to_string(),
+        };
+        assert_eq!(source_package_from_opportunity(&opportunity).as_deref(), Some("linux"));
     }
 }

@@ -1,3 +1,13 @@
+fixer (0.35.0-1) unstable; urgency=medium
+
+  * Let workers acquire Debian source trees directly from `source_package` hints
+    in issue evidence, even when the exact runtime package is not installed locally.
+  * Make cross-host kernel-thread investigations like `kswapd0` patchable by
+    combining kernel package attribution on the reporter with source-package
+    workspace acquisition on the worker.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 31 Mar 2026 12:45:00 +0400
+
 fixer (0.34.0-1) unstable; urgency=medium
 
   * Attribute stuck kernel-thread investigations like `kswapd0` and `kworker`
