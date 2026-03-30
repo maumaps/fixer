@@ -1287,9 +1287,13 @@ async fn pull_work(
         }));
     }
 
-    let Some(mut issue) = next_issue_for_worker(&state.db, &install_id)
-        .await
-        .map_err(ApiError::internal)?
+    let Some(mut issue) = next_issue_for_worker(
+        &state.db,
+        &install_id,
+        state.config.server.worker_attempt_cooldown_seconds,
+    )
+    .await
+    .map_err(ApiError::internal)?
     else {
         return Ok(Json(WorkOffer {
             message: "no promoted work is currently available".to_string(),
@@ -5421,11 +5425,13 @@ async fn upsert_issue_cluster(
 struct WorkerCandidate {
     issue: IssueCluster,
     has_foreign_reports: bool,
+    last_attempt_at: Option<DateTime<Utc>>,
 }
 
 async fn next_issue_for_worker(
     db: &ServerDb,
     worker_install_id: &str,
+    worker_attempt_cooldown_seconds: u64,
 ) -> Result<Option<IssueCluster>> {
     match db {
         ServerDb::Postgres(db) => {
@@ -5440,7 +5446,12 @@ async fn next_issue_for_worker(
                     FROM cluster_reports report
                     WHERE report.cluster_id = issue.id
                       AND report.install_id <> $1
-               ) AS has_foreign_reports
+               ) AS has_foreign_reports,
+               (
+                    SELECT MAX(attempt.created_at)
+                    FROM patch_attempts attempt
+                    WHERE attempt.cluster_id = issue.id
+               ) AS last_attempt_at
         FROM issue_clusters issue
         WHERE promoted = TRUE
           AND public_visible = TRUE
@@ -5470,7 +5481,10 @@ async fn next_issue_for_worker(
                 .into_iter()
                 .map(worker_candidate_from_row)
                 .collect::<Result<Vec<_>>>()?;
-            Ok(select_worker_candidate(candidates))
+            Ok(select_worker_candidate(
+                candidates,
+                worker_attempt_cooldown_seconds,
+            ))
         }
         ServerDb::Sqlite(path) => {
             let connection = sqlite_connection(path)?;
@@ -5485,7 +5499,12 @@ async fn next_issue_for_worker(
                     FROM cluster_reports report
                     WHERE report.cluster_id = issue.id
                       AND report.install_id <> ?1
-               ) AS has_foreign_reports
+               ) AS has_foreign_reports,
+               (
+                    SELECT MAX(attempt.created_at)
+                    FROM patch_attempts attempt
+                    WHERE attempt.cluster_id = issue.id
+               ) AS last_attempt_at
         FROM issue_clusters issue
         WHERE promoted = 1
           AND public_visible = 1
@@ -5512,42 +5531,124 @@ async fn next_issue_for_worker(
             let rows = stmt.query_map([worker_install_id, now.as_str()], |row| {
                 let issue = issue_from_sqlite_row(row)?;
                 let has_foreign_reports = row.get::<_, i64>(16)? != 0;
+                let last_attempt_at = row
+                    .get::<_, Option<String>>(17)?
+                    .as_deref()
+                    .and_then(parse_timestamp);
                 Ok(WorkerCandidate {
                     issue,
                     has_foreign_reports,
+                    last_attempt_at,
                 })
             })?;
             let candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(select_worker_candidate(candidates))
+            Ok(select_worker_candidate(
+                candidates,
+                worker_attempt_cooldown_seconds,
+            ))
         }
     }
 }
 
-fn select_worker_candidate(candidates: Vec<WorkerCandidate>) -> Option<IssueCluster> {
+fn select_worker_candidate(
+    candidates: Vec<WorkerCandidate>,
+    worker_attempt_cooldown_seconds: u64,
+) -> Option<IssueCluster> {
+    let cooldown_cutoff = (worker_attempt_cooldown_seconds > 0)
+        .then(|| Utc::now() - Duration::seconds(worker_attempt_cooldown_seconds as i64));
     candidates
         .iter()
-        .find(|candidate| candidate.has_foreign_reports && candidate_needs_patch_refresh(candidate))
+        .find(|candidate| {
+            !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
+                && candidate.has_foreign_reports
+                && candidate_needs_patch_refresh(candidate)
+        })
         .map(|candidate| candidate.issue.clone())
         .or_else(|| {
             candidates
                 .iter()
                 .find(|candidate| {
-                    candidate.has_foreign_reports && issue_is_available_for_worker(&candidate.issue)
+                    !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
+                        && candidate.has_foreign_reports
+                        && issue_is_available_for_worker(&candidate.issue)
                 })
                 .map(|candidate| candidate.issue.clone())
         })
         .or_else(|| {
             candidates
                 .iter()
-                .find(|candidate| candidate_needs_patch_refresh(candidate))
+                .find(|candidate| {
+                    !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
+                        && candidate_needs_patch_refresh(candidate)
+                })
                 .map(|candidate| candidate.issue.clone())
         })
         .or_else(|| {
             candidates
                 .iter()
-                .find(|candidate| issue_is_available_for_worker(&candidate.issue))
+                .find(|candidate| {
+                    !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
+                        && issue_is_available_for_worker(&candidate.issue)
+                })
                 .map(|candidate| candidate.issue.clone())
         })
+        .or_else(|| {
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.has_foreign_reports && candidate_needs_patch_refresh(candidate)
+                })
+                .min_by(compare_worker_candidate_attempt_age)
+                .map(|candidate| candidate.issue.clone())
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.has_foreign_reports && issue_is_available_for_worker(&candidate.issue)
+                })
+                .min_by(compare_worker_candidate_attempt_age)
+                .map(|candidate| candidate.issue.clone())
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .filter(|candidate| candidate_needs_patch_refresh(candidate))
+                .min_by(compare_worker_candidate_attempt_age)
+                .map(|candidate| candidate.issue.clone())
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .filter(|candidate| issue_is_available_for_worker(&candidate.issue))
+                .min_by(compare_worker_candidate_attempt_age)
+                .map(|candidate| candidate.issue.clone())
+        })
+}
+
+fn compare_worker_candidate_attempt_age(
+    left: &&WorkerCandidate,
+    right: &&WorkerCandidate,
+) -> Ordering {
+    match (&left.last_attempt_at, &right.last_attempt_at) {
+        (Some(left), Some(right)) => left.cmp(right),
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn candidate_is_in_recent_attempt_cooldown(
+    candidate: &WorkerCandidate,
+    cooldown_cutoff: Option<DateTime<Utc>>,
+) -> bool {
+    let Some(cooldown_cutoff) = cooldown_cutoff else {
+        return false;
+    };
+    candidate
+        .last_attempt_at
+        .map(|attempted_at| attempted_at >= cooldown_cutoff)
+        .unwrap_or(false)
 }
 
 fn candidate_needs_patch_refresh(candidate: &WorkerCandidate) -> bool {
@@ -5612,10 +5713,12 @@ fn issue_from_row(row: Row) -> Result<IssueCluster> {
 
 fn worker_candidate_from_row(row: Row) -> Result<WorkerCandidate> {
     let has_foreign_reports: bool = row.get(16);
+    let last_attempt_at: Option<DateTime<Utc>> = row.get(17);
     let issue = issue_from_row(row)?;
     Ok(WorkerCandidate {
         issue,
         has_foreign_reports,
+        last_attempt_at,
     })
 }
 
@@ -10205,7 +10308,7 @@ mod tests {
         );
 
         let issue = test_runtime()
-            .block_on(next_issue_for_worker(&db, "worker-install"))
+            .block_on(next_issue_for_worker(&db, "worker-install", 3600))
             .unwrap()
             .unwrap();
 
@@ -10233,11 +10336,156 @@ mod tests {
         );
 
         let issue = test_runtime()
-            .block_on(next_issue_for_worker(&db, "worker-install"))
+            .block_on(next_issue_for_worker(&db, "worker-install", 3600))
             .unwrap()
             .unwrap();
 
         assert_eq!(issue.id, "issue-self");
+    }
+
+    #[test]
+    fn worker_queue_skips_recently_attempted_issue_when_other_shared_work_exists() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let hot_issue = sample_crash(
+            "postgres",
+            "Top frame: hot_issue_frame [postgres]",
+            &["hot_issue_frame [postgres]"],
+        );
+        let alternate_issue = sample_crash(
+            "qbittorrent",
+            "Top frame: alternate_issue_frame [qbittorrent]",
+            &["alternate_issue_frame [qbittorrent]"],
+        );
+        let now = Utc::now();
+        let recent_attempt_at = (now - Duration::minutes(5)).to_rfc3339();
+        let last_seen = now.to_rfc3339();
+
+        insert_test_issue(
+            &connection,
+            "issue-hot",
+            "cluster-hot",
+            200,
+            &last_seen,
+            &hot_issue,
+            &["other-install-a"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-alt",
+            "cluster-alt",
+            180,
+            &last_seen,
+            &alternate_issue,
+            &["other-install-b"],
+        );
+        insert_test_attempt(
+            &connection,
+            "attempt-hot",
+            "lease-hot",
+            &PatchAttempt {
+                cluster_id: "issue-hot".to_string(),
+                install_id: "reviewer-install".to_string(),
+                outcome: "report".to_string(),
+                state: "ready".to_string(),
+                summary: "A fresh attempt was just recorded.".to_string(),
+                bundle_path: None,
+                output_path: None,
+                validation_status: Some("ready".to_string()),
+                details: json!({}),
+                created_at: recent_attempt_at.clone(),
+            },
+            &recent_attempt_at,
+        );
+
+        let issue = test_runtime()
+            .block_on(next_issue_for_worker(&db, "worker-install", 3600))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(issue.id, "issue-alt");
+    }
+
+    #[test]
+    fn worker_queue_falls_back_to_oldest_recent_attempt_when_everything_is_cooling_down() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let first_issue = sample_crash(
+            "postgres",
+            "Top frame: first_issue_frame [postgres]",
+            &["first_issue_frame [postgres]"],
+        );
+        let second_issue = sample_crash(
+            "qbittorrent",
+            "Top frame: second_issue_frame [qbittorrent]",
+            &["second_issue_frame [qbittorrent]"],
+        );
+        let now = Utc::now();
+        let newer_attempt_at = (now - Duration::minutes(5)).to_rfc3339();
+        let older_attempt_at = (now - Duration::minutes(15)).to_rfc3339();
+        let last_seen = now.to_rfc3339();
+
+        insert_test_issue(
+            &connection,
+            "issue-newer",
+            "cluster-newer",
+            220,
+            &last_seen,
+            &first_issue,
+            &["other-install-a"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-older",
+            "cluster-older",
+            180,
+            &last_seen,
+            &second_issue,
+            &["other-install-b"],
+        );
+        insert_test_attempt(
+            &connection,
+            "attempt-newer",
+            "lease-newer",
+            &PatchAttempt {
+                cluster_id: "issue-newer".to_string(),
+                install_id: "reviewer-install-a".to_string(),
+                outcome: "report".to_string(),
+                state: "ready".to_string(),
+                summary: "A very recent attempt was recorded.".to_string(),
+                bundle_path: None,
+                output_path: None,
+                validation_status: Some("ready".to_string()),
+                details: json!({}),
+                created_at: newer_attempt_at.clone(),
+            },
+            &newer_attempt_at,
+        );
+        insert_test_attempt(
+            &connection,
+            "attempt-older",
+            "lease-older",
+            &PatchAttempt {
+                cluster_id: "issue-older".to_string(),
+                install_id: "reviewer-install-b".to_string(),
+                outcome: "report".to_string(),
+                state: "ready".to_string(),
+                summary: "An older recent attempt was recorded.".to_string(),
+                bundle_path: None,
+                output_path: None,
+                validation_status: Some("ready".to_string()),
+                details: json!({}),
+                created_at: older_attempt_at.clone(),
+            },
+            &older_attempt_at,
+        );
+
+        let issue = test_runtime()
+            .block_on(next_issue_for_worker(&db, "worker-install", 3600))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(issue.id, "issue-older");
     }
 
     #[test]

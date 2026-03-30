@@ -59,6 +59,10 @@ pub struct ServiceConfig {
     pub stuck_process_investigation_limit: usize,
     #[serde(default = "default_hotspot_investigation_retention_days")]
     pub hotspot_investigation_retention_days: u64,
+    #[serde(default = "default_proposal_bundle_retention_days")]
+    pub proposal_bundle_retention_days: u64,
+    #[serde(default = "default_proposal_bundle_keep_per_opportunity")]
+    pub proposal_bundle_keep_per_opportunity: usize,
     #[serde(default = "default_coredump_limit")]
     pub coredump_limit: usize,
     #[serde(default = "default_journal_lines")]
@@ -167,6 +171,8 @@ pub struct ServerConfig {
     pub quarantine_corroboration_threshold: i64,
     #[serde(default = "default_lease_seconds")]
     pub lease_seconds: u64,
+    #[serde(default = "default_worker_attempt_cooldown")]
+    pub worker_attempt_cooldown_seconds: u64,
     #[serde(default = "default_worker_trust_minimum")]
     pub worker_trust_minimum: i64,
     #[serde(default = "default_rate_limit_per_hour")]
@@ -212,6 +218,8 @@ impl Default for ServiceConfig {
             stuck_process_min_runtime_seconds: default_stuck_process_min_runtime(),
             stuck_process_investigation_limit: default_stuck_process_investigation_limit(),
             hotspot_investigation_retention_days: default_hotspot_investigation_retention_days(),
+            proposal_bundle_retention_days: default_proposal_bundle_retention_days(),
+            proposal_bundle_keep_per_opportunity: default_proposal_bundle_keep_per_opportunity(),
             coredump_limit: default_coredump_limit(),
             journal_lines: default_journal_lines(),
             watched_repos: Vec::new(),
@@ -291,6 +299,7 @@ impl Default for ServerConfig {
             max_bundle_items: default_max_submission_items(),
             quarantine_corroboration_threshold: default_quarantine_threshold(),
             lease_seconds: default_lease_seconds(),
+            worker_attempt_cooldown_seconds: default_worker_attempt_cooldown(),
             worker_trust_minimum: default_worker_trust_minimum(),
             max_submissions_per_hour: default_rate_limit_per_hour(),
             max_work_pulls_per_hour: default_rate_limit_per_hour(),
@@ -392,6 +401,14 @@ fn default_hotspot_investigation_retention_days() -> u64 {
     7
 }
 
+fn default_proposal_bundle_retention_days() -> u64 {
+    7
+}
+
+fn default_proposal_bundle_keep_per_opportunity() -> usize {
+    2
+}
+
 fn default_journal_lines() -> usize {
     50
 }
@@ -478,6 +495,10 @@ fn default_quarantine_threshold() -> i64 {
 
 fn default_lease_seconds() -> u64 {
     900
+}
+
+fn default_worker_attempt_cooldown() -> u64 {
+    60 * 60
 }
 
 fn default_worker_trust_minimum() -> i64 {

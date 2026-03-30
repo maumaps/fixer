@@ -10,10 +10,28 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+fn create_bundle_dir(config: &FixerConfig, opportunity_id: i64) -> Result<PathBuf> {
+    let proposals_root = config.service.state_dir.join("proposals");
+    fs::create_dir_all(&proposals_root)?;
+    prune_proposal_bundles(
+        &proposals_root,
+        config.service.proposal_bundle_retention_days,
+        config.service.proposal_bundle_keep_per_opportunity,
+    )?;
+    let bundle_dir = proposals_root.join(format!(
+        "{}-{}",
+        opportunity_id,
+        now_rfc3339().replace(':', "-")
+    ));
+    fs::create_dir_all(&bundle_dir)?;
+    Ok(bundle_dir)
+}
 
 pub fn create_proposal(
     store: &Store,
@@ -33,12 +51,7 @@ pub fn create_proposal_with_prior_patch(
     prior_best_patch: Option<&PatchAttempt>,
     engine: &str,
 ) -> Result<ProposalRecord> {
-    let bundle_dir = config.service.state_dir.join("proposals").join(format!(
-        "{}-{}",
-        opportunity.id,
-        now_rfc3339().replace(':', "-")
-    ));
-    fs::create_dir_all(&bundle_dir)?;
+    let bundle_dir = create_bundle_dir(config, opportunity.id)?;
 
     let evidence_path = bundle_dir.join("evidence.json");
     let prompt_path = bundle_dir.join("prompt.md");
@@ -129,12 +142,7 @@ pub fn prepare_codex_job_with_prior_patch(
     run_as_user: &str,
     allow_kernel: bool,
 ) -> Result<CodexJobSpec> {
-    let bundle_dir = config.service.state_dir.join("proposals").join(format!(
-        "{}-{}",
-        opportunity.id,
-        now_rfc3339().replace(':', "-")
-    ));
-    fs::create_dir_all(&bundle_dir)?;
+    let bundle_dir = create_bundle_dir(config, opportunity.id)?;
     let job_workspace = snapshot_workspace_for_job(workspace, &bundle_dir)?;
     let evidence_path = bundle_dir.join("evidence.json");
     let prompt_path = bundle_dir.join("prompt.md");
@@ -182,6 +190,64 @@ pub fn load_codex_job(job_dir: &std::path::Path) -> Result<CodexJobSpec> {
     let raw =
         fs::read(&job_path).with_context(|| format!("failed to read {}", job_path.display()))?;
     serde_json::from_slice(&raw).with_context(|| format!("failed to parse {}", job_path.display()))
+}
+
+fn prune_proposal_bundles(
+    root: &Path,
+    retention_days: u64,
+    keep_per_opportunity: usize,
+) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    let keep_per_opportunity = keep_per_opportunity.max(1);
+    let cutoff = (retention_days > 0).then(|| {
+        Utc::now() - ChronoDuration::seconds((retention_days.saturating_mul(24 * 60 * 60)) as i64)
+    });
+    let mut grouped: BTreeMap<String, Vec<(DateTime<Utc>, PathBuf)>> = BTreeMap::new();
+
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some((opportunity_id, _)) = file_name.split_once('-') else {
+            continue;
+        };
+        if opportunity_id.parse::<i64>().is_err() {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(Utc::now);
+        grouped
+            .entry(opportunity_id.to_string())
+            .or_default()
+            .push((modified, path));
+    }
+
+    for bundles in grouped.values_mut() {
+        bundles.sort_by(|left, right| right.0.cmp(&left.0));
+        for (index, (modified, path)) in bundles.iter().enumerate() {
+            let stale = cutoff.is_some_and(|cutoff| *modified < cutoff);
+            if index >= keep_per_opportunity || stale {
+                fs::remove_dir_all(path).with_context(|| {
+                    format!("failed to prune proposal bundle {}", path.display())
+                })?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn load_codex_job_status(bundle_dir: &Path) -> Result<CodexJobStatus> {
@@ -634,12 +700,7 @@ pub fn create_external_report_proposal(
     opportunity: &OpportunityRecord,
     acquisition_error: &str,
 ) -> Result<ProposalRecord> {
-    let bundle_dir = config.service.state_dir.join("proposals").join(format!(
-        "{}-{}",
-        opportunity.id,
-        now_rfc3339().replace(':', "-")
-    ));
-    fs::create_dir_all(&bundle_dir)?;
+    let bundle_dir = create_bundle_dir(config, opportunity.id)?;
 
     let evidence_path = bundle_dir.join("evidence.json");
     let summary_path = bundle_dir.join("proposal.md");
@@ -700,18 +761,35 @@ pub fn supports_process_investigation_report(opportunity: &OpportunityRecord) ->
             })
 }
 
+pub fn process_investigation_blocker_kind(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("codex auth lease")
+        || lower.contains("codex auth was not found")
+        || lower.contains("log in as")
+        || lower.contains("lease has expired")
+        || lower.contains("lease is paused")
+        || lower.contains("lease budget")
+    {
+        "codex-auth"
+    } else if lower.contains("no repo root or package name")
+        || lower.contains("patchable workspace")
+        || lower.contains("workspace")
+        || lower.contains("source package")
+        || lower.contains("source tree")
+    {
+        "workspace"
+    } else {
+        "automatic-patch"
+    }
+}
+
 pub fn create_process_investigation_report_proposal(
     store: &Store,
     config: &FixerConfig,
     opportunity: &OpportunityRecord,
     acquisition_error: Option<&str>,
 ) -> Result<ProposalRecord> {
-    let bundle_dir = config.service.state_dir.join("proposals").join(format!(
-        "{}-{}",
-        opportunity.id,
-        now_rfc3339().replace(':', "-")
-    ));
-    fs::create_dir_all(&bundle_dir)?;
+    let bundle_dir = create_bundle_dir(config, opportunity.id)?;
 
     let evidence_path = bundle_dir.join("evidence.json");
     let summary_path = bundle_dir.join("proposal.md");
@@ -727,11 +805,14 @@ pub fn create_process_investigation_report_proposal(
         .and_then(|details| details.get("subsystem"))
         .and_then(Value::as_str)
         .unwrap_or("investigation");
+    let blocker_kind = acquisition_error.map(process_investigation_blocker_kind);
     let evidence = json!({
         "report_kind": format!("{report_kind}-investigation"),
         "opportunity": opportunity,
         "package": package,
         "system": system,
+        "automatic_patch_blocker": acquisition_error,
+        "automatic_patch_blocker_kind": blocker_kind,
         "workspace_error": acquisition_error,
     });
     fs::write(&evidence_path, serde_json::to_vec_pretty(&evidence)?)?;
@@ -759,12 +840,7 @@ pub fn create_local_remediation_proposal(
     config: &FixerConfig,
     opportunity: &OpportunityRecord,
 ) -> Result<ProposalRecord> {
-    let bundle_dir = config.service.state_dir.join("proposals").join(format!(
-        "{}-{}",
-        opportunity.id,
-        now_rfc3339().replace(':', "-")
-    ));
-    fs::create_dir_all(&bundle_dir)?;
+    let bundle_dir = create_bundle_dir(config, opportunity.id)?;
 
     let evidence_path = bundle_dir.join("evidence.json");
     let summary_path = bundle_dir.join("proposal.md");
@@ -812,12 +888,7 @@ pub fn create_complaint_plan_proposal(
     collection_report: Option<&ComplaintCollectionReport>,
     related: &[SharedOpportunity],
 ) -> Result<ProposalRecord> {
-    let bundle_dir = config.service.state_dir.join("proposals").join(format!(
-        "{}-{}",
-        opportunity.id,
-        now_rfc3339().replace(':', "-")
-    ));
-    fs::create_dir_all(&bundle_dir)?;
+    let bundle_dir = create_bundle_dir(config, opportunity.id)?;
 
     let evidence_path = bundle_dir.join("evidence.json");
     let summary_path = bundle_dir.join("plan.md");
@@ -935,7 +1006,7 @@ fn copy_directory_recursively(
         })?;
     }
     let status = Command::new("cp")
-        .args(["-a"])
+        .args(["-a", "--reflink=auto"])
         .arg(source)
         .arg(destination)
         .status()
@@ -2122,17 +2193,32 @@ fn render_process_investigation_report(
     body.push_str("## Recommended Action\n\n");
     match acquisition_error {
         Some(error) => {
-            if is_stuck_process {
+            let blocker_kind = process_investigation_blocker_kind(error);
+            if blocker_kind == "codex-auth" {
+                body.push_str("Fixer gathered enough evidence to describe the issue, and a patch might still be possible, but this host could not start the automated Codex pass.\n\n");
+                body.push_str(&format!("Automatic patch attempt blocker: `{error}`\n\n"));
+                body.push_str("Fix the local Codex auth lease or login state, then retry the patch pass if this issue still looks worth pursuing.\n\n");
+            } else if blocker_kind == "workspace" && is_stuck_process {
                 body.push_str("Fixer diagnosed a likely stuck-process wait, but it could not automatically acquire a patchable source workspace on this host.\n\n");
-            } else if is_desktop_resume {
+                body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
+                body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
+            } else if blocker_kind == "workspace" && is_desktop_resume {
                 body.push_str("Fixer diagnosed a suspend/resume display-stack failure, but it could not automatically acquire a patchable graphics or desktop source workspace on this host.\n\n");
-            } else if is_oom_kill {
+                body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
+                body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
+            } else if blocker_kind == "workspace" && is_oom_kill {
                 body.push_str("Fixer diagnosed a kernel OOM kill, but it could not automatically acquire a patchable source workspace on this host.\n\n");
-            } else {
+                body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
+                body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
+            } else if blocker_kind == "workspace" {
                 body.push_str("Fixer diagnosed a likely runaway CPU loop, but it could not automatically acquire a patchable source workspace on this host.\n\n");
+                body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
+                body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
+            } else {
+                body.push_str("Fixer gathered enough evidence to describe the issue, but the automatic patch attempt did not get far enough to produce a real patch on this host.\n\n");
+                body.push_str(&format!("Automatic patch attempt blocker: `{error}`\n\n"));
+                body.push_str("Use the diagnosis below to understand the issue first, then retry the patch pass once the blocker above is resolved.\n\n");
             }
-            body.push_str(&format!("Workspace acquisition error: `{error}`\n\n"));
-            body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
         }
         None => {
             if is_stuck_process {
@@ -2409,6 +2495,49 @@ fn render_process_investigation_report(
         evidence_path.display()
     ));
     body
+}
+
+pub fn annotate_process_investigation_report_blocker(
+    bundle_dir: &Path,
+    blocker: &str,
+) -> Result<()> {
+    let evidence_path = bundle_dir.join("evidence.json");
+    let summary_path = bundle_dir.join("proposal.md");
+    let raw = fs::read(&evidence_path)
+        .with_context(|| format!("failed to read {}", evidence_path.display()))?;
+    let mut evidence: Value = serde_json::from_slice(&raw)
+        .with_context(|| format!("failed to parse {}", evidence_path.display()))?;
+    evidence["automatic_patch_blocker"] = json!(blocker);
+    evidence["automatic_patch_blocker_kind"] = json!(process_investigation_blocker_kind(blocker));
+    if process_investigation_blocker_kind(blocker) == "workspace" {
+        evidence["workspace_error"] = json!(blocker);
+    }
+    fs::write(&evidence_path, serde_json::to_vec_pretty(&evidence)?)?;
+
+    let opportunity: OpportunityRecord = serde_json::from_value(
+        evidence
+            .get("opportunity")
+            .cloned()
+            .ok_or_else(|| anyhow!("missing opportunity in {}", evidence_path.display()))?,
+    )?;
+    let package = evidence
+        .get("package")
+        .cloned()
+        .filter(|value| !value.is_null())
+        .map(serde_json::from_value::<InstalledPackageMetadata>)
+        .transpose()?;
+    let system = evidence.get("system").cloned().unwrap_or_else(|| json!({}));
+    fs::write(
+        &summary_path,
+        render_process_investigation_report(
+            &opportunity,
+            package.as_ref(),
+            &system,
+            &evidence_path,
+            Some(blocker),
+        ),
+    )?;
+    Ok(())
 }
 
 fn render_local_remediation_sql(opportunity: &OpportunityRecord) -> Result<String> {
@@ -3335,6 +3464,53 @@ mod tests {
     }
 
     #[test]
+    fn process_investigation_report_mentions_codex_auth_blockers_explicitly() {
+        let opportunity = OpportunityRecord {
+            id: 11,
+            finding_id: 11,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for postgres".to_string(),
+            score: 106,
+            state: "open".to_string(),
+            summary: "postgres is stuck in a likely file not found retry loop.".to_string(),
+            evidence: json!({
+                "package_name": "postgresql-18",
+                "details": {
+                    "subsystem": "runaway-process",
+                    "profile_target": { "name": "postgres" },
+                    "loop_classification": "file-not-found-retry",
+                    "loop_confidence": 0.84,
+                    "loop_explanation": "The trace keeps retrying file lookups that fail with ENOENT.",
+                    "top_hot_symbols": ["verify_compact_attribute (3.15% in postgres)"],
+                    "top_syscalls": [{ "name": "openat", "count": 1428 }],
+                    "process_state": "S (sleeping)",
+                    "wchan": "ep_poll"
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-03-30T00:00:00Z".to_string(),
+            updated_at: "2026-03-30T00:00:00Z".to_string(),
+        };
+        let system = json!({
+            "os_pretty_name": "Debian GNU/Linux forky/sid",
+            "kernel": "Linux 6.19.8+deb14-amd64"
+        });
+        let rendered = render_process_investigation_report(
+            &opportunity,
+            None,
+            &system,
+            Path::new("/tmp/evidence.json"),
+            Some(
+                "the current Codex auth lease is paused: auto-paused after 3 recent Codex failures",
+            ),
+        );
+        assert!(rendered.contains("could not start the automated Codex pass"));
+        assert!(rendered.contains("Automatic patch attempt blocker"));
+        assert!(rendered.contains("Codex auth lease is paused"));
+    }
+
+    #[test]
     fn published_codex_session_sanitizes_local_bundle_paths() {
         let dir = tempfile::tempdir().unwrap();
         let bundle_dir = dir.path().join("proposal");
@@ -3521,6 +3697,35 @@ mod tests {
         assert!(!primary_model_rate_limit_active(&config));
         remember_primary_model_rate_limit(&config).unwrap();
         assert!(primary_model_rate_limit_active(&config));
+    }
+
+    #[test]
+    fn proposal_bundle_pruning_keeps_only_recent_bundles_per_opportunity() {
+        let dir = tempfile::tempdir().unwrap();
+        let proposals_root = dir.path().join("proposals");
+        std::fs::create_dir_all(&proposals_root).unwrap();
+
+        for suffix in ["00", "01", "02", "03"] {
+            let bundle = proposals_root.join(format!("42-2026-03-30T00-00-{suffix}Z"));
+            std::fs::create_dir_all(&bundle).unwrap();
+            std::fs::write(bundle.join("marker.txt"), suffix).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        super::prune_proposal_bundles(&proposals_root, 7, 2).unwrap();
+
+        let mut remaining = std::fs::read_dir(&proposals_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec![
+                "42-2026-03-30T00-00-02Z".to_string(),
+                "42-2026-03-30T00-00-03Z".to_string()
+            ]
+        );
     }
 
     #[test]

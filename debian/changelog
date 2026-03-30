@@ -1,3 +1,16 @@
+fixer (0.29.0-1) unstable; urgency=medium
+
+  * Stop advertising worker Codex availability when a user lease is missing, expired,
+    revoked, or paused.
+  * Record investigation patch blockers explicitly so diagnosis-only runs explain whether
+    they were blocked by Codex auth, workspace acquisition, or another patch failure.
+  * Cool down recently attempted worker issues so hosts try other public work instead of
+    tight-looping the same issue repeatedly.
+  * Prune old proposal bundles automatically and prefer reflink workspace copies to keep
+    worker disk usage under control.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 30 Mar 2026 20:28:58 +0400
+
 fixer (0.28.0-1) unstable; urgency=medium
 
   * Prefer GPT-5.3-Codex-Spark automatically after primary Codex rate-limit hits and

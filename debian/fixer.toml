@@ -10,6 +10,8 @@ collect_bpftrace = false
 perf_duration_seconds = 3
 coredump_limit = 10
 journal_lines = 50
+proposal_bundle_retention_days = 7
+proposal_bundle_keep_per_opportunity = 2
 watched_repos = []
 warning_logs = []
 
@@ -59,6 +61,7 @@ max_payload_bytes = 524288
 max_bundle_items = 50
 quarantine_corroboration_threshold = 2
 lease_seconds = 900
+worker_attempt_cooldown_seconds = 3600
 worker_trust_minimum = 2
 max_submissions_per_hour = 60
 max_work_pulls_per_hour = 60

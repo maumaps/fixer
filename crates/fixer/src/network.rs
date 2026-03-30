@@ -154,6 +154,45 @@ pub fn revoke_codex_auth_lease(store: &Store) -> Result<Option<CodexAuthLease>> 
     Ok(Some(lease))
 }
 
+#[derive(Debug, Clone)]
+struct CodexWorkerAvailability {
+    ready: bool,
+    reason: Option<String>,
+}
+
+fn codex_worker_availability(
+    store: &Store,
+    config: &FixerConfig,
+) -> Result<CodexWorkerAvailability> {
+    let has_codex_binary =
+        store.capability_available("codex")? || command_exists(&config.patch.codex_command);
+    if !has_codex_binary {
+        return Ok(CodexWorkerAvailability {
+            ready: false,
+            reason: Some("Codex is not installed on this host".to_string()),
+        });
+    }
+
+    match config.patch.auth_mode {
+        CodexAuthMode::RootDirect => Ok(CodexWorkerAvailability {
+            ready: true,
+            reason: None,
+        }),
+        CodexAuthMode::UserLease => {
+            let status = codex_auth_lease_status(store, config)?;
+            Ok(CodexWorkerAvailability {
+                ready: status.ready,
+                reason: (!status.ready).then(|| {
+                    format!(
+                        "Codex auth lease is not ready on this host: {}",
+                        status.notes.join("; ")
+                    )
+                }),
+            })
+        }
+    }
+}
+
 fn require_local_admin_tools() -> Result<()> {
     for tool in ["runuser", "systemd-run", "getent", "chown"] {
         if !command_exists(tool) {
@@ -770,11 +809,14 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
             "worker participation is disabled; run `fixer opt-in --mode submitter+worker` first"
         ));
     }
-    if config.patch.auth_mode == CodexAuthMode::RootDirect
-        && (!store.capability_available("codex")? || !command_exists(&config.patch.codex_command))
-    {
+    let codex_worker = codex_worker_availability(store, config)?;
+    if !codex_worker.ready {
         return Err(anyhow!(
-            "Codex is not available on this host, so it cannot accept worker leases"
+            "{}",
+            codex_worker.reason.unwrap_or_else(|| {
+                "Codex worker is not ready on this host, so it cannot accept worker leases"
+                    .to_string()
+            })
         ));
     }
 
@@ -1076,6 +1118,11 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                 }
                 Err(error) => {
                     if let Some(report) = investigation_report {
+                        let patch_error = error.to_string();
+                        let _ = proposal::annotate_process_investigation_report_blocker(
+                            &report.bundle_path,
+                            &patch_error,
+                        );
                         let submission_bundle = proposal::prepare_submission(store, report.id).ok();
                         WorkerResultEnvelope {
                             lease_id: lease.lease_id.clone(),
@@ -1084,10 +1131,9 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                                 install_id: participation.identity.install_id.clone(),
                                 outcome: "report".to_string(),
                                 state: report.state.clone(),
-                                summary: format!(
-                                    "{} A diagnosis report was created, but the patch attempt failed to run cleanly: {}",
-                                    process_investigation_worker_summary(&opportunity),
-                                    error
+                                summary: process_investigation_blocked_patch_summary(
+                                    &opportunity,
+                                    &patch_error,
                                 ),
                                 bundle_path: Some(report.bundle_path.display().to_string()),
                                 output_path: report
@@ -1100,7 +1146,9 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                                     "local_submission_bundle": submission_bundle.map(|path| path.display().to_string()),
                                     "local_opportunity_id": opportunity.id,
                                     "diagnosis": process_investigation_worker_diagnosis(&opportunity),
-                                    "patch_error": error.to_string(),
+                                    "patch_error": patch_error,
+                                    "automatic_patch_blocker_kind": proposal::process_investigation_blocker_kind(&patch_error),
+                                    "report_only_reason": process_investigation_report_only_reason_for_error(&patch_error),
                                     "workspace": workspace,
                                 }),
                                 created_at: now_rfc3339(),
@@ -1131,6 +1179,7 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                 ) {
                     Ok(report) => {
                         let submission_bundle = proposal::prepare_submission(store, report.id).ok();
+                        let workspace_error = error.to_string();
                         WorkerResultEnvelope {
                             lease_id: lease.lease_id.clone(),
                             attempt: PatchAttempt {
@@ -1138,9 +1187,9 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                                 install_id: participation.identity.install_id.clone(),
                                 outcome: "report".to_string(),
                                 state: report.state.clone(),
-                                summary: format!(
-                                    "{} A diagnosis report was created even though no patchable workspace was available.",
-                                    process_investigation_worker_summary(&opportunity)
+                                summary: process_investigation_blocked_patch_summary(
+                                    &opportunity,
+                                    &workspace_error,
                                 ),
                                 bundle_path: Some(report.bundle_path.display().to_string()),
                                 output_path: report
@@ -1153,7 +1202,9 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                                     "local_submission_bundle": submission_bundle.map(|path| path.display().to_string()),
                                     "local_opportunity_id": opportunity.id,
                                     "diagnosis": process_investigation_worker_diagnosis(&opportunity),
-                                    "workspace_error": error.to_string(),
+                                    "workspace_error": workspace_error,
+                                    "automatic_patch_blocker_kind": proposal::process_investigation_blocker_kind(&workspace_error),
+                                    "report_only_reason": process_investigation_report_only_reason_for_error(&workspace_error),
                                 }),
                                 created_at: now_rfc3339(),
                             },
@@ -1339,7 +1390,7 @@ fn materialize_shared_opportunity(
 
 fn build_client_hello(
     store: &Store,
-    _config: &FixerConfig,
+    config: &FixerConfig,
     identity: &InstallIdentity,
     state: &ParticipationState,
 ) -> Result<ClientHello> {
@@ -1349,13 +1400,14 @@ fn build_client_hello(
         .filter(|capability| capability.available)
         .map(|capability| capability.name)
         .collect::<Vec<_>>();
+    let codex_worker = codex_worker_availability(store, config)?;
     Ok(ClientHello {
         install_id: identity.install_id.clone(),
         version: current_binary_version().to_string(),
         protocol_version: default_protocol_version(),
         mode: state.mode.clone(),
         hostname: current_hostname(),
-        has_codex: capabilities.iter().any(|capability| capability == "codex"),
+        has_codex: codex_worker.ready,
         capabilities,
         richer_evidence_allowed: state.richer_evidence_allowed,
     })
@@ -1487,6 +1539,37 @@ fn process_investigation_prefers_report_only(
         .get("likely_external_root_cause")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+fn process_investigation_report_only_reason_for_error(error: &str) -> &'static str {
+    match proposal::process_investigation_blocker_kind(error) {
+        "codex-auth" => "codex-auth-unavailable",
+        "workspace" => "workspace-acquisition",
+        _ => "automatic-patch-blocked",
+    }
+}
+
+fn process_investigation_blocked_patch_summary(
+    opportunity: &crate::models::OpportunityRecord,
+    error: &str,
+) -> String {
+    match proposal::process_investigation_blocker_kind(error) {
+        "codex-auth" => format!(
+            "{} A diagnosis report was created, but Fixer could not start the automated patch attempt because Codex auth on this host is unavailable: {}",
+            process_investigation_worker_summary(opportunity),
+            error
+        ),
+        "workspace" => format!(
+            "{} A diagnosis report was created even though no patchable workspace was available: {}",
+            process_investigation_worker_summary(opportunity),
+            error
+        ),
+        _ => format!(
+            "{} A diagnosis report was created, but the automated patch attempt stopped before completion: {}",
+            process_investigation_worker_summary(opportunity),
+            error
+        ),
+    }
 }
 
 fn published_session_has_diff(session: Option<&Value>) -> bool {
@@ -1637,7 +1720,9 @@ pub fn verify_worker_pull_pow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{FindingRecord, OpportunityRecord};
+    use crate::models::{
+        Capability, FindingRecord, OpportunityRecord, ParticipationMode, ParticipationState,
+    };
     use crate::storage::Store;
     use serde_json::json;
     use std::fs;
@@ -1677,6 +1762,16 @@ mod tests {
             jobs_started_day: "2026-03-29".to_string(),
             jobs_started_today: 0,
             recent_failures: Vec::new(),
+        }
+    }
+
+    fn sample_codex_capability() -> Capability {
+        Capability {
+            name: "codex".to_string(),
+            binary: "codex".to_string(),
+            available: true,
+            path: Some("/usr/bin/codex".into()),
+            notes: Some("AI patch proposal engine".to_string()),
         }
     }
 
@@ -1721,6 +1816,22 @@ mod tests {
     }
 
     #[test]
+    fn process_investigation_blocked_patch_reason_detects_codex_auth_failures() {
+        assert_eq!(
+            process_investigation_report_only_reason_for_error(
+                "the current Codex auth lease is paused: auto-paused after 3 recent Codex failures"
+            ),
+            "codex-auth-unavailable"
+        );
+        assert_eq!(
+            process_investigation_report_only_reason_for_error(
+                "opportunity 655 has no repo root or package name"
+            ),
+            "workspace-acquisition"
+        );
+    }
+
+    #[test]
     fn conservative_budget_is_bounded() {
         let budget = lease_budget_for_preset(&LeaseBudgetPreset::Conservative);
         assert_eq!(budget.max_active_jobs, 1);
@@ -1734,6 +1845,70 @@ mod tests {
         let paths = codex_state_dir_paths(home);
         assert_eq!(paths[0], Path::new("/home/alice/.cache/codex"));
         assert_eq!(paths[1], Path::new("/home/alice/.local/share/codex"));
+    }
+
+    #[test]
+    fn build_client_hello_hides_codex_when_user_lease_is_not_ready() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        store
+            .sync_capabilities(&[sample_codex_capability()])
+            .unwrap();
+
+        let config = FixerConfig::default();
+        let identity = store.ensure_install_identity().unwrap();
+        let state = ParticipationState {
+            mode: ParticipationMode::SubmitterWorker,
+            ..ParticipationState::default()
+        };
+
+        let hello = build_client_hello(&store, &config, &identity, &state).unwrap();
+        assert!(!hello.has_codex);
+        assert!(
+            hello
+                .capabilities
+                .iter()
+                .any(|capability| capability == "codex")
+        );
+    }
+
+    #[test]
+    fn build_client_hello_advertises_codex_for_root_direct_hosts() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        store
+            .sync_capabilities(&[sample_codex_capability()])
+            .unwrap();
+
+        let mut config = FixerConfig::default();
+        config.patch.auth_mode = CodexAuthMode::RootDirect;
+        config.patch.codex_command = "sh".to_string();
+        let identity = store.ensure_install_identity().unwrap();
+        let state = ParticipationState {
+            mode: ParticipationMode::SubmitterWorker,
+            ..ParticipationState::default()
+        };
+
+        let hello = build_client_hello(&store, &config, &identity, &state).unwrap();
+        assert!(hello.has_codex);
+    }
+
+    #[test]
+    fn worker_once_stops_before_polling_when_user_lease_is_not_ready() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        store
+            .sync_capabilities(&[sample_codex_capability()])
+            .unwrap();
+        store
+            .save_participation_state(&ParticipationState {
+                mode: ParticipationMode::SubmitterWorker,
+                ..ParticipationState::default()
+            })
+            .unwrap();
+
+        let error = worker_once(&store, &FixerConfig::default()).unwrap_err();
+        assert!(error.to_string().contains("Codex auth lease is not ready"));
     }
 
     #[test]
