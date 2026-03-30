@@ -756,8 +756,17 @@ struct PublicIssueDetail {
     best_triage: Option<PublicAttempt>,
     best_triage_handoff: Option<PublicTriageHandoff>,
     last_seen: String,
+    technical_snapshot: Option<PublicTechnicalSnapshot>,
     possible_duplicates: Vec<PublicPossibleDuplicate>,
     attempts: Vec<PublicAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicTechnicalSnapshot {
+    title: String,
+    summary: String,
+    frames: Vec<String>,
+    highlights: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5975,57 +5984,13 @@ async fn load_public_issue_candidates(
     }
 }
 
-async fn load_public_issue(db: &ServerDb, id: String) -> Result<PublicIssue, ApiError> {
-    match db {
-        ServerDb::Postgres(db) => {
-            let row = db
-                .query_opt(
-                    "
-            SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
-                   severity, score, corroboration_count,
-                   (best_patch_json IS NOT NULL) AS best_patch_available,
-                   (best_triage_json IS NOT NULL) AS best_triage_available,
-                   last_seen
-            FROM issue_clusters
-            WHERE id = $1 AND promoted = TRUE AND public_visible = TRUE
-            ",
-                    &[&id],
-                )
-                .await
-                .map_err(ApiError::internal)?;
-            let Some(row) = row else {
-                return Err(ApiError::new(StatusCode::NOT_FOUND, "issue not found"));
-            };
-            public_issue_from_row(row)
-        }
-        ServerDb::Sqlite(path) => {
-            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
-            let row = connection
-                .query_row(
-                    "
-            SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
-                   severity, score, corroboration_count,
-                   (best_patch_json IS NOT NULL) AS best_patch_available,
-                   (best_triage_json IS NOT NULL) AS best_triage_available,
-                   last_seen
-            FROM issue_clusters
-            WHERE id = ?1 AND promoted = 1 AND public_visible = 1
-            ",
-                    [id.as_str()],
-                    public_issue_from_sqlite_row,
-                )
-                .optional()
-                .map_err(ApiError::internal)?;
-            row.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "issue not found"))
-        }
-    }
-}
-
 async fn load_public_issue_detail(
     db: &ServerDb,
     id: String,
 ) -> Result<PublicIssueDetail, ApiError> {
-    let issue = load_public_issue(db, id.clone()).await?;
+    let candidate = load_duplicate_candidate_by_id(db, &id).await?;
+    let technical_snapshot = build_public_technical_snapshot(&candidate.representative);
+    let issue = candidate.issue;
     let best_patch = load_public_issue_best_patch(db, &id).await?;
     let best_triage = load_public_issue_best_triage(db, &id).await?;
     let best_patch_diff_url = public_best_patch_diff_url(&id, best_patch.as_ref());
@@ -6051,6 +6016,7 @@ async fn load_public_issue_detail(
             .and_then(|attempt| attempt.handoff.clone()),
         best_triage,
         last_seen: issue.last_seen,
+        technical_snapshot,
         possible_duplicates,
         attempts,
     })
@@ -6553,7 +6519,12 @@ fn compare_public_issue_priority(
     let right_impact = issue_user_impact_score(&right.issue, &right.representative);
     right_impact
         .cmp(&left_impact)
-        .then_with(|| right.issue.corroboration_count.cmp(&left.issue.corroboration_count))
+        .then_with(|| {
+            right
+                .issue
+                .corroboration_count
+                .cmp(&left.issue.corroboration_count)
+        })
         .then_with(|| {
             compare_issue_priority(
                 &left.issue.kind,
@@ -6581,9 +6552,7 @@ fn compare_public_issue_priority(
 fn issue_user_impact_score(issue: &PublicIssue, representative: &SharedOpportunity) -> i64 {
     let subsystem = representative_subsystem(representative);
     let target_name = representative_fixability_target_name(representative);
-    let kernelish_target = target_name
-        .as_deref()
-        .is_some_and(is_kernelish_target_name);
+    let kernelish_target = target_name.as_deref().is_some_and(is_kernelish_target_name);
     let mut score = match issue.kind.as_str() {
         "crash" => 92,
         "hotspot" => 44,
@@ -6621,7 +6590,10 @@ fn issue_user_impact_score(issue: &PublicIssue, representative: &SharedOpportuni
     score
 }
 
-fn issue_human_context(issue: &PublicIssue, representative: &SharedOpportunity) -> IssueHumanContext {
+fn issue_human_context(
+    issue: &PublicIssue,
+    representative: &SharedOpportunity,
+) -> IssueHumanContext {
     let impact_score = issue_user_impact_score(issue, representative);
     let subsystem = representative_subsystem(representative);
     let target = representative_fixability_target_name(representative)
@@ -8583,6 +8555,184 @@ fn normalize_kernel_warning_message(raw: &str) -> String {
     normalize_proc_path(&text)
 }
 
+fn build_public_technical_snapshot(item: &SharedOpportunity) -> Option<PublicTechnicalSnapshot> {
+    match item.finding.kind.as_str() {
+        "crash" => build_public_crash_snapshot(item),
+        "investigation" => build_public_investigation_snapshot(item),
+        _ => None,
+    }
+}
+
+fn build_public_crash_snapshot(item: &SharedOpportunity) -> Option<PublicTechnicalSnapshot> {
+    let details = &item.finding.details;
+    let frames = sanitize_snapshot_frames(
+        details
+            .get("primary_stack")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        14,
+    );
+    if frames.is_empty() {
+        return None;
+    }
+    let signal = details
+        .get("signal_name")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            details
+                .get("signal_number")
+                .and_then(Value::as_i64)
+                .map(|value| format!("signal {value}"))
+        });
+    let executable = details
+        .get("executable")
+        .and_then(Value::as_str)
+        .map(file_name_or_self)
+        .or_else(|| item.finding.package_name.as_deref())
+        .map(sanitize_public_text);
+    let mut highlights = Vec::new();
+    if let Some(executable) = executable {
+        highlights.push(format!("Process: {executable}"));
+    }
+    if let Some(signal) = signal {
+        highlights.push(format!("Signal: {}", sanitize_public_text(&signal)));
+    }
+    Some(PublicTechnicalSnapshot {
+        title: "Crashing thread stack trace".to_string(),
+        summary:
+            "Fixer kept the most informative crashing thread and shows the top stack frames below."
+                .to_string(),
+        frames,
+        highlights,
+    })
+}
+
+fn build_public_investigation_snapshot(
+    item: &SharedOpportunity,
+) -> Option<PublicTechnicalSnapshot> {
+    let details = &item.finding.details;
+    let subsystem = details
+        .get("subsystem")
+        .and_then(Value::as_str)
+        .unwrap_or("runaway-process");
+    match subsystem {
+        "runaway-process" => {
+            let frames = sanitize_snapshot_frames(
+                details
+                    .get("stack_excerpt")
+                    .and_then(Value::as_str)
+                    .into_iter()
+                    .flat_map(|excerpt| excerpt.lines())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                12,
+            );
+            if frames.is_empty() {
+                return None;
+            }
+            let mut highlights = Vec::new();
+            if let Some(command_line) = details.get("command_line").and_then(Value::as_str) {
+                highlights.push(format!("Command: {}", sanitize_public_text(command_line)));
+            }
+            if let Some(wchan) = details.get("wchan").and_then(Value::as_str) {
+                highlights.push(format!("Wait site: {}", normalize_stack_frame(wchan)));
+            }
+            if let Some(symbol) = details
+                .get("hot_path_symbol")
+                .and_then(Value::as_str)
+                .map(normalize_stack_frame)
+            {
+                let percent = details
+                    .get("hot_path_percent")
+                    .and_then(Value::as_f64)
+                    .map(|value| format!("{value:.2}% sampled CPU"))
+                    .unwrap_or_else(|| "sampled hot path".to_string());
+                highlights.push(format!("Hot path: {symbol} ({percent})"));
+            } else if let Some(symbol) = details
+                .get("top_hot_symbols")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str)
+            {
+                highlights.push(format!("Hot path: {}", normalize_stack_frame(symbol)));
+            }
+            if let Some(sequence) = details
+                .get("dominant_sequence")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(4)
+                        .map(normalize_stack_frame)
+                        .filter(|value| !value.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
+                })
+                .filter(|value| !value.is_empty())
+            {
+                highlights.push(format!("Repeated loop: {sequence}"));
+            }
+            Some(PublicTechnicalSnapshot {
+                title: "Sampled wait stack".to_string(),
+                summary: "This is the stack-shaped slice and hot path Fixer captured while the process was spinning.".to_string(),
+                frames,
+                highlights,
+            })
+        }
+        "stuck-process" => {
+            let frames = sanitize_snapshot_frames(
+                details
+                    .get("stack_excerpt")
+                    .and_then(Value::as_str)
+                    .into_iter()
+                    .flat_map(|excerpt| excerpt.lines())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                12,
+            );
+            if frames.is_empty() {
+                return None;
+            }
+            let mut highlights = Vec::new();
+            if let Some(state) = details.get("process_state").and_then(Value::as_str) {
+                highlights.push(format!("State: {}", sanitize_public_text(state)));
+            }
+            if let Some(wchan) = details.get("wchan").and_then(Value::as_str) {
+                highlights.push(format!("Wait site: {}", normalize_stack_frame(wchan)));
+            }
+            Some(PublicTechnicalSnapshot {
+                title: "Kernel wait stack".to_string(),
+                summary: "This is where Fixer saw the sampled task blocked in the kernel."
+                    .to_string(),
+                frames,
+                highlights,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn sanitize_snapshot_frames(raw_frames: Vec<String>, limit: usize) -> Vec<String> {
+    let mut frames = Vec::new();
+    for frame in raw_frames {
+        let normalized = normalize_stack_frame(frame.trim());
+        if normalized.is_empty() || frames.contains(&normalized) {
+            continue;
+        }
+        frames.push(normalized);
+        if frames.len() >= limit {
+            break;
+        }
+    }
+    frames
+}
+
 fn file_name_or_self(raw: &str) -> &str {
     Path::new(raw)
         .file_name()
@@ -8884,6 +9034,7 @@ fn render_patches_page(patches: &[PublicPatchEntry]) -> String {
 
 fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
     let best_result_markup = render_best_result_panel(issue);
+    let technical_snapshot_markup = render_technical_snapshot_section(issue);
     let duplicates_markup = render_possible_duplicates_section(issue);
     let attempts_markup = if issue.attempts.is_empty() {
         "<p class=\"fine-print\">No public attempts have been published for this issue yet.</p>"
@@ -8906,6 +9057,7 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
             <p class="fine-print">Last seen: {}. Public JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
         </section>
 
+        {}
         {}
         {}
 
@@ -8931,6 +9083,7 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
         issue.id,
         issue.id,
         best_result_markup,
+        technical_snapshot_markup,
         duplicates_markup,
         attempts_markup,
     );
@@ -8948,6 +9101,38 @@ fn render_best_result_panel(issue: &PublicIssueDetail) -> String {
         return panel;
     }
     render_best_triage_panel(issue).unwrap_or_default()
+}
+
+fn render_technical_snapshot_section(issue: &PublicIssueDetail) -> String {
+    let Some(snapshot) = issue.technical_snapshot.as_ref() else {
+        return String::new();
+    };
+    let highlight_markup = if snapshot.highlights.is_empty() {
+        String::new()
+    } else {
+        let items = snapshot
+            .highlights
+            .iter()
+            .map(|highlight| format!("<li>{}</li>", html_escape(highlight)))
+            .collect::<Vec<_>>()
+            .join("");
+        format!("<ul class=\"attempt-list\">{items}</ul>")
+    };
+    format!(
+        r#"<section class="panel section">
+            <h2>Technical snapshot</h2>
+            <p class="issue-summary">{}</p>
+            <section class="patch-summary">
+                <h4>{}</h4>
+                {}
+                <pre class="code-block"><code>{}</code></pre>
+            </section>
+        </section>"#,
+        html_escape(&snapshot.summary),
+        html_escape(&snapshot.title),
+        highlight_markup,
+        html_escape(&snapshot.frames.join("\n")),
+    )
 }
 
 fn render_possible_duplicates_section(issue: &PublicIssueDetail) -> String {
@@ -10434,6 +10619,7 @@ mod tests {
             best_triage: None,
             best_triage_handoff: None,
             last_seen: "2026-03-29T00:00:00Z".to_string(),
+            technical_snapshot: None,
             possible_duplicates: Vec::new(),
             attempts: Vec::new(),
         };
@@ -10488,6 +10674,7 @@ mod tests {
                 next_steps: vec!["Capture a fresh backend sample.".to_string()],
             }),
             last_seen: "2026-03-29T00:00:00Z".to_string(),
+            technical_snapshot: None,
             possible_duplicates: vec![PublicPossibleDuplicate {
                 id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f9".to_string(),
                 kind: "investigation".to_string(),
@@ -10515,6 +10702,55 @@ mod tests {
         assert!(markup.contains("similarity: 82%"));
         assert!(markup.contains("same package, same wait site"));
         assert!(markup.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f9"));
+    }
+
+    #[test]
+    fn render_issue_detail_page_includes_technical_snapshot() {
+        let issue = PublicIssueDetail {
+            id: "019d3d49-57e6-7123-8e0d-6d7e9c8e7b19".to_string(),
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for kwin_x11".to_string(),
+            summary: "kwin_x11 is stuck in a likely busy poll loop.".to_string(),
+            package_name: Some("kwin-x11".to_string()),
+            source_package: Some("kwin-x11".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 104,
+            corroboration_count: 1,
+            best_patch_available: false,
+            best_triage_available: false,
+            best_patch_diff_url: None,
+            best_patch: None,
+            best_triage: None,
+            best_triage_handoff: None,
+            last_seen: "2026-03-29T00:00:00Z".to_string(),
+            technical_snapshot: Some(PublicTechnicalSnapshot {
+                title: "Sampled wait stack".to_string(),
+                summary:
+                    "This is the stack-shaped slice and hot path Fixer captured while the process was spinning."
+                        .to_string(),
+                frames: vec![
+                    "futex_do_wait".to_string(),
+                    "__futex_wait".to_string(),
+                    "futex_wait".to_string(),
+                ],
+                highlights: vec![
+                    "Command: /usr/bin/kwin_x11 --replace".to_string(),
+                    "Wait site: futex_do_wait".to_string(),
+                    "Hot path: i915_gem_do_execbuffer (5.22% sampled CPU)".to_string(),
+                ],
+            }),
+            possible_duplicates: Vec::new(),
+            attempts: Vec::new(),
+        };
+
+        let markup = render_issue_detail_page(&issue);
+
+        assert!(markup.contains("Technical snapshot"));
+        assert!(markup.contains("Sampled wait stack"));
+        assert!(markup.contains("Command: /usr/bin/kwin_x11 --replace"));
+        assert!(markup.contains("futex_do_wait"));
+        assert!(markup.contains("i915_gem_do_execbuffer (5.22% sampled CPU)"));
     }
 
     #[test]
@@ -10560,6 +10796,7 @@ mod tests {
             best_triage: None,
             best_triage_handoff: None,
             last_seen: "2026-03-29T00:00:00Z".to_string(),
+            technical_snapshot: None,
             possible_duplicates: Vec::new(),
             attempts: Vec::new(),
         };

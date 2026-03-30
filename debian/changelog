@@ -1,3 +1,12 @@
+fixer (0.37.0-1) unstable; urgency=medium
+
+  * Show a public technical snapshot on issue detail pages so crash and
+    investigation issues include a readable stack trace or wait-stack excerpt.
+  * Highlight the sampled wait site, hot path, and loop shape on detail pages
+    instead of leaving that evidence buried in internal JSON.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 31 Mar 2026 16:45:00 +0400
+
 fixer (0.36.0-1) unstable; urgency=medium
 
   * Make the public issues board more humane by explaining likely user impact
