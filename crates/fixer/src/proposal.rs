@@ -984,6 +984,7 @@ fn snapshot_workspace_for_job(
 ) -> Result<PreparedWorkspace> {
     let target = bundle_dir.join("workspace");
     copy_directory_recursively(&workspace.repo_root, &target)?;
+    let _ = initialize_workspace_git_baseline(&target);
     let mut job_workspace = workspace.clone();
     job_workspace.repo_root = target;
     job_workspace.acquisition_note = format!(
@@ -991,6 +992,36 @@ fn snapshot_workspace_for_job(
         workspace.acquisition_note
     );
     Ok(job_workspace)
+}
+
+fn initialize_workspace_git_baseline(workspace_root: &Path) -> Result<()> {
+    if workspace_root.join(".git").exists() || !command_exists("git") {
+        return Ok(());
+    }
+
+    let run = |args: &[&str]| -> Result<()> {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(workspace_root)
+            .status()
+            .with_context(|| format!("failed to run git {:?} in {}", args, workspace_root.display()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "git {:?} failed in {}",
+                args,
+                workspace_root.display()
+            ))
+        }
+    };
+
+    run(&["init", "-q"])?;
+    run(&["config", "user.name", "Fixer"])?;
+    run(&["config", "user.email", "fixer@localhost"])?;
+    run(&["add", "-A", "."])?;
+    run(&["commit", "-q", "-m", "Fixer baseline"])?;
+    Ok(())
 }
 
 fn copy_directory_recursively(
@@ -1039,14 +1070,25 @@ fn render_public_session_diff(
         return Ok(None);
     }
 
+    if let Some(diff) = render_public_session_git_diff(workspace_root)? {
+        return Ok(Some(truncate_public_session_text(&diff, 128 * 1024)));
+    }
+
     let output = Command::new("diff")
         .args([
             "-urN",
             "--exclude=.git",
             "--exclude=.pc",
+            "--exclude=.deps",
+            "--exclude=.libs",
             "--exclude=build",
             "--exclude=autom4te.cache",
+            "--exclude=Makefile",
+            "--exclude=config.status",
+            "--exclude=config.cache",
             "--exclude=config.log",
+            "--exclude=config.h",
+            "--exclude=stamp-h1",
         ])
         .arg(source_workspace_root)
         .arg(workspace_root)
@@ -1070,6 +1112,38 @@ fn render_public_session_diff(
             "failed to generate a public diff for the Codex session: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )),
+    }
+}
+
+fn render_public_session_git_diff(workspace_root: &Path) -> Result<Option<String>> {
+    if !workspace_root.join(".git").exists() || !command_exists("git") {
+        return Ok(None);
+    }
+
+    let output = Command::new("git")
+        .args([
+            "diff",
+            "--no-ext-diff",
+            "--binary",
+            "--relative",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "HEAD",
+            "--",
+            ".",
+        ])
+        .current_dir(workspace_root)
+        .output()
+        .context("failed to generate a git-backed public diff for the Codex session")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let diff = filter_generated_public_diff_blocks(&String::from_utf8_lossy(&output.stdout));
+    if diff.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(diff))
     }
 }
 
@@ -1098,7 +1172,7 @@ fn normalize_public_patch_diff(
     }
 
     let trailing_newline = normalized.ends_with('\n');
-    let mut lines = normalized
+    let filtered = normalized
         .lines()
         .filter(|line| {
             !(line.starts_with("diff -ur")
@@ -1108,10 +1182,74 @@ fn normalize_public_patch_diff(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    if trailing_newline && !lines.is_empty() {
-        lines.push('\n');
+    let mut filtered = filter_generated_public_diff_blocks(&filtered);
+    if trailing_newline && !filtered.is_empty() {
+        filtered.push('\n');
     }
-    lines
+    filtered
+}
+
+fn filter_generated_public_diff_blocks(diff: &str) -> String {
+    let mut kept_blocks = Vec::new();
+    let mut current_block = Vec::new();
+    let mut current_path: Option<String> = None;
+
+    let flush_block = |kept_blocks: &mut Vec<String>,
+                       current_block: &mut Vec<String>,
+                       current_path: &mut Option<String>| {
+        if current_block.is_empty() {
+            *current_path = None;
+            return;
+        }
+        if current_path
+            .as_deref()
+            .is_none_or(|path| !is_generated_public_diff_path(path))
+        {
+            kept_blocks.push(current_block.join("\n"));
+        }
+        current_block.clear();
+        *current_path = None;
+    };
+
+    for line in diff.lines() {
+        if line.starts_with("--- ") {
+            flush_block(&mut kept_blocks, &mut current_block, &mut current_path);
+            current_path = Some(extract_public_diff_path(line));
+        } else if current_path.is_none() && line.starts_with("+++ ") {
+            current_path = Some(extract_public_diff_path(line));
+        }
+        current_block.push(line.to_string());
+    }
+    flush_block(&mut kept_blocks, &mut current_block, &mut current_path);
+    kept_blocks.join("\n")
+}
+
+fn extract_public_diff_path(header_line: &str) -> String {
+    header_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches("a/")
+        .trim_start_matches("b/")
+        .to_string()
+}
+
+fn is_generated_public_diff_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "/dev/null" {
+        return false;
+    }
+    let normalized = trimmed.trim_start_matches("./");
+    let basename = normalized.rsplit('/').next().unwrap_or(normalized);
+    normalized.contains("/.deps/")
+        || normalized.starts_with(".deps/")
+        || normalized.contains("/.libs/")
+        || normalized.starts_with(".libs/")
+        || matches!(
+            basename,
+            "Makefile" | "config.status" | "config.cache" | "config.log" | "config.h" | "stamp-h1"
+        )
 }
 
 fn sanitize_public_session_text(
@@ -2985,9 +3123,11 @@ fn pg_amcheck_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_codex_failure, load_published_codex_session, parse_review_verdict,
+        classify_codex_failure, filter_generated_public_diff_blocks, is_generated_public_diff_path,
+        load_published_codex_session, parse_review_verdict, render_public_session_git_diff,
         pg_amcheck_command, prepare_codex_job_with_prior_patch, primary_model_rate_limit_active,
         remember_primary_model_rate_limit, render_external_bug_report,
+        initialize_workspace_git_baseline,
         render_local_remediation_report, render_local_remediation_sql,
         render_process_investigation_report, sanitize_command_line_for_report,
         suggested_report_destination,
@@ -3671,6 +3811,60 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn generated_public_diff_paths_are_filtered() {
+        assert!(is_generated_public_diff_path(".deps/Action.Po"));
+        assert!(is_generated_public_diff_path("linux/.deps/ProcessTable.Po"));
+        assert!(is_generated_public_diff_path("Makefile"));
+        assert!(!is_generated_public_diff_path("linux/LinuxProcessTable.c"));
+    }
+
+    #[test]
+    fn public_diff_filter_keeps_source_changes_and_drops_build_artifacts() {
+        let diff = "\
+--- a/.deps/Action.Po\n\
++++ b/.deps/Action.Po\n\
+@@ -0,0 +1 @@\n\
++generated\n\
+--- a/linux/LinuxProcess.h\n\
++++ b/linux/LinuxProcess.h\n\
+@@ -1,2 +1,3 @@\n\
+ struct LinuxProcess {\n\
++   uint64_t last_deleted_lib_calctime;\n\
+ };\n";
+
+        let filtered = filter_generated_public_diff_blocks(diff);
+
+        assert!(!filtered.contains(".deps/Action.Po"));
+        assert!(filtered.contains("linux/LinuxProcess.h"));
+        assert!(filtered.contains("last_deleted_lib_calctime"));
+    }
+
+    #[test]
+    fn git_backed_public_diff_ignores_untracked_build_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("linux")).unwrap();
+        std::fs::create_dir_all(workspace.join(".deps")).unwrap();
+        std::fs::write(
+            workspace.join("linux/LinuxProcessTable.c"),
+            "static int maps = 1;\n",
+        )
+        .unwrap();
+        initialize_workspace_git_baseline(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("linux/LinuxProcessTable.c"),
+            "static int maps = 2;\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join(".deps/Action.Po"), "generated\n").unwrap();
+
+        let diff = render_public_session_git_diff(&workspace).unwrap().unwrap();
+
+        assert!(diff.contains("linux/LinuxProcessTable.c"));
+        assert!(!diff.contains(".deps/Action.Po"));
     }
 
     #[test]

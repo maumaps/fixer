@@ -1,3 +1,12 @@
+fixer (0.32.0-1) unstable; urgency=medium
+
+  * Stop publishing build-generated artifacts like `.deps`, generated `Makefile`, and
+    `config.status` as public patch diffs for worker-produced fixes.
+  * Filter public diff blocks down to source changes so broken patch pages do not show
+    validation/build byproducts as if they were the actual fix.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 30 Mar 2026 21:46:00 +0400
+
 fixer (0.31.0-1) unstable; urgency=medium
 
   * Reorder the public and worker issue queues by fixability so package-backed crashes and
