@@ -1,3 +1,12 @@
+fixer (0.31.0-1) unstable; urgency=medium
+
+  * Reorder the public and worker issue queues by fixability so package-backed crashes and
+    runaway-process investigations beat kernel hangs and other low-patchability reports.
+  * Keep the cooldown backoff behavior, but only after trying the most actionable shared
+    issues first.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 30 Mar 2026 21:26:00 +0400
+
 fixer (0.30.0-1) unstable; urgency=medium
 
   * Overfetch and rank coredumps so real desktop crashes like plasmashell are not crowded

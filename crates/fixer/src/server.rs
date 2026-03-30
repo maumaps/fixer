@@ -5433,6 +5433,7 @@ async fn next_issue_for_worker(
     worker_install_id: &str,
     worker_attempt_cooldown_seconds: u64,
 ) -> Result<Option<IssueCluster>> {
+    let candidate_limit: i64 = 256;
     match db {
         ServerDb::Postgres(db) => {
             let rows = db
@@ -5463,18 +5464,10 @@ async fn next_issue_for_worker(
                   AND lease.state = 'leased'
                   AND lease.expires_at > NOW()
           )
-        ORDER BY
-            CASE kind
-                WHEN 'investigation' THEN 0
-                WHEN 'crash' THEN 1
-                WHEN 'warning' THEN 2
-                ELSE 3
-            END ASC,
-            score DESC,
-            last_seen DESC
-        LIMIT 64
+        ORDER BY score DESC, last_seen DESC
+        LIMIT $2
         ",
-                    &[&worker_install_id],
+                    &[&worker_install_id, &candidate_limit],
                 )
                 .await?;
             let candidates = rows
@@ -5516,31 +5509,26 @@ async fn next_issue_for_worker(
                   AND lease.state = 'leased'
                   AND lease.expires_at > ?2
           )
-        ORDER BY
-            CASE kind
-                WHEN 'investigation' THEN 0
-                WHEN 'crash' THEN 1
-                WHEN 'warning' THEN 2
-                ELSE 3
-            END ASC,
-            score DESC,
-            last_seen DESC
-        LIMIT 64
+        ORDER BY score DESC, last_seen DESC
+        LIMIT ?3
         ",
             )?;
-            let rows = stmt.query_map([worker_install_id, now.as_str()], |row| {
-                let issue = issue_from_sqlite_row(row)?;
-                let has_foreign_reports = row.get::<_, i64>(16)? != 0;
-                let last_attempt_at = row
-                    .get::<_, Option<String>>(17)?
-                    .as_deref()
-                    .and_then(parse_timestamp);
-                Ok(WorkerCandidate {
-                    issue,
-                    has_foreign_reports,
-                    last_attempt_at,
-                })
-            })?;
+            let rows = stmt.query_map(
+                params![worker_install_id, now.as_str(), candidate_limit],
+                |row| {
+                    let issue = issue_from_sqlite_row(row)?;
+                    let has_foreign_reports = row.get::<_, i64>(16)? != 0;
+                    let last_attempt_at = row
+                        .get::<_, Option<String>>(17)?
+                        .as_deref()
+                        .and_then(parse_timestamp);
+                    Ok(WorkerCandidate {
+                        issue,
+                        has_foreign_reports,
+                        last_attempt_at,
+                    })
+                },
+            )?;
             let candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(select_worker_candidate(
                 candidates,
@@ -5556,7 +5544,9 @@ fn select_worker_candidate(
 ) -> Option<IssueCluster> {
     let cooldown_cutoff = (worker_attempt_cooldown_seconds > 0)
         .then(|| Utc::now() - Duration::seconds(worker_attempt_cooldown_seconds as i64));
-    candidates
+    let mut sorted_candidates = candidates.iter().collect::<Vec<_>>();
+    sorted_candidates.sort_by(compare_worker_candidate_priority);
+    sorted_candidates
         .iter()
         .find(|candidate| {
             !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
@@ -5565,7 +5555,7 @@ fn select_worker_candidate(
         })
         .map(|candidate| candidate.issue.clone())
         .or_else(|| {
-            candidates
+            sorted_candidates
                 .iter()
                 .find(|candidate| {
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
@@ -5575,7 +5565,7 @@ fn select_worker_candidate(
                 .map(|candidate| candidate.issue.clone())
         })
         .or_else(|| {
-            candidates
+            sorted_candidates
                 .iter()
                 .find(|candidate| {
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
@@ -5584,7 +5574,7 @@ fn select_worker_candidate(
                 .map(|candidate| candidate.issue.clone())
         })
         .or_else(|| {
-            candidates
+            sorted_candidates
                 .iter()
                 .find(|candidate| {
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
@@ -5593,37 +5583,64 @@ fn select_worker_candidate(
                 .map(|candidate| candidate.issue.clone())
         })
         .or_else(|| {
-            candidates
+            sorted_candidates
                 .iter()
                 .filter(|candidate| {
                     candidate.has_foreign_reports && candidate_needs_patch_refresh(candidate)
                 })
-                .min_by(compare_worker_candidate_attempt_age)
+                .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
                 .map(|candidate| candidate.issue.clone())
         })
         .or_else(|| {
-            candidates
+            sorted_candidates
                 .iter()
                 .filter(|candidate| {
                     candidate.has_foreign_reports && issue_is_available_for_worker(&candidate.issue)
                 })
-                .min_by(compare_worker_candidate_attempt_age)
+                .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
                 .map(|candidate| candidate.issue.clone())
         })
         .or_else(|| {
-            candidates
+            sorted_candidates
                 .iter()
                 .filter(|candidate| candidate_needs_patch_refresh(candidate))
-                .min_by(compare_worker_candidate_attempt_age)
+                .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
                 .map(|candidate| candidate.issue.clone())
         })
         .or_else(|| {
-            candidates
+            sorted_candidates
                 .iter()
                 .filter(|candidate| issue_is_available_for_worker(&candidate.issue))
-                .min_by(compare_worker_candidate_attempt_age)
+                .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
                 .map(|candidate| candidate.issue.clone())
         })
+}
+
+fn compare_worker_candidate_priority(
+    left: &&WorkerCandidate,
+    right: &&WorkerCandidate,
+) -> Ordering {
+    compare_issue_priority(
+        &left.issue.kind,
+        left.issue.package_name.as_deref(),
+        left.issue.source_package.as_deref(),
+        left.issue.score,
+        left.issue.corroboration_count,
+        left.issue.best_patch.is_some(),
+        false,
+        &left.issue.last_seen,
+        &left.issue.representative,
+        &right.issue.kind,
+        right.issue.package_name.as_deref(),
+        right.issue.source_package.as_deref(),
+        right.issue.score,
+        right.issue.corroboration_count,
+        right.issue.best_patch.is_some(),
+        false,
+        &right.issue.last_seen,
+        &right.issue.representative,
+    )
+    .then_with(|| compare_worker_candidate_attempt_age(left, right))
 }
 
 fn compare_worker_candidate_attempt_age(
@@ -5853,6 +5870,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
 }
 
 async fn load_public_issues(db: &ServerDb, limit: i64) -> Result<Vec<PublicIssue>, ApiError> {
+    let fetch_limit = (limit.max(32) * 4).clamp(64, 512);
     match db {
         ServerDb::Postgres(db) => {
             let rows = db
@@ -5862,17 +5880,23 @@ async fn load_public_issues(db: &ServerDb, limit: i64) -> Result<Vec<PublicIssue
                    severity, score, corroboration_count,
                    (best_patch_json IS NOT NULL) AS best_patch_available,
                    (best_triage_json IS NOT NULL) AS best_triage_available,
-                   last_seen
+                   last_seen, representative_json
             FROM issue_clusters
             WHERE promoted = TRUE AND public_visible = TRUE
             ORDER BY score DESC, last_seen DESC
             LIMIT $1
             ",
-                    &[&limit],
+                    &[&fetch_limit],
                 )
                 .await
                 .map_err(ApiError::internal)?;
-            rows.into_iter().map(public_issue_from_row).collect()
+            let mut issues = rows
+                .into_iter()
+                .map(duplicate_candidate_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            issues.sort_by(compare_public_issue_priority);
+            issues.truncate(limit.max(0) as usize);
+            Ok(issues.into_iter().map(|entry| entry.issue).collect())
         }
         ServerDb::Sqlite(path) => {
             let connection = sqlite_connection(path).map_err(ApiError::internal)?;
@@ -5883,7 +5907,7 @@ async fn load_public_issues(db: &ServerDb, limit: i64) -> Result<Vec<PublicIssue
                    severity, score, corroboration_count,
                    (best_patch_json IS NOT NULL) AS best_patch_available,
                    (best_triage_json IS NOT NULL) AS best_triage_available,
-                   last_seen
+                   last_seen, representative_json
             FROM issue_clusters
             WHERE promoted = 1 AND public_visible = 1
             ORDER BY score DESC, last_seen DESC
@@ -5892,10 +5916,14 @@ async fn load_public_issues(db: &ServerDb, limit: i64) -> Result<Vec<PublicIssue
                 )
                 .map_err(ApiError::internal)?;
             let rows = stmt
-                .query_map([limit], public_issue_from_sqlite_row)
+                .query_map([fetch_limit], duplicate_candidate_from_sqlite_row)
                 .map_err(ApiError::internal)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(ApiError::internal)
+            let mut issues = rows
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(ApiError::internal)?;
+            issues.sort_by(compare_public_issue_priority);
+            issues.truncate(limit.max(0) as usize);
+            Ok(issues.into_iter().map(|entry| entry.issue).collect())
         }
     }
 }
@@ -6468,6 +6496,185 @@ fn public_attempt_from_row(row: Row) -> Result<PublicAttempt, ApiError> {
     let envelope =
         serde_json::from_value::<WorkerResultEnvelope>(bundle_json).map_err(ApiError::internal)?;
     Ok(public_attempt_from_patch_attempt(envelope.attempt))
+}
+
+fn compare_public_issue_priority(
+    left: &DuplicateCandidateIssue,
+    right: &DuplicateCandidateIssue,
+) -> Ordering {
+    compare_issue_priority(
+        &left.issue.kind,
+        left.issue.package_name.as_deref(),
+        left.issue.source_package.as_deref(),
+        left.issue.score,
+        left.issue.corroboration_count,
+        left.issue.best_patch_available,
+        left.issue.best_triage_available,
+        &left.issue.last_seen,
+        &left.representative,
+        &right.issue.kind,
+        right.issue.package_name.as_deref(),
+        right.issue.source_package.as_deref(),
+        right.issue.score,
+        right.issue.corroboration_count,
+        right.issue.best_patch_available,
+        right.issue.best_triage_available,
+        &right.issue.last_seen,
+        &right.representative,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_issue_priority(
+    left_kind: &str,
+    left_package_name: Option<&str>,
+    left_source_package: Option<&str>,
+    left_score: i64,
+    left_corroboration_count: i64,
+    left_best_patch_available: bool,
+    left_best_triage_available: bool,
+    left_last_seen: &str,
+    left_representative: &SharedOpportunity,
+    right_kind: &str,
+    right_package_name: Option<&str>,
+    right_source_package: Option<&str>,
+    right_score: i64,
+    right_corroboration_count: i64,
+    right_best_patch_available: bool,
+    right_best_triage_available: bool,
+    right_last_seen: &str,
+    right_representative: &SharedOpportunity,
+) -> Ordering {
+    let left_priority = left_score
+        + issue_fixability_adjustment(
+            left_kind,
+            left_package_name,
+            left_source_package,
+            left_corroboration_count,
+            left_best_patch_available,
+            left_best_triage_available,
+            left_representative,
+        );
+    let right_priority = right_score
+        + issue_fixability_adjustment(
+            right_kind,
+            right_package_name,
+            right_source_package,
+            right_corroboration_count,
+            right_best_patch_available,
+            right_best_triage_available,
+            right_representative,
+        );
+    right_priority
+        .cmp(&left_priority)
+        .then_with(|| right_corroboration_count.cmp(&left_corroboration_count))
+        .then_with(|| parse_timestamp(right_last_seen).cmp(&parse_timestamp(left_last_seen)))
+        .then_with(|| right_score.cmp(&left_score))
+}
+
+fn issue_fixability_adjustment(
+    kind: &str,
+    package_name: Option<&str>,
+    source_package: Option<&str>,
+    corroboration_count: i64,
+    best_patch_available: bool,
+    best_triage_available: bool,
+    representative: &SharedOpportunity,
+) -> i64 {
+    let mut adjustment = 0;
+    adjustment += match (source_package, package_name) {
+        (Some(_), _) => 14,
+        (None, Some(_)) => 10,
+        (None, None) => -12,
+    };
+    if source_package
+        .or(package_name)
+        .is_some_and(is_kernelish_package_name)
+    {
+        adjustment -= 18;
+    }
+    if best_patch_available {
+        adjustment += 6;
+    }
+    if best_triage_available {
+        adjustment -= 8;
+    }
+    adjustment += (corroboration_count.saturating_sub(1)).min(3) * 3;
+
+    match kind {
+        "crash" => adjustment += 16,
+        "hotspot" => adjustment -= 10,
+        "warning" => adjustment -= 12,
+        "investigation" => match representative_subsystem(representative) {
+            Some("runaway-process") => adjustment += 16,
+            Some("oom-kill") => adjustment -= 10,
+            Some("desktop-resume") => adjustment -= 18,
+            Some("stuck-process") => adjustment -= 30,
+            _ => {}
+        },
+        _ => {}
+    }
+
+    if representative_likely_external_root_cause(representative) {
+        adjustment -= 16;
+    }
+    if let Some(target_name) = representative_fixability_target_name(representative) {
+        if is_kernelish_target_name(&target_name) {
+            adjustment -= 18;
+        }
+    }
+    adjustment
+}
+
+fn representative_subsystem(representative: &SharedOpportunity) -> Option<&str> {
+    representative
+        .finding
+        .details
+        .get("subsystem")
+        .and_then(Value::as_str)
+}
+
+fn representative_likely_external_root_cause(representative: &SharedOpportunity) -> bool {
+    representative
+        .finding
+        .details
+        .get("likely_external_root_cause")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn representative_fixability_target_name(representative: &SharedOpportunity) -> Option<String> {
+    if representative.finding.kind == "investigation" {
+        return Some(normalized_investigation_target_name(representative));
+    }
+    representative
+        .finding
+        .details
+        .get("process_name")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| representative.finding.artifact_name.clone())
+}
+
+fn is_kernelish_package_name(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.starts_with("linux-image")
+        || normalized.starts_with("linux-headers")
+        || normalized.starts_with("linux-modules")
+        || normalized == "linux"
+}
+
+fn is_kernelish_target_name(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.starts_with("kworker")
+        || normalized.starts_with("jbd2/")
+        || normalized.starts_with("kswapd")
+        || normalized.starts_with("kcompactd")
+        || normalized.starts_with("ksoftirqd")
+        || normalized.starts_with("migration/")
+        || normalized.starts_with("rcu")
+        || normalized.starts_with("watchdog/")
+        || normalized.starts_with("writeback")
 }
 
 fn public_issue_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicIssue> {
@@ -9400,6 +9607,54 @@ mod tests {
         }
     }
 
+    fn sample_runaway_investigation(target: &str, package_name: Option<&str>) -> SharedOpportunity {
+        SharedOpportunity {
+            local_opportunity_id: 1,
+            opportunity: OpportunityRecord {
+                id: 1,
+                finding_id: 1,
+                kind: "investigation".to_string(),
+                title: format!("Runaway CPU investigation for {target}"),
+                score: 106,
+                state: "open".to_string(),
+                summary: format!(
+                    "{target} is stuck in a likely busy loop with repeated recvfrom x120, sendto x120, epoll_wait x120."
+                ),
+                evidence: json!({}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "2026-03-30T10:00:00Z".to_string(),
+                updated_at: "2026-03-30T10:00:00Z".to_string(),
+            },
+            finding: FindingRecord {
+                id: 1,
+                kind: "investigation".to_string(),
+                title: format!("Runaway CPU investigation for {target}"),
+                severity: "high".to_string(),
+                fingerprint: format!("runaway-{target}"),
+                summary: format!(
+                    "{target} is stuck in a likely busy loop with repeated recvfrom x120, sendto x120, epoll_wait x120."
+                ),
+                details: json!({
+                    "subsystem": "runaway-process",
+                    "profile_target": {
+                        "name": target,
+                        "package_name": package_name,
+                    },
+                    "loop_classification": "dbus-spin",
+                    "repeated_syscalls": ["recvfrom", "sendto", "epoll_wait"],
+                }),
+                artifact_name: Some(target.to_string()),
+                artifact_path: None,
+                package_name: package_name.map(ToOwned::to_owned),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "2026-03-30T10:00:00Z".to_string(),
+                last_seen: "2026-03-30T10:00:00Z".to_string(),
+            },
+        }
+    }
+
     fn sample_desktop_resume_investigation(
         target: &str,
         crashed_processes: &[&str],
@@ -9474,6 +9729,16 @@ mod tests {
             best_patch_available: false,
             best_triage_available: false,
             last_seen: opportunity.finding.last_seen.clone(),
+        }
+    }
+
+    fn duplicate_candidate_for_test(
+        id: &str,
+        opportunity: &SharedOpportunity,
+    ) -> DuplicateCandidateIssue {
+        DuplicateCandidateIssue {
+            issue: public_issue_for_test(id, opportunity),
+            representative: opportunity.clone(),
         }
     }
 
@@ -10313,6 +10578,62 @@ mod tests {
             .unwrap();
 
         assert_eq!(issue.id, "issue-shared");
+    }
+
+    #[test]
+    fn worker_queue_prefers_fixable_runaway_issue_over_kernel_stuck_process() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let stuck_issue = sample_stuck_process_investigation(
+            "kworker/u33:2+i915_flip",
+            2141,
+            "2026-03-30T16:53:47Z",
+        );
+        let runaway_issue = sample_runaway_investigation("kdeconnectd", Some("kdeconnect"));
+
+        insert_test_issue(
+            &connection,
+            "issue-stuck",
+            "cluster-stuck",
+            110,
+            "2026-03-30T16:53:47Z",
+            &stuck_issue,
+            &["other-install-a"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-runaway",
+            "cluster-runaway",
+            106,
+            "2026-03-30T16:53:47Z",
+            &runaway_issue,
+            &["other-install-b"],
+        );
+
+        let issue = test_runtime()
+            .block_on(next_issue_for_worker(&db, "worker-install", 3600))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(issue.id, "issue-runaway");
+    }
+
+    #[test]
+    fn public_priority_prefers_fixable_user_space_issue_over_kernel_hang() {
+        let stuck = sample_stuck_process_investigation(
+            "kworker/u33:2+i915_flip",
+            2141,
+            "2026-03-30T16:53:47Z",
+        );
+        let runaway = sample_runaway_investigation("kdeconnectd", Some("kdeconnect"));
+        let mut entries = vec![
+            duplicate_candidate_for_test("issue-stuck", &stuck),
+            duplicate_candidate_for_test("issue-runaway", &runaway),
+        ];
+
+        entries.sort_by(compare_public_issue_priority);
+
+        assert_eq!(entries[0].issue.id, "issue-runaway");
     }
 
     #[test]
