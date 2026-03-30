@@ -93,6 +93,7 @@ pub fn resolve_installed_package_metadata(package_name: &str) -> Result<Installe
         .filter(|x| !x.is_empty())
         .unwrap_or(package_name)
         .to_string();
+    let source_package = normalize_patchable_source_package(package_name, &source_package);
     let installed_version = lines
         .next()
         .map(str::trim)
@@ -301,6 +302,15 @@ fn package_name_from_opportunity(opportunity: &OpportunityRecord) -> Option<Stri
         .map(ToString::to_string)
 }
 
+fn normalize_patchable_source_package(package_name: &str, source_package: &str) -> String {
+    if package_name.starts_with("linux-image-")
+        && source_package.starts_with("linux-signed")
+    {
+        return "linux".to_string();
+    }
+    source_package.to_string()
+}
+
 fn sanitize_dir_name(name: &str) -> String {
     name.chars()
         .map(|ch| {
@@ -360,7 +370,8 @@ fn deb_src_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_cloneable_repo_url, parse_apt_origins, parse_maintainer_url, sanitize_dir_name,
+        is_cloneable_repo_url, normalize_patchable_source_package, parse_apt_origins,
+        parse_maintainer_url, sanitize_dir_name,
     };
 
     #[test]
@@ -401,6 +412,21 @@ zoom:\n\
         assert_eq!(
             parse_maintainer_url("Example Maintainer <maintainer@example.test>"),
             None
+        );
+    }
+
+    #[test]
+    fn normalizes_signed_kernel_source_to_linux() {
+        assert_eq!(
+            normalize_patchable_source_package(
+                "linux-image-6.19.8+deb14-amd64",
+                "linux-signed-amd64"
+            ),
+            "linux"
+        );
+        assert_eq!(
+            normalize_patchable_source_package("htop", "htop"),
+            "htop"
         );
     }
 }

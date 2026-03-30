@@ -306,7 +306,10 @@ fn collect_stuck_process_groups(config: &FixerConfig) -> Result<Vec<StuckProcess
             })
             .or_else(|| process_comm(pid))
             .unwrap_or_else(|| "process".to_string());
-        let package_name = executable.as_deref().and_then(map_path_to_package);
+        let package_name = executable
+            .as_deref()
+            .and_then(map_path_to_package)
+            .or_else(|| kernel_thread_package_name(&status_raw, executable.as_deref(), &comm));
         let group_key = executable
             .as_ref()
             .map(|path| path.display().to_string())
@@ -419,6 +422,39 @@ fn normalize_stuck_process_target_name(raw: &str) -> String {
         }
     }
     "kworker".to_string()
+}
+
+fn kernel_thread_package_name(
+    status_raw: &str,
+    executable: Option<&Path>,
+    comm: &str,
+) -> Option<String> {
+    if executable.is_some() {
+        return None;
+    }
+    (status_reports_kernel_thread(status_raw) || looks_like_kernel_thread_name(comm))
+        .then(current_kernel_image_package_name)
+}
+
+fn status_reports_kernel_thread(status_raw: &str) -> bool {
+    status_raw.lines().any(|line| {
+        let Some((key, value)) = line.split_once(':') else {
+            return false;
+        };
+        key.trim() == "Kthread" && value.trim() == "1"
+    })
+}
+
+fn looks_like_kernel_thread_name(comm: &str) -> bool {
+    let comm = comm.trim();
+    comm.starts_with("kworker")
+        || comm.starts_with("kswapd")
+        || comm.starts_with("kcompactd")
+        || comm.starts_with("ksoftirqd/")
+        || comm.starts_with("migration/")
+        || comm.starts_with("watchdog/")
+        || comm.starts_with("jbd2/")
+        || comm == "oom_reaper"
 }
 
 fn collect_repos(repo_paths: &[PathBuf], store: &Store) -> Result<usize> {
@@ -4405,14 +4441,15 @@ mod tests {
         crash_event_executable, crash_event_label, crash_event_process_name,
         dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
         is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
-        kernel_module_package_hint, kernel_warning_module_candidates, looks_like_warning,
+        kernel_module_package_hint, kernel_thread_package_name,
+        kernel_warning_module_candidates, looks_like_warning,
         normalize_oom_task_memcg_target, normalize_perf_symbol,
         normalize_stuck_process_target_name, parse_apparmor_denial, parse_coredump_info,
         parse_dkms_status_line, parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
         parse_perf_hot_paths, parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
         prioritize_coredump_events, process_runtime_seconds, safe_perf_name,
         stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
-        summarize_top_syscalls, system_uptime_seconds,
+        summarize_top_syscalls, system_uptime_seconds, current_kernel_image_package_name,
     };
     use crate::models::PopularBinaryProfile;
     use serde_json::{Value, json};
@@ -4482,6 +4519,27 @@ mod tests {
             "kworker"
         );
         assert_eq!(normalize_stuck_process_target_name("postgres"), "postgres");
+    }
+
+    #[test]
+    fn kernel_thread_package_name_uses_running_kernel_image() {
+        let status = "\
+Name:\tkswapd0\n\
+State:\tD (disk sleep)\n\
+Kthread:\t1\n";
+        assert_eq!(
+            kernel_thread_package_name(status, None, "kswapd0"),
+            Some(current_kernel_image_package_name())
+        );
+    }
+
+    #[test]
+    fn user_process_without_executable_is_not_treated_as_kernel_thread() {
+        let status = "\
+Name:\trg\n\
+State:\tD (disk sleep)\n\
+Kthread:\t0\n";
+        assert_eq!(kernel_thread_package_name(status, None, "rg"), None);
     }
 
     #[test]

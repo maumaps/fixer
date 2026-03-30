@@ -1,3 +1,12 @@
+fixer (0.34.0-1) unstable; urgency=medium
+
+  * Attribute stuck kernel-thread investigations like `kswapd0` and `kworker`
+    to the running kernel package so they can acquire a patchable workspace.
+  * Normalize signed Debian kernel runtime packages to the `linux` source package
+    when preparing workspaces, avoiding immediate triage-only failures for these issues.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 31 Mar 2026 12:10:00 +0400
+
 fixer (0.33.0-1) unstable; urgency=medium
 
   * Let Codex declare the intended patch paths in a dedicated `Git Add Paths` section and
