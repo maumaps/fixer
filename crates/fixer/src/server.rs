@@ -866,8 +866,10 @@ struct DashboardSnapshot {
     quarantined_issue_count: i64,
     ready_patch_count: i64,
     ready_triage_count: i64,
+    corroborated_public_issue_count: i64,
+    largest_public_cluster_size: i64,
     last_submission_at: Option<String>,
-    top_issues: Vec<PublicIssue>,
+    top_issues: Vec<DuplicateCandidateIssue>,
 }
 
 fn sqlite_path_from_url(url: &str) -> Option<PathBuf> {
@@ -5840,6 +5842,8 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 (SELECT COUNT(*) FROM issue_clusters WHERE promoted = FALSE),
                 (SELECT COUNT(*) FROM issue_clusters WHERE best_patch_json IS NOT NULL),
                 (SELECT COUNT(*) FROM issue_clusters WHERE best_patch_json IS NULL AND best_triage_json IS NOT NULL),
+                (SELECT COUNT(*) FROM issue_clusters WHERE promoted = TRUE AND public_visible = TRUE AND corroboration_count >= 2),
+                (SELECT COALESCE(MAX(corroboration_count), 0) FROM issue_clusters WHERE promoted = TRUE AND public_visible = TRUE),
                 (SELECT MAX(received_at) FROM submissions)
             ",
                     &[],
@@ -5847,7 +5851,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 .await
                 .map_err(ApiError::internal)?;
             let last_submission_at = row
-                .get::<_, Option<DateTime<Utc>>>(6)
+                .get::<_, Option<DateTime<Utc>>>(8)
                 .map(|value| value.to_rfc3339());
             Ok(DashboardSnapshot {
                 install_count: row.get(0),
@@ -5856,8 +5860,10 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 quarantined_issue_count: row.get(3),
                 ready_patch_count: row.get(4),
                 ready_triage_count: row.get(5),
+                corroborated_public_issue_count: row.get(6),
+                largest_public_cluster_size: row.get(7),
                 last_submission_at,
-                top_issues: load_public_issues(db, 8).await?,
+                top_issues: load_public_issue_candidates(db, 8).await?,
             })
         }
         ServerDb::Sqlite(path) => {
@@ -5896,6 +5902,20 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                     |row| row.get(0),
                 )
                 .map_err(ApiError::internal)?;
+            let corroborated_public_issue_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM issue_clusters WHERE promoted = 1 AND public_visible = 1 AND corroboration_count >= 2",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
+            let largest_public_cluster_size: i64 = connection
+                .query_row(
+                    "SELECT COALESCE(MAX(corroboration_count), 0) FROM issue_clusters WHERE promoted = 1 AND public_visible = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
             let last_submission_at = connection
                 .query_row("SELECT MAX(received_at) FROM submissions", [], |row| {
                     row.get::<_, Option<String>>(0)
@@ -5910,8 +5930,10 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 quarantined_issue_count,
                 ready_patch_count,
                 ready_triage_count,
+                corroborated_public_issue_count,
+                largest_public_cluster_size,
                 last_submission_at,
-                top_issues: load_public_issues(db, 8).await?,
+                top_issues: load_public_issue_candidates(db, 8).await?,
             })
         }
     }
@@ -6682,6 +6704,15 @@ fn issue_seen_summary(corroboration_count: i64) -> String {
     }
 }
 
+fn cluster_size_summary(corroboration_count: i64) -> String {
+    match corroboration_count {
+        count if count <= 0 => "not corroborated yet".to_string(),
+        1 => "single-host issue family".to_string(),
+        2 => "2-host issue family".to_string(),
+        count => format!("{count}-host issue family"),
+    }
+}
+
 fn render_issue_queue_tags(issue: &PublicIssue, context: &IssueHumanContext) -> String {
     let mut tags = vec![format!(
         "<span class=\"tag {}\">impact: {}</span>",
@@ -6728,7 +6759,7 @@ fn render_issue_queue_card(entry: &DuplicateCandidateIssue) -> String {
             <p class="issue-summary">{}</p>
             <p class="impact-summary"><strong>Likely user impact.</strong> {}</p>
             <div class="meta">{}</div>
-            <p class="fine-print">Last seen {}. <a href="/issues/{}">Details</a> · <a href="/v1/issues/{}">JSON</a></p>
+            <p class="fine-print"><strong>Cluster size:</strong> {}. Last seen {}. <a href="/issues/{}">Details</a> · <a href="/v1/issues/{}">JSON</a></p>
         </article>"#,
         html_escape(&context.kind_label),
         issue.id,
@@ -6738,6 +6769,7 @@ fn render_issue_queue_card(entry: &DuplicateCandidateIssue) -> String {
         html_escape(&issue.summary),
         html_escape(&context.impact_summary),
         render_issue_queue_tags(issue, &context),
+        html_escape(&cluster_size_summary(issue.corroboration_count)),
         html_escape(&format_timestamp(&issue.last_seen)),
         issue.id,
         issue.id
@@ -8788,7 +8820,7 @@ sudo apt install fixer"
         snapshot
             .top_issues
             .iter()
-            .map(render_issue_card)
+            .map(render_issue_queue_card)
             .collect::<Vec<_>>()
             .join("")
     };
@@ -8902,9 +8934,47 @@ sudo apt install fixer"
             <p class="fine-print">Public pages and public issue JSON expose only aggregate sanitized metadata. They do not expose hostnames, install IDs, raw command lines, or private evidence bundles.</p>
         </section>
 
+        <section class="grid columns section">
+            <article class="panel">
+                <h2>How the queue is sorted</h2>
+                <p class="section-intro">The homepage is meant to answer the human question first: what is likely to hurt someone the most right now, and how widely is it happening?</p>
+                <div class="journey-list">
+                    <div class="journey-step">
+                        <strong>1. User impact comes first.</strong>
+                        Wake-from-sleep failures, crashes, and OOM kills rise above background hotspots even when the lower-impact issue looks more immediately patchable.
+                    </div>
+                    <div class="journey-step">
+                        <strong>2. Bigger issue families rise next.</strong>
+                        When the same failure is seen on more hosts, the family moves upward because it is less likely to be a one-off.
+                    </div>
+                    <div class="journey-step">
+                        <strong>3. Fixability and freshness break ties.</strong>
+                        Package-backed issues, ready patches, triage handoffs, and recent activity still matter, but they come after impact and cluster size.
+                    </div>
+                </div>
+            </article>
+            <article class="panel">
+                <h2>Cluster size right now</h2>
+                <p class="section-intro">These numbers help explain whether the queue is mostly single-host sightings or already-converging public issue families.</p>
+                <div class="snapshot-grid">
+                    <div class="snapshot-stat">
+                        <strong>{}</strong>
+                        <span>public issue families seen on 2+ hosts</span>
+                    </div>
+                    <div class="snapshot-stat">
+                        <strong>{}</strong>
+                        <span>largest public issue family right now</span>
+                    </div>
+                </div>
+                <div class="snapshot-foot">
+                    <p class="fine-print">Each issue card now spells out its cluster size directly, for example <em>single-host issue family</em> or <em>4-host issue family</em>.</p>
+                </div>
+            </article>
+        </section>
+
         <section class="panel section">
             <h2>Promoted issues right now</h2>
-            <p class="section-intro">This is the work that already made it through quarantine and into the public queue.</p>
+            <p class="section-intro">This is the work that already made it through quarantine and into the public queue. These cards are sorted by likely user impact first, then by how large the issue family is, then by fixability and freshness.</p>
             <div class="issue-list">{top_issue_markup}</div>
         </section>
         "#,
@@ -8917,6 +8987,8 @@ sudo apt install fixer"
         snapshot.quarantined_issue_count,
         html_escape(&apt_snippet),
         html_escape(PRIVACY_WARNING),
+        snapshot.corroborated_public_issue_count,
+        snapshot.largest_public_cluster_size,
     );
 
     render_page(
@@ -9390,47 +9462,6 @@ fn render_page(
         body,
         html_escape(&footer_note),
         HEALTH_INDICATOR_SCRIPT
-    )
-}
-
-fn render_issue_card(issue: &PublicIssue) -> String {
-    let mut extra = String::new();
-    let _ = write!(
-        extra,
-        "<p class=\"fine-print\">Last seen: {}. Public page: <a href=\"/issues/{}\">/issues/{}</a>. Public JSON: <a href=\"/v1/issues/{}\">/v1/issues/{}</a></p>",
-        html_escape(&format_timestamp(&issue.last_seen)),
-        issue.id,
-        issue.id,
-        issue.id,
-        issue.id
-    );
-
-    format!(
-        r#"<article class="issue-card">
-            <div class="issue-topline">
-                <h3><a href="/issues/{}">{}</a></h3>
-                <span class="tag">{}</span>
-            </div>
-            <p class="issue-summary">{}</p>
-            <div class="meta">{}</div>
-            {}
-        </article>"#,
-        issue.id,
-        html_escape(&issue.title),
-        html_escape(&issue.kind),
-        html_escape(&issue.summary),
-        render_issue_tags(
-            issue.kind.as_str(),
-            issue.package_name.as_deref(),
-            issue.source_package.as_deref(),
-            issue.ecosystem.as_deref(),
-            issue.severity.as_deref(),
-            issue.score,
-            issue.corroboration_count,
-            issue.best_patch_available,
-            issue.best_triage_available,
-        ),
-        extra
     )
 }
 
@@ -10324,31 +10355,6 @@ mod tests {
     }
 
     #[test]
-    fn render_issue_card_marks_patch_ready() {
-        let issue = PublicIssue {
-            id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
-            kind: "warning".to_string(),
-            title: "AppArmor denied cupsd".to_string(),
-            summary: "cupsd cannot read /etc/paperspecs".to_string(),
-            package_name: Some("cups-daemon".to_string()),
-            source_package: Some("cups".to_string()),
-            ecosystem: Some("debian".to_string()),
-            severity: Some("high".to_string()),
-            score: 93,
-            corroboration_count: 3,
-            best_patch_available: true,
-            best_triage_available: false,
-            last_seen: "2026-03-29T00:00:00Z".to_string(),
-        };
-
-        let markup = render_issue_card(&issue);
-        assert!(markup.contains("patch attempt ready"));
-        assert!(markup.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
-        assert!(markup.contains("/v1/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
-        assert!(!markup.contains("representative_json"));
-    }
-
-    #[test]
     fn humane_issue_queue_card_explains_user_impact() {
         let candidate = duplicate_candidate_for_test(
             "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8",
@@ -10363,6 +10369,7 @@ mod tests {
         assert!(markup.contains("Wake-from-sleep failure"));
         assert!(markup.contains("Likely user impact."));
         assert!(markup.contains("very disruptive"));
+        assert!(markup.contains("Cluster size:"));
         assert!(markup.contains("Details"));
         assert!(markup.contains("JSON"));
     }
@@ -10453,6 +10460,8 @@ mod tests {
             quarantined_issue_count: 3,
             ready_patch_count: 2,
             ready_triage_count: 1,
+            corroborated_public_issue_count: 4,
+            largest_public_cluster_size: 6,
             last_submission_at: Some("2026-03-30T00:00:00Z".to_string()),
             top_issues: Vec::new(),
         };
@@ -10462,6 +10471,9 @@ mod tests {
         assert!(markup.contains("Install first, opt in later"));
         assert!(markup.contains("Shared queue, not private guessing"));
         assert!(markup.contains("sanitized issue families, not raw host evidence"));
+        assert!(markup.contains("How the queue is sorted"));
+        assert!(markup.contains("public issue families seen on 2+ hosts"));
+        assert!(markup.contains("largest public issue family right now"));
     }
 
     #[test]

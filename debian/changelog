@@ -1,3 +1,12 @@
+fixer (0.38.0-1) unstable; urgency=medium
+
+  * Make the homepage more explanatory by showing humane queue cards with
+    cluster size and likely user impact instead of bare summaries.
+  * Explain how the public queue is sorted and surface live cluster-size
+    metrics such as multi-host issue families and the largest family size.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 31 Mar 2026 17:30:00 +0400
+
 fixer (0.37.0-1) unstable; urgency=medium
 
   * Show a public technical snapshot on issue detail pages so crash and
