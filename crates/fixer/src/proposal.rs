@@ -291,24 +291,32 @@ pub fn load_published_codex_session(bundle_dir: &Path) -> Result<Value> {
         ),
         16 * 1024,
     );
-    let response = output_path
+    let raw_response = output_path
         .exists()
         .then(|| {
-            let raw = read_text(&output_path)
-                .with_context(|| format!("failed to read {}", output_path.display()))?;
-            Ok::<String, anyhow::Error>(truncate_public_session_text(
-                &sanitize_public_session_text(
-                    &raw,
-                    bundle_dir,
-                    workspace_root.as_deref(),
-                    source_workspace_root.as_deref(),
-                ),
-                64 * 1024,
-            ))
+            read_text(&output_path).with_context(|| format!("failed to read {}", output_path.display()))
         })
         .transpose()?;
-    let diff =
-        render_public_session_diff(source_workspace_root.as_deref(), workspace_root.as_deref())?;
+    let git_add_paths = raw_response
+        .as_deref()
+        .map(extract_git_add_paths_from_response)
+        .unwrap_or_default();
+    let response = raw_response.as_ref().map(|raw| {
+        truncate_public_session_text(
+            &sanitize_public_session_text(
+                raw,
+                bundle_dir,
+                workspace_root.as_deref(),
+                source_workspace_root.as_deref(),
+            ),
+            64 * 1024,
+        )
+    });
+    let diff = render_public_session_diff(
+        source_workspace_root.as_deref(),
+        workspace_root.as_deref(),
+        &git_add_paths,
+    )?;
     let status = load_codex_job_status(bundle_dir).ok();
     Ok(json!({
         "prompt": prompt,
@@ -1060,6 +1068,7 @@ fn copy_directory_recursively(
 fn render_public_session_diff(
     source_workspace_root: Option<&Path>,
     workspace_root: Option<&Path>,
+    git_add_paths: &[String],
 ) -> Result<Option<String>> {
     let (Some(source_workspace_root), Some(workspace_root)) =
         (source_workspace_root, workspace_root)
@@ -1070,7 +1079,7 @@ fn render_public_session_diff(
         return Ok(None);
     }
 
-    if let Some(diff) = render_public_session_git_diff(workspace_root)? {
+    if let Some(diff) = render_public_session_git_diff(workspace_root, git_add_paths)? {
         return Ok(Some(truncate_public_session_text(&diff, 128 * 1024)));
     }
 
@@ -1115,9 +1124,21 @@ fn render_public_session_diff(
     }
 }
 
-fn render_public_session_git_diff(workspace_root: &Path) -> Result<Option<String>> {
+fn render_public_session_git_diff(
+    workspace_root: &Path,
+    git_add_paths: &[String],
+) -> Result<Option<String>> {
     if !workspace_root.join(".git").exists() || !command_exists("git") {
         return Ok(None);
+    }
+    let intended_paths = sanitize_git_add_paths(git_add_paths);
+    if !intended_paths.is_empty() {
+        let mut add_cmd = Command::new("git");
+        add_cmd
+            .args(["add", "-N", "--"])
+            .args(intended_paths.iter())
+            .current_dir(workspace_root);
+        let _ = add_cmd.status();
     }
 
     let output = Command::new("git")
@@ -1145,6 +1166,26 @@ fn render_public_session_git_diff(workspace_root: &Path) -> Result<Option<String
     } else {
         Ok(Some(diff))
     }
+}
+
+fn sanitize_git_add_paths(paths: &[String]) -> Vec<String> {
+    paths.iter()
+        .filter_map(|path| {
+            let trimmed = path.trim().trim_matches('`').trim();
+            if trimmed.is_empty() || trimmed.starts_with('/') {
+                return None;
+            }
+            let trimmed = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim();
+            let path = Path::new(trimmed);
+            if path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_)))
+            {
+                return None;
+            }
+            Some(trimmed.to_string())
+        })
+        .collect()
 }
 
 fn normalize_public_patch_diff(
@@ -1250,6 +1291,96 @@ fn is_generated_public_diff_path(path: &str) -> bool {
             basename,
             "Makefile" | "config.status" | "config.cache" | "config.log" | "config.h" | "stamp-h1"
         )
+}
+
+fn extract_git_add_paths_from_response(response: &str) -> Vec<String> {
+    let authoring_response =
+        latest_patch_authoring_response(response).unwrap_or_else(|| response.trim().to_string());
+    extract_markdown_section(&authoring_response, "Git Add Paths")
+        .map(|section| {
+            section
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .filter(|line| !line.starts_with('#'))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn latest_patch_authoring_response(response: &str) -> Option<String> {
+    let mut saw_heading = false;
+    let mut current_label: Option<String> = None;
+    let mut current_lines = Vec::new();
+    let mut selected: Option<String> = None;
+    let finalize_section =
+        |label: Option<&str>, lines: &mut Vec<String>, selected: &mut Option<String>| {
+            let content = lines.join("\n").trim().to_string();
+            if label.is_some_and(is_patch_authoring_stage) && !content.is_empty() {
+                *selected = Some(content);
+            }
+            lines.clear();
+        };
+    for line in response.lines() {
+        if let Some(label) = line.strip_prefix("## ") {
+            let label = label.trim();
+            if is_codex_stage_heading(label) {
+                saw_heading = true;
+                finalize_section(current_label.as_deref(), &mut current_lines, &mut selected);
+                current_label = Some(label.to_string());
+                continue;
+            }
+        }
+        current_lines.push(line.to_string());
+    }
+    finalize_section(current_label.as_deref(), &mut current_lines, &mut selected);
+    if selected.is_some() {
+        selected
+    } else if saw_heading {
+        None
+    } else {
+        let trimmed = response.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+}
+
+fn is_patch_authoring_stage(label: &str) -> bool {
+    label == "Patch Pass" || label.starts_with("Refinement Pass ")
+}
+
+fn is_codex_stage_heading(label: &str) -> bool {
+    label == "Plan Pass"
+        || label == "Patch Pass"
+        || label.starts_with("Review Pass ")
+        || label.starts_with("Refinement Pass ")
+        || label == "Workflow Note"
+}
+
+fn extract_markdown_section(text: &str, heading: &str) -> Option<String> {
+    let mut in_section = false;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if let Some(current_heading) = line.strip_prefix("## ") {
+            let current_heading = current_heading.trim();
+            if in_section {
+                break;
+            }
+            if current_heading == heading {
+                in_section = true;
+            }
+            continue;
+        }
+        if in_section {
+            lines.push(line);
+        }
+    }
+    let content = lines.join("\n").trim().to_string();
+    if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
 }
 
 fn sanitize_public_session_text(
@@ -1849,7 +1980,7 @@ fn build_refinement_prompt(
 }
 
 fn patch_response_contract() -> &'static str {
-    "In every authoring pass, your final response must start with `Subject: <single-line git commit subject>` and then include these markdown sections exactly:\n\n## Commit Message\nA short upstream-friendly explanation of what changed and why.\n\n## Issue Connection\nExplain how the code change addresses the observed issue evidence instead of merely paraphrasing the diff.\n\n## Validation\nList the checks you ran, or say clearly that you could not run them."
+    "In every authoring pass, your final response must start with `Subject: <single-line git commit subject>` and then include these markdown sections exactly:\n\n## Commit Message\nA short upstream-friendly explanation of what changed and why.\n\n## Issue Connection\nExplain how the code change addresses the observed issue evidence instead of merely paraphrasing the diff.\n\n## Git Add Paths\nList the repo-relative paths that belong in the final patch, one per line. Include intentionally new files, and do not list generated build artifacts.\n\n## Validation\nList the checks you ran, or say clearly that you could not run them."
 }
 
 fn render_external_bug_report(
@@ -3123,7 +3254,8 @@ fn pg_amcheck_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_codex_failure, filter_generated_public_diff_blocks, is_generated_public_diff_path,
+        classify_codex_failure, extract_git_add_paths_from_response,
+        filter_generated_public_diff_blocks, is_generated_public_diff_path,
         load_published_codex_session, parse_review_verdict, render_public_session_git_diff,
         pg_amcheck_command, prepare_codex_job_with_prior_patch, primary_model_rate_limit_active,
         remember_primary_model_rate_limit, render_external_bug_report,
@@ -3843,6 +3975,42 @@ mod tests {
     }
 
     #[test]
+    fn extracts_git_add_paths_from_latest_patch_pass() {
+        let response = "\
+## Patch Pass
+
+Subject: htop: improve maps scan scheduling
+
+## Commit Message
+Example.
+
+## Issue Connection
+Example.
+
+## Git Add Paths
+- linux/LinuxProcess.h
+- linux/LinuxProcessTable.c
+
+## Validation
+- not run
+
+## Review Pass 1
+
+RESULT: ok
+";
+
+        let paths = extract_git_add_paths_from_response(response);
+
+        assert_eq!(
+            paths,
+            vec![
+                "- linux/LinuxProcess.h".to_string(),
+                "- linux/LinuxProcessTable.c".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn git_backed_public_diff_ignores_untracked_build_artifacts() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
@@ -3861,10 +4029,27 @@ mod tests {
         .unwrap();
         std::fs::write(workspace.join(".deps/Action.Po"), "generated\n").unwrap();
 
-        let diff = render_public_session_git_diff(&workspace).unwrap().unwrap();
+        let diff = render_public_session_git_diff(&workspace, &[]).unwrap().unwrap();
 
         assert!(diff.contains("linux/LinuxProcessTable.c"));
         assert!(!diff.contains(".deps/Action.Po"));
+    }
+
+    #[test]
+    fn git_backed_public_diff_includes_intended_new_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/existing.c"), "old\n").unwrap();
+        initialize_workspace_git_baseline(&workspace).unwrap();
+        std::fs::write(workspace.join("src/new.c"), "new file\n").unwrap();
+        std::fs::write(workspace.join(".deps-temp"), "generated\n").unwrap();
+
+        let diff =
+            render_public_session_git_diff(&workspace, &["src/new.c".to_string()]).unwrap().unwrap();
+
+        assert!(diff.contains("src/new.c"));
+        assert!(!diff.contains(".deps-temp"));
     }
 
     #[test]

@@ -1,3 +1,12 @@
+fixer (0.33.0-1) unstable; urgency=medium
+
+  * Let Codex declare the intended patch paths in a dedicated `Git Add Paths` section and
+    use those paths to seed git-backed public patch generation.
+  * Prefer git-derived public diffs for isolated worker workspaces so intentionally new
+    files can be published without dragging in generated build artifacts.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 30 Mar 2026 22:35:00 +0400
+
 fixer (0.32.0-1) unstable; urgency=medium
 
   * Stop publishing build-generated artifacts like `.deps`, generated `Makefile`, and
