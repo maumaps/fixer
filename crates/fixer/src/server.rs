@@ -6145,7 +6145,16 @@ async fn load_public_attempt_totals(db: &ServerDb) -> Result<(i64, i64, i64), Ap
     match db {
         ServerDb::Postgres(client) => {
             let rows = client
-                .query("SELECT bundle_json FROM patch_attempts", &[])
+                .query(
+                    "
+                SELECT pa.bundle_json
+                FROM patch_attempts pa
+                JOIN issue_clusters ic ON ic.id = pa.cluster_id
+                WHERE ic.promoted = TRUE
+                  AND ic.public_visible = TRUE
+                ",
+                    &[],
+                )
                 .await
                 .map_err(ApiError::internal)?;
             for row in rows {
@@ -6167,7 +6176,15 @@ async fn load_public_attempt_totals(db: &ServerDb) -> Result<(i64, i64, i64), Ap
         ServerDb::Sqlite(path) => {
             let connection = sqlite_connection(path).map_err(ApiError::internal)?;
             let mut stmt = connection
-                .prepare("SELECT bundle_json FROM patch_attempts")
+                .prepare(
+                    "
+                SELECT pa.bundle_json
+                FROM patch_attempts pa
+                JOIN issue_clusters ic ON ic.id = pa.cluster_id
+                WHERE ic.promoted = 1
+                  AND ic.public_visible = 1
+                ",
+                )
                 .map_err(ApiError::internal)?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))

@@ -1,3 +1,10 @@
+fixer (0.47.0-1) unstable; urgency=medium
+
+  * Align public attempt counters with the promoted/public attempts board so
+    homepage totals match what the site can actually render.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 01 Apr 2026 18:45:00 +0400
+
 fixer (0.46.0-1) unstable; urgency=medium
 
   * Hide local Codex auth bookkeeping reports from the public site so expired
