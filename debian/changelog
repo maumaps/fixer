@@ -1,3 +1,12 @@
+fixer (0.56.0-1) unstable; urgency=medium
+
+  * Treat Debian and Ubuntu mirror paths as source-friendly so normal distro
+    packages do not get misclassified as external vendor binaries.
+  * Keep workspace blocker classification aligned with that broader mirror
+    detection so worker attempts keep trying real package workspaces.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 02 Apr 2026 01:26:52 +0400
+
 fixer (0.55.0-1) unstable; urgency=medium
 
   * Map Google Chrome package investigations to Chromium sources so workers

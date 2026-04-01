@@ -12,7 +12,7 @@ use crate::proposal;
 use crate::protocol::{current_binary_version, default_protocol_version};
 use crate::storage::Store;
 use crate::util::{command_exists, hash_text, now_rfc3339, read_text};
-use crate::workspace::ensure_workspace_for_opportunity;
+use crate::workspace::{ensure_workspace_for_opportunity, origin_is_debian_source_friendly};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::blocking::Client;
@@ -1816,13 +1816,7 @@ fn workspace_blocker_classification(
             .and_then(Value::as_array)
             .is_some_and(|origins| {
                 origins.iter().filter_map(Value::as_str).any(|origin| {
-                    let lower = origin.to_ascii_lowercase();
-                    !lower.contains("deb.debian.org")
-                        && !lower.contains("security.debian.org")
-                        && !lower.contains("debian.org/debian")
-                        && !lower.contains("ubuntu.com")
-                        && !lower.contains("archive.ubuntu.com")
-                        && !lower.contains("ports.ubuntu.com")
+                    !origin_is_debian_source_friendly(origin)
                 })
             })
     {
@@ -2307,6 +2301,47 @@ mod tests {
             )
             .as_deref(),
             Some("external-package")
+        );
+    }
+
+    #[test]
+    fn workspace_blocker_classification_accepts_debian_mirror_origins() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "htop burns CPU".to_string(),
+            score: 10,
+            state: "open".to_string(),
+            repo_root: None,
+            summary: "htop loops".to_string(),
+            evidence: json!({
+                "package_name": "htop",
+                "source_package": "htop",
+                "details": {
+                    "subsystem": "cpu",
+                    "package_metadata": {
+                        "package_name": "htop",
+                        "source_package": "htop",
+                        "cloneable_homepage": false,
+                        "apt_origins": [
+                            "http://debian.grena.ge/debian stable/main amd64 Packages"
+                        ]
+                    }
+                }
+            }),
+            ecosystem: None,
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+            updated_at: "2026-04-01T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            workspace_blocker_classification(
+                &opportunity,
+                "could not acquire a workspace for htop; enable deb-src or provide a cloneable homepage"
+            )
+            .as_deref(),
+            Some("workspace-unavailable")
         );
     }
 

@@ -8,6 +8,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use url::Url;
 
 pub fn ensure_workspace_for_opportunity(
     config: &FixerConfig,
@@ -352,14 +353,25 @@ fn chrome_workspace_alias(
     })
 }
 
-fn origin_is_debian_source_friendly(origin: &str) -> bool {
+pub(crate) fn origin_is_debian_source_friendly(origin: &str) -> bool {
     let lower = origin.to_ascii_lowercase();
-    lower.contains("deb.debian.org")
-        || lower.contains("security.debian.org")
-        || lower.contains("debian.org/debian")
-        || lower.contains("ubuntu.com")
-        || lower.contains("archive.ubuntu.com")
-        || lower.contains("ports.ubuntu.com")
+    origin_url(origin).is_some_and(|url| {
+        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        let path = url.path().to_ascii_lowercase();
+        host == "debian.org"
+            || host.ends_with(".debian.org")
+            || host == "ubuntu.com"
+            || host.ends_with(".ubuntu.com")
+            || path.starts_with("/debian")
+            || path.starts_with("/debian-security")
+            || path.starts_with("/ubuntu")
+            || path.starts_with("/ubuntu-ports")
+    }) || lower.contains("debian.org/debian")
+}
+
+fn origin_url(origin: &str) -> Option<Url> {
+    let candidate = origin.split_whitespace().next()?;
+    Url::parse(candidate).ok()
 }
 
 fn version_is_newer(candidate: &str, installed: &str) -> bool {
@@ -700,6 +712,22 @@ zoom:\n\
         };
         assert!(is_external_binary_package_without_workspace(
             &metadata, &target
+        ));
+    }
+
+    #[test]
+    fn accepts_debian_mirror_paths_as_source_friendly() {
+        assert!(origin_is_debian_source_friendly(
+            "http://debian.grena.ge/debian stable/main amd64 Packages"
+        ));
+        assert!(origin_is_debian_source_friendly(
+            "http://mirror.hetzner.com/debian/packages trixie/main amd64 Packages"
+        ));
+        assert!(origin_is_debian_source_friendly(
+            "http://ftp.by.debian.org/debian sid/main amd64 Packages"
+        ));
+        assert!(!origin_is_debian_source_friendly(
+            "https://packagecloud.io/slacktechnologies/slack/debian jessie/main amd64 Packages"
         ));
     }
 
