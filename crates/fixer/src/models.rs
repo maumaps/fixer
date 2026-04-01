@@ -191,8 +191,16 @@ pub struct CodexJobStatus {
     pub models_used: Vec<String>,
     #[serde(default)]
     pub rate_limit_fallback_used: bool,
+    #[serde(default)]
+    pub failure_stage: Option<String>,
     pub error: Option<String>,
     pub failure_kind: Option<String>,
+    #[serde(default)]
+    pub exit_status: Option<i32>,
+    #[serde(default)]
+    pub last_stderr_excerpt: Option<String>,
+    #[serde(default)]
+    pub review_failure_category: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

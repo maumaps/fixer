@@ -727,6 +727,25 @@ struct PublicAttempt {
     created_at: String,
     published_session: Option<PublishedAttemptSession>,
     handoff: Option<PublicTriageHandoff>,
+    blocker_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct PublicAttemptSummary {
+    total_attempt_count: usize,
+    ready_patch_count: usize,
+    ready_triage_count: usize,
+    ready_report_count: usize,
+    failed_patch_count: usize,
+    explained_impossible_count: usize,
+    other_attempt_count: usize,
+    top_blockers: Vec<PublicAttemptBlocker>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicAttemptBlocker {
+    label: String,
+    count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -758,6 +777,8 @@ struct PublicIssueDetail {
     last_seen: String,
     technical_snapshot: Option<PublicTechnicalSnapshot>,
     possible_duplicates: Vec<PublicPossibleDuplicate>,
+    attempt_summary: PublicAttemptSummary,
+    attempts_omitted_count: usize,
     attempts: Vec<PublicAttempt>,
 }
 
@@ -866,6 +887,9 @@ struct DashboardSnapshot {
     quarantined_issue_count: i64,
     ready_patch_count: i64,
     ready_triage_count: i64,
+    ready_report_count: i64,
+    failed_patch_attempt_count: i64,
+    explained_impossible_count: i64,
     corroborated_public_issue_count: i64,
     largest_public_cluster_size: i64,
     last_submission_at: Option<String>,
@@ -1732,16 +1756,10 @@ async fn ensure_forward_installs_schema(db: &ServerDb) -> Result<()> {
                 .query_map([], |row| row.get::<_, String>(1))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             if !columns.iter().any(|name| name == "patch_driver") {
-                connection.execute(
-                    "ALTER TABLE installs ADD COLUMN patch_driver TEXT",
-                    [],
-                )?;
+                connection.execute("ALTER TABLE installs ADD COLUMN patch_driver TEXT", [])?;
             }
             if !columns.iter().any(|name| name == "patch_model") {
-                connection.execute(
-                    "ALTER TABLE installs ADD COLUMN patch_model TEXT",
-                    [],
-                )?;
+                connection.execute("ALTER TABLE installs ADD COLUMN patch_model TEXT", [])?;
             }
         }
     }
@@ -5060,13 +5078,49 @@ fn select_best_patch_attempt(candidates: &[PatchAttempt]) -> Option<PatchAttempt
     }
 }
 
+fn repeated_workspace_blocked_triage_attempt(candidates: &[PatchAttempt]) -> Option<PatchAttempt> {
+    let mut repeated_reports = candidates
+        .iter()
+        .filter(|attempt| {
+            attempt.state == "ready"
+                && attempt.outcome == "report"
+                && attempt
+                    .details
+                    .get("report_only_reason")
+                    .and_then(Value::as_str)
+                    == Some("workspace-acquisition")
+                && attempt
+                    .details
+                    .get("handoff")
+                    .and_then(Value::as_object)
+                    .is_some()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if repeated_reports.len() < 2 {
+        return None;
+    }
+    repeated_reports.sort_by(compare_attempt_created_at);
+    let mut attempt = repeated_reports.pop()?;
+    attempt.outcome = "triage".to_string();
+    attempt.summary =
+        "A diagnosis report and external handoff were created locally because no patchable workspace was available.".to_string();
+    if let Some(object) = attempt.details.as_object_mut() {
+        object
+            .entry("report_only_reason".to_string())
+            .or_insert_with(|| json!("workspace-acquisition"));
+    }
+    Some(attempt)
+}
+
 fn best_attempts_from_candidates(
     candidates: Vec<PatchAttempt>,
 ) -> (Option<PatchAttempt>, Option<PatchAttempt>) {
-    (
-        select_best_patch_attempt(&candidates),
-        select_best_attempt(&candidates, "triage"),
-    )
+    let best_triage = select_best_attempt(&candidates, "triage")
+        .into_iter()
+        .chain(repeated_workspace_blocked_triage_attempt(&candidates))
+        .max_by(compare_attempt_created_at);
+    (select_best_patch_attempt(&candidates), best_triage)
 }
 
 async fn load_latest_patch_context_for_worker(
@@ -5294,12 +5348,23 @@ async fn upsert_issue_cluster(
     let representative_json = serde_json::to_value(item)?;
     let public_fields = build_public_issue_fields(item);
     let package_name = item.finding.package_name.clone();
-    let source_package = item
-        .opportunity
-        .evidence
-        .get("source_package")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
+    let source_package = canonical_public_source_package(
+        package_name.as_deref(),
+        item.opportunity
+            .evidence
+            .get("source_package")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                item.opportunity
+                    .evidence
+                    .get("details")
+                    .and_then(|details| details.get("package_metadata"))
+                    .and_then(|metadata| metadata.get("source_package"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            }),
+    );
     match db {
         ServerDb::Postgres(db) => {
             let existing_id = db
@@ -5526,6 +5591,7 @@ struct WorkerCandidate {
     has_foreign_reports: bool,
     last_attempt_at: Option<DateTime<Utc>>,
     last_attempt_model: Option<String>,
+    latest_attempt: Option<PatchAttempt>,
 }
 
 async fn next_issue_for_worker(
@@ -5553,7 +5619,14 @@ async fn next_issue_for_worker(
                     SELECT MAX(attempt.created_at)
                     FROM patch_attempts attempt
                     WHERE attempt.cluster_id = issue.id
-               ) AS last_attempt_at
+               ) AS last_attempt_at,
+               (
+                    SELECT bundle_json
+                    FROM patch_attempts attempt
+                    WHERE attempt.cluster_id = issue.id
+                    ORDER BY attempt.created_at DESC
+                    LIMIT 1
+               ) AS latest_attempt_json
         FROM issue_clusters issue
         WHERE promoted = TRUE
           AND public_visible = TRUE
@@ -5599,7 +5672,14 @@ async fn next_issue_for_worker(
                     SELECT MAX(attempt.created_at)
                     FROM patch_attempts attempt
                     WHERE attempt.cluster_id = issue.id
-               ) AS last_attempt_at
+               ) AS last_attempt_at,
+               (
+                    SELECT bundle_json
+                    FROM patch_attempts attempt
+                    WHERE attempt.cluster_id = issue.id
+                    ORDER BY attempt.created_at DESC
+                    LIMIT 1
+               ) AS latest_attempt_json
         FROM issue_clusters issue
         WHERE promoted = 1
           AND public_visible = 1
@@ -5624,12 +5704,16 @@ async fn next_issue_for_worker(
                         .get::<_, Option<String>>(17)?
                         .as_deref()
                         .and_then(parse_timestamp);
+                    let latest_attempt = row
+                        .get::<_, Option<String>>(18)?
+                        .and_then(|raw| latest_attempt_from_json_str(&raw).ok());
                     let last_attempt_model = patch_attempt_model(issue.best_patch.as_ref());
                     Ok(WorkerCandidate {
                         issue,
                         has_foreign_reports,
                         last_attempt_at,
                         last_attempt_model,
+                        latest_attempt,
                     })
                 },
             )?;
@@ -5816,6 +5900,16 @@ fn candidate_is_in_recent_attempt_cooldown(
     candidate: &WorkerCandidate,
     cooldown_cutoff: Option<DateTime<Utc>>,
 ) -> bool {
+    if let (Some(last_attempt_at), Some(latest_attempt)) =
+        (candidate.last_attempt_at, candidate.latest_attempt.as_ref())
+    {
+        if let Some(seconds) = attempt_blocker_cooldown_seconds(latest_attempt) {
+            let blocker_cutoff = Utc::now() - Duration::seconds(seconds as i64);
+            if last_attempt_at >= blocker_cutoff {
+                return true;
+            }
+        }
+    }
     let Some(cooldown_cutoff) = cooldown_cutoff else {
         return false;
     };
@@ -5858,6 +5952,100 @@ fn patch_attempt_fixer_version(attempt: &PatchAttempt) -> Option<&str> {
         .or_else(|| attempt.details.get("fixer_version").and_then(Value::as_str))
 }
 
+fn normalize_attempt_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn attempt_blocker_reason_from_summary(summary: &str) -> Option<String> {
+    let summary = normalize_attempt_text(summary);
+    if let Some(rest) = summary.strip_prefix("Worker could not make a safe patch: ") {
+        return Some(rest.to_string());
+    }
+    if let Some((_, rest)) = summary.rsplit_once(": ") {
+        if summary.contains("patch attempt failed to run cleanly") {
+            return Some(rest.to_string());
+        }
+    }
+    if summary.ends_with("patch proposal did not complete cleanly.") {
+        return Some("patch proposal did not complete cleanly".to_string());
+    }
+    None
+}
+
+fn attempt_blocker_reason(attempt: &PatchAttempt) -> Option<String> {
+    for key in [
+        "report_only_reason",
+        "patch_failure_kind",
+        "workspace_failure_kind",
+        "patch_refresh_failure_kind",
+    ] {
+        if let Some(reason) = attempt
+            .details
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(reason.to_string());
+        }
+    }
+    if let Some(reason) = attempt
+        .details
+        .get("handoff")
+        .and_then(|value| value.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(reason.to_string());
+    }
+    attempt_blocker_reason_from_summary(&attempt.summary)
+}
+
+fn attempt_blocker_cooldown_seconds(attempt: &PatchAttempt) -> Option<u64> {
+    match attempt_blocker_reason(attempt).as_deref() {
+        Some("codex-auth-unavailable") => Some(60 * 60),
+        Some("workspace-acquisition") => Some(30 * 60),
+        Some("review") => Some(20 * 60),
+        Some("api") | Some("execution") | Some("auth") | Some("rate-limit") => Some(15 * 60),
+        _ => None,
+    }
+}
+
+fn build_public_attempt_summary(attempts: &[PublicAttempt]) -> PublicAttemptSummary {
+    let mut summary = PublicAttemptSummary {
+        total_attempt_count: attempts.len(),
+        ..PublicAttemptSummary::default()
+    };
+    let mut blocker_counts = HashMap::<String, usize>::new();
+    for attempt in attempts {
+        match (attempt.outcome.as_str(), attempt.state.as_str()) {
+            ("patch", "ready") => summary.ready_patch_count += 1,
+            ("triage", "ready") => summary.ready_triage_count += 1,
+            ("report", "ready") => summary.ready_report_count += 1,
+            ("patch", "failed") => summary.failed_patch_count += 1,
+            ("impossible", "explained") => summary.explained_impossible_count += 1,
+            _ => summary.other_attempt_count += 1,
+        }
+        if let Some(label) = attempt.blocker_reason.as_deref() {
+            *blocker_counts.entry(label.to_string()).or_default() += 1;
+        }
+    }
+    let mut top_blockers = blocker_counts
+        .into_iter()
+        .map(|(label, count)| PublicAttemptBlocker { label, count })
+        .collect::<Vec<_>>();
+    top_blockers.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    top_blockers.truncate(5);
+    summary.top_blockers = top_blockers;
+    summary
+}
+
 fn issue_from_row(row: Row) -> Result<IssueCluster> {
     let representative: SharedOpportunity = serde_json::from_value(row.get::<_, Value>(13))?;
     let best_patch = row
@@ -5888,14 +6076,34 @@ fn issue_from_row(row: Row) -> Result<IssueCluster> {
 fn worker_candidate_from_row(row: Row) -> Result<WorkerCandidate> {
     let has_foreign_reports: bool = row.get(16);
     let last_attempt_at: Option<DateTime<Utc>> = row.get(17);
+    let latest_attempt = row
+        .get::<_, Option<Value>>(18)
+        .map(latest_attempt_from_json_value)
+        .transpose()?;
     let issue = issue_from_row(row)?;
-    let last_attempt_model = patch_attempt_model(issue.best_patch.as_ref());
+    let last_attempt_model = patch_attempt_model(latest_attempt.as_ref())
+        .or_else(|| patch_attempt_model(issue.best_patch.as_ref()));
     Ok(WorkerCandidate {
         issue,
         has_foreign_reports,
         last_attempt_at,
         last_attempt_model,
+        latest_attempt,
     })
+}
+
+fn latest_attempt_from_json_value(raw: Value) -> Result<PatchAttempt> {
+    Ok(
+        canonicalize_worker_result_envelope(serde_json::from_value::<WorkerResultEnvelope>(raw)?)
+            .attempt,
+    )
+}
+
+fn latest_attempt_from_json_str(raw: &str) -> Result<PatchAttempt> {
+    Ok(
+        canonicalize_worker_result_envelope(serde_json::from_str::<WorkerResultEnvelope>(raw)?)
+            .attempt,
+    )
 }
 
 fn patch_attempt_model(attempt: Option<&PatchAttempt>) -> Option<String> {
@@ -5959,6 +6167,9 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 (SELECT COUNT(*) FROM issue_clusters WHERE promoted = FALSE),
                 (SELECT COUNT(*) FROM issue_clusters WHERE best_patch_json IS NOT NULL),
                 (SELECT COUNT(*) FROM issue_clusters WHERE best_patch_json IS NULL AND best_triage_json IS NOT NULL),
+                (SELECT COUNT(*) FROM patch_attempts WHERE outcome = 'report' AND state = 'ready'),
+                (SELECT COUNT(*) FROM patch_attempts WHERE outcome = 'patch' AND state = 'failed'),
+                (SELECT COUNT(*) FROM patch_attempts WHERE outcome = 'impossible' AND state = 'explained'),
                 (SELECT COUNT(*) FROM issue_clusters WHERE promoted = TRUE AND public_visible = TRUE AND corroboration_count >= 2),
                 (SELECT COALESCE(MAX(corroboration_count), 0) FROM issue_clusters WHERE promoted = TRUE AND public_visible = TRUE),
                 (SELECT MAX(received_at) FROM submissions)
@@ -5968,7 +6179,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 .await
                 .map_err(ApiError::internal)?;
             let last_submission_at = row
-                .get::<_, Option<DateTime<Utc>>>(8)
+                .get::<_, Option<DateTime<Utc>>>(11)
                 .map(|value| value.to_rfc3339());
             Ok(DashboardSnapshot {
                 install_count: row.get(0),
@@ -5977,8 +6188,11 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 quarantined_issue_count: row.get(3),
                 ready_patch_count: row.get(4),
                 ready_triage_count: row.get(5),
-                corroborated_public_issue_count: row.get(6),
-                largest_public_cluster_size: row.get(7),
+                ready_report_count: row.get(6),
+                failed_patch_attempt_count: row.get(7),
+                explained_impossible_count: row.get(8),
+                corroborated_public_issue_count: row.get(9),
+                largest_public_cluster_size: row.get(10),
                 last_submission_at,
                 top_issues: load_public_issue_candidates(db, 8).await?,
             })
@@ -6026,6 +6240,27 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                     |row| row.get(0),
                 )
                 .map_err(ApiError::internal)?;
+            let ready_report_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM patch_attempts WHERE outcome = 'report' AND state = 'ready'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
+            let failed_patch_attempt_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM patch_attempts WHERE outcome = 'patch' AND state = 'failed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
+            let explained_impossible_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM patch_attempts WHERE outcome = 'impossible' AND state = 'explained'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
             let largest_public_cluster_size: i64 = connection
                 .query_row(
                     "SELECT COALESCE(MAX(corroboration_count), 0) FROM issue_clusters WHERE promoted = 1 AND public_visible = 1",
@@ -6047,6 +6282,9 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 quarantined_issue_count,
                 ready_patch_count,
                 ready_triage_count,
+                ready_report_count,
+                failed_patch_attempt_count,
+                explained_impossible_count,
                 corroborated_public_issue_count,
                 largest_public_cluster_size,
                 last_submission_at,
@@ -6134,7 +6372,10 @@ async fn load_public_issue_detail(
     let best_triage = load_public_issue_best_triage(db, &id).await?;
     let best_patch_diff_url = public_best_patch_diff_url(&id, best_patch.as_ref());
     let possible_duplicates = load_possible_duplicates(db, &id, &issue, 6).await?;
-    let attempts = load_public_attempts(db, &id, 10).await?;
+    let all_attempts = load_public_attempts(db, &id, 1024).await?;
+    let attempt_summary = build_public_attempt_summary(&all_attempts);
+    let attempts_omitted_count = all_attempts.len().saturating_sub(10);
+    let attempts = all_attempts.into_iter().take(10).collect();
     Ok(PublicIssueDetail {
         id: issue.id,
         kind: issue.kind,
@@ -6157,6 +6398,8 @@ async fn load_public_issue_detail(
         last_seen: issue.last_seen,
         technical_snapshot,
         possible_duplicates,
+        attempt_summary,
+        attempts_omitted_count,
         attempts,
     })
 }
@@ -7032,6 +7275,28 @@ fn is_kernelish_package_name(value: &str) -> bool {
         || normalized == "linux"
 }
 
+fn canonical_public_source_package(
+    package_name: Option<&str>,
+    source_package: Option<String>,
+) -> Option<String> {
+    let source_package = source_package
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(source_package) = source_package {
+        if source_package
+            .to_ascii_lowercase()
+            .starts_with("linux-signed")
+        {
+            return Some("linux".to_string());
+        }
+        return Some(source_package);
+    }
+    if package_name.is_some_and(is_kernelish_package_name) {
+        return Some("linux".to_string());
+    }
+    None
+}
+
 fn is_kernelish_target_name(value: &str) -> bool {
     let normalized = value.trim().to_ascii_lowercase();
     normalized.starts_with("kworker")
@@ -7439,6 +7704,7 @@ fn public_attempt_from_patch_attempt(attempt: PatchAttempt) -> PublicAttempt {
     let attempt = canonicalize_patch_attempt(attempt);
     let published_session = published_session_from_attempt_details(&attempt.details);
     let handoff = public_triage_handoff_from_attempt(&attempt, published_session.as_ref());
+    let blocker_reason = attempt_blocker_reason(&attempt);
     PublicAttempt {
         outcome: attempt.outcome,
         state: attempt.state,
@@ -7447,6 +7713,7 @@ fn public_attempt_from_patch_attempt(attempt: PatchAttempt) -> PublicAttempt {
         created_at: attempt.created_at,
         published_session,
         handoff,
+        blocker_reason,
     }
 }
 
@@ -8723,7 +8990,11 @@ fn format_package_highlight(name: Option<String>, version: Option<String>) -> Op
 fn push_env_highlights(details: &Value, highlights: &mut Vec<String>) {
     let pkg = details
         .get("package_name")
-        .or_else(|| details.get("profile_target").and_then(|t| t.get("package_name")))
+        .or_else(|| {
+            details
+                .get("profile_target")
+                .and_then(|t| t.get("package_name"))
+        })
         .and_then(Value::as_str)
         .map(sanitize_public_text);
     let ver = details
@@ -8740,7 +9011,10 @@ fn push_env_highlights(details: &Value, highlights: &mut Vec<String>) {
     let ver = details.get("distro_version_id").and_then(Value::as_str);
     match (id, ver) {
         (Some(id), Some(ver)) => {
-            highlights.push(format!("Distribution: {}", sanitize_public_text(&format!("{id} {ver}"))));
+            highlights.push(format!(
+                "Distribution: {}",
+                sanitize_public_text(&format!("{id} {ver}"))
+            ));
         }
         (Some(id), None) => {
             highlights.push(format!("Distribution: {}", sanitize_public_text(id)));
@@ -8966,6 +9240,8 @@ sudo apt install fixer"
         "The shared queue is quiet right now."
     } else if snapshot.ready_patch_count > 0 {
         "There is live work in the queue and at least one diff-ready attempt."
+    } else if snapshot.ready_report_count > 0 {
+        "The queue is active, but most worker output is still diagnosis-only rather than diff-ready."
     } else if snapshot.ready_triage_count > 0 {
         "The queue is active and some issues already have clean public handoffs."
     } else {
@@ -9030,12 +9306,24 @@ sudo apt install fixer"
                         </div>
                         <div class="snapshot-stat">
                             <strong>{}</strong>
+                            <span>diagnosis-only reports</span>
+                        </div>
+                        <div class="snapshot-stat">
+                            <strong>{}</strong>
+                            <span>failed patch attempts</span>
+                        </div>
+                        <div class="snapshot-stat">
+                            <strong>{}</strong>
+                            <span>explained impossible attempts</span>
+                        </div>
+                        <div class="snapshot-stat">
+                            <strong>{}</strong>
                             <span>still quarantined against spam</span>
                         </div>
                     </div>
                     <div class="snapshot-foot">
                         <p><strong>Last submission:</strong> {last_submission}</p>
-                        <p class="fine-print">Fixer promotes corroborated or trusted issues, then lets workers pull from the public queue.</p>
+                        <p class="fine-print">Fixer promotes corroborated or trusted issues, then lets workers pull from the public queue. When workers cannot land an honest diff, the public issue page now shows diagnosis-only and blocked attempts instead of hiding them.</p>
                     </div>
                 </aside>
             </div>
@@ -9141,6 +9429,9 @@ sudo apt install fixer"
         snapshot.promoted_issue_count,
         snapshot.ready_patch_count,
         snapshot.ready_triage_count,
+        snapshot.ready_report_count,
+        snapshot.failed_patch_attempt_count,
+        snapshot.explained_impossible_count,
         snapshot.quarantined_issue_count,
         html_escape(&apt_snippet),
         html_escape(PRIVACY_WARNING),
@@ -9265,6 +9556,7 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
     let best_result_markup = render_best_result_panel(issue);
     let technical_snapshot_markup = render_technical_snapshot_section(issue);
     let duplicates_markup = render_possible_duplicates_section(issue);
+    let attempt_summary_markup = render_attempt_summary_section(issue);
     let attempts_markup = if issue.attempts.is_empty() {
         "<p class=\"fine-print\">No public attempts have been published for this issue yet.</p>"
             .to_string()
@@ -9286,6 +9578,7 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
             <p class="fine-print">Last seen: {}. Public JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
         </section>
 
+        {}
         {}
         {}
         {}
@@ -9314,6 +9607,7 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
         best_result_markup,
         technical_snapshot_markup,
         duplicates_markup,
+        attempt_summary_markup,
         attempts_markup,
     );
     render_page(
@@ -9322,6 +9616,92 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
         NavPage::Issues,
         body,
         0,
+    )
+}
+
+fn render_attempt_summary_section(issue: &PublicIssueDetail) -> String {
+    let summary = &issue.attempt_summary;
+    if summary.total_attempt_count == 0 {
+        return String::new();
+    }
+    let blocker_markup = if summary.top_blockers.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<section class=\"patch-summary\"><h4>Most common blockers</h4><ul class=\"attempt-list\">{}</ul></section>",
+            summary
+                .top_blockers
+                .iter()
+                .map(|blocker| format!(
+                    "<li><strong>{}</strong> <span class=\"fine-print\">({} attempt{})</span></li>",
+                    html_escape(&blocker.label),
+                    blocker.count,
+                    if blocker.count == 1 { "" } else { "s" }
+                ))
+                .collect::<Vec<_>>()
+                .join("")
+        )
+    };
+    let omitted_note = if issue.attempts_omitted_count == 0 {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"fine-print\">Showing the 10 most recent attempts below and summarizing {} older attempt{} here.</p>",
+            issue.attempts_omitted_count,
+            if issue.attempts_omitted_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        )
+    };
+    format!(
+        r#"<section class="panel section">
+            <h2>Worker outcome summary</h2>
+            <p class="section-intro">This issue has {total} recorded worker attempt{plural}. Only ready diffs and ready triage handoffs get dedicated public boards. Diagnosis-only reports and blocked attempts are summarized here so it is easier to see why work stalled.</p>
+            <div class="snapshot-grid">
+                <div class="snapshot-stat">
+                    <strong>{ready_patch}</strong>
+                    <span>ready patch attempts</span>
+                </div>
+                <div class="snapshot-stat">
+                    <strong>{ready_triage}</strong>
+                    <span>ready triage handoffs</span>
+                </div>
+                <div class="snapshot-stat">
+                    <strong>{ready_report}</strong>
+                    <span>diagnosis-only reports</span>
+                </div>
+                <div class="snapshot-stat">
+                    <strong>{failed_patch}</strong>
+                    <span>failed patch attempts</span>
+                </div>
+                <div class="snapshot-stat">
+                    <strong>{explained_impossible}</strong>
+                    <span>explained impossible attempts</span>
+                </div>
+                <div class="snapshot-stat">
+                    <strong>{other}</strong>
+                    <span>other attempt states</span>
+                </div>
+            </div>
+            {blocker_markup}
+            {omitted_note}
+        </section>"#,
+        total = summary.total_attempt_count,
+        plural = if summary.total_attempt_count == 1 {
+            ""
+        } else {
+            "s"
+        },
+        ready_patch = summary.ready_patch_count,
+        ready_triage = summary.ready_triage_count,
+        ready_report = summary.ready_report_count,
+        failed_patch = summary.failed_patch_count,
+        explained_impossible = summary.explained_impossible_count,
+        other = summary.other_attempt_count,
+        blocker_markup = blocker_markup,
+        omitted_note = omitted_note,
     )
 }
 
@@ -9622,6 +10002,17 @@ fn render_page(
     )
 }
 
+fn public_attempt_heading(attempt: &PublicAttempt) -> &'static str {
+    match (attempt.outcome.as_str(), attempt.state.as_str()) {
+        ("patch", "ready") => "ready patch attempt",
+        ("triage", "ready") => "ready triage handoff",
+        ("report", "ready") => "diagnosis-only report",
+        ("patch", "failed") => "failed patch attempt",
+        ("impossible", "explained") => "explained impossible attempt",
+        _ => "worker attempt",
+    }
+}
+
 fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
     let mut sections = Vec::new();
     if let Some(session) = &attempt.published_session {
@@ -9679,6 +10070,16 @@ fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
             )
         })
         .unwrap_or_default();
+    let blocker_markup = attempt
+        .blocker_reason
+        .as_deref()
+        .map(|reason| {
+            format!(
+                "<section class=\"patch-summary\"><h4>Why it stopped</h4><p class=\"issue-summary\">{}</p></section>",
+                html_escape(reason)
+            )
+        })
+        .unwrap_or_default();
 
     format!(
         r#"<article class="issue-card">
@@ -9690,8 +10091,9 @@ fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
             <div class="meta"><span class="tag">state: {}</span><span class="tag">created: {}</span>{}</div>
             {}
             {}
+            {}
         </article>"#,
-        html_escape(&format!("{} attempt", attempt.outcome)),
+        html_escape(public_attempt_heading(attempt)),
         html_escape(&attempt.outcome),
         html_escape(&attempt.summary),
         html_escape(&attempt.state),
@@ -9704,6 +10106,7 @@ fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
                 html_escape(status)
             ))
             .unwrap_or_default(),
+        blocker_markup,
         handoff_markup,
         session_markup
     )
@@ -10617,6 +11020,9 @@ mod tests {
             quarantined_issue_count: 3,
             ready_patch_count: 2,
             ready_triage_count: 1,
+            ready_report_count: 7,
+            failed_patch_attempt_count: 3,
+            explained_impossible_count: 2,
             corroborated_public_issue_count: 4,
             largest_public_cluster_size: 6,
             last_submission_at: Some("2026-03-30T00:00:00Z".to_string()),
@@ -10735,6 +11141,7 @@ mod tests {
                     rate_limit_fallback_used: false,
                 }),
                 handoff: None,
+                blocker_reason: None,
             },
         });
 
@@ -10784,12 +11191,15 @@ mod tests {
                     rate_limit_fallback_used: false,
                 }),
                 handoff: None,
+                blocker_reason: None,
             }),
             best_triage: None,
             best_triage_handoff: None,
             last_seen: "2026-03-29T00:00:00Z".to_string(),
             technical_snapshot: None,
             possible_duplicates: Vec::new(),
+            attempt_summary: PublicAttemptSummary::default(),
+            attempts_omitted_count: 0,
             attempts: Vec::new(),
         };
 
@@ -10835,6 +11245,7 @@ mod tests {
                     report_url: None,
                     next_steps: vec!["Capture a fresh backend sample.".to_string()],
                 }),
+                blocker_reason: None,
             }),
             best_triage_handoff: Some(PublicTriageHandoff {
                 reason: "likely-external-root-cause".to_string(),
@@ -10862,6 +11273,8 @@ mod tests {
                 similarity_score: 0.82,
                 match_reasons: vec!["same package".to_string(), "same wait site".to_string()],
             }],
+            attempt_summary: PublicAttemptSummary::default(),
+            attempts_omitted_count: 0,
             attempts: Vec::new(),
         };
 
@@ -10910,6 +11323,8 @@ mod tests {
                 ],
             }),
             possible_duplicates: Vec::new(),
+            attempt_summary: PublicAttemptSummary::default(),
+            attempts_omitted_count: 0,
             attempts: Vec::new(),
         };
 
@@ -10961,12 +11376,15 @@ mod tests {
                     rate_limit_fallback_used: false,
                 }),
                 handoff: None,
+                blocker_reason: None,
             }),
             best_triage: None,
             best_triage_handoff: None,
             last_seen: "2026-03-29T00:00:00Z".to_string(),
             technical_snapshot: None,
             possible_duplicates: Vec::new(),
+            attempt_summary: PublicAttemptSummary::default(),
+            attempts_omitted_count: 0,
             attempts: Vec::new(),
         };
 
@@ -11068,6 +11486,48 @@ mod tests {
 
         assert!(patch_attempt_needs_worker_refresh(&legacy_patch));
         assert!(!patch_attempt_needs_worker_refresh(&current_patch));
+    }
+
+    #[test]
+    fn repeated_workspace_blocked_reports_promote_to_triage() {
+        let report_attempt = |created_at: &str| PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "report".to_string(),
+            state: "ready".to_string(),
+            summary:
+                "A diagnosis report was created even though no patchable workspace was available."
+                    .to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "report_only_reason": "workspace-acquisition",
+                "workspace_classification": "external-package",
+                "handoff": {
+                    "target": "google-chrome-stable",
+                    "report_url": "https://bugs.example.test/chrome",
+                    "next_steps": ["File upstream issue"]
+                }
+            }),
+            created_at: created_at.to_string(),
+        };
+
+        let (_, best_triage) = best_attempts_from_candidates(vec![
+            report_attempt("2026-03-30T00:00:00Z"),
+            report_attempt("2026-03-31T00:00:00Z"),
+        ]);
+
+        let best_triage = best_triage.expect("workspace reports should promote to triage");
+        assert_eq!(best_triage.outcome, "triage");
+        assert_eq!(
+            best_triage
+                .details
+                .get("report_only_reason")
+                .and_then(Value::as_str),
+            Some("workspace-acquisition")
+        );
+        assert!(best_triage.summary.contains("external handoff"));
     }
 
     #[test]

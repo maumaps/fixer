@@ -1,5 +1,13 @@
 Fixer installs a CLI, a collector service, and an optional aggregation server.
 
+The canonical service runbook for release, deployment, enrollment, and upgrade
+operations lives in:
+
+  doc/service-actions.md
+
+Use that document for operator workflows. This Debian note stays focused on
+package behavior and local service layout.
+
 The easiest install path for the collector package is:
 
   sudo apt install ./fixer_<version>_<arch>.deb

@@ -3,12 +3,14 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+PARENT_DIR=$(CDPATH= cd -- "$REPO_ROOT/.." && pwd)
 HOST=${FIXER_DEPLOY_HOST:-root@fixer.maumap.com}
 SITE=${FIXER_SITE_NAME:-fixer.maumap.com}
 VERSION=$(dpkg-parsechangelog -SVersion)
 ARCH=$(dpkg --print-architecture)
-FIXER_PACKAGE=${FIXER_PACKAGE_PATH:-"$REPO_ROOT/dist/packages/$VERSION/$ARCH/fixer_${VERSION}_${ARCH}.deb"}
-FIXER_SERVER_PACKAGE=${FIXER_SERVER_PACKAGE_PATH:-"$REPO_ROOT/dist/packages/$VERSION/$ARCH/fixer-server_${VERSION}_${ARCH}.deb"}
+PACKAGE_ROOT=${OUTPUT_DIR:-"$PARENT_DIR/dist/packages"}
+FIXER_PACKAGE=${FIXER_PACKAGE_PATH:-"$PACKAGE_ROOT/$VERSION/$ARCH/fixer_${VERSION}_${ARCH}.deb"}
+FIXER_SERVER_PACKAGE=${FIXER_SERVER_PACKAGE_PATH:-"$PACKAGE_ROOT/$VERSION/$ARCH/fixer-server_${VERSION}_${ARCH}.deb"}
 REMOTE_STAGE=/root/fixer-deploy
 
 if [ ! -f "$FIXER_PACKAGE" ] || [ ! -f "$FIXER_SERVER_PACKAGE" ]; then

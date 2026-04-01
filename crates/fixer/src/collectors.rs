@@ -1157,10 +1157,7 @@ fn collect_network_driver_hang_investigations(
         let package_name = event.package_name();
         let finding = FindingInput {
             kind: "investigation".to_string(),
-            title: format!(
-                "Network driver hang investigation for {}",
-                event.interface
-            ),
+            title: format!("Network driver hang investigation for {}", event.interface),
             severity: "high".to_string(),
             fingerprint: hash_text(format!(
                 "network-driver-hang:{}:{}:{}",
@@ -1333,7 +1330,11 @@ fn parse_network_driver_hang_events(raw: &str) -> Vec<NetworkDriverHangEvent> {
                         continue;
                     }
                 }
-            } else if in_register_dump.as_ref().map(|k| k == &key).unwrap_or(false) {
+            } else if in_register_dump
+                .as_ref()
+                .map(|k| k == &key)
+                .unwrap_or(false)
+            {
                 in_register_dump = None;
             }
         }
@@ -1390,7 +1391,13 @@ fn ethtool_interface_stats(iface: &str) -> Option<String> {
 fn pci_device_sysfs_info(pci_address: &str) -> Option<String> {
     let base = format!("/sys/bus/pci/devices/{pci_address}");
     let mut parts = Vec::new();
-    for field in &["vendor", "device", "subsystem_vendor", "subsystem_device", "class"] {
+    for field in &[
+        "vendor",
+        "device",
+        "subsystem_vendor",
+        "subsystem_device",
+        "class",
+    ] {
         let path = format!("{base}/{field}");
         if let Ok(value) = fs::read_to_string(&path) {
             parts.push(format!("{field}: {}", value.trim()));
@@ -4313,13 +4320,10 @@ fn distro_info() -> (Option<String>, Option<String>) {
 }
 
 fn installed_version_for_package(package: &str) -> Option<String> {
-    command_output(
-        "dpkg-query",
-        &["-W", "-f=${Version}", package],
-    )
-    .ok()
-    .map(|v| v.trim().to_string())
-    .filter(|v| !v.is_empty())
+    command_output("dpkg-query", &["-W", "-f=${Version}", package])
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn add_env_context(details: &mut Value) {
@@ -4873,12 +4877,12 @@ mod tests {
         current_kernel_image_package_name, dominant_syscall_sequence, extend_unique_log_lines,
         investigation_cooldown_active, is_low_signal_kernel_warning, is_profile_candidate,
         kernel_module_lookup_names, kernel_module_package_hint, kernel_thread_package_name,
-        kernel_warning_module_candidates, looks_like_warning, normalize_oom_task_memcg_target,
-        normalize_perf_symbol, normalize_stuck_process_target_name, parse_apparmor_denial,
-        parse_coredump_info, parse_dkms_status_line, parse_kernel_oom_kill_events,
-        parse_latest_desktop_resume_failure, parse_perf_hot_paths,
+        kernel_warning_module_candidates, looks_like_warning, netdev_watchdog_driver,
+        normalize_oom_task_memcg_target, normalize_perf_symbol,
+        normalize_stuck_process_target_name, parse_apparmor_denial, parse_coredump_info,
+        parse_dkms_status_line, parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
+        parse_network_driver_hang_events, parse_perf_hot_paths,
         parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
-        netdev_watchdog_driver, parse_network_driver_hang_events,
         prioritize_coredump_events, process_runtime_seconds, safe_perf_name,
         stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
         summarize_top_syscalls, system_uptime_seconds,
@@ -5514,8 +5518,7 @@ Mar 30 10:12:35 host kernel: e1000e 0000:00:19.0 eth0: Reset adapter unexpectedl
 
     #[test]
     fn parses_netdev_watchdog_tx_timeout_into_investigation() {
-        let raw =
-            "Mar 30 10:12:34 host kernel: NETDEV WATCHDOG: eth0 (e1000e): transmit queue 0 timed out 10280 ms\n";
+        let raw = "Mar 30 10:12:34 host kernel: NETDEV WATCHDOG: eth0 (e1000e): transmit queue 0 timed out 10280 ms\n";
         let events = parse_network_driver_hang_events(raw);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].driver, "e1000e");
@@ -5553,10 +5556,15 @@ Mar 30 10:12:34 host kernel: e1000e 0000:00:19.0 eth0: Detected Hardware Unit Ha
             Some("e1000e".to_string())
         );
         assert_eq!(
-            netdev_watchdog_driver("NETDEV WATCHDOG: ens3 (virtio_net): transmit queue 0 timed out"),
+            netdev_watchdog_driver(
+                "NETDEV WATCHDOG: ens3 (virtio_net): transmit queue 0 timed out"
+            ),
             Some("virtio_net".to_string())
         );
-        assert_eq!(netdev_watchdog_driver("NETDEV WATCHDOG: eth0: no parens"), None);
+        assert_eq!(
+            netdev_watchdog_driver("NETDEV WATCHDOG: eth0: no parens"),
+            None
+        );
     }
 
     #[test]

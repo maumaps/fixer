@@ -310,17 +310,49 @@ fn package_name_from_opportunity(opportunity: &OpportunityRecord) -> Option<Stri
 }
 
 fn source_package_from_opportunity(opportunity: &OpportunityRecord) -> Option<String> {
+    let package_name = package_name_from_opportunity(opportunity);
     opportunity
         .evidence
         .get("source_package")
         .or_else(|| opportunity.evidence.get("details")?.get("source_package"))
+        .or_else(|| {
+            opportunity
+                .evidence
+                .get("details")?
+                .get("package_metadata")?
+                .get("source_package")
+        })
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .map(ToString::to_string)
+        .map(|value| {
+            package_name
+                .as_deref()
+                .map(|package_name| normalize_patchable_source_package(package_name, value))
+                .unwrap_or_else(|| value.to_string())
+        })
 }
 
 fn normalize_patchable_source_package(package_name: &str, source_package: &str) -> String {
-    if package_name.starts_with("linux-image-") && source_package.starts_with("linux-signed") {
+    if (package_name.starts_with("linux-image-")
+        || package_name.starts_with("linux-headers-")
+        || package_name.starts_with("linux-modules-"))
+        && source_package.starts_with("linux-signed")
+    {
+        return "linux".to_string();
+    }
+    if package_name.starts_with("linux-image-")
+        || package_name.starts_with("linux-headers-")
+        || package_name.starts_with("linux-modules-")
+    {
+        if source_package.starts_with("linux-image")
+            || source_package.starts_with("linux-headers")
+            || source_package.starts_with("linux-modules")
+            || source_package == "linux"
+        {
+            return "linux".to_string();
+        }
+    }
+    if package_name == "linux" {
         return "linux".to_string();
     }
     source_package.to_string()
@@ -458,6 +490,35 @@ zoom:\n\
                 "source_package": "linux",
                 "details": {
                     "source_package": "linux-ignored"
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+            updated_at: "2026-03-31T00:00:00Z".to_string(),
+        };
+        assert_eq!(
+            source_package_from_opportunity(&opportunity).as_deref(),
+            Some("linux")
+        );
+    }
+
+    #[test]
+    fn reads_source_package_hint_from_package_metadata() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "kernel issue".to_string(),
+            score: 100,
+            state: "open".to_string(),
+            summary: "summary".to_string(),
+            evidence: json!({
+                "package_name": "linux-image-6.19.8+deb14-amd64",
+                "details": {
+                    "package_metadata": {
+                        "source_package": "linux-signed-amd64"
+                    }
                 }
             }),
             repo_root: None,

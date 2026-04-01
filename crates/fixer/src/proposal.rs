@@ -9,9 +9,9 @@ use crate::util::{command_exists, command_output, now_rfc3339, read_text};
 use crate::workspace::resolve_installed_package_metadata;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use regex::Regex;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -490,8 +490,12 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                 selected_model,
                 models_used: ordered_unique_strings(&models_used),
                 rate_limit_fallback_used,
+                failure_stage: Some("plan".to_string()),
                 failure_kind: Some(classify_codex_failure(&plan_stage.log)),
                 error: Some(plan_stage.error),
+                exit_status: plan_stage.exit_status,
+                last_stderr_excerpt: plan_stage.stderr_excerpt,
+                review_failure_category: None,
             };
             fs::write(
                 job.bundle_dir.join("status.json"),
@@ -542,8 +546,12 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
             selected_model,
             models_used: ordered_unique_strings(&models_used),
             rate_limit_fallback_used,
+            failure_stage: Some("patch".to_string()),
             failure_kind: Some(classify_codex_failure(&patch_stage.log)),
             error: Some(patch_stage.error),
+            exit_status: patch_stage.exit_status,
+            last_stderr_excerpt: patch_stage.stderr_excerpt,
+            review_failure_category: None,
         };
         fs::write(
             job.bundle_dir.join("status.json"),
@@ -553,6 +561,10 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
     }
 
     let mut workflow_failure: Option<(String, String)> = None;
+    let mut workflow_failure_stage: Option<String> = None;
+    let mut workflow_exit_status: Option<i32> = None;
+    let mut workflow_stderr_excerpt: Option<String> = None;
+    let mut workflow_review_failure_category: Option<String> = None;
     let patch_output_indicates_triage = stage_output_marks_successful_triage(&patch_stage.output);
     let mut current_author_output_path = job.bundle_dir.join("patch-output.txt");
     if config.patch.review_after_patch && !patch_output_indicates_triage {
@@ -594,9 +606,13 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                     classify_codex_failure(&review_stage.log),
                     review_stage.error,
                 ));
+                workflow_failure_stage = Some("review".to_string());
+                workflow_exit_status = review_stage.exit_status;
+                workflow_stderr_excerpt = review_stage.stderr_excerpt.clone();
                 break;
             }
-            match parse_review_verdict(&review_stage.output) {
+            let verdict = parse_review_verdict(&review_stage.output);
+            match verdict {
                 Some(CodexReviewVerdict::Ok) => break,
                 Some(CodexReviewVerdict::FixNeeded) => {
                     if refinement_round >= config.patch.review_fix_passes {
@@ -607,6 +623,13 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                                 review_label, refinement_round
                             ),
                         ));
+                        workflow_failure_stage = Some("review".to_string());
+                        workflow_exit_status = review_stage.exit_status;
+                        workflow_stderr_excerpt = review_stage.stderr_excerpt.clone();
+                        workflow_review_failure_category = review_failure_category(
+                            Some(&CodexReviewVerdict::FixNeeded),
+                            &review_stage.output,
+                        );
                         break;
                     }
                     refinement_round += 1;
@@ -648,6 +671,9 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                             classify_codex_failure(&refine_stage.log),
                             refine_stage.error,
                         ));
+                        workflow_failure_stage = Some("refinement".to_string());
+                        workflow_exit_status = refine_stage.exit_status;
+                        workflow_stderr_excerpt = refine_stage.stderr_excerpt.clone();
                         break;
                     }
                     current_author_output_path = refine_output_path;
@@ -660,6 +686,11 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                             review_label
                         ),
                     ));
+                    workflow_failure_stage = Some("review".to_string());
+                    workflow_exit_status = review_stage.exit_status;
+                    workflow_stderr_excerpt = review_stage.stderr_excerpt.clone();
+                    workflow_review_failure_category =
+                        review_failure_category(None, &review_stage.output);
                     break;
                 }
             }
@@ -696,8 +727,12 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         selected_model,
         models_used: ordered_unique_strings(&models_used),
         rate_limit_fallback_used,
+        failure_stage: workflow_failure_stage,
         failure_kind: workflow_failure.as_ref().map(|(kind, _)| kind.clone()),
         error: workflow_failure.map(|(_, error)| error),
+        exit_status: workflow_exit_status,
+        last_stderr_excerpt: workflow_stderr_excerpt,
+        review_failure_category: workflow_review_failure_category,
     };
     fs::write(
         job.bundle_dir.join("status.json"),
@@ -1457,7 +1492,9 @@ fn truncate_public_session_text(text: &str, max_len: usize) -> String {
 struct CodexProcessOutcome {
     success: bool,
     log: String,
+    stderr: String,
     model_used: Option<String>,
+    exit_status: Option<i32>,
 }
 
 struct CodexStageOutcome {
@@ -1469,6 +1506,8 @@ struct CodexStageOutcome {
     selected_model: Option<String>,
     models_used: Vec<String>,
     rate_limit_fallback_used: bool,
+    exit_status: Option<i32>,
+    stderr_excerpt: Option<String>,
 }
 
 struct CodexStageTranscript {
@@ -1480,6 +1519,15 @@ struct CodexStageTranscript {
 enum CodexReviewVerdict {
     Ok,
     FixNeeded,
+}
+
+fn review_failure_category(verdict: Option<&CodexReviewVerdict>, output: &str) -> Option<String> {
+    match verdict {
+        Some(CodexReviewVerdict::FixNeeded) => Some("findings-persisted".to_string()),
+        Some(CodexReviewVerdict::Ok) => None,
+        None if output.trim().is_empty() => Some("missing-review-output".to_string()),
+        None => Some("invalid-review-verdict".to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1659,8 +1707,7 @@ fn run_codex_stage(
     let primary_label = configured_primary_model_label(config);
     if !outcome.success {
         let failure_kind = classify_codex_failure(&outcome.log);
-        let should_retry_with_spark_now =
-            failure_kind == "rate-limit" || proactive_spark_fallback;
+        let should_retry_with_spark_now = failure_kind == "rate-limit" || proactive_spark_fallback;
 
         if failure_kind == "rate-limit" {
             let attempted_model = outcome.model_used.as_deref();
@@ -1668,11 +1715,19 @@ fn run_codex_stage(
                 let _ = remember_primary_model_rate_limit(config);
             }
         }
-        if let Some(spark_model) =
-            should_retry_with_spark(config, should_retry_with_spark_now, outcome.model_used.as_deref())
-        {
-            let retry_outcome =
-                run_driver_process(config, repo_root, prompt_path, output_path, prompt, Some(&spark_model))?;
+        if let Some(spark_model) = should_retry_with_spark(
+            config,
+            should_retry_with_spark_now,
+            outcome.model_used.as_deref(),
+        ) {
+            let retry_outcome = run_driver_process(
+                config,
+                repo_root,
+                prompt_path,
+                output_path,
+                prompt,
+                Some(&spark_model),
+            )?;
             if let Some(model) = retry_outcome.model_used.clone() {
                 models_used.push(model);
             }
@@ -1696,6 +1751,8 @@ fn run_codex_stage(
     } else {
         summarize_failure_log(&logs.join("\n\n"))
     };
+    let stderr_excerpt =
+        (!outcome.stderr.trim().is_empty()).then(|| summarize_failure_log(&outcome.stderr));
     Ok(CodexStageOutcome {
         label,
         success: outcome.success,
@@ -1705,6 +1762,8 @@ fn run_codex_stage(
         selected_model: outcome.model_used,
         models_used,
         rate_limit_fallback_used,
+        exit_status: outcome.exit_status,
+        stderr_excerpt,
     })
 }
 
@@ -1828,19 +1887,19 @@ fn run_codex_process(
         stdin.write_all(prompt.as_bytes())?;
     }
     let output = child.wait_with_output()?;
-    let log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let log = format!("{stdout}{stderr}");
     Ok(CodexProcessOutcome {
         success: output.status.success(),
         log,
+        stderr,
         model_used: Some(
             model
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "codex-default".to_string()),
         ),
+        exit_status: output.status.code(),
     })
 }
 
@@ -1856,9 +1915,7 @@ fn run_driver_process(
         PatchDriver::Codex => run_codex_process(config, repo_root, output_path, prompt, model),
         PatchDriver::Claude => run_claude_process(config, repo_root, output_path, prompt, model),
         PatchDriver::Gemini => run_gemini_process(config, repo_root, output_path, prompt, model),
-        PatchDriver::Aider => {
-            run_aider_process(config, repo_root, prompt_path, output_path, model)
-        }
+        PatchDriver::Aider => run_aider_process(config, repo_root, prompt_path, output_path, model),
     }
 }
 
@@ -1905,18 +1962,17 @@ fn run_claude_process(
     }
     let output = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let log = format!(
-        "{}{}",
-        stdout,
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let log = format!("{stdout}{stderr}");
     if output.status.success() {
         fs::write(output_path, stdout.as_bytes())?;
     }
     Ok(CodexProcessOutcome {
         success: output.status.success(),
         log,
+        stderr,
         model_used: Some(model_used),
+        exit_status: output.status.code(),
     })
 }
 
@@ -1957,18 +2013,17 @@ fn run_gemini_process(
     }
     let output = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let log = format!(
-        "{}{}",
-        stdout,
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let log = format!("{stdout}{stderr}");
     if output.status.success() {
         fs::write(output_path, stdout.as_bytes())?;
     }
     Ok(CodexProcessOutcome {
         success: output.status.success(),
         log,
+        stderr,
         model_used: Some(model_used),
+        exit_status: output.status.code(),
     })
 }
 
@@ -2007,18 +2062,17 @@ fn run_aider_process(
         .with_context(|| format!("failed to launch {}", config.patch.aider_command))?;
     let output = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let log = format!(
-        "{}{}",
-        stdout,
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let log = format!("{stdout}{stderr}");
     if output.status.success() {
         fs::write(output_path, stdout.as_bytes())?;
     }
     Ok(CodexProcessOutcome {
         success: output.status.success(),
         log,
+        stderr,
         model_used: Some(model_used),
+        exit_status: output.status.code(),
     })
 }
 
@@ -2076,8 +2130,7 @@ fn should_use_spark_for_weak_weekly_budget(
 
     let weekly_keyword_re = WEEKLY_KEYWORD_RE
         .get_or_init(|| Regex::new(r"(?i)(week|weekly|per\s+week|7\s*day|7-day|7d)").unwrap());
-    let percent_re =
-        PERCENT_RE.get_or_init(|| Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*%").unwrap());
+    let percent_re = PERCENT_RE.get_or_init(|| Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*%").unwrap());
     let remaining_to_limit_re = REMAINING_TO_LIMIT_RE.get_or_init(|| {
         Regex::new(
             r"(?i)(?:remaining|left)\s*[:=]?\s*(\d+(?:\.\d+)?)(?:\s*(?:/|of)\s*)(\d+(?:\.\d+)?)",
@@ -2113,15 +2166,13 @@ fn should_use_spark_for_weak_weekly_budget(
     false
 }
 
-fn parse_codex_status_weekly_limit_threshold(
-    log: &str,
-    fallback_threshold_percent: f64,
-) -> bool {
+fn parse_codex_status_weekly_limit_threshold(log: &str, fallback_threshold_percent: f64) -> bool {
     if fallback_threshold_percent <= 0.0 {
         return false;
     }
     for value in extract_json_objects(log) {
-        if codex_json_has_weekly_headroom_below_threshold(&value, fallback_threshold_percent, false) {
+        if codex_json_has_weekly_headroom_below_threshold(&value, fallback_threshold_percent, false)
+        {
             return true;
         }
     }
@@ -2229,9 +2280,13 @@ fn codex_json_has_weekly_headroom_below_threshold(
             }
             false
         }
-        Value::Array(values) => values
-            .iter()
-            .any(|value| codex_json_has_weekly_headroom_below_threshold(value, threshold_percent, in_weekly_context)),
+        Value::Array(values) => values.iter().any(|value| {
+            codex_json_has_weekly_headroom_below_threshold(
+                value,
+                threshold_percent,
+                in_weekly_context,
+            )
+        }),
         _ => false,
     }
 }
@@ -2243,7 +2298,10 @@ fn is_weekly_context_key(key: &str) -> bool {
 
 fn is_weekly_context_hint_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    key.contains("period") || key.contains("window") || key.contains("interval") || key == "duration"
+    key.contains("period")
+        || key.contains("window")
+        || key.contains("interval")
+        || key == "duration"
 }
 
 fn is_weekly_period_hint_field(key: &str, raw: &str) -> bool {
@@ -3279,10 +3337,7 @@ fn render_process_investigation_report(
             if !params.is_empty() {
                 body.push_str("\n## Active Module Parameters\n\n");
                 for (k, v) in params {
-                    body.push_str(&format!(
-                        "- `{k}` = `{}`\n",
-                        v.as_str().unwrap_or_default()
-                    ));
+                    body.push_str(&format!("- `{k}` = `{}`\n", v.as_str().unwrap_or_default()));
                 }
             }
         }
@@ -4525,8 +4580,12 @@ mod tests {
                 selected_model: Some("gpt-5.3-codex-spark".to_string()),
                 models_used: vec!["gpt-5.4".to_string(), "gpt-5.3-codex-spark".to_string()],
                 rate_limit_fallback_used: true,
+                failure_stage: None,
                 error: None,
                 failure_kind: None,
+                exit_status: None,
+                last_stderr_excerpt: None,
+                review_failure_category: None,
             })
             .unwrap(),
         )

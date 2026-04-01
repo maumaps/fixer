@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use fixer::app::{is_permission_or_readonly_error, App};
+use fixer::app::{App, is_permission_or_readonly_error};
 use fixer::config::FixerConfig;
 use fixer::models::{FindingRecord, LeaseBudgetPreset, ParticipationMode};
 use fixer::proposal;

@@ -55,6 +55,24 @@ pub struct WorkerRunOutcome {
     pub result: Option<WorkerResultEnvelope>,
 }
 
+const LOCAL_WORKER_BLOCKER_HISTORY_KEY: &str = "worker_local_blocker_history";
+const MAX_LOCAL_WORKER_BLOCKERS: usize = 64;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalWorkerBlocker {
+    cluster_id: String,
+    blocker_kind: String,
+    blocker_reason: String,
+    error: String,
+    created_at: String,
+    cooldown_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct LocalWorkerBlockerHistory {
+    entries: Vec<LocalWorkerBlocker>,
+}
+
 pub fn bootstrap_codex_auth_user(
     store: &Store,
     config: &FixerConfig,
@@ -169,16 +187,14 @@ fn codex_worker_availability(
             let ready = command_exists(&config.patch.claude_command);
             return Ok(CodexWorkerAvailability {
                 ready,
-                reason: (!ready)
-                    .then(|| "Claude CLI is not installed on this host".to_string()),
+                reason: (!ready).then(|| "Claude CLI is not installed on this host".to_string()),
             });
         }
         PatchDriver::Gemini => {
             let ready = command_exists(&config.patch.gemini_command);
             return Ok(CodexWorkerAvailability {
                 ready,
-                reason: (!ready)
-                    .then(|| "Gemini CLI is not installed on this host".to_string()),
+                reason: (!ready).then(|| "Gemini CLI is not installed on this host".to_string()),
             });
         }
         PatchDriver::Aider => {
@@ -891,7 +907,7 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                 .max(config.network.worker_pow_difficulty),
         ),
     };
-    let offer = post_json::<_, WorkOffer>(config, "v1/work/pull", &work_request)?;
+    let mut offer = post_json::<_, WorkOffer>(config, "v1/work/pull", &work_request)?;
     let Some(lease) = offer.lease.clone() else {
         return Ok(WorkerRunOutcome {
             hello,
@@ -1012,16 +1028,7 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                     if let Ok(job_status) =
                         proposal::load_codex_job_status(&local_proposal.bundle_path)
                     {
-                        details
-                            .insert("worker_model".to_string(), json!(job_status.selected_model));
-                        details.insert(
-                            "worker_models_used".to_string(),
-                            json!(job_status.models_used),
-                        );
-                        details.insert(
-                            "worker_rate_limit_fallback_used".to_string(),
-                            json!(job_status.rate_limit_fallback_used),
-                        );
+                        append_job_status_details(&mut details, &job_status);
                     }
                     if let Some(best_patch) = lease.issue.best_patch.as_ref() {
                         details.insert(
@@ -1163,6 +1170,16 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                 Err(error) => {
                     if let Some(report) = investigation_report {
                         let patch_error = error.to_string();
+                        if supports_process_report
+                            && !should_publish_process_investigation_blocker(&patch_error)
+                        {
+                            let blocker =
+                                record_local_worker_blocker(store, &lease.issue.id, &patch_error)?;
+                            offer.message = format!(
+                                "worker lease {} hit a local blocker on this host ({}); Fixer recorded it and reported the diagnosis once so the shared queue can cool down",
+                                lease.lease_id, blocker.blocker_reason
+                            );
+                        }
                         let _ = proposal::annotate_process_investigation_report_blocker(
                             &report.bundle_path,
                             &patch_error,
@@ -1194,6 +1211,7 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                                     "automatic_patch_blocker_kind": proposal::process_investigation_blocker_kind(&patch_error),
                                     "report_only_reason": process_investigation_report_only_reason_for_error(&patch_error),
                                     "workspace": workspace,
+                                    "local_blocker_cooldown_seconds": process_investigation_blocker_cooldown_seconds(&patch_error),
                                 }),
                                 created_at: now_rfc3339(),
                             },
@@ -1224,6 +1242,11 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                     Ok(report) => {
                         let submission_bundle = proposal::prepare_submission(store, report.id).ok();
                         let workspace_error = error.to_string();
+                        let workspace_classification =
+                            workspace_blocker_classification(&opportunity, &workspace_error);
+                        let handoff = workspace_classification
+                            .as_ref()
+                            .map(|_| workspace_blocked_handoff(&opportunity, &workspace_error));
                         WorkerResultEnvelope {
                             lease_id: lease.lease_id.clone(),
                             attempt: PatchAttempt {
@@ -1249,6 +1272,9 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                                     "workspace_error": workspace_error,
                                     "automatic_patch_blocker_kind": proposal::process_investigation_blocker_kind(&workspace_error),
                                     "report_only_reason": process_investigation_report_only_reason_for_error(&workspace_error),
+                                    "workspace_classification": workspace_classification,
+                                    "workspace_acquisition_note": format!("Fixer could not prepare a patchable workspace: {}", error),
+                                    "handoff": handoff,
                                 }),
                                 created_at: now_rfc3339(),
                             },
@@ -1308,6 +1334,7 @@ fn build_submission_bundle(
     let items = store
         .list_submission_candidates(config.network.max_submission_items)?
         .into_iter()
+        .map(canonicalize_shared_opportunity)
         .map(|item| redact_shared_opportunity(item, &mut redactions))
         .collect::<Vec<_>>();
     redactions.sort();
@@ -1598,6 +1625,266 @@ fn process_investigation_report_only_reason_for_error(error: &str) -> &'static s
         "codex-auth" => "codex-auth-unavailable",
         "workspace" => "workspace-acquisition",
         _ => "automatic-patch-blocked",
+    }
+}
+
+fn should_publish_process_investigation_blocker(error: &str) -> bool {
+    proposal::process_investigation_blocker_kind(error) != "codex-auth"
+}
+
+fn process_investigation_blocker_cooldown_seconds(error: &str) -> u64 {
+    match proposal::process_investigation_blocker_kind(error) {
+        "codex-auth" => 60 * 60,
+        "workspace" => 30 * 60,
+        _ => 15 * 60,
+    }
+}
+
+fn record_local_worker_blocker(
+    store: &Store,
+    cluster_id: &str,
+    error: &str,
+) -> Result<LocalWorkerBlocker> {
+    let blocker = LocalWorkerBlocker {
+        cluster_id: cluster_id.to_string(),
+        blocker_kind: proposal::process_investigation_blocker_kind(error).to_string(),
+        blocker_reason: process_investigation_report_only_reason_for_error(error).to_string(),
+        error: error.to_string(),
+        created_at: now_rfc3339(),
+        cooldown_seconds: process_investigation_blocker_cooldown_seconds(error),
+    };
+    let mut history = prune_local_worker_blocker_history(
+        store
+            .get_local_state::<LocalWorkerBlockerHistory>(LOCAL_WORKER_BLOCKER_HISTORY_KEY)?
+            .unwrap_or_default(),
+    );
+    history.entries.retain(|entry| {
+        !(entry.cluster_id == blocker.cluster_id && entry.blocker_reason == blocker.blocker_reason)
+    });
+    history.entries.push(blocker.clone());
+    if history.entries.len() > MAX_LOCAL_WORKER_BLOCKERS {
+        let drain = history.entries.len() - MAX_LOCAL_WORKER_BLOCKERS;
+        history.entries.drain(0..drain);
+    }
+    store.set_local_state(LOCAL_WORKER_BLOCKER_HISTORY_KEY, &history)?;
+    store.set_local_state("last_worker_local_blocker", &blocker)?;
+    Ok(blocker)
+}
+
+fn prune_local_worker_blocker_history(
+    mut history: LocalWorkerBlockerHistory,
+) -> LocalWorkerBlockerHistory {
+    let now = Utc::now();
+    history.entries.retain(|entry| {
+        let Ok(created_at) = DateTime::parse_from_rfc3339(&entry.created_at) else {
+            return false;
+        };
+        created_at.with_timezone(&Utc) + ChronoDuration::seconds(entry.cooldown_seconds as i64)
+            > now
+    });
+    history
+        .entries
+        .sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    history
+}
+
+fn canonicalize_submission_source_package(
+    package_name: Option<&str>,
+    source_package: Option<&str>,
+) -> Option<String> {
+    let source_package = source_package
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (package_name.map(str::trim), source_package) {
+        (Some(package_name), Some(source_package))
+            if (package_name.starts_with("linux-image-")
+                || package_name.starts_with("linux-headers-")
+                || package_name.starts_with("linux-modules-"))
+                && (source_package.starts_with("linux-signed")
+                    || source_package.starts_with("linux-image")
+                    || source_package.starts_with("linux-headers")
+                    || source_package.starts_with("linux-modules")
+                    || source_package == "linux") =>
+        {
+            Some("linux".to_string())
+        }
+        (_, Some(source_package)) => Some(source_package.to_string()),
+        (Some("linux"), None) => Some("linux".to_string()),
+        _ => None,
+    }
+}
+
+fn source_package_from_shared_evidence(item: &SharedOpportunity) -> Option<String> {
+    let details = item.opportunity.evidence.get("details");
+    canonicalize_submission_source_package(
+        item.finding.package_name.as_deref().or_else(|| {
+            item.opportunity
+                .evidence
+                .get("package_name")
+                .and_then(Value::as_str)
+        }),
+        item.opportunity
+            .evidence
+            .get("source_package")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                details
+                    .and_then(|value| value.get("source_package"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                details
+                    .and_then(|value| value.get("package_metadata"))
+                    .and_then(|value| value.get("source_package"))
+                    .and_then(Value::as_str)
+            }),
+    )
+}
+
+fn canonicalize_shared_opportunity(mut item: SharedOpportunity) -> SharedOpportunity {
+    if let Some(source_package) = source_package_from_shared_evidence(&item) {
+        if let Some(object) = item.opportunity.evidence.as_object_mut() {
+            object
+                .entry("source_package".to_string())
+                .or_insert_with(|| json!(source_package));
+        }
+    }
+    item
+}
+
+fn workspace_blocker_classification(
+    opportunity: &crate::models::OpportunityRecord,
+    error: &str,
+) -> Option<String> {
+    if proposal::process_investigation_blocker_kind(error) != "workspace" {
+        return None;
+    }
+    let diagnosis = process_investigation_worker_diagnosis(opportunity);
+    let package_name = opportunity
+        .evidence
+        .get("package_name")
+        .and_then(Value::as_str)
+        .or_else(|| diagnosis.get("package_name").and_then(Value::as_str))
+        .unwrap_or_default();
+    let source_package = opportunity
+        .evidence
+        .get("source_package")
+        .and_then(Value::as_str)
+        .or_else(|| diagnosis.get("source_package").and_then(Value::as_str))
+        .or_else(|| {
+            diagnosis
+                .get("package_metadata")
+                .and_then(|value| value.get("source_package"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default();
+    if package_name.starts_with("linux-") || source_package == "linux" {
+        return Some("kernel-source-unavailable".to_string());
+    }
+    let cloneable_homepage = diagnosis
+        .get("package_metadata")
+        .and_then(|value| value.get("cloneable_homepage"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let has_external_report_target = diagnosis
+        .get("package_metadata")
+        .and_then(|value| value.get("report_url"))
+        .and_then(Value::as_str)
+        .is_some()
+        || diagnosis
+            .get("package_metadata")
+            .and_then(|value| value.get("homepage"))
+            .and_then(Value::as_str)
+            .is_some();
+    if has_external_report_target && !cloneable_homepage {
+        return Some("external-package".to_string());
+    }
+    Some("workspace-unavailable".to_string())
+}
+
+fn workspace_blocked_handoff(opportunity: &crate::models::OpportunityRecord, error: &str) -> Value {
+    let diagnosis = process_investigation_worker_diagnosis(opportunity);
+    let classification = workspace_blocker_classification(opportunity, error)
+        .unwrap_or_else(|| "workspace-unavailable".to_string());
+    let target = opportunity
+        .evidence
+        .get("source_package")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            opportunity
+                .evidence
+                .get("package_name")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            diagnosis
+                .get("package_metadata")
+                .and_then(|value| value.get("source_package"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("the upstream maintainer")
+        .to_string();
+    let report_url = diagnosis
+        .get("package_metadata")
+        .and_then(|value| value.get("report_url"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            diagnosis
+                .get("package_metadata")
+                .and_then(|value| value.get("homepage"))
+                .and_then(Value::as_str)
+        });
+    let next_steps = match classification.as_str() {
+        "kernel-source-unavailable" => vec![
+            "Treat this as a kernel or lower-level subsystem handoff, not a package patch.".to_string(),
+            "File or update the relevant kernel/driver report with the diagnosis bundle and wait-site evidence.".to_string(),
+        ],
+        "external-package" => vec![
+            "File an upstream or vendor issue with the diagnosis bundle and package metadata.".to_string(),
+            "Include the workspace acquisition note so maintainers know why no local source patch was attempted.".to_string(),
+        ],
+        _ => vec![
+            "Review the package metadata and attach a source tree or upstream clone if one exists.".to_string(),
+            "If no patchable tree is available, file an external bug using the diagnosis bundle.".to_string(),
+        ],
+    };
+    json!({
+        "target": target,
+        "report_url": report_url,
+        "next_steps": next_steps,
+    })
+}
+
+fn append_job_status_details(
+    details: &mut serde_json::Map<String, Value>,
+    status: &CodexJobStatus,
+) {
+    details.insert("worker_model".to_string(), json!(status.selected_model));
+    details.insert("worker_models_used".to_string(), json!(status.models_used));
+    details.insert(
+        "worker_rate_limit_fallback_used".to_string(),
+        json!(status.rate_limit_fallback_used),
+    );
+    if let Some(stage) = status.failure_stage.as_deref() {
+        details.insert("patch_failure_stage".to_string(), json!(stage));
+    }
+    if let Some(kind) = status.failure_kind.as_deref() {
+        details.insert("patch_failure_kind".to_string(), json!(kind));
+    }
+    if let Some(error) = status.error.as_deref() {
+        details.insert("patch_error".to_string(), json!(error));
+    }
+    if let Some(exit_status) = status.exit_status {
+        details.insert("patch_exit_status".to_string(), json!(exit_status));
+    }
+    if let Some(stderr_excerpt) = status.last_stderr_excerpt.as_deref() {
+        details.insert(
+            "patch_last_stderr_excerpt".to_string(),
+            json!(stderr_excerpt),
+        );
+    }
+    if let Some(category) = status.review_failure_category.as_deref() {
+        details.insert("patch_review_failure_category".to_string(), json!(category));
     }
 }
 

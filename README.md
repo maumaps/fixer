@@ -194,18 +194,29 @@ The canonical public endpoints are:
 - triage: `https://fixer.maumap.com/triage`
 - APT repo: `https://fixer.maumap.com/apt/`
 
-Release packages can be built and published with:
+The canonical runbook lives in [doc/service-actions.md](./doc/service-actions.md). It covers each service action in a strict Markdown format that is both human-readable and linted by `scripts/validate-service-actions.py`.
+
+The main release path is:
 
 ```bash
-scripts/build-release-debs.sh
-scripts/publish-apt-repo.sh dist/packages/*/*/fixer_*_*.deb
+scripts/release-public.sh
 ```
+
+That wrapper validates non-local deployment readiness, builds the Debian packages, deploys the public server, republishes the hosted APT repository on the server, and then runs post-release verification.
+
+Fleet-wide client upgrades intentionally use a local-only inventory file:
+
+- inventory template: [doc/host-inventory-template.md](./doc/host-inventory-template.md)
+- real local inventory: `doc/local/host-inventory.md`
+- fleet upgrade command: `scripts/upgrade-all-hosts.sh`
 
 ## Documentation
 
 - [Architecture notes](./doc/architecture.md)
 - [Design decisions](./doc/design-decisions.md)
 - [Product brief](./doc/requirements.md)
+- [Service action runbook](./doc/service-actions.md)
+- [Host inventory template](./doc/host-inventory-template.md)
 - [Debian packaging notes](./debian/README.Debian)
 
 ## Current limits

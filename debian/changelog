@@ -1,3 +1,16 @@
+fixer (0.43.0-1) unstable; urgency=medium
+
+  * Suppress repeated worker churn for local blocker families such as expired
+    or paused Codex auth leases by recording blocker-aware cooldown state.
+  * Persist structured patch failure metadata including failure stage, exit
+    status, stderr excerpt, and review failure category.
+  * Promote source-package attribution from package metadata and normalize
+    kernel runtime packages to the canonical `linux` source package.
+  * Turn repeated workspace-blocked diagnosis reports into public triage
+    handoffs with clearer external or kernel-oriented next steps.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 01 Apr 2026 16:45:00 +0400
+
 fixer (0.42.0-1) unstable; urgency=medium
 
   * Reword homepage lede to welcome all coding agents, not just Codex.
