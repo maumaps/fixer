@@ -1282,11 +1282,12 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                             evidence_request: None,
                         }
                     }
-                    Err(report_error) => build_impossible_result(
+                    Err(report_error) => build_internal_only_impossible_result(
                         &participation.identity.install_id,
                         lease.issue.id,
                         &lease.lease_id,
                         "workspace-acquisition",
+                        "Fixer hit an internal error while recording the diagnosis for this workspace failure",
                         &format!("{error}; failed to create diagnostic report: {report_error}"),
                         json!({
                             "local_opportunity_id": opportunity.id,
@@ -2062,6 +2063,33 @@ fn build_impossible_result(
         }),
         evidence_request: None,
     }
+}
+
+fn build_internal_only_impossible_result(
+    install_id: &str,
+    cluster_id: String,
+    lease_id: &str,
+    category: &str,
+    public_summary: &str,
+    internal_error: &str,
+    mut details: Value,
+) -> WorkerResultEnvelope {
+    if let Some(object) = details.as_object_mut() {
+        object.insert("internal_only".to_string(), json!(true));
+        object.insert(
+            "internal_error_category".to_string(),
+            json!(category.to_string()),
+        );
+        object.insert("internal_error".to_string(), json!(internal_error));
+    }
+    build_impossible_result(
+        install_id,
+        cluster_id,
+        lease_id,
+        category,
+        public_summary,
+        details,
+    )
 }
 
 pub fn verify_worker_pull_pow(

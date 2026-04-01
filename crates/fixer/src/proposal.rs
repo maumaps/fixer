@@ -14,14 +14,34 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 fn create_bundle_dir(config: &FixerConfig, opportunity_id: i64) -> Result<PathBuf> {
-    let proposals_root = config.service.state_dir.join("proposals");
-    fs::create_dir_all(&proposals_root)?;
+    let proposals_root = match fs::create_dir_all(config.service.state_dir.join("proposals")) {
+        Ok(()) => config.service.state_dir.join("proposals"),
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            let fallback = std::env::temp_dir().join("fixer-proposals");
+            fs::create_dir_all(&fallback).with_context(|| {
+                format!(
+                    "failed to create fallback proposal directory {}",
+                    fallback.display()
+                )
+            })?;
+            fallback
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to create proposal directory {}",
+                    config.service.state_dir.join("proposals").display()
+                )
+            });
+        }
+    };
     prune_proposal_bundles(
         &proposals_root,
         config.service.proposal_bundle_retention_days,
@@ -4971,6 +4991,23 @@ RESULT: ok
                 "42-2026-03-30T00-00-03Z".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn create_bundle_dir_falls_back_when_state_dir_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = FixerConfig::default();
+        let locked_state_dir = dir.path().join("locked-state");
+        std::fs::create_dir_all(&locked_state_dir).unwrap();
+        std::fs::set_permissions(&locked_state_dir, std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+        config.service.state_dir = locked_state_dir;
+
+        let bundle_dir = super::create_bundle_dir(&config, 42).unwrap();
+
+        assert!(bundle_dir.starts_with(std::env::temp_dir().join("fixer-proposals")));
     }
 
     #[test]

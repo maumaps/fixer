@@ -9132,8 +9132,47 @@ fn hidden_kernel_workspace_attempt(attempt: &PatchAttempt) -> bool {
         .is_some_and(is_kernelish_package_name)
 }
 
+fn text_describes_internal_storage_issue(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("foreign key constraint failed")
+        || lower.contains("failed to create diagnostic report")
+        || lower.contains("failed to create diagnostic report: permission denied")
+        || lower.contains("sqlitefailure")
+        || lower.contains("database disk image is malformed")
+}
+
+fn hidden_internal_error_attempt(attempt: &PatchAttempt) -> bool {
+    if attempt
+        .details
+        .get("internal_only")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
+    if attempt
+        .details
+        .get("internal_error")
+        .and_then(Value::as_str)
+        .is_some_and(text_describes_internal_storage_issue)
+    {
+        return true;
+    }
+    if attempt
+        .details
+        .get("error")
+        .and_then(Value::as_str)
+        .is_some_and(text_describes_internal_storage_issue)
+    {
+        return true;
+    }
+    text_describes_internal_storage_issue(&attempt.summary)
+}
+
 fn publicly_visible_attempt(attempt: &PatchAttempt) -> bool {
-    !hidden_local_auth_bookkeeping_attempt(attempt) && !hidden_kernel_workspace_attempt(attempt)
+    !hidden_local_auth_bookkeeping_attempt(attempt)
+        && !hidden_kernel_workspace_attempt(attempt)
+        && !hidden_internal_error_attempt(attempt)
 }
 
 fn canonicalize_worker_result_envelope(mut result: WorkerResultEnvelope) -> WorkerResultEnvelope {
@@ -12413,6 +12452,30 @@ mod tests {
         };
 
         assert!(hidden_local_auth_bookkeeping_attempt(&attempt));
+        assert!(!publicly_visible_attempt(&attempt));
+    }
+
+    #[test]
+    fn internal_storage_error_attempt_is_not_publicly_visible() {
+        let attempt = PatchAttempt {
+            cluster_id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "impossible".to_string(),
+            state: "explained".to_string(),
+            summary: "Worker could not make a safe patch: FOREIGN KEY constraint failed"
+                .to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: None,
+            details: json!({
+                "internal_only": true,
+                "internal_error_category": "workspace-acquisition",
+                "internal_error": "could not prepare workspace; failed to create diagnostic report: FOREIGN KEY constraint failed"
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+
+        assert!(hidden_internal_error_attempt(&attempt));
         assert!(!publicly_visible_attempt(&attempt));
     }
 

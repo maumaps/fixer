@@ -1,3 +1,14 @@
+fixer (0.54.0-1) unstable; urgency=medium
+
+  * Stop leaking internal report-generation/storage errors like permission
+    denied and foreign key failures onto public issue pages.
+  * Fall back to a private temporary proposal bundle directory when the
+    configured state directory is not writable, so diagnostic report creation
+    can still succeed.
+  * Document deployment guardrails learned during live rollouts in AGENTS.md.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 01 Apr 2026 22:45:00 +0400
+
 fixer (0.53.0-1) unstable; urgency=medium
 
   * Capture multi-thread userspace backtraces for runaway CPU investigations
