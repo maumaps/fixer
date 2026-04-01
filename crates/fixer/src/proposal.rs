@@ -616,12 +616,14 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         let mut refinement_round = 0;
         loop {
             let review_label = format!("Review Pass {}", refinement_round + 1);
+            let current_changed_paths = workspace_changed_paths(&job.workspace.repo_root);
             let review_prompt = build_review_prompt(
                 &evidence_path,
                 &job.workspace,
                 source_workspace_root.as_deref(),
                 &current_author_output_path,
                 refinement_round,
+                &current_changed_paths,
             );
             let review_prompt_path = job
                 .bundle_dir
@@ -679,6 +681,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                     }
                     refinement_round += 1;
                     let refine_label = format!("Refinement Pass {}", refinement_round);
+                    let current_changed_paths = workspace_changed_paths(&job.workspace.repo_root);
                     let refine_prompt = build_refinement_prompt(
                         &evidence_path,
                         &job.workspace,
@@ -687,6 +690,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                         &current_author_output_path,
                         &review_output_path,
                         refinement_round,
+                        &current_changed_paths,
                     );
                     let refine_prompt_path = job
                         .bundle_dir
@@ -1263,6 +1267,48 @@ fn render_public_session_git_diff(
     } else {
         Ok(Some(diff))
     }
+}
+
+fn workspace_changed_paths(workspace_root: &Path) -> Vec<String> {
+    if !workspace_root.join(".git").exists() || !command_exists("git") {
+        return Vec::new();
+    }
+
+    let tracked_output = Command::new("git")
+        .args(["diff", "--name-only", "--relative"])
+        .current_dir(workspace_root)
+        .output();
+    let untracked_output = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(workspace_root)
+        .output();
+
+    let mut paths = Vec::new();
+    if let Ok(output) = tracked_output {
+        if output.status.success() {
+            paths.extend(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(ToString::to_string),
+            );
+        }
+    }
+    if let Ok(output) = untracked_output {
+        if output.status.success() {
+            paths.extend(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(ToString::to_string),
+            );
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn sanitize_git_add_paths(paths: &[String]) -> Vec<String> {
@@ -2525,6 +2571,7 @@ fn build_review_prompt(
     source_workspace_root: Option<&Path>,
     latest_patch_output_path: &Path,
     refinement_round: u32,
+    current_changed_paths: &[String],
 ) -> String {
     let source_hint = source_workspace_root
         .map(|path| {
@@ -2539,13 +2586,22 @@ fn build_review_prompt(
     } else {
         "Review the patch again after the latest refinement."
     };
+    let changed_paths_hint = if current_changed_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " The workspace currently changes these repo-relative paths: {}. Verify that `## Git Add Paths` matches this exact set and that `## Issue Connection` explains every shipped functional file.",
+            current_changed_paths.join(", ")
+        )
+    };
     format!(
-        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{} The latest author response is at `{}`. Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, weak or non-gittable commit message text, and explanations that fail to connect the observed issue evidence to the code change.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
+        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{}{} The latest author response is at `{}`. Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, weak or non-gittable commit message text, and explanations that fail to connect the observed issue evidence to the code change.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
         round_hint,
         source_hint,
+        changed_paths_hint,
         latest_patch_output_path.display(),
     )
 }
@@ -2558,6 +2614,7 @@ fn build_refinement_prompt(
     latest_patch_output_path: &Path,
     review_output_path: &Path,
     refinement_round: u32,
+    current_changed_paths: &[String],
 ) -> String {
     let source_hint = source_workspace_root
         .map(|path| {
@@ -2575,8 +2632,16 @@ fn build_refinement_prompt(
             )
         })
         .unwrap_or_default();
+    let changed_paths_hint = if current_changed_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " The workspace currently changes these repo-relative paths: {}. Either keep that exact set synchronized with `## Git Add Paths` and `## Issue Connection`, or revert any unintended file before you answer.",
+            current_changed_paths.join(", ")
+        )
+    };
     format!(
-        "You are refining a fixer patch after an explicit code review.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the latest author response at `{}`. Read the review report at `{}`. This is refinement round {}.{}{} Address the review findings with the smallest reasonable follow-up changes. Keep the patch upstream-friendly, avoid awkward control flow when a simpler structure will do, keep the final response gittable, run relevant tests if available, and summarize which review findings you addressed.\n\n{}",
+        "You are refining a fixer patch after an explicit code review.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the latest author response at `{}`. Read the review report at `{}`. This is refinement round {}.{}{}{} Address the review findings with the smallest reasonable follow-up changes. Keep the patch upstream-friendly, avoid awkward control flow when a simpler structure will do, keep the final response gittable, run relevant tests if available, and summarize which review findings you addressed.\n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -2585,6 +2650,7 @@ fn build_refinement_prompt(
         refinement_round,
         source_hint,
         plan_hint,
+        changed_paths_hint,
         patch_response_contract(),
     )
 }

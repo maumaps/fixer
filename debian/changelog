@@ -1,3 +1,10 @@
+fixer (0.64.0-1) unstable; urgency=medium
+
+  * Show live changed-file sets to review and refinement passes so Git Add
+    Paths and Issue Connection stay aligned with the actual patch.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 02 Apr 2026 04:35:00 +0400
+
 fixer (0.63.0-1) unstable; urgency=medium
 
   * Reconcile Codex lease active-job counts against real running user units so
