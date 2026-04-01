@@ -1,3 +1,12 @@
+fixer (0.58.0-1) unstable; urgency=medium
+
+  * Retry Codex patch passes from a fresh shorter prompt when the first run
+    fails during remote compaction under high demand.
+  * Keep public patch attempts from turning into avoidable failures just
+    because a multi-pass Codex run hit transient context pressure.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 02 Apr 2026 02:01:30 +0400
+
 fixer (0.57.0-1) unstable; urgency=medium
 
   * Preserve paragraph and bullet formatting on public patch pages instead of

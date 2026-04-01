@@ -527,21 +527,46 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         plan_output_path = Some(current_plan_output_path);
     }
 
-    let patch_stage = run_codex_stage(
+    let mut patch_stage_output_path = job.bundle_dir.join("patch-output.txt");
+    let initial_patch_stage = run_codex_stage(
         config,
         &job.workspace.repo_root,
         &job.prompt_path,
-        &job.bundle_dir.join("patch-output.txt"),
+        &patch_stage_output_path,
         "Patch Pass",
         &patch_prompt,
     )?;
-    logs.push(render_stage_log(&patch_stage));
-    models_used.extend(patch_stage.models_used.clone());
-    rate_limit_fallback_used |= patch_stage.rate_limit_fallback_used;
-    selected_model = patch_stage.selected_model.clone().or(selected_model);
+    logs.push(render_stage_log(&initial_patch_stage));
+    models_used.extend(initial_patch_stage.models_used.clone());
+    rate_limit_fallback_used |= initial_patch_stage.rate_limit_fallback_used;
+    selected_model = initial_patch_stage
+        .selected_model
+        .clone()
+        .or(selected_model);
+    let mut patch_stage = initial_patch_stage;
+    let mut patch_stage_prompt = patch_prompt.clone();
+    if !patch_stage.success && should_retry_after_compaction_failure(&patch_stage.log) {
+        let retry_prompt = build_compact_patch_retry_prompt(&base_patch_prompt);
+        let retry_output_path = job.bundle_dir.join("patch-retry-output.txt");
+        let retry_stage = run_codex_stage(
+            config,
+            &job.workspace.repo_root,
+            &job.bundle_dir.join("patch-retry-prompt.md"),
+            &retry_output_path,
+            "Patch Pass Retry 1",
+            &retry_prompt,
+        )?;
+        logs.push(render_stage_log(&retry_stage));
+        models_used.extend(retry_stage.models_used.clone());
+        rate_limit_fallback_used |= retry_stage.rate_limit_fallback_used;
+        selected_model = retry_stage.selected_model.clone().or(selected_model);
+        patch_stage = retry_stage;
+        patch_stage_prompt = retry_prompt;
+        patch_stage_output_path = retry_output_path;
+    }
     transcripts.push(CodexStageTranscript {
         label: patch_stage.label.to_string(),
-        prompt: patch_prompt.clone(),
+        prompt: patch_stage_prompt.clone(),
         response: patch_stage.output.clone(),
     });
     if !patch_stage.success {
@@ -586,7 +611,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
     let mut workflow_stderr_excerpt: Option<String> = None;
     let mut workflow_review_failure_category: Option<String> = None;
     let patch_output_indicates_triage = stage_output_marks_successful_triage(&patch_stage.output);
-    let mut current_author_output_path = job.bundle_dir.join("patch-output.txt");
+    let mut current_author_output_path = patch_stage_output_path;
     if config.patch.review_after_patch && !patch_output_indicates_triage {
         let mut refinement_round = 0;
         loop {
@@ -2122,6 +2147,15 @@ fn classify_codex_failure(log: &str) -> String {
     }
 }
 
+fn should_retry_after_compaction_failure(log: &str) -> bool {
+    let lower = log.to_ascii_lowercase();
+    lower.contains("compact_remote")
+        || (lower.contains("remote compaction failed")
+            && (lower.contains("high demand")
+                || lower.contains("context window")
+                || lower.contains("context_length_exceeded")))
+}
+
 fn should_use_spark_for_weak_weekly_budget(
     config: &FixerConfig,
     log: &str,
@@ -2473,6 +2507,12 @@ fn build_patch_prompt_with_plan(patch_prompt: &str, plan_output_path: &Path) -> 
         "{}\n\nBefore editing, read the plan at `{}` and follow it unless the code proves part of it wrong. If you change course, say so explicitly in the final write-up instead of silently drifting from the plan.",
         patch_prompt,
         plan_output_path.display()
+    )
+}
+
+fn build_compact_patch_retry_prompt(base_patch_prompt: &str) -> String {
+    format!(
+        "{base_patch_prompt}\n\nWorkflow note: A previous patch pass failed during Codex remote compaction under high demand. Re-run this patch pass from a fresh context, keep the explanation concise, and avoid rehashing long evidence verbatim."
     )
 }
 
@@ -4055,6 +4095,7 @@ fn pg_amcheck_command(
 #[cfg(test)]
 mod tests {
     use super::{
+        build_compact_patch_retry_prompt,
         classify_codex_failure, extract_git_add_paths_from_response,
         filter_generated_public_diff_blocks, initialize_workspace_git_baseline,
         is_generated_public_diff_path, load_published_codex_session, parse_review_verdict,
@@ -4062,7 +4103,8 @@ mod tests {
         remember_primary_model_rate_limit, render_external_bug_report,
         render_local_remediation_report, render_local_remediation_sql,
         render_process_investigation_report, render_public_session_git_diff,
-        sanitize_command_line_for_report, should_use_spark_for_weak_weekly_budget,
+        sanitize_command_line_for_report, should_retry_after_compaction_failure,
+        should_use_spark_for_weak_weekly_budget,
         suggested_report_destination,
     };
     use crate::config::FixerConfig;
@@ -4878,6 +4920,27 @@ RESULT: ok
             classify_codex_failure("OpenAI usage blocked by x-ratelimit-limit"),
             "rate-limit"
         );
+    }
+
+    #[test]
+    fn detects_compaction_failures_that_should_retry_from_fresh_context() {
+        assert!(should_retry_after_compaction_failure(
+            "ERROR codex_core::compact_remote: remote compaction failed ... high demand"
+        ));
+        assert!(should_retry_after_compaction_failure(
+            "remote compaction failed because context window was exceeded"
+        ));
+        assert!(!should_retry_after_compaction_failure(
+            "HTTP 429 Too Many Requests: rate limit exceeded"
+        ));
+    }
+
+    #[test]
+    fn compact_patch_retry_prompt_keeps_fresh_context_note() {
+        let prompt = build_compact_patch_retry_prompt("base patch prompt");
+        assert!(prompt.contains("base patch prompt"));
+        assert!(prompt.contains("fresh context"));
+        assert!(prompt.contains("remote compaction"));
     }
 
     #[test]
