@@ -1456,8 +1456,7 @@ fn recover_unpublished_worker_result(
             Some(opportunity) => opportunity,
             None => continue,
         };
-        let supports_process_report =
-            proposal::supports_process_investigation_report(&opportunity);
+        let supports_process_report = proposal::supports_process_investigation_report(&opportunity);
         let mut details = serde_json::Map::from_iter([
             ("local_opportunity_id".to_string(), json!(opportunity.id)),
             (
@@ -1526,8 +1525,7 @@ fn recover_unpublished_worker_result(
                 process_investigation_worker_summary(&opportunity)
             )
         } else {
-            "Worker attempted a patch but the local proposal did not complete cleanly."
-                .to_string()
+            "Worker attempted a patch but the local proposal did not complete cleanly.".to_string()
         };
         return Ok(Some(RecoverableWorkerResult {
             lease_id: lease_id.clone(),

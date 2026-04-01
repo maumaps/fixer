@@ -1,3 +1,11 @@
+fixer (0.65.0-1) unstable; urgency=medium
+
+  * Add a deterministic local metadata review so stale Git Add Paths are
+    caught and refined before publication instead of relying on prompt wording
+    alone.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 02 Apr 2026 04:55:00 +0400
+
 fixer (0.64.0-1) unstable; urgency=medium
 
   * Show live changed-file sets to review and refinement passes so Git Add

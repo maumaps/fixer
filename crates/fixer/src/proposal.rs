@@ -617,6 +617,80 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         loop {
             let review_label = format!("Review Pass {}", refinement_round + 1);
             let current_changed_paths = workspace_changed_paths(&job.workspace.repo_root);
+            let review_output_path = job
+                .bundle_dir
+                .join(format!("review-{}-output.txt", refinement_round + 1));
+            let current_author_output = read_text(&current_author_output_path).unwrap_or_default();
+            if let Some(local_review_output) =
+                build_local_metadata_review(&current_author_output, &current_changed_paths)
+            {
+                fs::write(&review_output_path, local_review_output.as_bytes())?;
+                transcripts.push(CodexStageTranscript {
+                    label: format!("{review_label} (local metadata check)"),
+                    prompt: "Local metadata consistency check".to_string(),
+                    response: local_review_output.clone(),
+                });
+                if refinement_round >= config.patch.review_fix_passes {
+                    workflow_failure = Some((
+                        "review".to_string(),
+                        format!(
+                            "{} still found unresolved metadata issues after {} refinement pass(es).",
+                            review_label, refinement_round
+                        ),
+                    ));
+                    workflow_failure_stage = Some("review".to_string());
+                    workflow_review_failure_category = Some("git-add-paths-mismatch".to_string());
+                    break;
+                }
+                refinement_round += 1;
+                let refine_label = format!("Refinement Pass {}", refinement_round);
+                let current_changed_paths = workspace_changed_paths(&job.workspace.repo_root);
+                let refine_prompt = build_refinement_prompt(
+                    &evidence_path,
+                    &job.workspace,
+                    source_workspace_root.as_deref(),
+                    plan_output_path.as_deref(),
+                    &current_author_output_path,
+                    &review_output_path,
+                    refinement_round,
+                    &current_changed_paths,
+                );
+                let refine_prompt_path = job
+                    .bundle_dir
+                    .join(format!("refine-{}-prompt.md", refinement_round));
+                let refine_output_path = job
+                    .bundle_dir
+                    .join(format!("refine-{}-output.txt", refinement_round));
+                let refine_stage = run_codex_stage(
+                    config,
+                    &job.workspace.repo_root,
+                    &refine_prompt_path,
+                    &refine_output_path,
+                    &refine_label,
+                    &refine_prompt,
+                )?;
+                logs.push(render_stage_log(&refine_stage));
+                models_used.extend(refine_stage.models_used.clone());
+                rate_limit_fallback_used |= refine_stage.rate_limit_fallback_used;
+                selected_model = refine_stage.selected_model.clone().or(selected_model);
+                transcripts.push(CodexStageTranscript {
+                    label: refine_stage.label.to_string(),
+                    prompt: refine_prompt,
+                    response: refine_stage.output.clone(),
+                });
+                if !refine_stage.success {
+                    workflow_failure = Some((
+                        classify_codex_failure(&refine_stage.log),
+                        refine_stage.error,
+                    ));
+                    workflow_failure_stage = Some("refinement".to_string());
+                    workflow_exit_status = refine_stage.exit_status;
+                    workflow_stderr_excerpt = refine_stage.stderr_excerpt.clone();
+                    break;
+                }
+                current_author_output_path = refine_output_path;
+                continue;
+            }
             let review_prompt = build_review_prompt(
                 &evidence_path,
                 &job.workspace,
@@ -628,9 +702,6 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
             let review_prompt_path = job
                 .bundle_dir
                 .join(format!("review-{}-prompt.md", refinement_round + 1));
-            let review_output_path = job
-                .bundle_dir
-                .join(format!("review-{}-output.txt", refinement_round + 1));
             let review_stage = run_codex_stage(
                 config,
                 &job.workspace.repo_root,
@@ -1309,6 +1380,64 @@ fn workspace_changed_paths(workspace_root: &Path) -> Vec<String> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn build_local_metadata_review(
+    authoring_response: &str,
+    current_changed_paths: &[String],
+) -> Option<String> {
+    let actual_paths = sanitize_git_add_paths(
+        &current_changed_paths
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+    );
+    if actual_paths.is_empty() {
+        return None;
+    }
+    let declared_paths =
+        sanitize_git_add_paths(&extract_git_add_paths_from_response(authoring_response));
+    if declared_paths == actual_paths {
+        return None;
+    }
+
+    let missing_paths = actual_paths
+        .iter()
+        .filter(|path| !declared_paths.contains(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let extra_paths = declared_paths
+        .iter()
+        .filter(|path| !actual_paths.contains(path))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut findings = vec![format!(
+        "Patch metadata drift: the workspace currently changes `{}`, but `## Git Add Paths` lists `{}`. Update `## Git Add Paths` to match the real shipped file set exactly, and make sure `## Issue Connection` explains every functional file that remains in the patch.",
+        actual_paths.join("`, `"),
+        if declared_paths.is_empty() {
+            "(nothing)".to_string()
+        } else {
+            declared_paths.join("`, `")
+        }
+    )];
+    if !missing_paths.is_empty() {
+        findings.push(format!(
+            "Missing from `## Git Add Paths`: `{}`.",
+            missing_paths.join("`, `")
+        ));
+    }
+    if !extra_paths.is_empty() {
+        findings.push(format!(
+            "Listed in `## Git Add Paths` but not actually changed: `{}`.",
+            extra_paths.join("`, `")
+        ));
+    }
+
+    Some(format!(
+        "RESULT: fix-needed\n\n## Findings\n1. {}",
+        findings.join("\n2. ")
+    ))
 }
 
 fn sanitize_git_add_paths(paths: &[String]) -> Vec<String> {
@@ -5228,5 +5357,53 @@ RESULT: ok
                 .map(|path| path.file_name().unwrap().to_string_lossy().to_string()),
             Some("prior-best.patch".to_string())
         );
+    }
+
+    #[test]
+    fn local_metadata_review_accepts_matching_git_add_paths() {
+        let response = r#"Subject: Fix htop retry loop
+
+## Commit Message
+Keep the retry guard narrow.
+
+## Issue Connection
+This keeps htop from spinning when the watched file is missing.
+
+## Git Add Paths
+htop.c
+
+## Validation
+not run
+"#;
+
+        assert!(super::build_local_metadata_review(response, &["htop.c".to_string()]).is_none());
+    }
+
+    #[test]
+    fn local_metadata_review_flags_git_add_path_drift() {
+        let response = r#"Subject: Fix ssh loop
+
+## Commit Message
+Handle EINTR.
+
+## Issue Connection
+This tightens the main loop.
+
+## Git Add Paths
+serverloop.c
+
+## Validation
+not run
+"#;
+
+        let review = super::build_local_metadata_review(
+            response,
+            &["packet.c".to_string(), "serverloop.c".to_string()],
+        )
+        .unwrap();
+
+        assert!(review.starts_with("RESULT: fix-needed"));
+        assert!(review.contains("workspace currently changes `packet.c`, `serverloop.c`"));
+        assert!(review.contains("Missing from `## Git Add Paths`: `packet.c`."));
     }
 }
