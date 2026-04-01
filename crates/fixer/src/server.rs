@@ -9144,7 +9144,7 @@ fn text_describes_local_codex_auth_issue(text: &str) -> bool {
 }
 
 fn hidden_local_auth_bookkeeping_attempt(attempt: &PatchAttempt) -> bool {
-    if attempt.outcome != "report" || attempt.state != "ready" {
+    if !matches!(attempt.outcome.as_str(), "report" | "triage") || attempt.state != "ready" {
         return false;
     }
     if attempt
@@ -12582,6 +12582,34 @@ mod tests {
                 "patch_error": "the current Codex auth lease is paused: auto-paused after 3 recent Codex failures"
             }),
             created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+
+        assert!(hidden_local_auth_bookkeeping_attempt(&attempt));
+        assert!(!publicly_visible_attempt(&attempt));
+    }
+
+    #[test]
+    fn auth_blocked_triage_is_not_publicly_visible_attempt() {
+        let attempt = PatchAttempt {
+            cluster_id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "triage".to_string(),
+            state: "ready".to_string(),
+            summary: "A diagnosis report was created, but Fixer could not start the automated patch attempt because Codex auth on this host is unavailable: the current Codex auth lease is already using 1 active jobs".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "report_only_reason": "codex-auth-unavailable",
+                "automatic_patch_blocker_kind": "codex-auth",
+                "patch_error": "the current Codex auth lease is already using 1 active jobs",
+                "handoff": {
+                    "reason": "codex-auth-unavailable",
+                    "target": "external dependency or workload outside the current source tree",
+                    "next_steps": ["wait for auth capacity"]
+                }
+            }),
+            created_at: "2026-04-01T22:42:02Z".to_string(),
         };
 
         assert!(hidden_local_auth_bookkeeping_attempt(&attempt));
