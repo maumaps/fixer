@@ -32,7 +32,7 @@ pub fn ensure_workspace_for_opportunity(
     let metadata = package_name
         .as_deref()
         .and_then(|name| resolve_installed_package_metadata(name).ok());
-    let source_package = source_package_hint
+    let requested_source_package = source_package_hint
         .or_else(|| metadata.as_ref().map(|pkg| pkg.source_package.clone()))
         .or(package_name.clone())
         .ok_or_else(|| {
@@ -41,9 +41,27 @@ pub fn ensure_workspace_for_opportunity(
                 opportunity.id
             )
         })?;
+    let workspace_target = metadata
+        .as_ref()
+        .and_then(|pkg| workspace_source_alias(pkg, &requested_source_package))
+        .unwrap_or_else(|| WorkspaceSourceTarget {
+            source_package: requested_source_package,
+            upstream_url: None,
+            acquisition_note: None,
+        });
+
+    if metadata
+        .as_ref()
+        .is_some_and(|pkg| is_external_binary_package_without_workspace(pkg, &workspace_target))
+    {
+        return Err(anyhow!(
+            "could not acquire a workspace for external package {}; no Debian source package or cloneable upstream repository is available",
+            workspace_target.source_package
+        ));
+    }
 
     if deb_src_enabled() {
-        if let Ok(repo_root) = ensure_debian_source_tree(config, &source_package) {
+        if let Ok(repo_root) = ensure_debian_source_tree(config, &workspace_target.source_package) {
             let repo_root = maybe_canonicalize(&repo_root);
             let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
             return Ok(PreparedWorkspace {
@@ -51,31 +69,50 @@ pub fn ensure_workspace_for_opportunity(
                 ecosystem,
                 source_kind: "debian-source".to_string(),
                 package_name,
-                source_package: Some(source_package),
+                source_package: Some(workspace_target.source_package.clone()),
                 homepage: metadata.as_ref().and_then(|pkg| pkg.homepage.clone()),
-                acquisition_note: "Fetched Debian source package via apt-get source.".to_string(),
+                acquisition_note: workspace_target
+                    .acquisition_note
+                    .clone()
+                    .unwrap_or_else(|| {
+                        "Fetched Debian source package via apt-get source.".to_string()
+                    }),
             });
         }
     }
 
-    if let Some(kernel_url) = kernel_upstream_repo_url(&source_package) {
-        let repo_root = ensure_upstream_clone(config, &source_package, kernel_url)?;
+    if let Some(upstream_url) = workspace_target
+        .upstream_url
+        .as_deref()
+        .or_else(|| kernel_upstream_repo_url(&workspace_target.source_package))
+    {
+        let repo_root =
+            ensure_upstream_clone(config, &workspace_target.source_package, upstream_url)?;
         let repo_root = maybe_canonicalize(&repo_root);
         let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
         return Ok(PreparedWorkspace {
             repo_root,
             ecosystem,
-            source_kind: "kernel-upstream-git".to_string(),
+            source_kind: if workspace_target.upstream_url.is_some() {
+                "upstream-git".to_string()
+            } else {
+                "kernel-upstream-git".to_string()
+            },
             package_name,
-            source_package: Some(source_package),
-            homepage: Some(kernel_url.to_string()),
-            acquisition_note: "Cloned upstream Linux kernel sources because Debian source indexes were unavailable on this worker.".to_string(),
+            source_package: Some(workspace_target.source_package.clone()),
+            homepage: Some(upstream_url.to_string()),
+            acquisition_note: workspace_target
+                .acquisition_note
+                .unwrap_or_else(|| {
+                    "Cloned upstream Linux kernel sources because Debian source indexes were unavailable on this worker.".to_string()
+                }),
         });
     }
 
     if let Some(homepage) = metadata.as_ref().and_then(|pkg| pkg.homepage.clone()) {
         if is_cloneable_repo_url(&homepage) {
-            let repo_root = ensure_upstream_clone(config, &source_package, &homepage)?;
+            let repo_root =
+                ensure_upstream_clone(config, &workspace_target.source_package, &homepage)?;
             let repo_root = maybe_canonicalize(&repo_root);
             let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
             return Ok(PreparedWorkspace {
@@ -83,7 +120,7 @@ pub fn ensure_workspace_for_opportunity(
                 ecosystem,
                 source_kind: "upstream-git".to_string(),
                 package_name,
-                source_package: Some(source_package),
+                source_package: Some(workspace_target.source_package.clone()),
                 homepage: Some(homepage),
                 acquisition_note: "Cloned upstream repository from package homepage because Debian source indexes are unavailable.".to_string(),
             });
@@ -92,8 +129,14 @@ pub fn ensure_workspace_for_opportunity(
 
     Err(anyhow!(
         "could not acquire a workspace for {}; enable deb-src or provide a cloneable homepage",
-        source_package
+        workspace_target.source_package
     ))
+}
+
+struct WorkspaceSourceTarget {
+    source_package: String,
+    upstream_url: Option<String>,
+    acquisition_note: Option<String>,
 }
 
 pub fn resolve_installed_package_metadata(package_name: &str) -> Result<InstalledPackageMetadata> {
@@ -239,6 +282,84 @@ fn parse_maintainer_url(raw: &str) -> Option<String> {
     let candidate = raw[start + 1..start + 1 + end].trim();
     (candidate.starts_with("https://") || candidate.starts_with("http://"))
         .then(|| candidate.to_string())
+}
+
+fn is_external_binary_package_without_workspace(
+    metadata: &InstalledPackageMetadata,
+    workspace_target: &WorkspaceSourceTarget,
+) -> bool {
+    if metadata.cloneable_homepage {
+        return false;
+    }
+    if metadata
+        .homepage
+        .as_deref()
+        .is_some_and(is_cloneable_repo_url)
+    {
+        return false;
+    }
+    let has_non_debian_origin = metadata
+        .apt_origins
+        .iter()
+        .any(|origin| !origin_is_debian_source_friendly(origin));
+    has_non_debian_origin
+        && metadata.source_package == metadata.package_name
+        && workspace_target.source_package == metadata.source_package
+        && workspace_target.upstream_url.is_none()
+}
+
+fn workspace_source_alias(
+    metadata: &InstalledPackageMetadata,
+    source_package: &str,
+) -> Option<WorkspaceSourceTarget> {
+    chrome_workspace_alias(metadata, source_package)
+}
+
+fn chrome_workspace_alias(
+    metadata: &InstalledPackageMetadata,
+    source_package: &str,
+) -> Option<WorkspaceSourceTarget> {
+    let package_name = metadata.package_name.as_str();
+    let is_google_chrome = matches!(
+        package_name,
+        "google-chrome-stable" | "google-chrome-beta" | "google-chrome-unstable"
+    );
+    if !is_google_chrome {
+        return None;
+    }
+    let has_google_chrome_origin = metadata.apt_origins.iter().any(|origin| {
+        origin
+            .to_ascii_lowercase()
+            .contains("dl.google.com/linux/chrome")
+    });
+    let has_chromium_maintainer = metadata
+        .maintainer
+        .as_deref()
+        .is_some_and(|maintainer| maintainer.to_ascii_lowercase().contains("chromium"));
+    if !has_google_chrome_origin && !has_chromium_maintainer {
+        return None;
+    }
+    Some(WorkspaceSourceTarget {
+        source_package: if source_package == metadata.package_name {
+            "chromium".to_string()
+        } else {
+            source_package.to_string()
+        },
+        upstream_url: Some("https://chromium.googlesource.com/chromium/src.git".to_string()),
+        acquisition_note: Some(
+            "Mapped Google Chrome to Chromium sources so Fixer can inspect the closest available upstream codebase.".to_string(),
+        ),
+    })
+}
+
+fn origin_is_debian_source_friendly(origin: &str) -> bool {
+    let lower = origin.to_ascii_lowercase();
+    lower.contains("deb.debian.org")
+        || lower.contains("security.debian.org")
+        || lower.contains("debian.org/debian")
+        || lower.contains("ubuntu.com")
+        || lower.contains("archive.ubuntu.com")
+        || lower.contains("ports.ubuntu.com")
 }
 
 fn version_is_newer(candidate: &str, installed: &str) -> bool {
@@ -462,11 +583,13 @@ fn deb_src_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_cloneable_repo_url, kernel_source_package_from_opportunity, kernel_upstream_repo_url,
-        normalize_patchable_source_package, parse_apt_origins, parse_maintainer_url,
+        WorkspaceSourceTarget, chrome_workspace_alias, is_cloneable_repo_url,
+        is_external_binary_package_without_workspace, kernel_source_package_from_opportunity,
+        kernel_upstream_repo_url, normalize_patchable_source_package,
+        origin_is_debian_source_friendly, parse_apt_origins, parse_maintainer_url,
         sanitize_dir_name, source_package_from_opportunity,
     };
-    use crate::models::OpportunityRecord;
+    use crate::models::{InstalledPackageMetadata, OpportunityRecord};
     use serde_json::json;
 
     #[test]
@@ -507,6 +630,77 @@ zoom:\n\
             parse_apt_origins(raw),
             vec!["https://example.invalid/deb stable/main amd64 Packages".to_string()]
         );
+    }
+
+    #[test]
+    fn detects_external_binary_package_without_workspace() {
+        let metadata = InstalledPackageMetadata {
+            package_name: "google-chrome-stable".to_string(),
+            source_package: "google-chrome-stable".to_string(),
+            installed_version: None,
+            candidate_version: None,
+            architecture: None,
+            maintainer: Some("Chrome Linux Team <chromium-dev@chromium.org>".to_string()),
+            vendor: None,
+            homepage: None,
+            report_url: None,
+            report_url_source: None,
+            status: Some("installed".to_string()),
+            apt_policy_raw: None,
+            apt_origins: vec![
+                "http://dl.google.com/linux/chrome/deb stable/main amd64 Packages".to_string(),
+            ],
+            upgrade_available: false,
+            update_command: None,
+            cloneable_homepage: false,
+        };
+
+        let alias = chrome_workspace_alias(&metadata, &metadata.source_package)
+            .expect("chrome should map to Chromium sources");
+        assert_eq!(alias.source_package, "chromium");
+        assert_eq!(
+            alias.upstream_url.as_deref(),
+            Some("https://chromium.googlesource.com/chromium/src.git")
+        );
+        assert!(!is_external_binary_package_without_workspace(
+            &metadata, &alias
+        ));
+        assert!(!origin_is_debian_source_friendly(
+            "http://dl.google.com/linux/chrome/deb stable/main amd64 Packages"
+        ));
+    }
+
+    #[test]
+    fn non_aliased_external_binary_package_still_requires_external_handoff() {
+        let metadata = InstalledPackageMetadata {
+            package_name: "zoom".to_string(),
+            source_package: "zoom".to_string(),
+            installed_version: None,
+            candidate_version: None,
+            architecture: None,
+            maintainer: Some("Zoom Communications, Inc.".to_string()),
+            vendor: None,
+            homepage: None,
+            report_url: None,
+            report_url_source: None,
+            status: Some("installed".to_string()),
+            apt_policy_raw: None,
+            apt_origins: vec![
+                "https://zoom.us/linux/download stable/main amd64 Packages".to_string(),
+            ],
+            upgrade_available: false,
+            update_command: None,
+            cloneable_homepage: false,
+        };
+
+        let target = WorkspaceSourceTarget {
+            source_package: metadata.source_package.clone(),
+            upstream_url: None,
+            acquisition_note: None,
+        };
+        assert!(is_external_binary_package_without_workspace(
+            &metadata, &target
+        ));
     }
 
     #[test]

@@ -1,3 +1,14 @@
+fixer (0.55.0-1) unstable; urgency=medium
+
+  * Map Google Chrome package investigations to Chromium sources so workers
+    can try a real upstream workspace instead of bailing out as an external
+    binary package immediately.
+  * Keep public workspace blocker classification aligned with that Chromium
+    fallback while preserving external-package handoff behavior for other
+    vendor-only packages.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 01 Apr 2026 23:55:08 +0400
+
 fixer (0.54.0-1) unstable; urgency=medium
 
   * Stop leaking internal report-generation/storage errors like permission

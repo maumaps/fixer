@@ -1805,6 +1805,31 @@ fn workspace_blocker_classification(
     {
         return Some("kernel-source-unavailable".to_string());
     }
+    let chrome_can_use_chromium_sources = matches!(
+        package_name,
+        "google-chrome-stable" | "google-chrome-beta" | "google-chrome-unstable"
+    );
+    if error.contains("external package")
+        || diagnosis
+            .get("package_metadata")
+            .and_then(|value| value.get("apt_origins"))
+            .and_then(Value::as_array)
+            .is_some_and(|origins| {
+                origins.iter().filter_map(Value::as_str).any(|origin| {
+                    let lower = origin.to_ascii_lowercase();
+                    !lower.contains("deb.debian.org")
+                        && !lower.contains("security.debian.org")
+                        && !lower.contains("debian.org/debian")
+                        && !lower.contains("ubuntu.com")
+                        && !lower.contains("archive.ubuntu.com")
+                        && !lower.contains("ports.ubuntu.com")
+                })
+            })
+    {
+        if !chrome_can_use_chromium_sources {
+            return Some("external-package".to_string());
+        }
+    }
     let cloneable_homepage = diagnosis
         .get("package_metadata")
         .and_then(|value| value.get("cloneable_homepage"))
@@ -2203,6 +2228,86 @@ mod tests {
 
         assert!(is_lease_expired(&expired));
         assert!(!is_lease_expired(&active));
+    }
+
+    #[test]
+    fn workspace_blocker_classification_detects_external_binary_packages() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "Crash with stack trace in chrome".to_string(),
+            score: 10,
+            state: "open".to_string(),
+            repo_root: None,
+            summary: "chrome crashed".to_string(),
+            evidence: json!({
+                "package_name": "google-chrome-stable",
+                "details": {
+                    "subsystem": "crash",
+                    "package_metadata": {
+                        "package_name": "google-chrome-stable",
+                        "source_package": "google-chrome-stable",
+                        "cloneable_homepage": false,
+                        "apt_origins": [
+                            "http://dl.google.com/linux/chrome/deb stable/main amd64 Packages"
+                        ]
+                    }
+                }
+            }),
+            ecosystem: None,
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+            updated_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            workspace_blocker_classification(
+                &opportunity,
+                "could not acquire a workspace for external package google-chrome-stable; no Debian source package or cloneable upstream repository is available"
+            )
+            .as_deref(),
+            Some("workspace-unavailable")
+        );
+    }
+
+    #[test]
+    fn workspace_blocker_classification_keeps_other_vendor_packages_external() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "Zoom spins CPU".to_string(),
+            score: 10,
+            state: "open".to_string(),
+            repo_root: None,
+            summary: "zoom spins".to_string(),
+            evidence: json!({
+                "package_name": "zoom",
+                "details": {
+                    "subsystem": "cpu",
+                    "package_metadata": {
+                        "package_name": "zoom",
+                        "source_package": "zoom",
+                        "cloneable_homepage": false,
+                        "apt_origins": [
+                            "https://zoom.us/linux/download stable/main amd64 Packages"
+                        ]
+                    }
+                }
+            }),
+            ecosystem: None,
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+            updated_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            workspace_blocker_classification(
+                &opportunity,
+                "could not acquire a workspace for external package zoom; no Debian source package or cloneable upstream repository is available"
+            )
+            .as_deref(),
+            Some("external-package")
+        );
     }
 
     #[test]
