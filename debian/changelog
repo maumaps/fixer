@@ -1,3 +1,12 @@
+fixer (0.57.0-1) unstable; urgency=medium
+
+  * Preserve paragraph and bullet formatting on public patch pages instead of
+    flattening Codex writeups into one line.
+  * Surface runtime evidence on issue pages even when no representative
+    backtrace was retained, so patch rationales stay tied to visible signals.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 02 Apr 2026 01:57:00 +0400
+
 fixer (0.56.0-1) unstable; urgency=medium
 
   * Treat Debian and Ubuntu mirror paths as source-friendly so normal distro

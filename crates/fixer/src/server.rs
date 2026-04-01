@@ -485,6 +485,10 @@ code, pre {
     margin-top: 0.9rem;
 }
 
+.patch-copy > :first-child {
+    margin-top: 0;
+}
+
 .patch-panel {
     border-color: rgba(36, 92, 45, 0.2);
     background: linear-gradient(
@@ -8663,15 +8667,13 @@ fn patch_validation_notes(
 fn extract_patch_response_metadata(response: &str) -> PatchResponseMetadata {
     let authoring_response =
         latest_patch_authoring_response(response).unwrap_or_else(|| response.trim().to_string());
-    let validation_notes = extract_markdown_section(&authoring_response, "Validation")
+    let validation_notes = extract_markdown_section_raw(&authoring_response, "Validation")
         .map(|section| parse_validation_notes(&section))
         .unwrap_or_default();
     PatchResponseMetadata {
         subject: extract_labeled_line(&authoring_response, "Subject:"),
-        commit_message: extract_markdown_section(&authoring_response, "Commit Message")
-            .map(|section| normalize_patch_response_text(&section)),
-        issue_connection: extract_markdown_section(&authoring_response, "Issue Connection")
-            .map(|section| normalize_patch_response_text(&section)),
+        commit_message: extract_markdown_section_raw(&authoring_response, "Commit Message"),
+        issue_connection: extract_markdown_section_raw(&authoring_response, "Issue Connection"),
         validation_notes,
     }
 }
@@ -8842,7 +8844,7 @@ fn extract_labeled_line(text: &str, prefix: &str) -> Option<String> {
     })
 }
 
-fn extract_markdown_section(text: &str, heading: &str) -> Option<String> {
+fn extract_markdown_section_raw(text: &str, heading: &str) -> Option<String> {
     let mut in_section = false;
     let mut lines = Vec::new();
     for line in text.lines() {
@@ -8861,11 +8863,10 @@ fn extract_markdown_section(text: &str, heading: &str) -> Option<String> {
         }
     }
     let content = lines.join("\n");
-    let normalized = normalize_patch_response_text(&content);
-    if normalized.is_empty() {
+    if content.trim().is_empty() {
         None
     } else {
-        Some(normalized)
+        Some(content.trim().to_string())
     }
 }
 
@@ -8898,6 +8899,79 @@ fn parse_validation_notes(section: &str) -> Vec<String> {
         } else {
             vec![normalized]
         }
+    }
+}
+
+fn render_patch_response_markup(text: &str) -> String {
+    let mut blocks = Vec::new();
+    let mut paragraph_lines = Vec::new();
+    let mut list_items = Vec::new();
+    let flush_paragraph = |blocks: &mut Vec<String>, paragraph_lines: &mut Vec<String>| {
+        if paragraph_lines.is_empty() {
+            return;
+        }
+        let content = paragraph_lines
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !content.is_empty() {
+            blocks.push(format!(
+                "<p class=\"issue-summary\">{}</p>",
+                html_escape(&content)
+            ));
+        }
+        paragraph_lines.clear();
+    };
+    let flush_list = |blocks: &mut Vec<String>, list_items: &mut Vec<String>| {
+        if list_items.is_empty() {
+            return;
+        }
+        let items = list_items
+            .iter()
+            .map(|item| format!("<li>{}</li>", html_escape(item)))
+            .collect::<Vec<_>>()
+            .join("");
+        blocks.push(format!("<ul class=\"attempt-list\">{items}</ul>"));
+        list_items.clear();
+    };
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            flush_paragraph(&mut blocks, &mut paragraph_lines);
+            flush_list(&mut blocks, &mut list_items);
+            continue;
+        }
+        if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            flush_paragraph(&mut blocks, &mut paragraph_lines);
+            list_items.push(item.trim().to_string());
+            continue;
+        }
+        if !list_items.is_empty() {
+            if let Some(last) = list_items.last_mut() {
+                last.push(' ');
+                last.push_str(trimmed);
+            }
+            continue;
+        }
+        paragraph_lines.push(trimmed.to_string());
+    }
+
+    flush_paragraph(&mut blocks, &mut paragraph_lines);
+    flush_list(&mut blocks, &mut list_items);
+
+    if blocks.is_empty() {
+        format!(
+            "<p class=\"issue-summary\">{}</p>",
+            html_escape(&normalize_patch_response_text(text))
+        )
+    } else {
+        blocks.join("")
     }
 }
 
@@ -9889,12 +9963,19 @@ fn build_public_investigation_snapshot(
                 },
                 12,
             );
-            if frames.is_empty() {
-                return None;
-            }
             let mut highlights = Vec::new();
             if let Some(command_line) = details.get("command_line").and_then(Value::as_str) {
                 highlights.push(format!("Command: {}", sanitize_public_text(command_line)));
+            }
+            if let Some(explanation) = details
+                .get("loop_explanation")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                highlights.push(format!(
+                    "Why Fixer classified it this way: {}",
+                    sanitize_public_text(explanation)
+                ));
             }
             if let Some(summary) = details
                 .get("thread_backtrace_summary")
@@ -9956,15 +10037,43 @@ fn build_public_investigation_snapshot(
             {
                 highlights.push(format!("Repeated loop: {sequence}"));
             }
+            if let Some(syscalls) = details
+                .get("top_syscalls")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_object)
+                        .take(4)
+                        .filter_map(|entry| {
+                            let name = entry.get("name").and_then(Value::as_str)?;
+                            let count = entry.get("count").and_then(Value::as_i64)?;
+                            Some(format!("{} x{}", normalize_stack_frame(name), count))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|value| !value.is_empty())
+            {
+                highlights.push(format!("Top syscalls: {syscalls}"));
+            }
             push_env_highlights(details, &mut highlights);
+            if frames.is_empty() && highlights.is_empty() {
+                return None;
+            }
             Some(PublicTechnicalSnapshot {
                 title: if details.get("representative_backtraces").is_some() {
                     "Representative thread backtrace".to_string()
+                } else if frames.is_empty() {
+                    "Observed runtime evidence".to_string()
                 } else {
                     "Sampled wait stack".to_string()
                 },
                 summary: if details.get("representative_backtraces").is_some() {
                     "This is the clearest retained userspace thread cluster Fixer captured while the process was spinning."
+                        .to_string()
+                } else if frames.is_empty() {
+                    "Fixer did not retain a representative backtrace for this issue, but it did retain the strongest public runtime signals that drove the diagnosis and patch attempt."
                         .to_string()
                 } else {
                     "This is the stack-shaped slice and hot path Fixer captured while the process was spinning.".to_string()
@@ -10628,6 +10737,14 @@ fn render_technical_snapshot_section(issue: &PublicIssueDetail) -> String {
             .join("");
         format!("<ul class=\"attempt-list\">{items}</ul>")
     };
+    let frames_markup = if snapshot.frames.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<pre class=\"code-block\"><code>{}</code></pre>",
+            html_escape(&snapshot.frames.join("\n"))
+        )
+    };
     format!(
         r#"<section class="panel section">
             <h2>Technical snapshot</h2>
@@ -10635,13 +10752,13 @@ fn render_technical_snapshot_section(issue: &PublicIssueDetail) -> String {
             <section class="patch-summary">
                 <h4>{}</h4>
                 {}
-                <pre class="code-block"><code>{}</code></pre>
+                {}
             </section>
         </section>"#,
         html_escape(&snapshot.summary),
         html_escape(&snapshot.title),
         highlight_markup,
-        html_escape(&snapshot.frames.join("\n")),
+        frames_markup,
     )
 }
 
@@ -10740,9 +10857,11 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
             <section class="patch-summary">
                 <h4>Suggested subject</h4>
                 <pre class="code-block"><code>{}</code></pre>
-                <p class="issue-summary"><strong>Commit message.</strong> {}</p>
+                <p class="issue-summary"><strong>Commit message.</strong></p>
+                <div class="patch-copy">{}</div>
                 <p class="issue-summary"><strong>Problem.</strong> {}</p>
-                <p class="issue-summary"><strong>How this patch connects to the issue.</strong> {}</p>
+                <p class="issue-summary"><strong>How this patch connects to the issue.</strong></p>
+                <div class="patch-copy">{}</div>
             </section>
             {}
             {}
@@ -10757,9 +10876,9 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
         validation,
         html_escape(&best_patch.summary),
         html_escape(&cover.subject),
-        html_escape(&cover.commit_message),
+        render_patch_response_markup(&cover.commit_message),
         html_escape(&cover.problem),
-        html_escape(&cover.issue_connection),
+        render_patch_response_markup(&cover.issue_connection),
         changed_files,
         validation_notes,
         patch_url,
@@ -11409,10 +11528,10 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
         cover
             .as_ref()
             .map(|cover| format!(
-                "<section class=\"patch-summary\"><h4>Suggested subject</h4><pre class=\"code-block\"><code>{}</code></pre><p class=\"issue-summary\"><strong>Commit message.</strong> {}</p><p class=\"issue-summary\"><strong>Issue connection.</strong> {}</p></section>",
+                "<section class=\"patch-summary\"><h4>Suggested subject</h4><pre class=\"code-block\"><code>{}</code></pre><p class=\"issue-summary\"><strong>Commit message.</strong></p><div class=\"patch-copy\">{}</div><p class=\"issue-summary\"><strong>Issue connection.</strong></p><div class=\"patch-copy\">{}</div></section>",
                 html_escape(&cover.subject),
-                html_escape(&cover.commit_message),
-                html_escape(&cover.issue_connection)
+                render_patch_response_markup(&cover.commit_message),
+                render_patch_response_markup(&cover.issue_connection)
             ))
             .unwrap_or_default(),
         actions,
@@ -12609,6 +12728,51 @@ mod tests {
     }
 
     #[test]
+    fn render_public_patch_card_preserves_markdown_lists() {
+        let card = render_public_patch_card(&PublicPatchEntry {
+            id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5fa".to_string(),
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for perl".to_string(),
+            summary: "Perl burned CPU across multiple hosts.".to_string(),
+            package_name: Some("perl-base".to_string()),
+            source_package: Some("perl".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 106,
+            corroboration_count: 1,
+            last_seen: "2026-04-01T21:38:00Z".to_string(),
+            best_patch_diff_url: Some(
+                "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5fa/best.patch".to_string(),
+            ),
+            best_patch: PublicAttempt {
+                outcome: "patch".to_string(),
+                state: "ready".to_string(),
+                summary: "Patch proposal created locally.".to_string(),
+                validation_status: Some("ready".to_string()),
+                created_at: "2026-04-01T21:38:00Z".to_string(),
+                published_session: Some(PublishedAttemptSession {
+                    prompt: "Read ./evidence.json".to_string(),
+                    response: Some(
+                        "## Refinement Pass 1\n\nSubject: perl: make tiny positive select timeouts block\n\n## Commit Message\nThe loop now keeps a positive timeout blocking.\n\n- Fix the zero-timeout truncation.\n- Keep positive delays positive.\n\n## Issue Connection\nThe issue matches repeated `pselect6` wakeups.\n\n- `pselect6` keeps returning immediately.\n- A rounded-down timeout explains that behavior.\n\n## Validation\n- perl -I./lib -c t/op/sselect.t\n".to_string(),
+                    ),
+                    diff: Some("--- a/pp_sys.c\n+++ b/pp_sys.c\n@@\n+/* Keep tiny positive timeouts from becoming polls. */\n".to_string()),
+                    model: Some("gpt-5.3-codex-spark".to_string()),
+                    models_used: vec!["gpt-5.3-codex-spark".to_string()],
+                    rate_limit_fallback_used: false,
+                }),
+                handoff: None,
+                blocker_reason: None,
+                failure_diagnostics: None,
+                failure_context: None,
+            },
+        });
+
+        assert!(card.contains("<ul class=\"attempt-list\">"));
+        assert!(card.contains("Fix the zero-timeout truncation."));
+        assert!(card.contains("A rounded-down timeout explains that behavior."));
+    }
+
+    #[test]
     fn render_issue_detail_page_includes_best_patch_download() {
         let issue = PublicIssueDetail {
             id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
@@ -12850,6 +13014,50 @@ mod tests {
         assert!(markup.contains("Command: /usr/bin/kwin_x11 --replace"));
         assert!(markup.contains("futex_do_wait"));
         assert!(markup.contains("i915_gem_do_execbuffer (5.22% sampled CPU)"));
+    }
+
+    #[test]
+    fn render_issue_detail_page_includes_highlights_only_snapshot() {
+        let issue = PublicIssueDetail {
+            id: "019d4017-20f8-7752-9734-0bcd71623118".to_string(),
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for perl".to_string(),
+            summary: "perl is stuck in a likely busy poll loop.".to_string(),
+            package_name: Some("perl-base".to_string()),
+            source_package: Some("perl".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 106,
+            corroboration_count: 1,
+            best_patch_available: false,
+            best_triage_available: false,
+            best_patch_diff_url: None,
+            best_patch: None,
+            best_triage: None,
+            best_triage_handoff: None,
+            last_seen: "2026-04-01T21:38:00Z".to_string(),
+            technical_snapshot: Some(PublicTechnicalSnapshot {
+                title: "Observed runtime evidence".to_string(),
+                summary: "Fixer retained syscall and hot-path evidence even though no representative backtrace was kept.".to_string(),
+                frames: Vec::new(),
+                highlights: vec![
+                    "Why Fixer classified it this way: repeated pselect6 wakeups with no progress".to_string(),
+                    "Hot path: Perl_runops_standard (100.00% sampled CPU)".to_string(),
+                    "Top syscalls: pselect6 x4".to_string(),
+                ],
+            }),
+            possible_duplicates: Vec::new(),
+            attempt_summary: PublicAttemptSummary::default(),
+            attempts_omitted_count: 0,
+            attempts: Vec::new(),
+            showing_all_attempts: false,
+        };
+
+        let markup = render_issue_detail_page(&issue);
+
+        assert!(markup.contains("Observed runtime evidence"));
+        assert!(markup.contains("Top syscalls: pselect6 x4"));
+        assert!(!markup.contains("<pre class=\"code-block\"><code></code></pre>"));
     }
 
     #[test]
