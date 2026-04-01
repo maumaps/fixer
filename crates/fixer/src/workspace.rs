@@ -58,6 +58,21 @@ pub fn ensure_workspace_for_opportunity(
         }
     }
 
+    if let Some(kernel_url) = kernel_upstream_repo_url(&source_package) {
+        let repo_root = ensure_upstream_clone(config, &source_package, kernel_url)?;
+        let repo_root = maybe_canonicalize(&repo_root);
+        let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
+        return Ok(PreparedWorkspace {
+            repo_root,
+            ecosystem,
+            source_kind: "kernel-upstream-git".to_string(),
+            package_name,
+            source_package: Some(source_package),
+            homepage: Some(kernel_url.to_string()),
+            acquisition_note: "Cloned upstream Linux kernel sources because Debian source indexes were unavailable on this worker.".to_string(),
+        });
+    }
+
     if let Some(homepage) = metadata.as_ref().and_then(|pkg| pkg.homepage.clone()) {
         if is_cloneable_repo_url(&homepage) {
             let repo_root = ensure_upstream_clone(config, &source_package, &homepage)?;
@@ -373,7 +388,13 @@ fn sanitize_dir_name(name: &str) -> String {
 fn is_cloneable_repo_url(url: &str) -> bool {
     url.starts_with("https://github.com/")
         || url.starts_with("https://gitlab.com/")
+        || url.starts_with("https://git.kernel.org/")
         || url.ends_with(".git")
+}
+
+fn kernel_upstream_repo_url(source_package: &str) -> Option<&'static str> {
+    (source_package == "linux")
+        .then_some("https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git")
 }
 
 fn deb_src_enabled() -> bool {
@@ -417,8 +438,9 @@ fn deb_src_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_cloneable_repo_url, normalize_patchable_source_package, parse_apt_origins,
-        parse_maintainer_url, sanitize_dir_name, source_package_from_opportunity,
+        is_cloneable_repo_url, kernel_upstream_repo_url, normalize_patchable_source_package,
+        parse_apt_origins, parse_maintainer_url, sanitize_dir_name,
+        source_package_from_opportunity,
     };
     use crate::models::OpportunityRecord;
     use serde_json::json;
@@ -426,10 +448,22 @@ mod tests {
     #[test]
     fn detects_cloneable_urls() {
         assert!(is_cloneable_repo_url("https://github.com/uutils/coreutils"));
+        assert!(is_cloneable_repo_url(
+            "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
+        ));
         assert!(is_cloneable_repo_url("https://example.test/repo.git"));
         assert!(!is_cloneable_repo_url(
             "https://example.test/project-homepage"
         ));
+    }
+
+    #[test]
+    fn linux_source_package_has_kernel_git_fallback() {
+        assert_eq!(
+            kernel_upstream_repo_url("linux"),
+            Some("https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git")
+        );
+        assert_eq!(kernel_upstream_repo_url("postgresql-18"), None);
     }
 
     #[test]

@@ -5168,6 +5168,7 @@ fn repeated_workspace_blocked_triage_attempt(candidates: &[PatchAttempt]) -> Opt
         .filter(|attempt| {
             attempt.state == "ready"
                 && attempt.outcome == "report"
+                && !hidden_kernel_workspace_attempt(attempt)
                 && attempt
                     .details
                     .get("report_only_reason")
@@ -6777,10 +6778,14 @@ async fn load_public_issue_best_triage(
             row.map(|row| {
                 let best_triage_json: Value = row.get(0);
                 serde_json::from_value::<PatchAttempt>(best_triage_json)
-                    .map(public_attempt_from_patch_attempt)
+                    .map(|attempt| {
+                        (!hidden_kernel_workspace_attempt(&attempt))
+                            .then(|| public_attempt_from_patch_attempt(attempt))
+                    })
                     .map_err(ApiError::internal)
             })
             .transpose()
+            .map(Option::flatten)
         }
         ServerDb::Sqlite(path) => {
             let connection = sqlite_connection(path).map_err(ApiError::internal)?;
@@ -6798,7 +6803,10 @@ async fn load_public_issue_best_triage(
                     |row| {
                         let best_triage =
                             serde_json::from_str::<PatchAttempt>(&row.get::<_, String>(0)?)
-                                .map(public_attempt_from_patch_attempt)
+                                .map(|attempt| {
+                                    (!hidden_kernel_workspace_attempt(&attempt))
+                                        .then(|| public_attempt_from_patch_attempt(attempt))
+                                })
                                 .map_err(|error| {
                                     rusqlite::Error::FromSqlConversionFailure(
                                         0,
@@ -6811,6 +6819,7 @@ async fn load_public_issue_best_triage(
                 )
                 .optional()
                 .map_err(ApiError::internal)
+                .map(Option::flatten)
         }
     }
 }
@@ -6890,7 +6899,7 @@ async fn load_public_triage(db: &ServerDb, limit: i64) -> Result<Vec<PublicTriag
                 .await
                 .map_err(ApiError::internal)?;
             rows.into_iter()
-                .map(public_triage_from_row)
+                .filter_map(|row| public_triage_from_row(row).transpose())
                 .collect::<Result<Vec<_>, _>>()?
         }
         ServerDb::Sqlite(path) => {
@@ -6915,6 +6924,9 @@ async fn load_public_triage(db: &ServerDb, limit: i64) -> Result<Vec<PublicTriag
                 .map_err(ApiError::internal)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(ApiError::internal)?
+                .into_iter()
+                .flatten()
+                .collect()
         }
     };
     triage.sort_by(|left, right| {
@@ -7200,17 +7212,20 @@ fn public_patch_from_row(row: Row) -> Result<PublicPatchEntry, ApiError> {
     })
 }
 
-fn public_triage_from_row(row: Row) -> Result<PublicTriageEntry, ApiError> {
+fn public_triage_from_row(row: Row) -> Result<Option<PublicTriageEntry>, ApiError> {
     let best_triage_json: Value = row.get(10);
-    let best_triage = serde_json::from_value::<PatchAttempt>(best_triage_json)
-        .map(public_attempt_from_patch_attempt)
-        .map_err(ApiError::internal)?;
+    let best_triage_attempt =
+        serde_json::from_value::<PatchAttempt>(best_triage_json).map_err(ApiError::internal)?;
+    if hidden_kernel_workspace_attempt(&best_triage_attempt) {
+        return Ok(None);
+    }
+    let best_triage = public_attempt_from_patch_attempt(best_triage_attempt);
     let handoff = best_triage
         .handoff
         .clone()
         .ok_or_else(|| ApiError::internal("triage result missing public handoff"))?;
     let last_seen: DateTime<Utc> = row.get(11);
-    Ok(PublicTriageEntry {
+    Ok(Some(PublicTriageEntry {
         id: row.get(0),
         kind: row.get(1),
         title: row.get(2),
@@ -7224,7 +7239,7 @@ fn public_triage_from_row(row: Row) -> Result<PublicTriageEntry, ApiError> {
         last_seen: last_seen.to_rfc3339(),
         best_triage,
         handoff,
-    })
+    }))
 }
 
 fn compare_public_issue_priority(
@@ -7992,9 +8007,10 @@ fn public_patch_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pub
     })
 }
 
-fn public_triage_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicTriageEntry> {
-    let best_triage = serde_json::from_str::<PatchAttempt>(&row.get::<_, String>(10)?)
-        .map(public_attempt_from_patch_attempt)
+fn public_triage_from_sqlite_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Option<PublicTriageEntry>> {
+    let best_triage_attempt = serde_json::from_str::<PatchAttempt>(&row.get::<_, String>(10)?)
         .map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
                 10,
@@ -8002,6 +8018,10 @@ fn public_triage_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pu
                 Box::new(error),
             )
         })?;
+    if hidden_kernel_workspace_attempt(&best_triage_attempt) {
+        return Ok(None);
+    }
+    let best_triage = public_attempt_from_patch_attempt(best_triage_attempt);
     let handoff = best_triage.handoff.clone().ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
             10,
@@ -8009,7 +8029,7 @@ fn public_triage_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pu
             "triage result missing public handoff".into(),
         )
     })?;
-    Ok(PublicTriageEntry {
+    Ok(Some(PublicTriageEntry {
         id: row.get(0)?,
         kind: row.get(1)?,
         title: row.get(2)?,
@@ -8023,7 +8043,7 @@ fn public_triage_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pu
         last_seen: row.get(11)?,
         best_triage,
         handoff,
-    })
+    }))
 }
 
 fn public_attempt_from_patch_attempt(attempt: PatchAttempt) -> PublicAttempt {
@@ -8766,8 +8786,36 @@ fn hidden_local_auth_bookkeeping_attempt(attempt: &PatchAttempt) -> bool {
     text_describes_local_codex_auth_issue(&attempt.summary)
 }
 
+fn hidden_kernel_workspace_attempt(attempt: &PatchAttempt) -> bool {
+    if !matches!(attempt.outcome.as_str(), "report" | "triage") {
+        return false;
+    }
+    if attempt
+        .details
+        .get("report_only_reason")
+        .and_then(Value::as_str)
+        != Some("workspace-acquisition")
+    {
+        return false;
+    }
+    if attempt
+        .details
+        .get("workspace_classification")
+        .and_then(Value::as_str)
+        == Some("kernel-source-unavailable")
+    {
+        return true;
+    }
+    attempt
+        .details
+        .get("handoff")
+        .and_then(|value| value.get("target"))
+        .and_then(Value::as_str)
+        .is_some_and(is_kernelish_package_name)
+}
+
 fn publicly_visible_attempt(attempt: &PatchAttempt) -> bool {
-    !hidden_local_auth_bookkeeping_attempt(attempt)
+    !hidden_local_auth_bookkeeping_attempt(attempt) && !hidden_kernel_workspace_attempt(attempt)
 }
 
 fn canonicalize_worker_result_envelope(mut result: WorkerResultEnvelope) -> WorkerResultEnvelope {
