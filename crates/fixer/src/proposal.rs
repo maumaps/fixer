@@ -1362,6 +1362,7 @@ fn workspace_changed_paths(workspace_root: &Path) -> Vec<String> {
                     .lines()
                     .map(str::trim)
                     .filter(|line| !line.is_empty())
+                    .filter(|line| !is_generated_workspace_metadata_path(line))
                     .map(ToString::to_string),
             );
         }
@@ -1373,6 +1374,7 @@ fn workspace_changed_paths(workspace_root: &Path) -> Vec<String> {
                     .lines()
                     .map(str::trim)
                     .filter(|line| !line.is_empty())
+                    .filter(|line| !is_generated_workspace_metadata_path(line))
                     .map(ToString::to_string),
             );
         }
@@ -1460,9 +1462,14 @@ fn sanitize_git_add_paths(paths: &[String]) -> Vec<String> {
             }) {
                 return None;
             }
-            Some(trimmed.to_string())
+            (!is_generated_workspace_metadata_path(trimmed)).then(|| trimmed.to_string())
         })
         .collect()
+}
+
+fn is_generated_workspace_metadata_path(path: &str) -> bool {
+    let normalized = path.trim().trim_start_matches("./").trim_start_matches('/');
+    normalized == ".codex" || normalized.starts_with(".codex/")
 }
 
 fn normalize_public_patch_diff(
@@ -1559,6 +1566,9 @@ fn is_generated_public_diff_path(path: &str) -> bool {
         return false;
     }
     let normalized = trimmed.trim_start_matches("./");
+    if is_generated_workspace_metadata_path(normalized) {
+        return true;
+    }
     let basename = normalized.rsplit('/').next().unwrap_or(normalized);
     normalized.contains("/.deps/")
         || normalized.starts_with(".deps/")
@@ -5405,5 +5415,22 @@ not run
         assert!(review.starts_with("RESULT: fix-needed"));
         assert!(review.contains("workspace currently changes `packet.c`, `serverloop.c`"));
         assert!(review.contains("Missing from `## Git Add Paths`: `packet.c`."));
+    }
+
+    #[test]
+    fn generated_workspace_metadata_paths_are_ignored() {
+        assert!(super::is_generated_workspace_metadata_path(".codex"));
+        assert!(super::is_generated_workspace_metadata_path("./.codex"));
+        assert!(super::is_generated_workspace_metadata_path(
+            ".codex/session.json"
+        ));
+        assert_eq!(
+            super::sanitize_git_add_paths(&[
+                ".codex".to_string(),
+                "./.codex/session.json".to_string(),
+                "src/pk-spawn.c".to_string()
+            ]),
+            vec!["src/pk-spawn.c".to_string()]
+        );
     }
 }

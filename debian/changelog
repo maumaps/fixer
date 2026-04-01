@@ -1,3 +1,10 @@
+fixer (0.66.0-1) unstable; urgency=medium
+
+  * Ignore workspace `.codex` artifacts when comparing live changed files to
+    Git Add Paths so review metadata checks only enforce real shippable paths.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 02 Apr 2026 05:10:00 +0400
+
 fixer (0.65.0-1) unstable; urgency=medium
 
   * Add a deterministic local metadata review so stale Git Add Paths are
