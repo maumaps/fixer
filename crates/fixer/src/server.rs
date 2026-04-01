@@ -7011,8 +7011,7 @@ fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
 
 fn public_attempt_entry_from_row(row: Row) -> Result<PublicAttemptEntry, ApiError> {
     let attempt_json: Value = row.get(12);
-    let attempt = serde_json::from_value::<PatchAttempt>(attempt_json)
-        .map(public_attempt_from_patch_attempt)
+    let envelope = serde_json::from_value::<WorkerResultEnvelope>(attempt_json)
         .map_err(ApiError::internal)?;
     Ok(PublicAttemptEntry {
         issue_id: row.get(0),
@@ -7027,7 +7026,7 @@ fn public_attempt_entry_from_row(row: Row) -> Result<PublicAttemptEntry, ApiErro
         corroboration_count: row.get(9),
         best_patch_available: row.get(10),
         best_triage_available: row.get(11),
-        attempt,
+        attempt: public_attempt_from_patch_attempt(envelope.attempt),
     })
 }
 

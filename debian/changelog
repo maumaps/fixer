@@ -1,3 +1,10 @@
+fixer (0.45.0-1) unstable; urgency=medium
+
+  * Fix the public attempts board on PostgreSQL by decoding stored worker
+    result envelopes before rendering individual attempt entries.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 01 Apr 2026 18:13:00 +0400
+
 fixer (0.44.0-1) unstable; urgency=medium
 
   * Publish a dedicated public attempts board with filters for diagnosis-only
