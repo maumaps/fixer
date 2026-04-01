@@ -7001,13 +7001,13 @@ fn attempt_board_filter_from_query(raw: Option<&str>) -> Result<AttemptBoardFilt
     }
 }
 
-fn attempt_filter_sql(filter: AttemptBoardFilter) -> &'static str {
+fn attempt_matches_filter(filter: AttemptBoardFilter, attempt: &PatchAttempt) -> bool {
     match filter {
-        AttemptBoardFilter::All => "",
-        AttemptBoardFilter::Reports => "AND pa.outcome = 'report' AND pa.state = 'ready'",
-        AttemptBoardFilter::Failures => "AND pa.outcome = 'patch' AND pa.state = 'failed'",
+        AttemptBoardFilter::All => true,
+        AttemptBoardFilter::Reports => attempt.outcome == "report" && attempt.state == "ready",
+        AttemptBoardFilter::Failures => attempt.outcome == "patch" && attempt.state == "failed",
         AttemptBoardFilter::Impossible => {
-            "AND pa.outcome = 'impossible' AND pa.state = 'explained'"
+            attempt.outcome == "impossible" && attempt.state == "explained"
         }
     }
 }
@@ -7017,11 +7017,11 @@ async fn load_public_attempt_entries(
     filter: AttemptBoardFilter,
     limit: i64,
 ) -> Result<Vec<PublicAttemptEntry>, ApiError> {
-    let filter_sql = attempt_filter_sql(filter);
     match db {
         ServerDb::Postgres(db) => {
-            let query = format!(
-                "
+            let rows = db
+                .query(
+                    "
             SELECT ic.id, ic.kind, ic.public_title, ic.public_summary, ic.package_name,
                    ic.source_package, ic.ecosystem, ic.severity, ic.score, ic.corroboration_count,
                    (ic.best_patch_json IS NOT NULL) AS best_patch_available,
@@ -7031,13 +7031,10 @@ async fn load_public_attempt_entries(
             JOIN issue_clusters ic ON ic.id = pa.cluster_id
             WHERE ic.promoted = TRUE
               AND ic.public_visible = TRUE
-              {filter_sql}
             ORDER BY pa.created_at DESC
-            LIMIT $1
-            "
-            );
-            let rows = db
-                .query(&query, &[&limit])
+            ",
+                    &[],
+                )
                 .await
                 .map_err(ApiError::internal)?;
             let mut entries = Vec::new();
@@ -7047,6 +7044,9 @@ async fn load_public_attempt_entries(
                     .map_err(ApiError::internal)?;
                 let envelope = canonicalize_worker_result_envelope(envelope);
                 if !publicly_visible_attempt(&envelope.attempt) {
+                    continue;
+                }
+                if !attempt_matches_filter(filter, &envelope.attempt) {
                     continue;
                 }
                 entries.push(PublicAttemptEntry {
@@ -7064,13 +7064,17 @@ async fn load_public_attempt_entries(
                     best_triage_available: row.get(11),
                     attempt: public_attempt_from_patch_attempt(envelope.attempt),
                 });
+                if entries.len() >= limit as usize {
+                    break;
+                }
             }
             Ok(entries)
         }
         ServerDb::Sqlite(path) => {
             let connection = sqlite_connection(path).map_err(ApiError::internal)?;
-            let query = format!(
-                "
+            let mut stmt = connection
+                .prepare(
+                    "
             SELECT ic.id, ic.kind, ic.public_title, ic.public_summary, ic.package_name,
                    ic.source_package, ic.ecosystem, ic.severity, ic.score, ic.corroboration_count,
                    (ic.best_patch_json IS NOT NULL) AS best_patch_available,
@@ -7080,14 +7084,12 @@ async fn load_public_attempt_entries(
             JOIN issue_clusters ic ON ic.id = pa.cluster_id
             WHERE ic.promoted = 1
               AND ic.public_visible = 1
-              {filter_sql}
             ORDER BY pa.created_at DESC
-            LIMIT ?1
-            "
-            );
-            let mut stmt = connection.prepare(&query).map_err(ApiError::internal)?;
+            ",
+                )
+                .map_err(ApiError::internal)?;
             let rows = stmt
-                .query_map(params![limit], |row| {
+                .query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -7128,6 +7130,9 @@ async fn load_public_attempt_entries(
                 if !publicly_visible_attempt(&envelope.attempt) {
                     continue;
                 }
+                if !attempt_matches_filter(filter, &envelope.attempt) {
+                    continue;
+                }
                 entries.push(PublicAttemptEntry {
                     issue_id,
                     kind,
@@ -7143,6 +7148,9 @@ async fn load_public_attempt_entries(
                     best_triage_available: best_triage_available != 0,
                     attempt: public_attempt_from_patch_attempt(envelope.attempt),
                 });
+                if entries.len() >= limit as usize {
+                    break;
+                }
             }
             Ok(entries)
         }
