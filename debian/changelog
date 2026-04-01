@@ -1,3 +1,17 @@
+fixer (0.44.0-1) unstable; urgency=medium
+
+  * Publish a dedicated public attempts board with filters for diagnosis-only
+    reports, failed patch attempts, and explained impossible attempts.
+  * Link live snapshot counts on the homepage to their corresponding public
+    boards so stalled work is directly visible instead of only summarized.
+  * Show more published attempts on issue pages and allow browsing the full
+    public attempt history for a given issue.
+  * Add robots.txt rules that allow indexing of useful human-facing boards
+    while blocking machine endpoints, raw diff downloads, health checks, and
+    the APT repository.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 01 Apr 2026 17:50:00 +0400
+
 fixer (0.43.0-1) unstable; urgency=medium
 
   * Suppress repeated worker churn for local blocker families such as expired

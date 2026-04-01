@@ -12,7 +12,7 @@ use crate::protocol::{
 };
 use crate::util::{hash_text, now_rfc3339};
 use anyhow::{Context, Result, anyhow};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -730,6 +730,23 @@ struct PublicAttempt {
     blocker_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct PublicAttemptEntry {
+    issue_id: String,
+    issue_title: String,
+    issue_summary: String,
+    kind: String,
+    package_name: Option<String>,
+    source_package: Option<String>,
+    ecosystem: Option<String>,
+    severity: Option<String>,
+    score: i64,
+    corroboration_count: i64,
+    best_patch_available: bool,
+    best_triage_available: bool,
+    attempt: PublicAttempt,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 struct PublicAttemptSummary {
     total_attempt_count: usize,
@@ -780,6 +797,25 @@ struct PublicIssueDetail {
     attempt_summary: PublicAttemptSummary,
     attempts_omitted_count: usize,
     attempts: Vec<PublicAttempt>,
+    showing_all_attempts: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptBoardFilter {
+    All,
+    Reports,
+    Failures,
+    Impossible,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AttemptBoardQuery {
+    kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct IssueDetailQuery {
+    all_attempts: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -960,7 +996,9 @@ pub async fn serve(config: FixerConfig) -> Result<()> {
 
     let app = Router::new()
         .route("/", get(landing_page))
+        .route("/robots.txt", get(robots_txt))
         .route("/issues", get(public_issues_page))
+        .route("/attempts", get(public_attempts_page))
         .route("/triage", get(public_triage_page))
         .route("/patches", get(public_patches_page))
         .route("/issues/{id}/best.patch", get(public_issue_best_patch))
@@ -973,6 +1011,7 @@ pub async fn serve(config: FixerConfig) -> Result<()> {
         .route("/v1/work/pull", post(pull_work))
         .route("/v1/work/{lease_id}/result", post(submit_work_result))
         .route("/v1/issues", get(list_issues))
+        .route("/v1/attempts", get(list_attempts))
         .route("/v1/triage", get(list_triage))
         .route("/v1/patches", get(list_patches))
         .route("/v1/issues/{id}", get(get_issue))
@@ -1008,6 +1047,15 @@ async fn public_issues_page(
     Ok(Html(render_issues_page(&issues)))
 }
 
+async fn public_attempts_page(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<AttemptBoardQuery>,
+) -> Result<Html<String>, ApiError> {
+    let filter = attempt_board_filter_from_query(query.kind.as_deref())?;
+    let attempts = load_public_attempt_entries(&state.db, filter, 250).await?;
+    Ok(Html(render_attempts_page(filter, &attempts)))
+}
+
 async fn public_patches_page(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Html<String>, ApiError> {
@@ -1025,10 +1073,37 @@ async fn public_triage_page(
 async fn public_issue_detail_page(
     State(state): State<Arc<ServerState>>,
     AxumPath(id): AxumPath<String>,
+    Query(query): Query<IssueDetailQuery>,
 ) -> Result<Html<String>, ApiError> {
     validate_uuid_param(&id, "issue id")?;
-    let issue = load_public_issue_detail(&state.db, id).await?;
+    let show_all_attempts = query
+        .all_attempts
+        .as_deref()
+        .map(|value| matches!(value, "1" | "true" | "yes" | "all"))
+        .unwrap_or(false);
+    let issue = load_public_issue_detail(&state.db, id, show_all_attempts).await?;
     Ok(Html(render_issue_detail_page(&issue)))
+}
+
+async fn robots_txt() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        concat!(
+            "User-agent: *\n",
+            "Allow: /\n",
+            "Allow: /issues\n",
+            "Allow: /issues/\n",
+            "Allow: /attempts\n",
+            "Allow: /patches\n",
+            "Allow: /triage\n",
+            "Disallow: /v1/\n",
+            "Disallow: /healthz\n",
+            "Disallow: /issues/*/best.patch\n",
+            "Disallow: /issues/*/best.diff\n",
+            "Disallow: /apt/\n"
+        ),
+    )
+        .into_response()
 }
 
 async fn public_issue_best_patch(
@@ -1036,7 +1111,7 @@ async fn public_issue_best_patch(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, ApiError> {
     validate_uuid_param(&id, "issue id")?;
-    let issue = load_public_issue_detail(&state.db, id).await?;
+    let issue = load_public_issue_detail(&state.db, id, true).await?;
     let best_patch = issue
         .best_patch
         .as_ref()
@@ -1477,12 +1552,21 @@ async fn list_triage(
     Ok(Json(triage))
 }
 
+async fn list_attempts(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<AttemptBoardQuery>,
+) -> Result<Json<Vec<PublicAttemptEntry>>, ApiError> {
+    let filter = attempt_board_filter_from_query(query.kind.as_deref())?;
+    let attempts = load_public_attempt_entries(&state.db, filter, 250).await?;
+    Ok(Json(attempts))
+}
+
 async fn get_issue(
     State(state): State<Arc<ServerState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<PublicIssueDetail>, ApiError> {
     validate_uuid_param(&id, "issue id")?;
-    let issue = load_public_issue_detail(&state.db, id).await?;
+    let issue = load_public_issue_detail(&state.db, id, true).await?;
     Ok(Json(issue))
 }
 
@@ -6364,6 +6448,7 @@ async fn load_public_issue_candidates(
 async fn load_public_issue_detail(
     db: &ServerDb,
     id: String,
+    show_all_attempts: bool,
 ) -> Result<PublicIssueDetail, ApiError> {
     let candidate = load_duplicate_candidate_by_id(db, &id).await?;
     let technical_snapshot = build_public_technical_snapshot(&candidate.representative);
@@ -6374,8 +6459,12 @@ async fn load_public_issue_detail(
     let possible_duplicates = load_possible_duplicates(db, &id, &issue, 6).await?;
     let all_attempts = load_public_attempts(db, &id, 1024).await?;
     let attempt_summary = build_public_attempt_summary(&all_attempts);
-    let attempts_omitted_count = all_attempts.len().saturating_sub(10);
-    let attempts = all_attempts.into_iter().take(10).collect();
+    let displayed_attempt_count = if show_all_attempts { 1024 } else { 25 };
+    let attempts_omitted_count = all_attempts.len().saturating_sub(displayed_attempt_count);
+    let attempts = all_attempts
+        .into_iter()
+        .take(displayed_attempt_count)
+        .collect();
     Ok(PublicIssueDetail {
         id: issue.id,
         kind: issue.kind,
@@ -6401,6 +6490,7 @@ async fn load_public_issue_detail(
         attempt_summary,
         attempts_omitted_count,
         attempts,
+        showing_all_attempts: show_all_attempts,
     })
 }
 
@@ -6816,6 +6906,90 @@ async fn load_public_attempts(
     }
 }
 
+fn attempt_board_filter_from_query(raw: Option<&str>) -> Result<AttemptBoardFilter, ApiError> {
+    match raw.unwrap_or("all") {
+        "all" => Ok(AttemptBoardFilter::All),
+        "reports" | "report" => Ok(AttemptBoardFilter::Reports),
+        "failures" | "failed" => Ok(AttemptBoardFilter::Failures),
+        "impossible" => Ok(AttemptBoardFilter::Impossible),
+        other => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("unknown attempt filter: {other}"),
+        )),
+    }
+}
+
+fn attempt_filter_sql(filter: AttemptBoardFilter) -> &'static str {
+    match filter {
+        AttemptBoardFilter::All => "",
+        AttemptBoardFilter::Reports => "AND pa.outcome = 'report' AND pa.state = 'ready'",
+        AttemptBoardFilter::Failures => "AND pa.outcome = 'patch' AND pa.state = 'failed'",
+        AttemptBoardFilter::Impossible => {
+            "AND pa.outcome = 'impossible' AND pa.state = 'explained'"
+        }
+    }
+}
+
+async fn load_public_attempt_entries(
+    db: &ServerDb,
+    filter: AttemptBoardFilter,
+    limit: i64,
+) -> Result<Vec<PublicAttemptEntry>, ApiError> {
+    let filter_sql = attempt_filter_sql(filter);
+    match db {
+        ServerDb::Postgres(db) => {
+            let query = format!(
+                "
+            SELECT ic.id, ic.kind, ic.public_title, ic.public_summary, ic.package_name,
+                   ic.source_package, ic.ecosystem, ic.severity, ic.score, ic.corroboration_count,
+                   (ic.best_patch_json IS NOT NULL) AS best_patch_available,
+                   (ic.best_triage_json IS NOT NULL) AS best_triage_available,
+                   pa.bundle_json
+            FROM patch_attempts pa
+            JOIN issue_clusters ic ON ic.id = pa.cluster_id
+            WHERE ic.promoted = TRUE
+              AND ic.public_visible = TRUE
+              {filter_sql}
+            ORDER BY pa.created_at DESC
+            LIMIT $1
+            "
+            );
+            let rows = db
+                .query(&query, &[&limit])
+                .await
+                .map_err(ApiError::internal)?;
+            rows.into_iter()
+                .map(public_attempt_entry_from_row)
+                .collect()
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            let query = format!(
+                "
+            SELECT ic.id, ic.kind, ic.public_title, ic.public_summary, ic.package_name,
+                   ic.source_package, ic.ecosystem, ic.severity, ic.score, ic.corroboration_count,
+                   (ic.best_patch_json IS NOT NULL) AS best_patch_available,
+                   (ic.best_triage_json IS NOT NULL) AS best_triage_available,
+                   pa.bundle_json
+            FROM patch_attempts pa
+            JOIN issue_clusters ic ON ic.id = pa.cluster_id
+            WHERE ic.promoted = 1
+              AND ic.public_visible = 1
+              {filter_sql}
+            ORDER BY pa.created_at DESC
+            LIMIT ?1
+            "
+            );
+            let mut stmt = connection.prepare(&query).map_err(ApiError::internal)?;
+            let rows = stmt
+                .query_map(params![limit], public_attempt_entry_from_sqlite_row)
+                .map_err(ApiError::internal)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(ApiError::internal)
+        }
+    }
+}
+
 fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
     let last_seen: DateTime<Utc> = row.get(12);
     Ok(PublicIssue {
@@ -6832,6 +7006,28 @@ fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
         best_patch_available: row.get(10),
         best_triage_available: row.get(11),
         last_seen: last_seen.to_rfc3339(),
+    })
+}
+
+fn public_attempt_entry_from_row(row: Row) -> Result<PublicAttemptEntry, ApiError> {
+    let attempt_json: Value = row.get(12);
+    let attempt = serde_json::from_value::<PatchAttempt>(attempt_json)
+        .map(public_attempt_from_patch_attempt)
+        .map_err(ApiError::internal)?;
+    Ok(PublicAttemptEntry {
+        issue_id: row.get(0),
+        kind: row.get(1),
+        issue_title: row.get(2),
+        issue_summary: row.get(3),
+        package_name: row.get(4),
+        source_package: row.get(5),
+        ecosystem: row.get(6),
+        severity: row.get(7),
+        score: row.get(8),
+        corroboration_count: row.get(9),
+        best_patch_available: row.get(10),
+        best_triage_available: row.get(11),
+        attempt,
     })
 }
 
@@ -7698,6 +7894,30 @@ fn public_attempt_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<P
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
     })?;
     Ok(public_attempt_from_patch_attempt(envelope.attempt))
+}
+
+fn public_attempt_entry_from_sqlite_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PublicAttemptEntry> {
+    let raw: String = row.get(12)?;
+    let envelope = serde_json::from_str::<WorkerResultEnvelope>(&raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(PublicAttemptEntry {
+        issue_id: row.get(0)?,
+        kind: row.get(1)?,
+        issue_title: row.get(2)?,
+        issue_summary: row.get(3)?,
+        package_name: row.get(4)?,
+        source_package: row.get(5)?,
+        ecosystem: row.get(6)?,
+        severity: row.get(7)?,
+        score: row.get(8)?,
+        corroboration_count: row.get(9)?,
+        best_patch_available: row.get::<_, i64>(10)? != 0,
+        best_triage_available: row.get::<_, i64>(11)? != 0,
+        attempt: public_attempt_from_patch_attempt(envelope.attempt),
+    })
 }
 
 fn public_attempt_from_patch_attempt(attempt: PatchAttempt) -> PublicAttempt {
@@ -9297,23 +9517,23 @@ sudo apt install fixer"
                             <span>promoted issue families</span>
                         </div>
                         <div class="snapshot-stat">
-                            <strong>{}</strong>
+                            <strong><a href="/patches">{}</a></strong>
                             <span>diff-ready patch attempts</span>
                         </div>
                         <div class="snapshot-stat">
-                            <strong>{}</strong>
+                            <strong><a href="/triage">{}</a></strong>
                             <span>successful public triage handoffs</span>
                         </div>
                         <div class="snapshot-stat">
-                            <strong>{}</strong>
+                            <strong><a href="/attempts?kind=reports">{}</a></strong>
                             <span>diagnosis-only reports</span>
                         </div>
                         <div class="snapshot-stat">
-                            <strong>{}</strong>
+                            <strong><a href="/attempts?kind=failures">{}</a></strong>
                             <span>failed patch attempts</span>
                         </div>
                         <div class="snapshot-stat">
-                            <strong>{}</strong>
+                            <strong><a href="/attempts?kind=impossible">{}</a></strong>
                             <span>explained impossible attempts</span>
                         </div>
                         <div class="snapshot-stat">
@@ -9445,6 +9665,7 @@ sudo apt install fixer"
         NavPage::Home,
         body,
         snapshot.quarantined_issue_count,
+        true,
     )
 }
 
@@ -9480,6 +9701,70 @@ fn render_triage_page(entries: &[PublicTriageEntry]) -> String {
         NavPage::Triage,
         body,
         0,
+        true,
+    )
+}
+
+fn render_attempts_page(filter: AttemptBoardFilter, entries: &[PublicAttemptEntry]) -> String {
+    let hero_title = match filter {
+        AttemptBoardFilter::All => "Published worker attempts",
+        AttemptBoardFilter::Reports => "Diagnosis-only reports",
+        AttemptBoardFilter::Failures => "Failed patch attempts",
+        AttemptBoardFilter::Impossible => "Explained impossible attempts",
+    };
+    let hero_lede = match filter {
+        AttemptBoardFilter::All => {
+            "This board exposes the public worker history across promoted issues, including stalled runs. It is meant to make failure modes visible without exposing raw private evidence."
+        }
+        AttemptBoardFilter::Reports => {
+            "These attempts produced a public diagnosis but no honest diff. They are useful for seeing where work repeatedly stops and which clusters are still mostly investigative."
+        }
+        AttemptBoardFilter::Failures => {
+            "These are the public patch attempts that failed before becoming a ready diff. The goal is transparency: you should be able to see where review, execution, workspace, or model failures are accumulating."
+        }
+        AttemptBoardFilter::Impossible => {
+            "These attempts ended with an explicit public explanation that no honest fix was available in the current source tree or operating conditions."
+        }
+    };
+    let api_suffix = match filter {
+        AttemptBoardFilter::All => String::new(),
+        AttemptBoardFilter::Reports => "?kind=reports".to_string(),
+        AttemptBoardFilter::Failures => "?kind=failures".to_string(),
+        AttemptBoardFilter::Impossible => "?kind=impossible".to_string(),
+    };
+    let attempts_markup = if entries.is_empty() {
+        "<p class=\"fine-print\">No public attempts match this filter yet.</p>".to_string()
+    } else {
+        entries
+            .iter()
+            .map(render_public_attempt_entry_card)
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let filters_markup = render_attempt_filter_links(filter);
+    let body = format!(
+        r#"
+        <section class="hero">
+            <p class="tag">Public attempt board</p>
+            <h1>{hero_title}</h1>
+            <p class="lede">{hero_lede}</p>
+            <div class="hero-actions">{filters_markup}</div>
+            <p class="fine-print">Public JSON: <a href="/v1/attempts{api_suffix}">/v1/attempts{api_suffix}</a></p>
+        </section>
+
+        <section class="panel section">
+            <h2>Recent public attempts</h2>
+            <div class="issue-list">{attempts_markup}</div>
+        </section>
+        "#
+    );
+    render_page(
+        "Fixer Attempts",
+        "Public worker attempt history across Fixer issues",
+        NavPage::Attempts,
+        body,
+        0,
+        true,
     )
 }
 
@@ -9514,6 +9799,7 @@ fn render_issues_page(issues: &[DuplicateCandidateIssue]) -> String {
         NavPage::Issues,
         body,
         0,
+        true,
     )
 }
 
@@ -9549,6 +9835,7 @@ fn render_patches_page(patches: &[PublicPatchEntry]) -> String {
         NavPage::Patches,
         body,
         0,
+        true,
     )
 }
 
@@ -9616,6 +9903,7 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
         NavPage::Issues,
         body,
         0,
+        true,
     )
 }
 
@@ -9642,17 +9930,21 @@ fn render_attempt_summary_section(issue: &PublicIssueDetail) -> String {
                 .join("")
         )
     };
-    let omitted_note = if issue.attempts_omitted_count == 0 {
+    let omitted_note = if issue.showing_all_attempts {
+        "<p class=\"fine-print\">Showing the full published public attempt history for this issue.</p>"
+            .to_string()
+    } else if issue.attempts_omitted_count == 0 {
         String::new()
     } else {
         format!(
-            "<p class=\"fine-print\">Showing the 10 most recent attempts below and summarizing {} older attempt{} here.</p>",
+            "<p class=\"fine-print\">Showing the 25 most recent attempts below and summarizing {} older attempt{} here. <a href=\"/issues/{}?all_attempts=1\">Show all published attempts for this issue</a>.</p>",
             issue.attempts_omitted_count,
             if issue.attempts_omitted_count == 1 {
                 ""
             } else {
                 "s"
-            }
+            },
+            issue.id
         )
     };
     format!(
@@ -9931,6 +10223,7 @@ fn render_page(
     nav_page: NavPage,
     body: String,
     quarantined_count: i64,
+    indexable: bool,
 ) -> String {
     let home_class = if matches!(nav_page, NavPage::Home) {
         "active"
@@ -9952,6 +10245,11 @@ fn render_page(
     } else {
         ""
     };
+    let attempts_class = if matches!(nav_page, NavPage::Attempts) {
+        "active"
+    } else {
+        ""
+    };
     let footer_note = if quarantined_count > 0 {
         format!(
             "{} issue clusters are still quarantined while they wait for corroboration or a trusted submitter.",
@@ -9968,6 +10266,7 @@ fn render_page(
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{}</title>
     <meta name="description" content="{}">
+    {}
     <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
@@ -9977,6 +10276,7 @@ fn render_page(
             <div class="nav-links">
                 <a class="{}" href="/">Overview</a>
                 <a class="{}" href="/issues">Issues</a>
+                <a class="{}" href="/attempts">Attempts</a>
                 <a class="{}" href="/triage">Triage</a>
                 <a class="{}" href="/patches">Patches</a>
                 <span class="nav-status" id="health-indicator" aria-live="polite" title="Health: checking">⚪ Health</span>
@@ -9992,8 +10292,14 @@ fn render_page(
 </html>"#,
         html_escape(title),
         html_escape(description),
+        if indexable {
+            String::new()
+        } else {
+            "<meta name=\"robots\" content=\"noindex,follow\">".to_string()
+        },
         home_class,
         issues_class,
+        attempts_class,
         triage_class,
         patches_class,
         body,
@@ -10013,7 +10319,83 @@ fn public_attempt_heading(attempt: &PublicAttempt) -> &'static str {
     }
 }
 
-fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
+fn render_attempt_filter_links(active: AttemptBoardFilter) -> String {
+    [
+        (AttemptBoardFilter::All, "/attempts", "All attempts"),
+        (
+            AttemptBoardFilter::Reports,
+            "/attempts?kind=reports",
+            "Diagnosis-only",
+        ),
+        (
+            AttemptBoardFilter::Failures,
+            "/attempts?kind=failures",
+            "Failed patches",
+        ),
+        (
+            AttemptBoardFilter::Impossible,
+            "/attempts?kind=impossible",
+            "Impossible",
+        ),
+    ]
+    .into_iter()
+    .map(|(filter, href, label)| {
+        let class = if filter == active {
+            "button primary"
+        } else {
+            "button soft"
+        };
+        format!("<a class=\"{class}\" href=\"{href}\">{label}</a>")
+    })
+    .collect::<Vec<_>>()
+    .join("")
+}
+
+fn render_public_attempt_entry_card(entry: &PublicAttemptEntry) -> String {
+    let preview = render_patch_preview(entry.attempt.published_session.as_ref());
+    format!(
+        r#"<article class="issue-card patch-card">
+            <div class="issue-topline">
+                <h3><a href="/issues/{}">{}</a></h3>
+                <span class="tag">{}</span>
+            </div>
+            <p class="issue-summary">{}</p>
+            <div class="meta">{}<span class="tag">attempted: {}</span></div>
+            <section class="patch-summary">
+                <h4>Attempt summary</h4>
+                <p class="issue-summary">{}</p>
+            </section>
+            {}
+            {}
+            <p class="fine-print">Issue page: <a href="/issues/{}">/issues/{}</a>. Issue JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
+        </article>"#,
+        entry.issue_id,
+        html_escape(&entry.issue_title),
+        html_escape(public_attempt_heading(&entry.attempt)),
+        html_escape(&entry.issue_summary),
+        render_issue_tags(
+            entry.kind.as_str(),
+            entry.package_name.as_deref(),
+            entry.source_package.as_deref(),
+            entry.ecosystem.as_deref(),
+            entry.severity.as_deref(),
+            entry.score,
+            entry.corroboration_count,
+            entry.best_patch_available,
+            entry.best_triage_available,
+        ),
+        html_escape(&format_timestamp(&entry.attempt.created_at)),
+        html_escape(&entry.attempt.summary),
+        render_public_attempt_sections(&entry.attempt),
+        preview,
+        entry.issue_id,
+        entry.issue_id,
+        entry.issue_id,
+        entry.issue_id,
+    )
+}
+
+fn render_public_attempt_sections(attempt: &PublicAttempt) -> String {
     let mut sections = Vec::new();
     if let Some(session) = &attempt.published_session {
         sections.push(format!(
@@ -10082,20 +10464,10 @@ fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
         .unwrap_or_default();
 
     format!(
-        r#"<article class="issue-card">
-            <div class="issue-topline">
-                <h3>{}</h3>
-                <span class="tag">{}</span>
-            </div>
-            <p class="issue-summary">{}</p>
-            <div class="meta"><span class="tag">state: {}</span><span class="tag">created: {}</span>{}</div>
-            {}
-            {}
-            {}
-        </article>"#,
-        html_escape(public_attempt_heading(attempt)),
-        html_escape(&attempt.outcome),
-        html_escape(&attempt.summary),
+        r#"<div class="meta"><span class="tag">state: {}</span><span class="tag">created: {}</span>{}</div>
+        {}
+        {}
+        {}"#,
         html_escape(&attempt.state),
         html_escape(&format_timestamp(&attempt.created_at)),
         attempt
@@ -10109,6 +10481,23 @@ fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
         blocker_markup,
         handoff_markup,
         session_markup
+    )
+}
+
+fn render_public_attempt_card(attempt: &PublicAttempt) -> String {
+    format!(
+        r#"<article class="issue-card">
+            <div class="issue-topline">
+                <h3>{}</h3>
+                <span class="tag">{}</span>
+            </div>
+            <p class="issue-summary">{}</p>
+            {}
+        </article>"#,
+        html_escape(public_attempt_heading(attempt)),
+        html_escape(&attempt.outcome),
+        html_escape(&attempt.summary),
+        render_public_attempt_sections(attempt)
     )
 }
 
@@ -10451,6 +10840,7 @@ fn html_escape(value: &str) -> String {
 enum NavPage {
     Home,
     Issues,
+    Attempts,
     Triage,
     Patches,
 }
@@ -10975,6 +11365,7 @@ mod tests {
             NavPage::Home,
             "<section>body</section>".to_string(),
             0,
+            true,
         );
 
         assert!(markup.contains("id=\"health-indicator\""));
@@ -10991,6 +11382,7 @@ mod tests {
             NavPage::Patches,
             "<section>body</section>".to_string(),
             0,
+            true,
         );
 
         assert!(markup.contains("<a class=\"active\" href=\"/patches\">Patches</a>"));
@@ -11004,9 +11396,63 @@ mod tests {
             NavPage::Triage,
             "<section>body</section>".to_string(),
             0,
+            true,
         );
 
         assert!(markup.contains("<a class=\"active\" href=\"/triage\">Triage</a>"));
+    }
+
+    #[test]
+    fn render_attempts_page_includes_filters_and_issue_links() {
+        let markup = render_attempts_page(
+            AttemptBoardFilter::Reports,
+            &[PublicAttemptEntry {
+                issue_id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+                issue_title: "Runaway CPU investigation for postgres".to_string(),
+                issue_summary: "Postgres burned CPU across multiple hosts.".to_string(),
+                kind: "investigation".to_string(),
+                package_name: Some("postgresql-18".to_string()),
+                source_package: Some("postgresql-18".to_string()),
+                ecosystem: Some("debian".to_string()),
+                severity: Some("high".to_string()),
+                score: 106,
+                corroboration_count: 2,
+                best_patch_available: false,
+                best_triage_available: true,
+                attempt: PublicAttempt {
+                    outcome: "report".to_string(),
+                    state: "ready".to_string(),
+                    summary: "Diagnosis captured without an honest diff.".to_string(),
+                    validation_status: Some("ready".to_string()),
+                    created_at: "2026-03-29T00:00:00Z".to_string(),
+                    published_session: None,
+                    handoff: None,
+                    blocker_reason: Some("workspace acquisition failed".to_string()),
+                },
+            }],
+        );
+
+        assert!(markup.contains("Diagnosis-only reports"));
+        assert!(markup.contains("/attempts?kind=reports"));
+        assert!(markup.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8"));
+        assert!(markup.contains("workspace acquisition failed"));
+    }
+
+    #[test]
+    fn robots_txt_blocks_machine_endpoints_and_allows_human_boards() {
+        let response = test_runtime().block_on(robots_txt());
+        let rt = test_runtime();
+        let body = rt.block_on(async move {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("robots body");
+            String::from_utf8(body.to_vec()).expect("utf8 robots body")
+        });
+
+        assert!(body.contains("Allow: /issues"));
+        assert!(body.contains("Allow: /attempts"));
+        assert!(body.contains("Disallow: /v1/"));
+        assert!(body.contains("Disallow: /issues/*/best.diff"));
     }
 
     #[test]
@@ -11201,6 +11647,7 @@ mod tests {
             attempt_summary: PublicAttemptSummary::default(),
             attempts_omitted_count: 0,
             attempts: Vec::new(),
+            showing_all_attempts: false,
         };
 
         let markup = render_issue_detail_page(&issue);
@@ -11276,6 +11723,7 @@ mod tests {
             attempt_summary: PublicAttemptSummary::default(),
             attempts_omitted_count: 0,
             attempts: Vec::new(),
+            showing_all_attempts: false,
         };
 
         let markup = render_issue_detail_page(&issue);
@@ -11326,6 +11774,7 @@ mod tests {
             attempt_summary: PublicAttemptSummary::default(),
             attempts_omitted_count: 0,
             attempts: Vec::new(),
+            showing_all_attempts: false,
         };
 
         let markup = render_issue_detail_page(&issue);
@@ -11386,6 +11835,7 @@ mod tests {
             attempt_summary: PublicAttemptSummary::default(),
             attempts_omitted_count: 0,
             attempts: Vec::new(),
+            showing_all_attempts: false,
         };
 
         let patch = render_public_patch_email(&issue, issue.best_patch.as_ref().unwrap()).unwrap();
