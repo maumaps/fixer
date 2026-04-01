@@ -10889,6 +10889,9 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
 }
 
 fn render_best_triage_panel(issue: &PublicIssueDetail) -> Option<String> {
+    if issue.best_patch.is_some() {
+        return None;
+    }
     let best_triage = issue.best_triage.as_ref()?;
     let handoff = issue.best_triage_handoff.as_ref()?;
     let validation = best_triage
@@ -12833,6 +12836,85 @@ mod tests {
         assert!(markup.contains("Commit message."));
         assert!(markup.contains("How this patch connects to the issue."));
         assert!(markup.contains("Avoid the retry loop on missing files."));
+    }
+
+    #[test]
+    fn render_issue_detail_page_hides_best_triage_when_best_patch_exists() {
+        let issue = PublicIssueDetail {
+            id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for htop".to_string(),
+            summary: "htop burned CPU across multiple hosts.".to_string(),
+            package_name: Some("htop".to_string()),
+            source_package: Some("htop".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 106,
+            corroboration_count: 2,
+            best_patch_available: true,
+            best_triage_available: true,
+            best_patch_diff_url: Some(
+                "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch".to_string(),
+            ),
+            best_patch: Some(PublicAttempt {
+                outcome: "patch".to_string(),
+                state: "ready".to_string(),
+                summary: "Patch proposal created locally.".to_string(),
+                validation_status: Some("ready".to_string()),
+                created_at: "2026-03-29T00:00:00Z".to_string(),
+                published_session: Some(PublishedAttemptSession {
+                    prompt: "Read ./evidence.json".to_string(),
+                    response: Some("Patched ./workspace/linux/LinuxProcessTable.c".to_string()),
+                    diff: Some(
+                        "--- a/linux/LinuxProcessTable.c\n+++ b/linux/LinuxProcessTable.c\n@@\n+/* preserve deleted-library state */\n"
+                            .to_string(),
+                    ),
+                    model: Some("gpt-5.4".to_string()),
+                    models_used: vec!["gpt-5.4".to_string()],
+                    rate_limit_fallback_used: false,
+                }),
+                handoff: None,
+                blocker_reason: None,
+                failure_diagnostics: None,
+                failure_context: None,
+            }),
+            best_triage: Some(PublicAttempt {
+                outcome: "triage".to_string(),
+                state: "ready".to_string(),
+                summary: "A diagnosis and external handoff were created locally.".to_string(),
+                validation_status: Some("ready".to_string()),
+                created_at: "2026-03-29T00:10:00Z".to_string(),
+                published_session: None,
+                handoff: Some(PublicTriageHandoff {
+                    reason: "workspace-acquisition".to_string(),
+                    target: "htop".to_string(),
+                    report_url: Some("https://htop.dev/".to_string()),
+                    next_steps: vec!["File an upstream issue.".to_string()],
+                }),
+                blocker_reason: None,
+                failure_diagnostics: None,
+                failure_context: None,
+            }),
+            best_triage_handoff: Some(PublicTriageHandoff {
+                reason: "workspace-acquisition".to_string(),
+                target: "htop".to_string(),
+                report_url: Some("https://htop.dev/".to_string()),
+                next_steps: vec!["File an upstream issue.".to_string()],
+            }),
+            last_seen: "2026-03-29T00:00:00Z".to_string(),
+            technical_snapshot: None,
+            possible_duplicates: Vec::new(),
+            attempt_summary: PublicAttemptSummary::default(),
+            attempts_omitted_count: 0,
+            attempts: Vec::new(),
+            showing_all_attempts: false,
+        };
+
+        let markup = render_issue_detail_page(&issue);
+
+        assert!(markup.contains("Pull-request-ready diff"));
+        assert!(!markup.contains("Successful triage"));
+        assert!(!markup.contains("Likely owner"));
     }
 
     #[test]

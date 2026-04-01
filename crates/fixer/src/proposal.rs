@@ -4095,17 +4095,16 @@ fn pg_amcheck_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_compact_patch_retry_prompt,
-        classify_codex_failure, extract_git_add_paths_from_response,
-        filter_generated_public_diff_blocks, initialize_workspace_git_baseline,
-        is_generated_public_diff_path, load_published_codex_session, parse_review_verdict,
-        pg_amcheck_command, prepare_codex_job_with_prior_patch, primary_model_rate_limit_active,
+        build_compact_patch_retry_prompt, classify_codex_failure,
+        extract_git_add_paths_from_response, filter_generated_public_diff_blocks,
+        initialize_workspace_git_baseline, is_generated_public_diff_path,
+        load_published_codex_session, parse_review_verdict, pg_amcheck_command,
+        prepare_codex_job_with_prior_patch, primary_model_rate_limit_active,
         remember_primary_model_rate_limit, render_external_bug_report,
         render_local_remediation_report, render_local_remediation_sql,
         render_process_investigation_report, render_public_session_git_diff,
         sanitize_command_line_for_report, should_retry_after_compaction_failure,
-        should_use_spark_for_weak_weekly_budget,
-        suggested_report_destination,
+        should_use_spark_for_weak_weekly_budget, suggested_report_destination,
     };
     use crate::config::FixerConfig;
     use crate::models::{

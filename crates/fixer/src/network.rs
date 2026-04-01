@@ -1815,9 +1815,10 @@ fn workspace_blocker_classification(
             .and_then(|value| value.get("apt_origins"))
             .and_then(Value::as_array)
             .is_some_and(|origins| {
-                origins.iter().filter_map(Value::as_str).any(|origin| {
-                    !origin_is_debian_source_friendly(origin)
-                })
+                origins
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|origin| !origin_is_debian_source_friendly(origin))
             })
     {
         if !chrome_can_use_chromium_sources {

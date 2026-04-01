@@ -1,3 +1,10 @@
+fixer (0.59.0-1) unstable; urgency=medium
+
+  * Hide stale triage handoffs on public issue pages once a real public patch
+    exists for the same issue family.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 02 Apr 2026 02:14:30 +0400
+
 fixer (0.58.0-1) unstable; urgency=medium
 
   * Retry Codex patch passes from a fresh shorter prompt when the first run
