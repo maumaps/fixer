@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use fixer::app::App;
+use fixer::app::{is_permission_or_readonly_error, App};
 use fixer::config::FixerConfig;
 use fixer::models::{FindingRecord, LeaseBudgetPreset, ParticipationMode};
 use fixer::proposal;
@@ -355,7 +355,13 @@ fn main() -> Result<()> {
                 OptInMode::Submitter => ParticipationMode::Submitter,
                 OptInMode::SubmitterWorker => ParticipationMode::SubmitterWorker,
             };
-            let snapshot = app.opt_in(mode, richer_evidence)?;
+            let snapshot = app.opt_in(mode, richer_evidence).map_err(|e| {
+                if is_permission_or_readonly_error(&e) {
+                    e.context("(are you superuser? try: sudo fixer opt-in)")
+                } else {
+                    e
+                }
+            })?;
             println!("{}", snapshot.policy_text);
             println!();
             println!("install_id: {}", snapshot.identity.install_id);

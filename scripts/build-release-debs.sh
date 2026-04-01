@@ -3,10 +3,11 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-OUTPUT_DIR=${OUTPUT_DIR:-"$REPO_ROOT/dist/packages"}
+PARENT_DIR=$(CDPATH= cd -- "$REPO_ROOT/.." && pwd)
+# Default to a directory outside the git repo so debs survive git clean / re-clones.
+OUTPUT_DIR=${OUTPUT_DIR:-"$PARENT_DIR/dist/packages"}
 VERSION=$(dpkg-parsechangelog -SVersion)
 ARCH=$(dpkg --print-architecture)
-PARENT_DIR=$(CDPATH= cd -- "$REPO_ROOT/.." && pwd)
 
 mkdir -p "$OUTPUT_DIR/$VERSION/$ARCH"
 

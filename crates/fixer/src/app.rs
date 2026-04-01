@@ -476,7 +476,7 @@ fn should_retry_complaint_in_overlay(error: &anyhow::Error) -> bool {
     is_permission_or_readonly_error(error)
 }
 
-fn is_permission_or_readonly_error(error: &anyhow::Error) -> bool {
+pub fn is_permission_or_readonly_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let text = cause.to_string().to_ascii_lowercase();
         text.contains("readonly database")

@@ -320,9 +320,7 @@ fn source_package_from_opportunity(opportunity: &OpportunityRecord) -> Option<St
 }
 
 fn normalize_patchable_source_package(package_name: &str, source_package: &str) -> String {
-    if package_name.starts_with("linux-image-")
-        && source_package.starts_with("linux-signed")
-    {
+    if package_name.starts_with("linux-image-") && source_package.starts_with("linux-signed") {
         return "linux".to_string();
     }
     source_package.to_string()
@@ -443,10 +441,7 @@ zoom:\n\
             ),
             "linux"
         );
-        assert_eq!(
-            normalize_patchable_source_package("htop", "htop"),
-            "htop"
-        );
+        assert_eq!(normalize_patchable_source_package("htop", "htop"), "htop");
     }
 
     #[test]
@@ -470,6 +465,9 @@ zoom:\n\
             created_at: "2026-03-31T00:00:00Z".to_string(),
             updated_at: "2026-03-31T00:00:00Z".to_string(),
         };
-        assert_eq!(source_package_from_opportunity(&opportunity).as_deref(), Some("linux"));
+        assert_eq!(
+            source_package_from_opportunity(&opportunity).as_deref(),
+            Some("linux")
+        );
     }
 }

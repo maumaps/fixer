@@ -1,7 +1,8 @@
 use crate::config::FixerConfig;
 use crate::models::{
     CodexJobSpec, CodexJobStatus, ComplaintCollectionReport, InstalledPackageMetadata,
-    OpportunityRecord, PatchAttempt, PreparedWorkspace, ProposalRecord, SharedOpportunity,
+    OpportunityRecord, PatchAttempt, PatchDriver, PreparedWorkspace, ProposalRecord,
+    SharedOpportunity,
 };
 use crate::storage::Store;
 use crate::util::{command_exists, command_output, now_rfc3339, read_text};
@@ -10,11 +11,13 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use regex::Regex;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 fn create_bundle_dir(config: &FixerConfig, opportunity_id: i64) -> Result<PathBuf> {
     let proposals_root = config.service.state_dir.join("proposals");
@@ -294,7 +297,8 @@ pub fn load_published_codex_session(bundle_dir: &Path) -> Result<Value> {
     let raw_response = output_path
         .exists()
         .then(|| {
-            read_text(&output_path).with_context(|| format!("failed to read {}", output_path.display()))
+            read_text(&output_path)
+                .with_context(|| format!("failed to read {}", output_path.display()))
         })
         .transpose()?;
     let git_add_paths = raw_response
@@ -764,7 +768,11 @@ pub fn supports_process_investigation_report(opportunity: &OpportunityRecord) ->
             .is_some_and(|subsystem| {
                 matches!(
                     subsystem,
-                    "runaway-process" | "stuck-process" | "oom-kill" | "desktop-resume"
+                    "runaway-process"
+                        | "stuck-process"
+                        | "oom-kill"
+                        | "desktop-resume"
+                        | "network-driver-hang"
                 )
             })
 }
@@ -1012,7 +1020,13 @@ fn initialize_workspace_git_baseline(workspace_root: &Path) -> Result<()> {
             .args(args)
             .current_dir(workspace_root)
             .status()
-            .with_context(|| format!("failed to run git {:?} in {}", args, workspace_root.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to run git {:?} in {}",
+                    args,
+                    workspace_root.display()
+                )
+            })?;
         if status.success() {
             Ok(())
         } else {
@@ -1169,7 +1183,8 @@ fn render_public_session_git_diff(
 }
 
 fn sanitize_git_add_paths(paths: &[String]) -> Vec<String> {
-    paths.iter()
+    paths
+        .iter()
         .filter_map(|path| {
             let trimmed = path.trim().trim_matches('`').trim();
             if trimmed.is_empty() || trimmed.starts_with('/') {
@@ -1177,10 +1192,14 @@ fn sanitize_git_add_paths(paths: &[String]) -> Vec<String> {
             }
             let trimmed = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim();
             let path = Path::new(trimmed);
-            if path
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_)))
-            {
+            if path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            }) {
                 return None;
             }
             Some(trimmed.to_string())
@@ -1471,11 +1490,22 @@ struct CodexModelLimitState {
 }
 
 fn configured_primary_model_label(config: &FixerConfig) -> String {
-    config
+    if let Some(m) = config
         .patch
         .model
-        .clone()
-        .unwrap_or_else(|| "codex-default".to_string())
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return m.to_string();
+    }
+    match config.patch.driver {
+        PatchDriver::Codex => "codex-default",
+        PatchDriver::Claude => "claude-default",
+        PatchDriver::Gemini => "gemini-default",
+        PatchDriver::Aider => "aider-default",
+    }
+    .to_string()
 }
 
 fn configured_spark_model(config: &FixerConfig) -> Option<String> {
@@ -1545,6 +1575,9 @@ fn clear_primary_model_rate_limit(config: &FixerConfig) -> Result<()> {
 }
 
 fn initial_stage_model(config: &FixerConfig) -> Option<String> {
+    if config.patch.driver != PatchDriver::Codex {
+        return config.patch.model.clone();
+    }
     let spark_model = configured_spark_model(config);
     if config.patch.spark_fallback_on_rate_limit
         && spark_model.is_some()
@@ -1557,10 +1590,13 @@ fn initial_stage_model(config: &FixerConfig) -> Option<String> {
 
 fn should_retry_with_spark(
     config: &FixerConfig,
-    failure_kind: &str,
+    should_fallback: bool,
     attempted_model: Option<&str>,
 ) -> Option<String> {
-    if failure_kind != "rate-limit" || !config.patch.spark_fallback_on_rate_limit {
+    if config.patch.driver != PatchDriver::Codex {
+        return None;
+    }
+    if !should_fallback || !config.patch.spark_fallback_on_rate_limit {
         return None;
     }
     let spark_model = configured_spark_model(config)?;
@@ -1594,9 +1630,10 @@ fn run_codex_stage(
     let mut models_used = Vec::new();
     let mut logs = Vec::new();
     let initial_model = initial_stage_model(config);
-    let mut outcome = run_codex_process(
+    let mut outcome = run_driver_process(
         config,
         repo_root,
+        prompt_path,
         output_path,
         prompt,
         initial_model.as_deref(),
@@ -1606,10 +1643,25 @@ fn run_codex_stage(
     }
     logs.push(render_process_attempt_log(&outcome));
     let mut rate_limit_fallback_used = false;
+    // Check proactively whether the primary model's weekly budget is running low,
+    // even if the current run succeeded, so we can fall back to spark before the
+    // hard rate-limit hits next time.
+    let proactive_spark_fallback = should_use_spark_for_weak_weekly_budget(
+        config,
+        &outcome.log,
+        config.patch.spark_weekly_headroom_threshold,
+    );
+
+    if proactive_spark_fallback {
+        let _ = remember_primary_model_rate_limit(config);
+    }
 
     let primary_label = configured_primary_model_label(config);
     if !outcome.success {
         let failure_kind = classify_codex_failure(&outcome.log);
+        let should_retry_with_spark_now =
+            failure_kind == "rate-limit" || proactive_spark_fallback;
+
         if failure_kind == "rate-limit" {
             let attempted_model = outcome.model_used.as_deref();
             if attempted_model.unwrap_or("codex-default") == primary_label {
@@ -1617,10 +1669,10 @@ fn run_codex_stage(
             }
         }
         if let Some(spark_model) =
-            should_retry_with_spark(config, &failure_kind, outcome.model_used.as_deref())
+            should_retry_with_spark(config, should_retry_with_spark_now, outcome.model_used.as_deref())
         {
             let retry_outcome =
-                run_codex_process(config, repo_root, output_path, prompt, Some(&spark_model))?;
+                run_driver_process(config, repo_root, prompt_path, output_path, prompt, Some(&spark_model))?;
             if let Some(model) = retry_outcome.model_used.clone() {
                 models_used.push(model);
             }
@@ -1628,7 +1680,9 @@ fn run_codex_stage(
             outcome = retry_outcome;
             rate_limit_fallback_used = true;
         }
-    } else if outcome.model_used.as_deref() == Some(primary_label.as_str()) {
+    } else if outcome.model_used.as_deref() == Some(primary_label.as_str())
+        && !proactive_spark_fallback
+    {
         let _ = clear_primary_model_rate_limit(config);
     }
     let output = if output_path.exists() {
@@ -1657,7 +1711,7 @@ fn run_codex_stage(
 fn render_process_attempt_log(outcome: &CodexProcessOutcome) -> String {
     format!(
         "model: {}\n\n{}",
-        outcome.model_used.as_deref().unwrap_or("codex-default"),
+        outcome.model_used.as_deref().unwrap_or("unknown"),
         outcome.log
     )
 }
@@ -1790,16 +1844,199 @@ fn run_codex_process(
     })
 }
 
+fn run_driver_process(
+    config: &FixerConfig,
+    repo_root: &Path,
+    prompt_path: &Path,
+    output_path: &Path,
+    prompt: &str,
+    model: Option<&str>,
+) -> Result<CodexProcessOutcome> {
+    match config.patch.driver {
+        PatchDriver::Codex => run_codex_process(config, repo_root, output_path, prompt, model),
+        PatchDriver::Claude => run_claude_process(config, repo_root, output_path, prompt, model),
+        PatchDriver::Gemini => run_gemini_process(config, repo_root, output_path, prompt, model),
+        PatchDriver::Aider => {
+            run_aider_process(config, repo_root, prompt_path, output_path, model)
+        }
+    }
+}
+
+fn run_claude_process(
+    config: &FixerConfig,
+    repo_root: &Path,
+    output_path: &Path,
+    prompt: &str,
+    model: Option<&str>,
+) -> Result<CodexProcessOutcome> {
+    if !command_exists(&config.patch.claude_command) {
+        return Err(anyhow!(
+            "Claude CLI `{}` was not found in PATH",
+            config.patch.claude_command
+        ));
+    }
+    let model_used = model
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "claude-default".to_string());
+    let mut cmd = Command::new(&config.patch.claude_command);
+    for arg in &config.patch.claude_args {
+        cmd.arg(arg);
+    }
+    if let Some(m) = model {
+        cmd.arg("--model").arg(m);
+    }
+    // --dangerously-skip-permissions is safe here: repo_root is an isolated
+    // temporary workspace prepared by create_proposal_with_prior_patch, not the
+    // user's live tree.
+    cmd.arg("--dangerously-skip-permissions")
+        .arg("--output-format")
+        .arg("text")
+        .arg("-p")
+        .arg("-")
+        .current_dir(repo_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to launch {}", config.patch.claude_command))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(prompt.as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let log = format!(
+        "{}{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.status.success() {
+        fs::write(output_path, stdout.as_bytes())?;
+    }
+    Ok(CodexProcessOutcome {
+        success: output.status.success(),
+        log,
+        model_used: Some(model_used),
+    })
+}
+
+fn run_gemini_process(
+    config: &FixerConfig,
+    repo_root: &Path,
+    output_path: &Path,
+    prompt: &str,
+    model: Option<&str>,
+) -> Result<CodexProcessOutcome> {
+    if !command_exists(&config.patch.gemini_command) {
+        return Err(anyhow!(
+            "Gemini CLI `{}` was not found in PATH",
+            config.patch.gemini_command
+        ));
+    }
+    let model_used = model
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "gemini-default".to_string());
+    let mut cmd = Command::new(&config.patch.gemini_command);
+    for arg in &config.patch.gemini_args {
+        cmd.arg(arg);
+    }
+    if let Some(m) = model {
+        cmd.arg("-m").arg(m);
+    }
+    cmd.arg("-p")
+        .arg("-")
+        .current_dir(repo_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to launch {}", config.patch.gemini_command))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(prompt.as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let log = format!(
+        "{}{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.status.success() {
+        fs::write(output_path, stdout.as_bytes())?;
+    }
+    Ok(CodexProcessOutcome {
+        success: output.status.success(),
+        log,
+        model_used: Some(model_used),
+    })
+}
+
+fn run_aider_process(
+    config: &FixerConfig,
+    repo_root: &Path,
+    prompt_path: &Path,
+    output_path: &Path,
+    model: Option<&str>,
+) -> Result<CodexProcessOutcome> {
+    if !command_exists(&config.patch.aider_command) {
+        return Err(anyhow!(
+            "aider `{}` was not found in PATH",
+            config.patch.aider_command
+        ));
+    }
+    let model_name = model.unwrap_or("llama3");
+    let model_used = format!("ollama/{}", model_name);
+    let mut cmd = Command::new(&config.patch.aider_command);
+    cmd.env("OLLAMA_API_BASE", &config.patch.ollama_base_url);
+    cmd.arg("--model").arg(&model_used);
+    cmd.arg("--yes")
+        .arg("--no-pretty")
+        .arg("--no-check-update")
+        .arg("--no-show-model-warnings")
+        .arg("--message-file")
+        .arg(prompt_path);
+    for arg in &config.patch.aider_args {
+        cmd.arg(arg);
+    }
+    cmd.current_dir(repo_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("failed to launch {}", config.patch.aider_command))?;
+    let output = child.wait_with_output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let log = format!(
+        "{}{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.status.success() {
+        fs::write(output_path, stdout.as_bytes())?;
+    }
+    Ok(CodexProcessOutcome {
+        success: output.status.success(),
+        log,
+        model_used: Some(model_used),
+    })
+}
+
 fn classify_codex_failure(log: &str) -> String {
     let lower = log.to_ascii_lowercase();
     if lower.contains("401 unauthorized") || lower.contains("missing bearer") {
         "auth".to_string()
-    } else if lower.contains("rate limit")
-        || lower.contains("rate-limit")
+    } else if lower.contains("rate-limit")
+        || lower.contains("rate limit")
+        || lower.contains("ratelimit")
+        || lower.contains("rate_limit")
+        || lower.contains("rate limit exceeded")
         || lower.contains("too many requests")
         || lower.contains("429")
         || lower.contains("quota")
         || lower.contains("usage limit")
+        || lower.contains("x-ratelimit")
+        || lower.contains("insufficient quota")
     {
         "rate-limit".to_string()
     } else if lower.contains("500 internal server error")
@@ -1809,6 +2046,258 @@ fn classify_codex_failure(log: &str) -> String {
     } else {
         "execution".to_string()
     }
+}
+
+fn should_use_spark_for_weak_weekly_budget(
+    config: &FixerConfig,
+    log: &str,
+    fallback_threshold_percent: f64,
+) -> bool {
+    if !config.patch.spark_fallback_on_rate_limit {
+        return false;
+    }
+    if log.trim().is_empty() {
+        return false;
+    }
+    if fallback_threshold_percent <= 0.0 {
+        return false;
+    }
+    if fallback_threshold_percent >= 100.0 {
+        return true;
+    }
+
+    if parse_codex_status_weekly_limit_threshold(log, fallback_threshold_percent) {
+        return true;
+    }
+
+    static WEEKLY_KEYWORD_RE: OnceLock<Regex> = OnceLock::new();
+    static PERCENT_RE: OnceLock<Regex> = OnceLock::new();
+    static REMAINING_TO_LIMIT_RE: OnceLock<Regex> = OnceLock::new();
+
+    let weekly_keyword_re = WEEKLY_KEYWORD_RE
+        .get_or_init(|| Regex::new(r"(?i)(week|weekly|per\s+week|7\s*day|7-day|7d)").unwrap());
+    let percent_re =
+        PERCENT_RE.get_or_init(|| Regex::new(r"(?i)(\d+(?:\.\d+)?)\s*%").unwrap());
+    let remaining_to_limit_re = REMAINING_TO_LIMIT_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:remaining|left)\s*[:=]?\s*(\d+(?:\.\d+)?)(?:\s*(?:/|of)\s*)(\d+(?:\.\d+)?)",
+        )
+        .unwrap()
+    });
+
+    let lower = log.to_ascii_lowercase();
+    for line in lower.lines() {
+        if !weekly_keyword_re.is_match(line) {
+            continue;
+        }
+
+        if let Some(capture) = percent_re.captures(line) {
+            if let Some(value_raw) = capture.get(1).and_then(|v| v.as_str().parse::<f64>().ok()) {
+                if value_raw <= fallback_threshold_percent {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(capture) = remaining_to_limit_re.captures(line) {
+            let remaining = capture.get(1).and_then(|v| v.as_str().parse::<f64>().ok());
+            let limit = capture.get(2).and_then(|v| v.as_str().parse::<f64>().ok());
+            if let (Some(remaining), Some(limit)) = (remaining, limit) {
+                if limit > 0.0 && (remaining / limit) * 100.0 <= fallback_threshold_percent {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn parse_codex_status_weekly_limit_threshold(
+    log: &str,
+    fallback_threshold_percent: f64,
+) -> bool {
+    if fallback_threshold_percent <= 0.0 {
+        return false;
+    }
+    for value in extract_json_objects(log) {
+        if codex_json_has_weekly_headroom_below_threshold(&value, fallback_threshold_percent, false) {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_json_objects(log: &str) -> Vec<Value> {
+    let mut objects = Vec::new();
+    let mut depth = 0usize;
+    let mut start = None;
+    for (index, ch) in log.char_indices() {
+        if ch == '{' {
+            if depth == 0 {
+                start = Some(index);
+            }
+            depth += 1;
+        } else if ch == '}' {
+            if depth > 0 {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start_index) = start {
+                        let raw = &log[start_index..=index];
+                        if let Ok(value) = serde_json::from_str::<Value>(raw) {
+                            objects.push(value);
+                        }
+                    }
+                    start = None;
+                }
+            }
+        }
+    }
+    objects
+}
+
+fn codex_json_has_weekly_headroom_below_threshold(
+    value: &Value,
+    threshold_percent: f64,
+    in_weekly_context: bool,
+) -> bool {
+    match value {
+        Value::Object(map) => {
+            let mut remaining = None;
+            let mut limit = None;
+            let mut weekly_context = in_weekly_context;
+            let mut remaining_percent = None;
+            for (key, nested) in map {
+                let key_lower = key.to_ascii_lowercase();
+                let is_weekly_key = is_weekly_context_key(&key_lower);
+                if is_weekly_key {
+                    weekly_context = true;
+                }
+                if let Value::String(raw) = nested {
+                    if is_weekly_context_hint_key(&key_lower) && is_weekly_duration_hint(raw) {
+                        weekly_context = true;
+                    }
+                    if is_weekly_period_hint_field(key_lower.as_str(), raw) {
+                        weekly_context = true;
+                    }
+                }
+                if is_remaining_key(&key_lower) {
+                    remaining = parse_f64_from_value(nested);
+                    continue;
+                }
+                if is_limit_key(&key_lower) {
+                    limit = parse_f64_from_value(nested);
+                    continue;
+                }
+                if is_remaining_percent_key(&key_lower) {
+                    remaining_percent = parse_f64_from_value(nested);
+                    continue;
+                }
+                if key_lower.contains("percent") {
+                    if key_lower.contains("remaining") && remaining_percent.is_none() {
+                        remaining_percent = parse_f64_from_value(nested);
+                    }
+                }
+            }
+            if weekly_context {
+                if let Some(raw_percent) = remaining_percent {
+                    if raw_percent >= 0.0 && raw_percent <= threshold_percent {
+                        return true;
+                    }
+                }
+                if let (Some(remaining), Some(limit)) = (remaining, limit) {
+                    if limit > 0.0 {
+                        let remaining_percent = (remaining / limit) * 100.0;
+                        if remaining_percent <= threshold_percent {
+                            return true;
+                        }
+                    }
+                }
+            }
+            // Second pass: recurse into child objects with the weekly_context flag
+            // that may have been set during the first pass above.
+            for (key, nested) in map {
+                let key_lower = key.to_ascii_lowercase();
+                let child_weekly_context = weekly_context || is_weekly_context_key(&key_lower);
+                if codex_json_has_weekly_headroom_below_threshold(
+                    nested,
+                    threshold_percent,
+                    child_weekly_context,
+                ) {
+                    return true;
+                }
+            }
+            false
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|value| codex_json_has_weekly_headroom_below_threshold(value, threshold_percent, in_weekly_context)),
+        _ => false,
+    }
+}
+
+fn is_weekly_context_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("week") || key == "7d" || key == "weekly" || key == "per_week"
+}
+
+fn is_weekly_context_hint_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("period") || key.contains("window") || key.contains("interval") || key == "duration"
+}
+
+fn is_weekly_period_hint_field(key: &str, raw: &str) -> bool {
+    if !key.contains("period") && !key.contains("duration") && !key.contains("window") {
+        return false;
+    }
+    is_weekly_duration_hint(raw)
+}
+
+fn parse_f64_from_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(raw) => parse_f64_string(raw),
+        _ => None,
+    }
+}
+
+fn parse_f64_string(raw: &str) -> Option<f64> {
+    raw.trim()
+        .trim_end_matches('%')
+        .replace(',', "")
+        .trim()
+        .parse::<f64>()
+        .ok()
+}
+
+fn is_remaining_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "remaining" || key == "remaining_requests" || key == "remaining_tokens"
+}
+
+fn is_remaining_percent_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "remaining_percent"
+        || key == "remaining_ratio"
+        || key == "remaining_pct"
+        || key == "remaining_percentage"
+        || key == "remaining_ratio_percentage"
+}
+
+fn is_limit_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "limit" || key == "limit_requests" || key == "limit_tokens"
+}
+
+fn is_weekly_duration_hint(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.contains("week")
+        || value.contains("weekly")
+        || value.contains("7d")
+        || value.contains("7 day")
+        || value.contains("7 days")
+        || value.contains("7-day")
+        || value.contains("7_days")
 }
 
 fn summarize_failure_log(log: &str) -> String {
@@ -2341,6 +2830,7 @@ fn render_process_investigation_report(
     let is_stuck_process = subsystem == "stuck-process";
     let is_oom_kill = subsystem == "oom-kill";
     let is_desktop_resume = subsystem == "desktop-resume";
+    let is_network_driver_hang = subsystem == "network-driver-hang";
     let classification = details
         .get("loop_classification")
         .and_then(Value::as_str)
@@ -2350,6 +2840,8 @@ fn render_process_investigation_report(
             "resume-display-failure"
         } else if is_oom_kill {
             "kernel-oom-kill"
+        } else if is_network_driver_hang {
+            "network-driver-hang"
         } else {
             "unknown-userspace-loop"
         });
@@ -2366,6 +2858,8 @@ fn render_process_investigation_report(
             "Fixer correlated suspend/resume timing with graphics stack errors, desktop-process crashes, and display-manager restart attempts."
         } else if is_oom_kill {
             "Fixer collected kernel log evidence showing that the OOM killer selected and terminated this process."
+        } else if is_network_driver_hang {
+            "Fixer detected kernel-reported network adapter hardware failures and collected driver, firmware, and module parameter context."
         } else {
             "Fixer collected a CPU-hot process sample but could not derive a stronger hypothesis yet."
         });
@@ -2456,6 +2950,8 @@ fn render_process_investigation_report(
         body.push_str("# Desktop Resume Failure Investigation Report\n\n");
     } else if is_oom_kill {
         body.push_str("# OOM Kill Investigation Report\n\n");
+    } else if is_network_driver_hang {
+        body.push_str("# Network Driver Hang Investigation Report\n\n");
     } else {
         body.push_str("# Runaway CPU Investigation Report\n\n");
     }
@@ -2475,6 +2971,10 @@ fn render_process_investigation_report(
                 body.push_str("Fixer diagnosed a suspend/resume display-stack failure, but it could not automatically acquire a patchable graphics or desktop source workspace on this host.\n\n");
                 body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
                 body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
+            } else if blocker_kind == "workspace" && is_network_driver_hang {
+                body.push_str("Fixer diagnosed a network driver hardware hang, but it could not automatically acquire a patchable kernel source workspace on this host.\n\n");
+                body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
+                body.push_str("Use the diagnosis below to file an upstream or distro kernel bug, or apply a known module-parameter workaround if one is listed.\n\n");
             } else if blocker_kind == "workspace" && is_oom_kill {
                 body.push_str("Fixer diagnosed a kernel OOM kill, but it could not automatically acquire a patchable source workspace on this host.\n\n");
                 body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
@@ -2496,6 +2996,8 @@ fn render_process_investigation_report(
                 body.push_str("Fixer gathered enough evidence to describe the suspend/resume failure. Review the diagnosis below, then decide whether this looks like a graphics-driver, X11, compositor, or display-manager regression.\n\n");
             } else if is_oom_kill {
                 body.push_str("Fixer gathered enough evidence to describe the OOM kill. Review the diagnosis below, then decide whether this points at application memory growth, an unusually heavy workload, or broader system memory pressure.\n\n");
+            } else if is_network_driver_hang {
+                body.push_str("Fixer gathered enough evidence to describe the network driver hang. Review the driver and hardware details below, then decide whether to apply a module-parameter workaround, file an upstream or Debian kernel bug, or attempt a kernel source patch.\n\n");
             } else {
                 body.push_str("Fixer gathered enough evidence to describe the loop. Review the diagnosis below, then run `fixer propose-fix <id> --engine codex` against a prepared source tree if you want an automated patch attempt.\n\n");
             }
@@ -2580,10 +3082,29 @@ fn render_process_investigation_report(
     } else {
         if is_desktop_resume {
             body.push_str("\n## Why Fixer Believes Resume Broke The Desktop\n\n");
+        } else if is_network_driver_hang {
+            body.push_str("\n## Why Fixer Believes This Is A Hardware Hang\n\n");
         } else {
             body.push_str("\n## Why Fixer Believes It Is Stuck\n\n");
         }
-        if is_desktop_resume {
+        if is_network_driver_hang {
+            if let Some(driver) = details.get("driver").and_then(Value::as_str) {
+                body.push_str(&format!("- Network driver: `{driver}`\n"));
+            }
+            if let Some(iface) = details.get("interface").and_then(Value::as_str) {
+                body.push_str(&format!("- Interface: `{iface}`\n"));
+            }
+            if let Some(pci) = details.get("pci_address").and_then(Value::as_str) {
+                body.push_str(&format!("- PCI address: `{pci}`\n"));
+            }
+            body.push_str(&format!(
+                "- Hang type: `{}`\n- Classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
+                details.get("hang_type").and_then(Value::as_str).unwrap_or("unknown"),
+                classification,
+                confidence,
+                explanation
+            ));
+        } else if is_desktop_resume {
             body.push_str(&format!(
                 "- Affected desktop target: `{}`\n- Failure classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
                 target_name, classification, confidence, explanation
@@ -2685,6 +3206,101 @@ fn render_process_investigation_report(
                 for line in lines {
                     body.push_str(&format!("- `{line}`\n"));
                 }
+            }
+        }
+    }
+    if is_network_driver_hang {
+        if let Some(hang_lines) = details.get("hang_lines").and_then(Value::as_array) {
+            let lines = hang_lines
+                .iter()
+                .filter_map(Value::as_str)
+                .take(8)
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                body.push_str("\n## Kernel Hardware Hang Log Lines\n\n");
+                body.push_str("```text\n");
+                for line in lines {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+                body.push_str("```\n");
+            }
+        }
+        if let Some(reg_dump) = details.get("register_dump").and_then(Value::as_array) {
+            let lines = reg_dump
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                body.push_str("\n## Hardware Register State At Hang\n\n");
+                body.push_str("```text\n");
+                for line in lines {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+                body.push_str("```\n");
+            }
+        }
+        if let Some(link_events) = details.get("link_events").and_then(Value::as_array) {
+            let lines = link_events
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                body.push_str("\n## Link State Events\n\n");
+                body.push_str("```text\n");
+                for line in lines {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+                body.push_str("```\n");
+            }
+        }
+        if let Some(pci_info) = details.get("pci_device_info").and_then(Value::as_str) {
+            body.push_str("\n## PCI Device Identity\n\n");
+            body.push_str("```text\n");
+            body.push_str(pci_info);
+            body.push_str("\n```\n");
+        }
+        if let Some(ethtool_info) = details.get("ethtool_driver_info").and_then(Value::as_str) {
+            body.push_str("\n## Driver And Firmware Version\n\n");
+            body.push_str("```text\n");
+            body.push_str(ethtool_info);
+            body.push_str("\n```\n");
+        }
+        if let Some(stats) = details.get("ethtool_stats").and_then(Value::as_str) {
+            body.push_str("\n## Interface Statistics\n\n");
+            body.push_str("```text\n");
+            body.push_str(stats);
+            body.push_str("\n```\n");
+        }
+        let module_params = details.get("module_params");
+        if let Some(params) = module_params.and_then(Value::as_object) {
+            if !params.is_empty() {
+                body.push_str("\n## Active Module Parameters\n\n");
+                for (k, v) in params {
+                    body.push_str(&format!(
+                        "- `{k}` = `{}`\n",
+                        v.as_str().unwrap_or_default()
+                    ));
+                }
+            }
+        }
+        if let Some(eee_enabled) = details.get("eee_enabled").and_then(Value::as_bool) {
+            body.push_str("\n## Known Workarounds\n\n");
+            if eee_enabled {
+                let iface = details
+                    .get("interface")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<iface>");
+                let driver = details
+                    .get("driver")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<driver>");
+                body.push_str("Energy-Efficient Ethernet (EEE) is **enabled** on this interface. Disabling EEE is a known workaround for hardware unit hangs in some Intel adapters:\n\n");
+                body.push_str(&format!("```bash\n# Disable EEE temporarily\nethtool --set-eee {iface} eee off\n\n# To persist across reboots, add to /etc/modprobe.d/{driver}.conf:\n# options {driver} EEE=0\n```\n"));
+            } else {
+                body.push_str("EEE is already disabled on this interface — this common workaround is already applied.\n");
             }
         }
     }
@@ -3255,13 +3871,13 @@ fn pg_amcheck_command(
 mod tests {
     use super::{
         classify_codex_failure, extract_git_add_paths_from_response,
-        filter_generated_public_diff_blocks, is_generated_public_diff_path,
-        load_published_codex_session, parse_review_verdict, render_public_session_git_diff,
+        filter_generated_public_diff_blocks, initialize_workspace_git_baseline,
+        is_generated_public_diff_path, load_published_codex_session, parse_review_verdict,
         pg_amcheck_command, prepare_codex_job_with_prior_patch, primary_model_rate_limit_active,
         remember_primary_model_rate_limit, render_external_bug_report,
-        initialize_workspace_git_baseline,
         render_local_remediation_report, render_local_remediation_sql,
-        render_process_investigation_report, sanitize_command_line_for_report,
+        render_process_investigation_report, render_public_session_git_diff,
+        sanitize_command_line_for_report, should_use_spark_for_weak_weekly_budget,
         suggested_report_destination,
     };
     use crate::config::FixerConfig;
@@ -4029,7 +4645,9 @@ RESULT: ok
         .unwrap();
         std::fs::write(workspace.join(".deps/Action.Po"), "generated\n").unwrap();
 
-        let diff = render_public_session_git_diff(&workspace, &[]).unwrap().unwrap();
+        let diff = render_public_session_git_diff(&workspace, &[])
+            .unwrap()
+            .unwrap();
 
         assert!(diff.contains("linux/LinuxProcessTable.c"));
         assert!(!diff.contains(".deps/Action.Po"));
@@ -4045,8 +4663,9 @@ RESULT: ok
         std::fs::write(workspace.join("src/new.c"), "new file\n").unwrap();
         std::fs::write(workspace.join(".deps-temp"), "generated\n").unwrap();
 
-        let diff =
-            render_public_session_git_diff(&workspace, &["src/new.c".to_string()]).unwrap().unwrap();
+        let diff = render_public_session_git_diff(&workspace, &["src/new.c".to_string()])
+            .unwrap()
+            .unwrap();
 
         assert!(diff.contains("src/new.c"));
         assert!(!diff.contains(".deps-temp"));
@@ -4062,6 +4681,84 @@ RESULT: ok
             classify_codex_failure("usage limit reached for this model"),
             "rate-limit"
         );
+        assert_eq!(
+            classify_codex_failure("Request failed with error code rate_limit_exceeded"),
+            "rate-limit"
+        );
+        assert_eq!(
+            classify_codex_failure("OpenAI usage blocked by x-ratelimit-limit"),
+            "rate-limit"
+        );
+    }
+
+    #[test]
+    fn detects_weekly_rate_limit_headroom_threshold() {
+        let config = FixerConfig::default();
+        assert!(should_use_spark_for_weak_weekly_budget(
+            &config,
+            "weekly remaining 15%",
+            20.0
+        ));
+        assert!(!should_use_spark_for_weak_weekly_budget(
+            &config,
+            "weekly remaining: 35%",
+            20.0
+        ));
+        assert!(should_use_spark_for_weak_weekly_budget(
+            &config,
+            "per week usage: remaining 18/100",
+            20.0
+        ));
+        assert!(!should_use_spark_for_weak_weekly_budget(
+            &config,
+            "per week usage: remaining 80/100",
+            20.0
+        ));
+    }
+
+    #[test]
+    fn detects_weekly_rate_limit_headroom_from_status_json_payload() {
+        let config = FixerConfig::default();
+        let low_weekly_status = r#"{
+            "status": {
+                "requests": {
+                    "remaining": 15,
+                    "limit": 100,
+                    "duration": "7d"
+                }
+            }
+        }"#;
+        assert!(should_use_spark_for_weak_weekly_budget(
+            &config,
+            low_weekly_status,
+            20.0
+        ));
+
+        let low_weekly_percent_status = r#"{
+            "models": [
+                { "name": "gpt-5.4", "remaining_percent": 12, "window": "weekly" }
+            ]
+        }"#;
+        assert!(should_use_spark_for_weak_weekly_budget(
+            &config,
+            low_weekly_percent_status,
+            20.0
+        ));
+
+        let safe_weekly_status = r#"{
+            "status": {
+                "requests": {
+                    "remaining": 80,
+                    "limit": 100,
+                    "period": "daily"
+                }
+            }
+        }"#;
+        assert!(!should_use_spark_for_weak_weekly_budget(
+            &config,
+            safe_weekly_status,
+            20.0
+        ));
     }
 
     #[test]

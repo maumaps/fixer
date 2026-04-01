@@ -32,6 +32,7 @@ const COREDUMP_FETCH_MULTIPLIER: usize = 8;
 const RUNAWAY_INVESTIGATION_SUBSYSTEM: &str = "runaway-process";
 const STUCK_PROCESS_INVESTIGATION_SUBSYSTEM: &str = "stuck-process";
 const DESKTOP_RESUME_INVESTIGATION_SUBSYSTEM: &str = "desktop-resume";
+const NETWORK_DRIVER_HANG_INVESTIGATION_SUBSYSTEM: &str = "network-driver-hang";
 const RUNAWAY_STRACE_EXCERPT_LIMIT: usize = 24;
 const RUNAWAY_TOP_SYSCALL_LIMIT: usize = 6;
 const RUNAWAY_SEQUENCE_WINDOW: usize = 3;
@@ -65,6 +66,7 @@ pub fn collect_once(config: &FixerConfig, store: &Store) -> Result<CollectReport
         report.findings_seen += collect_warning_logs(config, store)?;
         report.findings_seen += collect_kernel_oom_kill_investigations(config, store)?;
         report.findings_seen += collect_desktop_resume_investigations(config, store)?;
+        report.findings_seen += collect_network_driver_hang_investigations(config, store)?;
         report.findings_seen += collect_kernel_warnings(config, store)?;
         report.findings_seen += collect_postgres_collation_mismatches(store)?;
     }
@@ -214,6 +216,42 @@ struct DesktopResumeFailureEvent {
     suspend_line: Option<String>,
     resume_line: String,
     display_restart_line: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetworkDriverHangEvent {
+    driver: String,
+    interface: String,
+    pci_address: Option<String>,
+    hang_type: String,
+    hang_lines: Vec<String>,
+    register_dump: Vec<String>,
+    link_events: Vec<String>,
+    ethtool_driver_info: Option<String>,
+    ethtool_stats: Option<String>,
+    eee_enabled: Option<bool>,
+    pci_device_info: Option<String>,
+    module_params: BTreeMap<String, String>,
+}
+
+impl NetworkDriverHangEvent {
+    fn public_summary(&self) -> String {
+        let loc = self.pci_address.as_deref().unwrap_or("unknown PCI");
+        match self.hang_type.as_str() {
+            "hardware-unit-hang" => format!(
+                "{} ({}) detected a hardware unit hang on {}, requiring adapter reset.",
+                self.driver, loc, self.interface
+            ),
+            _ => format!(
+                "{} ({}) transmit queue timed out on {}.",
+                self.driver, loc, self.interface
+            ),
+        }
+    }
+
+    fn package_name(&self) -> Option<String> {
+        Some(current_kernel_image_package_name())
+    }
 }
 
 fn collect_stuck_process_investigations(config: &FixerConfig, store: &Store) -> Result<usize> {
@@ -622,30 +660,37 @@ fn collect_crashes(config: &FixerConfig, store: &Store) -> Result<usize> {
         } else {
             format!("Top frame: {top_frame}")
         };
+        let mut details = json!({
+            "coredumpctl_event": event,
+            "process_name": parsed.process_name,
+            "pid": parsed.pid,
+            "signal_number": parsed.signal_number,
+            "signal_name": parsed.signal_name,
+            "timestamp": parsed.timestamp,
+            "command_line": parsed.command_line,
+            "executable": parsed.executable,
+            "storage": parsed.storage,
+            "stack_threads": parsed.stack_threads,
+            "stack_thread_count": parsed.stack_thread_count,
+            "total_stack_frame_count": parsed.total_stack_frame_count,
+            "useful_stack_frame_count": parsed.useful_stack_frame_count,
+            "primary_stack": parsed.primary_stack,
+            "symbolization": symbolization,
+            "raw_info_excerpt": info.lines().take(80).collect::<Vec<_>>().join("\n"),
+        });
+        if let Some(pkg) = artifact.as_ref().and_then(|a| a.package_name.as_deref()) {
+            if let Some(version) = installed_version_for_package(pkg) {
+                details["installed_package_version"] = json!(version);
+            }
+        }
+        add_env_context(&mut details);
         let finding = FindingInput {
             kind: "crash".to_string(),
             title,
             severity: "high".to_string(),
             fingerprint,
             summary,
-            details: json!({
-                "coredumpctl_event": event,
-                "process_name": parsed.process_name,
-                "pid": parsed.pid,
-                "signal_number": parsed.signal_number,
-                "signal_name": parsed.signal_name,
-                "timestamp": parsed.timestamp,
-                "command_line": parsed.command_line,
-                "executable": parsed.executable,
-                "storage": parsed.storage,
-                "stack_threads": parsed.stack_threads,
-                "stack_thread_count": parsed.stack_thread_count,
-                "total_stack_frame_count": parsed.total_stack_frame_count,
-                "useful_stack_frame_count": parsed.useful_stack_frame_count,
-                "primary_stack": parsed.primary_stack,
-                "symbolization": symbolization,
-                "raw_info_excerpt": info.lines().take(80).collect::<Vec<_>>().join("\n"),
-            }),
+            details,
             artifact,
             repo_root: None,
             ecosystem: None,
@@ -875,13 +920,15 @@ fn collect_kernel_warnings(config: &FixerConfig, store: &Store) -> Result<usize>
             details.insert("kernel_module".to_string(), json!(artifact.name));
             details.insert("kernel_module_path".to_string(), json!(artifact.path));
         }
+        let mut details = Value::Object(details);
+        add_env_context(&mut details);
         let finding = FindingInput {
             kind: "warning".to_string(),
             title: "Kernel warning".to_string(),
             severity: "medium".to_string(),
             fingerprint: hash_text(format!("kernel-warning:{line}")),
             summary: line.clone(),
-            details: Value::Object(details),
+            details,
             artifact,
             repo_root: None,
             ecosystem: None,
@@ -915,6 +962,36 @@ fn collect_kernel_oom_kill_investigations(config: &FixerConfig, store: &Store) -
         let package_name = event.package_name();
         let cgroup_target = event.cgroup_target.clone();
         let likely_external_root_cause = package_name.is_none();
+        let mut oom_details = json!({
+            "subsystem": "oom-kill",
+            "profile_target": {
+                "name": event.process_name.clone(),
+            },
+            "loop_classification": "kernel-oom-kill",
+            "loop_confidence": 1.0,
+            "loop_explanation": format!(
+                "The kernel OOM killer explicitly selected {} (pid {}) and logged its memory footprint at the kill site.",
+                event.process_name, event.pid
+            ),
+            "pid": event.pid,
+            "uid": event.uid,
+            "total_vm_kb": event.total_vm_kb,
+            "anon_rss_kb": event.anon_rss_kb,
+            "file_rss_kb": event.file_rss_kb,
+            "shmem_rss_kb": event.shmem_rss_kb,
+            "oom_score_adj": event.oom_score_adj,
+            "constraint": event.constraint.clone(),
+            "cpuset": event.cpuset.clone(),
+            "task_memcg": event.task_memcg.clone(),
+            "task_memcg_target": cgroup_target.clone(),
+            "invoker": event.invoker.clone(),
+            "killed_line": event.killed_line.clone(),
+            "oom_kill_line": event.oom_kill_line.clone(),
+            "invoker_line": event.invoker_line.clone(),
+            "package_name": package_name.clone(),
+            "likely_external_root_cause": likely_external_root_cause,
+        });
+        add_env_context(&mut oom_details);
         let finding = FindingInput {
             kind: "investigation".to_string(),
             title: format!("OOM kill investigation for {}", event.process_name),
@@ -927,35 +1004,7 @@ fn collect_kernel_oom_kill_investigations(config: &FixerConfig, store: &Store) -
                 event.constraint.as_deref().unwrap_or("-"),
             )),
             summary: event.public_summary(),
-            details: json!({
-                "subsystem": "oom-kill",
-                "profile_target": {
-                    "name": event.process_name.clone(),
-                },
-                "loop_classification": "kernel-oom-kill",
-                "loop_confidence": 1.0,
-                "loop_explanation": format!(
-                    "The kernel OOM killer explicitly selected {} (pid {}) and logged its memory footprint at the kill site.",
-                    event.process_name, event.pid
-                ),
-                "pid": event.pid,
-                "uid": event.uid,
-                "total_vm_kb": event.total_vm_kb,
-                "anon_rss_kb": event.anon_rss_kb,
-                "file_rss_kb": event.file_rss_kb,
-                "shmem_rss_kb": event.shmem_rss_kb,
-                "oom_score_adj": event.oom_score_adj,
-                "constraint": event.constraint.clone(),
-                "cpuset": event.cpuset.clone(),
-                "task_memcg": event.task_memcg.clone(),
-                "task_memcg_target": cgroup_target.clone(),
-                "invoker": event.invoker.clone(),
-                "killed_line": event.killed_line.clone(),
-                "oom_kill_line": event.oom_kill_line.clone(),
-                "invoker_line": event.invoker_line.clone(),
-                "package_name": package_name.clone(),
-                "likely_external_root_cause": likely_external_root_cause,
-            }),
+            details: oom_details,
             artifact: Some(ObservedArtifact {
                 kind: "binary".to_string(),
                 name: event.process_name.clone(),
@@ -1069,6 +1118,303 @@ fn collect_desktop_resume_investigations(config: &FixerConfig, store: &Store) ->
     };
     let _ = store.record_finding(&finding)?;
     Ok(1)
+}
+
+fn collect_network_driver_hang_investigations(
+    config: &FixerConfig,
+    store: &Store,
+) -> Result<usize> {
+    if !store.capability_available("journalctl")? {
+        return Ok(0);
+    }
+    // Use a broad kernel log (no grep filter) so parse_network_driver_hang_events
+    // can also capture the multi-line register dumps that follow hang detection lines.
+    let journal_lines = config.service.journal_lines.saturating_mul(4).to_string();
+    let output = command_output(
+        "journalctl",
+        &["-k", "-b", "-n", journal_lines.as_str(), "--no-pager"],
+    )
+    .unwrap_or_default();
+    if output.trim().is_empty() {
+        return Ok(0);
+    }
+    let events = parse_network_driver_hang_events(&output);
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let ethtool_available = store.capability_available("ethtool").unwrap_or(false);
+    let mut count = 0;
+    for mut event in events {
+        if ethtool_available {
+            event.ethtool_driver_info = ethtool_driver_info_for_iface(&event.interface);
+            event.ethtool_stats = ethtool_interface_stats(&event.interface);
+            event.eee_enabled = ethtool_eee_enabled(&event.interface);
+        }
+        event.module_params = sysfs_module_params(&event.driver);
+        if let Some(pci) = &event.pci_address {
+            event.pci_device_info = pci_device_sysfs_info(pci);
+        }
+        let package_name = event.package_name();
+        let finding = FindingInput {
+            kind: "investigation".to_string(),
+            title: format!(
+                "Network driver hang investigation for {}",
+                event.interface
+            ),
+            severity: "high".to_string(),
+            fingerprint: hash_text(format!(
+                "network-driver-hang:{}:{}:{}",
+                event.driver, event.interface, event.hang_type,
+            )),
+            summary: event.public_summary(),
+            details: json!({
+                "subsystem": NETWORK_DRIVER_HANG_INVESTIGATION_SUBSYSTEM,
+                "profile_target": {
+                    "name": event.interface,
+                },
+                "loop_classification": "network-driver-hang",
+                "loop_confidence": 0.95,
+                "loop_explanation": event.public_summary(),
+                "driver": event.driver,
+                "interface": event.interface,
+                "pci_address": event.pci_address,
+                "hang_type": event.hang_type,
+                "hang_lines": event.hang_lines,
+                "register_dump": event.register_dump,
+                "link_events": event.link_events,
+                "ethtool_driver_info": event.ethtool_driver_info,
+                "ethtool_stats": event.ethtool_stats,
+                "eee_enabled": event.eee_enabled,
+                "pci_device_info": event.pci_device_info,
+                "module_params": event.module_params,
+                "package_name": package_name,
+                "likely_external_root_cause": true,
+            }),
+            artifact: Some(ObservedArtifact {
+                kind: "network-interface".to_string(),
+                name: event.interface.clone(),
+                path: None,
+                package_name: package_name.clone(),
+                repo_root: None,
+                ecosystem: None,
+                metadata: json!({
+                    "source": NETWORK_DRIVER_HANG_INVESTIGATION_SUBSYSTEM,
+                    "driver": event.driver,
+                    "pci_address": event.pci_address,
+                    "hang_type": event.hang_type,
+                }),
+            }),
+            repo_root: None,
+            ecosystem: None,
+        };
+        let _ = store.record_finding(&finding)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn parse_network_driver_hang_events(raw: &str) -> Vec<NetworkDriverHangEvent> {
+    // Matches PCI-device-prefixed messages: "e1000e 0000:00:19.0 eth0: <msg>"
+    let pci_re = Regex::new(
+        r"^(?P<driver>[a-z][a-z0-9_-]*) (?P<pci>[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]) (?P<iface>[a-zA-Z][a-zA-Z0-9]*): (?P<msg>.*)",
+    )
+    .expect("valid network hang pci regex");
+    let watchdog_re = Regex::new(
+        r"NETDEV WATCHDOG:\s+(?P<iface>[a-zA-Z][a-zA-Z0-9]*)\s+\((?P<driver>[a-z][a-z0-9_-]*)\):\s+transmit queue \d+ timed out",
+    )
+    .expect("valid netdev watchdog regex");
+    // Matches "NIC Link is Down" / "NIC Link is Up" lines from any driver/iface
+    let link_re = Regex::new(
+        r"^(?P<driver>[a-z][a-z0-9_-]*)[: ]+(?P<iface>[a-zA-Z][a-zA-Z0-9]*) NIC Link is (?P<state>Up|Down)",
+    )
+    .expect("valid link event regex");
+
+    let mut events: BTreeMap<(String, String), NetworkDriverHangEvent> = BTreeMap::new();
+    // Accumulate link events separately; merge after hang events are fully built.
+    let mut link_events_by_key: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    // Track which key is currently in a register dump so we can append indented lines.
+    let mut in_register_dump: Option<(String, String)> = None;
+
+    for line in raw.lines() {
+        let message = line
+            .split_once(" kernel: ")
+            .map(|(_, m)| m.trim())
+            .unwrap_or(line.trim());
+
+        // NETDEV WATCHDOG format
+        if let Some(caps) = watchdog_re.captures(message) {
+            in_register_dump = None;
+            let driver = caps["driver"].to_string();
+            let iface = caps["iface"].to_string();
+            let key = (driver.clone(), iface.clone());
+            events
+                .entry(key)
+                .or_insert_with(|| NetworkDriverHangEvent {
+                    driver,
+                    interface: iface,
+                    pci_address: None,
+                    hang_type: "tx-timeout".to_string(),
+                    hang_lines: Vec::new(),
+                    register_dump: Vec::new(),
+                    link_events: Vec::new(),
+                    ethtool_driver_info: None,
+                    ethtool_stats: None,
+                    eee_enabled: None,
+                    pci_device_info: None,
+                    module_params: BTreeMap::new(),
+                })
+                .hang_lines
+                .push(line.to_string());
+            continue;
+        }
+
+        // PCI device format
+        if let Some(caps) = pci_re.captures(message) {
+            let driver = caps["driver"].to_string();
+            let pci = caps["pci"].to_string();
+            let iface = caps["iface"].to_string();
+            let msg = &caps["msg"];
+            let key = (driver.clone(), iface.clone());
+
+            if msg.starts_with("Detected Hardware Unit Hang") {
+                in_register_dump = Some(key.clone());
+                let entry = events.entry(key).or_insert_with(|| NetworkDriverHangEvent {
+                    driver: driver.clone(),
+                    interface: iface.clone(),
+                    pci_address: Some(pci.clone()),
+                    hang_type: "hardware-unit-hang".to_string(),
+                    hang_lines: Vec::new(),
+                    register_dump: Vec::new(),
+                    link_events: Vec::new(),
+                    ethtool_driver_info: None,
+                    ethtool_stats: None,
+                    eee_enabled: None,
+                    pci_device_info: None,
+                    module_params: BTreeMap::new(),
+                });
+                entry.hang_type = "hardware-unit-hang".to_string();
+                entry.hang_lines.push(line.to_string());
+                continue;
+            }
+
+            if msg.starts_with("Reset adapter") || msg.starts_with("Tx Queue Hung") {
+                in_register_dump = None;
+                let entry = events.entry(key).or_insert_with(|| NetworkDriverHangEvent {
+                    driver: driver.clone(),
+                    interface: iface.clone(),
+                    pci_address: Some(pci.clone()),
+                    hang_type: "tx-timeout".to_string(),
+                    hang_lines: Vec::new(),
+                    register_dump: Vec::new(),
+                    link_events: Vec::new(),
+                    ethtool_driver_info: None,
+                    ethtool_stats: None,
+                    eee_enabled: None,
+                    pci_device_info: None,
+                    module_params: BTreeMap::new(),
+                });
+                // hardware-unit-hang takes precedence
+                if entry.hang_type != "hardware-unit-hang" {
+                    entry.hang_type = "tx-timeout".to_string();
+                }
+                entry.hang_lines.push(line.to_string());
+                continue;
+            }
+
+            // Indented register-state line following a hardware unit hang
+            if msg.starts_with("  ") || msg.starts_with('\t') {
+                if let Some(ref dump_key) = in_register_dump.clone() {
+                    if *dump_key == key {
+                        if let Some(entry) = events.get_mut(dump_key) {
+                            if entry.register_dump.len() < 32 {
+                                entry.register_dump.push(msg.to_string());
+                            }
+                        }
+                        continue;
+                    }
+                }
+            } else if in_register_dump.as_ref().map(|k| k == &key).unwrap_or(false) {
+                in_register_dump = None;
+            }
+        }
+
+        // Link up/down events — collect by key; merged into events after the main loop.
+        if let Some(caps) = link_re.captures(message) {
+            let key = (caps["driver"].to_string(), caps["iface"].to_string());
+            let bucket = link_events_by_key.entry(key).or_default();
+            if bucket.len() < 16 {
+                bucket.push(line.to_string());
+            }
+        }
+    }
+
+    // Merge link events into the corresponding hang events.
+    for (key, link_lines) in link_events_by_key {
+        if let Some(entry) = events.get_mut(&key) {
+            entry.link_events = link_lines;
+        }
+    }
+
+    events.into_values().collect()
+}
+
+fn ethtool_driver_info_for_iface(iface: &str) -> Option<String> {
+    let output = command_output("ethtool", &["-i", iface]).ok()?;
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn ethtool_eee_enabled(iface: &str) -> Option<bool> {
+    let output = command_output("ethtool", &["--show-eee", iface]).ok()?;
+    for line in output.lines() {
+        let line = line.trim();
+        if line.starts_with("EEE status:") {
+            return Some(!line.contains("disabled"));
+        }
+    }
+    None
+}
+
+fn ethtool_interface_stats(iface: &str) -> Option<String> {
+    let output = command_output("ethtool", &["-S", iface]).ok()?;
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn pci_device_sysfs_info(pci_address: &str) -> Option<String> {
+    let base = format!("/sys/bus/pci/devices/{pci_address}");
+    let mut parts = Vec::new();
+    for field in &["vendor", "device", "subsystem_vendor", "subsystem_device", "class"] {
+        let path = format!("{base}/{field}");
+        if let Ok(value) = fs::read_to_string(&path) {
+            parts.push(format!("{field}: {}", value.trim()));
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("\n"))
+}
+
+fn sysfs_module_params(driver: &str) -> BTreeMap<String, String> {
+    let mut params = BTreeMap::new();
+    let params_dir = format!("/sys/module/{driver}/parameters");
+    let Ok(entries) = fs::read_dir(&params_dir) else {
+        return params;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Ok(value) = fs::read_to_string(entry.path()) {
+            params.insert(name, value.trim().to_string());
+        }
+    }
+    params
 }
 
 fn collect_postgres_collation_mismatches(store: &Store) -> Result<usize> {
@@ -1544,6 +1890,11 @@ fn kernel_warning_module_candidates(line: &str) -> Vec<String> {
     if message.starts_with("NVRM:") {
         candidates.push("nvidia".to_string());
     }
+    if message.starts_with("NETDEV WATCHDOG:") {
+        if let Some(driver) = netdev_watchdog_driver(message) {
+            candidates.push(driver);
+        }
+    }
     if let Some(module) = bracketed_kernel_module_name(message) {
         candidates.push(module);
     }
@@ -1554,6 +1905,22 @@ fn kernel_warning_module_candidates(line: &str) -> Vec<String> {
         }
     }
     dedupe_preserve_order(candidates)
+}
+
+fn netdev_watchdog_driver(message: &str) -> Option<String> {
+    // "NETDEV WATCHDOG: eth0 (e1000e): transmit queue 0 timed out"
+    let after = message.strip_prefix("NETDEV WATCHDOG:")?.trim();
+    let paren_start = after.find('(')?;
+    let paren_end = after.find(')')?;
+    if paren_end <= paren_start {
+        return None;
+    }
+    let driver = &after[paren_start + 1..paren_end];
+    if is_plausible_kernel_module_name(driver) {
+        Some(driver.to_string())
+    } else {
+        None
+    }
 }
 
 fn kernel_module_lookup_names(module: &str) -> Vec<String> {
@@ -2675,7 +3042,7 @@ fn maybe_record_runaway_investigation(
             "sampled_pids": profile.sampled_pids,
         }),
     };
-    let details = json!({
+    let mut details = json!({
         "subsystem": RUNAWAY_INVESTIGATION_SUBSYSTEM,
         "source_profile_fingerprint": source_profile_fingerprint,
         "source_hotspot_kind": "perf-profile",
@@ -2715,6 +3082,12 @@ fn maybe_record_runaway_investigation(
         "stack_excerpt": investigation.stack_excerpt,
         "raw_artifacts": investigation.raw_artifacts,
     });
+    if let Some(pkg) = target.package_name.as_deref() {
+        if let Some(version) = installed_version_for_package(pkg) {
+            details["installed_package_version"] = json!(version);
+        }
+    }
+    add_env_context(&mut details);
     let finding = FindingInput {
         kind: "investigation".to_string(),
         title: format!("Runaway CPU investigation for {}", target.name),
@@ -2802,7 +3175,7 @@ fn maybe_record_stuck_process_investigation(
             "sampled_pids": group.pids.clone(),
         }),
     };
-    let details = json!({
+    let mut details = json!({
         "subsystem": STUCK_PROCESS_INVESTIGATION_SUBSYSTEM,
         "source_process_fingerprint": source_process_fingerprint,
         "blocked_process_kind": "uninterruptible-sleep",
@@ -2835,6 +3208,12 @@ fn maybe_record_stuck_process_investigation(
         "executable": investigation.executable,
         "raw_artifacts": investigation.raw_artifacts,
     });
+    if let Some(pkg) = group.package_name.as_deref() {
+        if let Some(version) = installed_version_for_package(pkg) {
+            details["installed_package_version"] = json!(version);
+        }
+    }
+    add_env_context(&mut details);
     let finding = FindingInput {
         kind: "investigation".to_string(),
         title: format!("Stuck D-state investigation for {}", group.name),
@@ -3901,10 +4280,62 @@ fn resolve_perf_dso_path(
 }
 
 fn running_kernel_release() -> Option<String> {
-    fs::read_to_string("/proc/sys/kernel/osrelease")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    static CACHED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            fs::read_to_string("/proc/sys/kernel/osrelease")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .clone()
+}
+
+fn distro_info() -> (Option<String>, Option<String>) {
+    static CACHED: std::sync::OnceLock<(Option<String>, Option<String>)> =
+        std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let Ok(text) = fs::read_to_string("/etc/os-release") else {
+                return (None, None);
+            };
+            let id = text.lines().find_map(|line| {
+                let (k, v) = line.split_once('=')?;
+                (k == "ID").then(|| v.trim_matches('"').to_string())
+            });
+            let version_id = text.lines().find_map(|line| {
+                let (k, v) = line.split_once('=')?;
+                (k == "VERSION_ID").then(|| v.trim_matches('"').to_string())
+            });
+            (id, version_id)
+        })
+        .clone()
+}
+
+fn installed_version_for_package(package: &str) -> Option<String> {
+    command_output(
+        "dpkg-query",
+        &["-W", "-f=${Version}", package],
+    )
+    .ok()
+    .map(|v| v.trim().to_string())
+    .filter(|v| !v.is_empty())
+}
+
+fn add_env_context(details: &mut Value) {
+    let Some(map) = details.as_object_mut() else {
+        return;
+    };
+    if let Some(release) = running_kernel_release() {
+        map.entry("kernel_release").or_insert(json!(release));
+    }
+    let (distro_id, distro_version_id) = distro_info();
+    if let Some(id) = distro_id {
+        map.entry("distro_id").or_insert(json!(id));
+    }
+    if let Some(version) = distro_version_id {
+        map.entry("distro_version_id").or_insert(json!(version));
+    }
 }
 
 fn kernel_reference_path(release: &str) -> Option<PathBuf> {
@@ -4439,17 +4870,18 @@ mod tests {
         RunawayHypothesis, StuckProcessGroup, StuckProcessInvestigationSummary,
         apparmor_finding_from_kernel_line, classify_runaway_loop, classify_stuck_process,
         crash_event_executable, crash_event_label, crash_event_process_name,
-        dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
-        is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
-        kernel_module_package_hint, kernel_thread_package_name,
-        kernel_warning_module_candidates, looks_like_warning,
-        normalize_oom_task_memcg_target, normalize_perf_symbol,
-        normalize_stuck_process_target_name, parse_apparmor_denial, parse_coredump_info,
-        parse_dkms_status_line, parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
-        parse_perf_hot_paths, parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
+        current_kernel_image_package_name, dominant_syscall_sequence, extend_unique_log_lines,
+        investigation_cooldown_active, is_low_signal_kernel_warning, is_profile_candidate,
+        kernel_module_lookup_names, kernel_module_package_hint, kernel_thread_package_name,
+        kernel_warning_module_candidates, looks_like_warning, normalize_oom_task_memcg_target,
+        normalize_perf_symbol, normalize_stuck_process_target_name, parse_apparmor_denial,
+        parse_coredump_info, parse_dkms_status_line, parse_kernel_oom_kill_events,
+        parse_latest_desktop_resume_failure, parse_perf_hot_paths,
+        parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
+        netdev_watchdog_driver, parse_network_driver_hang_events,
         prioritize_coredump_events, process_runtime_seconds, safe_perf_name,
         stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
-        summarize_top_syscalls, system_uptime_seconds, current_kernel_image_package_name,
+        summarize_top_syscalls, system_uptime_seconds,
     };
     use crate::models::PopularBinaryProfile;
     use serde_json::{Value, json};
@@ -5057,5 +5489,79 @@ Stack trace of thread 222:\n\
         let runtime =
             process_runtime_seconds(std::process::id() as i32, system_uptime_seconds(), 100.0);
         assert!(runtime.is_some());
+    }
+
+    #[test]
+    fn parses_e1000e_hardware_unit_hang_into_investigation() {
+        let raw = "\
+Mar 30 10:12:34 host kernel: e1000e 0000:00:19.0 eth0: Detected Hardware Unit Hang:\n\
+Mar 30 10:12:34 host kernel: e1000e 0000:00:19.0 eth0:   TDH                  <0x41>\n\
+Mar 30 10:12:34 host kernel: e1000e 0000:00:19.0 eth0:   TDT                  <0x41>\n\
+Mar 30 10:12:34 host kernel: e1000e 0000:00:19.0 eth0:   next_to_use          <0x41>\n\
+Mar 30 10:12:34 host kernel: e1000e 0000:00:19.0 eth0:   next_to_clean        <0x40>\n\
+Mar 30 10:12:35 host kernel: e1000e 0000:00:19.0 eth0: Reset adapter unexpectedly\n";
+        let events = parse_network_driver_hang_events(raw);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].driver, "e1000e");
+        assert_eq!(events[0].interface, "eth0");
+        assert_eq!(events[0].pci_address.as_deref(), Some("0000:00:19.0"));
+        assert_eq!(events[0].hang_type, "hardware-unit-hang");
+        assert_eq!(events[0].hang_lines.len(), 2);
+        assert_eq!(events[0].register_dump.len(), 4);
+        assert!(events[0].register_dump[0].contains("TDH"));
+        assert!(events[0].register_dump[3].contains("next_to_clean"));
+    }
+
+    #[test]
+    fn parses_netdev_watchdog_tx_timeout_into_investigation() {
+        let raw =
+            "Mar 30 10:12:34 host kernel: NETDEV WATCHDOG: eth0 (e1000e): transmit queue 0 timed out 10280 ms\n";
+        let events = parse_network_driver_hang_events(raw);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].driver, "e1000e");
+        assert_eq!(events[0].interface, "eth0");
+        assert_eq!(events[0].hang_type, "tx-timeout");
+        assert_eq!(events[0].hang_lines.len(), 1);
+        assert!(events[0].register_dump.is_empty());
+    }
+
+    #[test]
+    fn hardware_unit_hang_takes_precedence_over_tx_timeout() {
+        let raw = "\
+Mar 30 10:12:33 host kernel: NETDEV WATCHDOG: eth0 (e1000e): transmit queue 0 timed out 10280 ms\n\
+Mar 30 10:12:34 host kernel: e1000e 0000:00:19.0 eth0: Detected Hardware Unit Hang:\n";
+        let events = parse_network_driver_hang_events(raw);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].hang_type, "hardware-unit-hang");
+    }
+
+    #[test]
+    fn link_events_are_correlated_with_hang_events() {
+        let raw = "\
+Mar 30 10:12:00 host kernel: e1000e: eth0 NIC Link is Down\n\
+Mar 30 10:12:01 host kernel: e1000e: eth0 NIC Link is Up 100 Mbps\n\
+Mar 30 10:12:34 host kernel: e1000e 0000:00:19.0 eth0: Detected Hardware Unit Hang:\n";
+        let events = parse_network_driver_hang_events(raw);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].link_events.len(), 2);
+    }
+
+    #[test]
+    fn netdev_watchdog_driver_extracts_driver_from_watchdog_message() {
+        assert_eq!(
+            netdev_watchdog_driver("NETDEV WATCHDOG: eth0 (e1000e): transmit queue 0 timed out"),
+            Some("e1000e".to_string())
+        );
+        assert_eq!(
+            netdev_watchdog_driver("NETDEV WATCHDOG: ens3 (virtio_net): transmit queue 0 timed out"),
+            Some("virtio_net".to_string())
+        );
+        assert_eq!(netdev_watchdog_driver("NETDEV WATCHDOG: eth0: no parens"), None);
+    }
+
+    #[test]
+    fn kernel_warning_candidates_extract_driver_from_netdev_watchdog() {
+        let line = "Mar 30 10:12:34 host kernel: NETDEV WATCHDOG: eth0 (e1000e): transmit queue 0 timed out 10280 ms";
+        assert_eq!(kernel_warning_module_candidates(line), vec!["e1000e"]);
     }
 }

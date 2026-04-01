@@ -95,6 +95,16 @@ pub enum CodexAuthMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
+pub enum PatchDriver {
+    #[default]
+    Codex,
+    Claude,
+    Gemini,
+    Aider,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
 pub enum LeaseBudgetPreset {
     Off,
     #[default]
@@ -370,6 +380,10 @@ pub struct ClientHello {
     pub has_codex: bool,
     #[serde(default)]
     pub richer_evidence_allowed: bool,
+    #[serde(default)]
+    pub patch_driver: Option<String>,
+    #[serde(default)]
+    pub patch_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

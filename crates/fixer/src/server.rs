@@ -1337,10 +1337,12 @@ async fn pull_work(
         }));
     }
 
+    let worker_model = request.client.patch_model.clone();
     let Some(mut issue) = next_issue_for_worker(
         &state.db,
         &install_id,
         state.config.server.worker_attempt_cooldown_seconds,
+        worker_model,
     )
     .await
     .map_err(ApiError::internal)?
@@ -1508,7 +1510,9 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             submission_count BIGINT NOT NULL DEFAULT 0,
             worker_result_count BIGINT NOT NULL DEFAULT 0,
             abuse_events BIGINT NOT NULL DEFAULT 0,
-            banned_until TIMESTAMPTZ
+            banned_until TIMESTAMPTZ,
+            patch_driver TEXT,
+            patch_model TEXT
         );
 
         CREATE TABLE IF NOT EXISTS submissions (
@@ -1615,7 +1619,9 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             submission_count INTEGER NOT NULL DEFAULT 0,
             worker_result_count INTEGER NOT NULL DEFAULT 0,
             abuse_events INTEGER NOT NULL DEFAULT 0,
-            banned_until TEXT
+            banned_until TEXT,
+            patch_driver TEXT,
+            patch_model TEXT
         );
 
         CREATE TABLE IF NOT EXISTS submissions (
@@ -1704,6 +1710,41 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
         }
     }
     ensure_forward_issue_cluster_schema(db).await?;
+    ensure_forward_installs_schema(db).await?;
+    Ok(())
+}
+
+async fn ensure_forward_installs_schema(db: &ServerDb) -> Result<()> {
+    match db {
+        ServerDb::Postgres(db) => {
+            db.batch_execute(
+                "
+            ALTER TABLE installs ADD COLUMN IF NOT EXISTS patch_driver TEXT;
+            ALTER TABLE installs ADD COLUMN IF NOT EXISTS patch_model TEXT
+            ",
+            )
+            .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let mut stmt = connection.prepare("PRAGMA table_info(installs)")?;
+            let columns = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !columns.iter().any(|name| name == "patch_driver") {
+                connection.execute(
+                    "ALTER TABLE installs ADD COLUMN patch_driver TEXT",
+                    [],
+                )?;
+            }
+            if !columns.iter().any(|name| name == "patch_model") {
+                connection.execute(
+                    "ALTER TABLE installs ADD COLUMN patch_model TEXT",
+                    [],
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4340,8 +4381,8 @@ async fn ensure_install(
         ServerDb::Postgres(db) => {
             db.execute(
                 "
-        INSERT INTO installs (install_id, first_seen, last_seen, mode, hostname, version, has_codex, capabilities_json, last_ip)
-        VALUES ($1, $2, $2, $3, $4, $5, $6, $7, $8)
+        INSERT INTO installs (install_id, first_seen, last_seen, mode, hostname, version, has_codex, capabilities_json, last_ip, patch_driver, patch_model)
+        VALUES ($1, $2, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (install_id) DO UPDATE SET
             last_seen = EXCLUDED.last_seen,
             mode = EXCLUDED.mode,
@@ -4349,7 +4390,9 @@ async fn ensure_install(
             version = EXCLUDED.version,
             has_codex = EXCLUDED.has_codex,
             capabilities_json = EXCLUDED.capabilities_json,
-            last_ip = EXCLUDED.last_ip
+            last_ip = EXCLUDED.last_ip,
+            patch_driver = EXCLUDED.patch_driver,
+            patch_model = EXCLUDED.patch_model
         ",
                 &[
                     &request.install_id,
@@ -4360,6 +4403,8 @@ async fn ensure_install(
                     &request.has_codex,
                     &serde_json::to_value(&request.capabilities)?,
                     &remote_addr,
+                    &request.patch_driver,
+                    &request.patch_model,
                 ],
             )
             .await?;
@@ -4368,8 +4413,8 @@ async fn ensure_install(
             let connection = sqlite_connection(path)?;
             connection.execute(
                 "
-        INSERT INTO installs (install_id, first_seen, last_seen, mode, hostname, version, has_codex, capabilities_json, last_ip)
-        VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        INSERT INTO installs (install_id, first_seen, last_seen, mode, hostname, version, has_codex, capabilities_json, last_ip, patch_driver, patch_model)
+        VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         ON CONFLICT(install_id) DO UPDATE SET
             last_seen = excluded.last_seen,
             mode = excluded.mode,
@@ -4377,7 +4422,9 @@ async fn ensure_install(
             version = excluded.version,
             has_codex = excluded.has_codex,
             capabilities_json = excluded.capabilities_json,
-            last_ip = excluded.last_ip
+            last_ip = excluded.last_ip,
+            patch_driver = excluded.patch_driver,
+            patch_model = excluded.patch_model
         ",
                 params![
                     request.install_id,
@@ -4388,6 +4435,8 @@ async fn ensure_install(
                     request.has_codex,
                     serde_json::to_string(&request.capabilities)?,
                     remote_addr,
+                    request.patch_driver,
+                    request.patch_model,
                 ],
             )?;
         }
@@ -5476,12 +5525,14 @@ struct WorkerCandidate {
     issue: IssueCluster,
     has_foreign_reports: bool,
     last_attempt_at: Option<DateTime<Utc>>,
+    last_attempt_model: Option<String>,
 }
 
 async fn next_issue_for_worker(
     db: &ServerDb,
     worker_install_id: &str,
     worker_attempt_cooldown_seconds: u64,
+    worker_model: Option<String>,
 ) -> Result<Option<IssueCluster>> {
     let candidate_limit: i64 = 256;
     match db {
@@ -5527,6 +5578,7 @@ async fn next_issue_for_worker(
             Ok(select_worker_candidate(
                 candidates,
                 worker_attempt_cooldown_seconds,
+                worker_model.as_deref(),
             ))
         }
         ServerDb::Sqlite(path) => {
@@ -5572,10 +5624,12 @@ async fn next_issue_for_worker(
                         .get::<_, Option<String>>(17)?
                         .as_deref()
                         .and_then(parse_timestamp);
+                    let last_attempt_model = patch_attempt_model(issue.best_patch.as_ref());
                     Ok(WorkerCandidate {
                         issue,
                         has_foreign_reports,
                         last_attempt_at,
+                        last_attempt_model,
                     })
                 },
             )?;
@@ -5583,27 +5637,80 @@ async fn next_issue_for_worker(
             Ok(select_worker_candidate(
                 candidates,
                 worker_attempt_cooldown_seconds,
+                worker_model.as_deref(),
             ))
         }
+    }
+}
+
+fn candidate_model_differs(candidate: &WorkerCandidate, worker_model: Option<&str>) -> bool {
+    match (worker_model, candidate.last_attempt_model.as_deref()) {
+        (Some(wm), Some(lm)) => wm != lm,
+        _ => false,
     }
 }
 
 fn select_worker_candidate(
     candidates: Vec<WorkerCandidate>,
     worker_attempt_cooldown_seconds: u64,
+    worker_model: Option<&str>,
 ) -> Option<IssueCluster> {
     let cooldown_cutoff = (worker_attempt_cooldown_seconds > 0)
         .then(|| Utc::now() - Duration::seconds(worker_attempt_cooldown_seconds as i64));
     let mut sorted_candidates = candidates.iter().collect::<Vec<_>>();
     sorted_candidates.sort_by(compare_worker_candidate_priority);
+    // Model-rotation tiers: prefer issues whose last attempt used a different model
     sorted_candidates
         .iter()
         .find(|candidate| {
             !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
                 && candidate.has_foreign_reports
                 && candidate_needs_patch_refresh(candidate)
+                && candidate_model_differs(candidate, worker_model)
         })
         .map(|candidate| candidate.issue.clone())
+        .or_else(|| {
+            sorted_candidates
+                .iter()
+                .find(|candidate| {
+                    !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
+                        && candidate.has_foreign_reports
+                        && issue_is_available_for_worker(&candidate.issue)
+                        && candidate_model_differs(candidate, worker_model)
+                })
+                .map(|candidate| candidate.issue.clone())
+        })
+        .or_else(|| {
+            sorted_candidates
+                .iter()
+                .find(|candidate| {
+                    !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
+                        && candidate_needs_patch_refresh(candidate)
+                        && candidate_model_differs(candidate, worker_model)
+                })
+                .map(|candidate| candidate.issue.clone())
+        })
+        .or_else(|| {
+            sorted_candidates
+                .iter()
+                .find(|candidate| {
+                    !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
+                        && issue_is_available_for_worker(&candidate.issue)
+                        && candidate_model_differs(candidate, worker_model)
+                })
+                .map(|candidate| candidate.issue.clone())
+        })
+        // Fall through to standard tiers (same-model fallback for single-model deployments)
+        .or_else(|| {
+            sorted_candidates
+                .iter()
+                .find(|candidate| {
+                    !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
+                        && candidate.has_foreign_reports
+                        && candidate_needs_patch_refresh(candidate)
+                })
+                .map(|candidate| candidate.issue.clone())
+        })
         .or_else(|| {
             sorted_candidates
                 .iter()
@@ -5782,11 +5889,21 @@ fn worker_candidate_from_row(row: Row) -> Result<WorkerCandidate> {
     let has_foreign_reports: bool = row.get(16);
     let last_attempt_at: Option<DateTime<Utc>> = row.get(17);
     let issue = issue_from_row(row)?;
+    let last_attempt_model = patch_attempt_model(issue.best_patch.as_ref());
     Ok(WorkerCandidate {
         issue,
         has_foreign_reports,
         last_attempt_at,
+        last_attempt_model,
     })
+}
+
+fn patch_attempt_model(attempt: Option<&PatchAttempt>) -> Option<String> {
+    attempt
+        .and_then(|a| a.details.get("worker_model"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
 }
 
 fn issue_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IssueCluster> {
@@ -8595,6 +8712,43 @@ fn build_public_technical_snapshot(item: &SharedOpportunity) -> Option<PublicTec
     }
 }
 
+fn format_package_highlight(name: Option<String>, version: Option<String>) -> Option<String> {
+    match (name, version) {
+        (Some(n), Some(v)) => Some(format!("Package: {n} {v}")),
+        (Some(n), None) => Some(format!("Package: {n}")),
+        _ => None,
+    }
+}
+
+fn push_env_highlights(details: &Value, highlights: &mut Vec<String>) {
+    let pkg = details
+        .get("package_name")
+        .or_else(|| details.get("profile_target").and_then(|t| t.get("package_name")))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text);
+    let ver = details
+        .get("installed_package_version")
+        .and_then(Value::as_str)
+        .map(sanitize_public_text);
+    if let Some(h) = format_package_highlight(pkg, ver) {
+        highlights.push(h);
+    }
+    if let Some(r) = details.get("kernel_release").and_then(Value::as_str) {
+        highlights.push(format!("Kernel: {}", sanitize_public_text(r)));
+    }
+    let id = details.get("distro_id").and_then(Value::as_str);
+    let ver = details.get("distro_version_id").and_then(Value::as_str);
+    match (id, ver) {
+        (Some(id), Some(ver)) => {
+            highlights.push(format!("Distribution: {}", sanitize_public_text(&format!("{id} {ver}"))));
+        }
+        (Some(id), None) => {
+            highlights.push(format!("Distribution: {}", sanitize_public_text(id)));
+        }
+        _ => {}
+    }
+}
+
 fn build_public_crash_snapshot(item: &SharedOpportunity) -> Option<PublicTechnicalSnapshot> {
     let details = &item.finding.details;
     let frames = sanitize_snapshot_frames(
@@ -8634,6 +8788,7 @@ fn build_public_crash_snapshot(item: &SharedOpportunity) -> Option<PublicTechnic
     if let Some(signal) = signal {
         highlights.push(format!("Signal: {}", sanitize_public_text(&signal)));
     }
+    push_env_highlights(details, &mut highlights);
     Some(PublicTechnicalSnapshot {
         title: "Crashing thread stack trace".to_string(),
         summary:
@@ -8710,6 +8865,7 @@ fn build_public_investigation_snapshot(
             {
                 highlights.push(format!("Repeated loop: {sequence}"));
             }
+            push_env_highlights(details, &mut highlights);
             Some(PublicTechnicalSnapshot {
                 title: "Sampled wait stack".to_string(),
                 summary: "This is the stack-shaped slice and hot path Fixer captured while the process was spinning.".to_string(),
@@ -8738,6 +8894,7 @@ fn build_public_investigation_snapshot(
             if let Some(wchan) = details.get("wchan").and_then(Value::as_str) {
                 highlights.push(format!("Wait site: {}", normalize_stack_frame(wchan)));
             }
+            push_env_highlights(details, &mut highlights);
             Some(PublicTechnicalSnapshot {
                 title: "Kernel wait stack".to_string(),
                 summary: "This is where Fixer saw the sampled task blocked in the kernel."
@@ -8794,8 +8951,8 @@ fn render_landing_page(config: &FixerConfig, snapshot: &DashboardSnapshot) -> St
     let repo_key_url = format!("{canonical_url}/apt/fixer-archive-keyring.gpg");
     let apt_repo_url = format!("{canonical_url}/apt/");
     let apt_snippet = format!(
-        "curl -fsSL {repo_key_url} | sudo gpg --dearmor -o /usr/share/keyrings/fixer-archive-keyring.gpg\n\
-echo \"deb [signed-by=/usr/share/keyrings/fixer-archive-keyring.gpg] {apt_repo_url} stable main\" | \\\n\
+        "sudo curl -fsSL {repo_key_url} -o /usr/share/keyrings/fixer-archive-keyring.gpg\n\
+echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/fixer-archive-keyring.gpg] {apt_repo_url} stable main\" | \\\n\
   sudo tee /etc/apt/sources.list.d/fixer.list >/dev/null\n\
 sudo apt update\n\
 sudo apt install fixer"
@@ -8832,7 +8989,7 @@ sudo apt install fixer"
                 <div class="hero-copy">
                     <p class="tag">Crowd-mode Linux repair, but opt-in and honest</p>
                     <h1>Fix real breakage together, not one machine at a time.</h1>
-                    <p class="lede">Fixer turns recurring Linux failures into shared repair work. Quiet participants can submit sanitized evidence. Codex-capable workers can investigate, ship a diff when there really is one, or publish a clean handoff when pretending to have a patch would be dishonest.</p>
+                    <p class="lede">Fixer turns recurring Linux failures into shared repair work. Quiet participants can submit sanitized evidence. Workers with a coding agent can investigate, ship a diff when there really is one, or publish a clean handoff when pretending to have a patch would be dishonest.</p>
                     <div class="hero-actions">
                         <a class="button primary" href="/issues">Browse promoted issues</a>
                         <a class="button soft" href="/patches">See successful patches</a>
@@ -11122,7 +11279,7 @@ mod tests {
         );
 
         let issue = test_runtime()
-            .block_on(next_issue_for_worker(&db, "worker-install", 3600))
+            .block_on(next_issue_for_worker(&db, "worker-install", 3600, None))
             .unwrap()
             .unwrap();
 
@@ -11160,7 +11317,7 @@ mod tests {
         );
 
         let issue = test_runtime()
-            .block_on(next_issue_for_worker(&db, "worker-install", 3600))
+            .block_on(next_issue_for_worker(&db, "worker-install", 3600, None))
             .unwrap()
             .unwrap();
 
@@ -11206,7 +11363,7 @@ mod tests {
         );
 
         let issue = test_runtime()
-            .block_on(next_issue_for_worker(&db, "worker-install", 3600))
+            .block_on(next_issue_for_worker(&db, "worker-install", 3600, None))
             .unwrap()
             .unwrap();
 
@@ -11269,7 +11426,7 @@ mod tests {
         );
 
         let issue = test_runtime()
-            .block_on(next_issue_for_worker(&db, "worker-install", 3600))
+            .block_on(next_issue_for_worker(&db, "worker-install", 3600, None))
             .unwrap()
             .unwrap();
 
@@ -11351,7 +11508,7 @@ mod tests {
         );
 
         let issue = test_runtime()
-            .block_on(next_issue_for_worker(&db, "worker-install", 3600))
+            .block_on(next_issue_for_worker(&db, "worker-install", 3600, None))
             .unwrap()
             .unwrap();
 
@@ -11727,6 +11884,8 @@ mod tests {
             capabilities: Vec::new(),
             has_codex: false,
             richer_evidence_allowed: false,
+            patch_driver: None,
+            patch_model: None,
         };
 
         let error = reject_incompatible_client(&request).unwrap_err();

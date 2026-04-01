@@ -1,3 +1,55 @@
+fixer (0.42.0-1) unstable; urgency=medium
+
+  * Reword homepage lede to welcome all coding agents, not just Codex.
+  * Record kernel release, distro ID, and distro version into every finding's
+    details at collection time (crashes, kernel warnings, OOM kills, runaway
+    and stuck process investigations).
+  * Record the installed package version for the crashing/runaway/stuck binary
+    into finding details using dpkg-query at collection time.
+  * Show package version, kernel release, and distribution as highlights on
+    public issue technical snapshot pages.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 01 Apr 2026 00:00:00 +0400
+
+fixer (0.41.0-1) unstable; urgency=medium
+
+  * Detect network driver hardware hangs (e1000e hardware unit hang, NETDEV
+    WATCHDOG TX timeouts) as high-severity investigations instead of plain
+    kernel warnings, with per-adapter clustering by driver+interface+hang-type.
+  * Collect hardware context for driver hang investigations: register state dump
+    (TDH, TDT, next_to_use, next_to_clean, MAC/PHY status), link up/down event
+    history, PCI device identity (vendor/device/class from sysfs), ethtool
+    driver and firmware version, ethtool interface statistics, active module
+    parameters from /sys/module/<driver>/parameters/, and EEE status.
+  * Generate investigation reports for network driver hangs including a Known
+    Workarounds section: if EEE is enabled, suggest ethtool --set-eee and the
+    corresponding modprobe.d option; if already disabled, note it is applied.
+  * Register ethtool as a detected capability used by hang investigations.
+  * Extract driver name from NETDEV WATCHDOG lines in kernel_warning_module_candidates.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 01 Apr 2026 00:00:00 +0400
+
+fixer (0.40.0-1) unstable; urgency=medium
+
+  * Add Claude, Gemini, and aider/Ollama as alternative patch drivers; rename
+    the Ollama driver variant to Aider to match the tool it actually runs.
+  * Make spark weekly-headroom fallback threshold configurable via
+    patch.spark_weekly_headroom_threshold (default 20%).
+  * Fix static regex compilation in weekly budget check — regexes are now
+    compiled once with OnceLock instead of on every worker iteration.
+  * Add install instructions fix: sudo curl, arch=$(dpkg --print-architecture)
+    in apt sources line, and "(are you superuser?)" hint on readonly-db errors.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 01 Apr 2026 00:00:00 +0400
+
+fixer (0.39.0-1) unstable; urgency=medium
+
+  * Automatically switch Codex to `gpt-5.3-codex-spark` in `/status` diagnostics
+    when weekly quota headroom drops below 20%, with safer parsing and fallback
+    behavior for mixed status payloads.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 31 Mar 2026 16:46:16 +0400
+
 fixer (0.38.0-1) unstable; urgency=medium
 
   * Make the homepage more explanatory by showing humane queue cards with

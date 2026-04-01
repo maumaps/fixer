@@ -22,14 +22,35 @@ LABEL=${APT_REPO_LABEL:-Fixer}
 DESCRIPTION=${APT_REPO_DESCRIPTION:-Fixer package repository}
 COMPONENT=${APT_REPO_COMPONENT:-main}
 ARCHITECTURES=${APT_REPO_ARCHITECTURES:-"amd64 arm64 source"}
+LIST_ARCHITECTURES=${APT_REPO_LIST_ARCHITECTURES:-}
 SUITES=${APT_REPO_SUITES:-}
 PUBLIC_URL=${APT_REPO_PUBLIC_URL:-https://fixer.maumap.com/apt}
 DEFAULT_SUITE=${APT_REPO_DEFAULT_SUITE:-stable}
 
+normalize_apt_arches() {
+    list=""
+    for architecture in $1; do
+        case "$architecture" in
+            source)
+                continue
+                ;;
+            *)
+                if [ -z "$list" ]; then
+                    list="$architecture"
+                else
+                    list="$list,$architecture"
+                fi
+                ;;
+        esac
+    done
+    printf '%s\n' "$list"
+}
+
 write_repo_index() {
     public_url=${PUBLIC_URL%/}
     key_url="$public_url/fixer-archive-keyring.gpg"
-    source_line="deb [signed-by=/usr/share/keyrings/fixer-archive-keyring.gpg] $public_url $DEFAULT_SUITE $COMPONENT"
+    apt_list_arches=${LIST_ARCHITECTURES:-$(normalize_apt_arches "$ARCHITECTURES")}
+    source_line="deb [arch=$apt_list_arches signed-by=/usr/share/keyrings/fixer-archive-keyring.gpg] $public_url $DEFAULT_SUITE $COMPONENT"
     cat >"$PUBLIC_DIR/index.html" <<EOF
 <!doctype html>
 <html lang="en">
@@ -123,7 +144,7 @@ write_repo_index() {
       <h1>Install Fixer from APT</h1>
       <p>Add the public keyring, register the repository, then install <code>fixer</code> with normal APT tooling.</p>
       <pre><code>sudo install -d -m 0755 /usr/share/keyrings /etc/apt/sources.list.d
-curl -fsSL $key_url -o /usr/share/keyrings/fixer-archive-keyring.gpg
+sudo curl -fsSL $key_url -o /usr/share/keyrings/fixer-archive-keyring.gpg
 echo "$source_line" | sudo tee /etc/apt/sources.list.d/fixer.list >/dev/null
 sudo apt update
 sudo apt install fixer</code></pre>

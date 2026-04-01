@@ -3,7 +3,7 @@ use crate::models::{
     ClientHello, CodexAuthLease, CodexAuthLeaseStatus, CodexAuthMode, CodexJobSpec, CodexJobStatus,
     CodexLeaseBudget, FindingBundle, FindingInput, ImpossibleReason, InstallIdentity,
     LeaseBudgetPreset, ObservedArtifact, OpportunityRecord, ParticipationMode, ParticipationState,
-    PatchAttempt, ProposalRecord, ServerHello, SharedOpportunity, SubmissionEnvelope,
+    PatchAttempt, PatchDriver, ProposalRecord, ServerHello, SharedOpportunity, SubmissionEnvelope,
     SubmissionReceipt, WorkOffer, WorkPullRequest, WorkerResultEnvelope,
 };
 use crate::pow::{mine_pow, verify_pow};
@@ -164,6 +164,32 @@ fn codex_worker_availability(
     store: &Store,
     config: &FixerConfig,
 ) -> Result<CodexWorkerAvailability> {
+    match config.patch.driver {
+        PatchDriver::Claude => {
+            let ready = command_exists(&config.patch.claude_command);
+            return Ok(CodexWorkerAvailability {
+                ready,
+                reason: (!ready)
+                    .then(|| "Claude CLI is not installed on this host".to_string()),
+            });
+        }
+        PatchDriver::Gemini => {
+            let ready = command_exists(&config.patch.gemini_command);
+            return Ok(CodexWorkerAvailability {
+                ready,
+                reason: (!ready)
+                    .then(|| "Gemini CLI is not installed on this host".to_string()),
+            });
+        }
+        PatchDriver::Aider => {
+            let ready = command_exists(&config.patch.aider_command);
+            return Ok(CodexWorkerAvailability {
+                ready,
+                reason: (!ready).then(|| "aider is not installed on this host".to_string()),
+            });
+        }
+        PatchDriver::Codex => {}
+    }
     let has_codex_binary =
         store.capability_available("codex")? || command_exists(&config.patch.codex_command);
     if !has_codex_binary {
@@ -674,36 +700,54 @@ fn create_worker_codex_proposal(
     opportunity: &OpportunityRecord,
     workspace: &crate::models::PreparedWorkspace,
 ) -> Result<crate::models::ProposalRecord> {
-    match config.patch.auth_mode {
-        CodexAuthMode::RootDirect => proposal::create_proposal_with_prior_patch(
-            store,
-            config,
-            opportunity,
-            workspace,
-            issue.best_patch.as_ref(),
-            "codex",
-        ),
-        CodexAuthMode::UserLease => {
-            let lease = store
-                .load_codex_auth_lease()?
-                .ok_or_else(|| anyhow!("no active Codex auth lease is configured"))?;
-            let job = proposal::prepare_codex_job_with_prior_patch(
+    let tool_name = match config.patch.driver {
+        PatchDriver::Codex => "codex",
+        PatchDriver::Claude => "claude",
+        PatchDriver::Gemini => "gemini",
+        PatchDriver::Aider => "aider",
+    };
+    match config.patch.driver {
+        PatchDriver::Claude | PatchDriver::Gemini | PatchDriver::Aider => {
+            proposal::create_proposal_with_prior_patch(
+                store,
                 config,
                 opportunity,
                 workspace,
                 issue.best_patch.as_ref(),
-                &lease.user,
-                lease.allow_kernel,
-            )?;
-            let status = run_codex_job_as_user(store, config, &job)?;
-            store.create_proposal(
-                opportunity.id,
-                "codex",
-                &status.state,
-                &job.bundle_dir,
-                status.output_path.as_deref(),
+                tool_name,
             )
         }
+        PatchDriver::Codex => match config.patch.auth_mode {
+            CodexAuthMode::RootDirect => proposal::create_proposal_with_prior_patch(
+                store,
+                config,
+                opportunity,
+                workspace,
+                issue.best_patch.as_ref(),
+                tool_name,
+            ),
+            CodexAuthMode::UserLease => {
+                let lease = store
+                    .load_codex_auth_lease()?
+                    .ok_or_else(|| anyhow!("no active Codex auth lease is configured"))?;
+                let job = proposal::prepare_codex_job_with_prior_patch(
+                    config,
+                    opportunity,
+                    workspace,
+                    issue.best_patch.as_ref(),
+                    &lease.user,
+                    lease.allow_kernel,
+                )?;
+                let status = run_codex_job_as_user(store, config, &job)?;
+                store.create_proposal(
+                    opportunity.id,
+                    tool_name,
+                    &status.state,
+                    &job.bundle_dir,
+                    status.output_path.as_deref(),
+                )
+            }
+        },
     }
 }
 
@@ -1401,6 +1445,12 @@ fn build_client_hello(
         .map(|capability| capability.name)
         .collect::<Vec<_>>();
     let codex_worker = codex_worker_availability(store, config)?;
+    let driver_name = match config.patch.driver {
+        PatchDriver::Codex => "codex",
+        PatchDriver::Claude => "claude",
+        PatchDriver::Gemini => "gemini",
+        PatchDriver::Aider => "aider",
+    };
     Ok(ClientHello {
         install_id: identity.install_id.clone(),
         version: current_binary_version().to_string(),
@@ -1410,6 +1460,8 @@ fn build_client_hello(
         has_codex: codex_worker.ready,
         capabilities,
         richer_evidence_allowed: state.richer_evidence_allowed,
+        patch_driver: Some(driver_name.to_string()),
+        patch_model: config.patch.model.clone(),
     })
 }
 

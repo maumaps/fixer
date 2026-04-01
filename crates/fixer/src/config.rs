@@ -1,4 +1,4 @@
-use crate::models::{CodexAuthMode, LeaseBudgetPreset};
+use crate::models::{CodexAuthMode, LeaseBudgetPreset, PatchDriver};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -101,6 +101,8 @@ pub struct PatchConfig {
     pub review_fix_passes: u32,
     #[serde(default = "default_true")]
     pub spark_fallback_on_rate_limit: bool,
+    #[serde(default = "default_spark_weekly_headroom_threshold")]
+    pub spark_weekly_headroom_threshold: f64,
     #[serde(default = "default_rate_limit_cooldown")]
     pub rate_limit_cooldown_seconds: u64,
     #[serde(default)]
@@ -115,6 +117,22 @@ pub struct PatchConfig {
     pub lease_failure_pause_window_seconds: u64,
     #[serde(default = "default_true")]
     pub lease_bootstrap_enable_linger: bool,
+    #[serde(default)]
+    pub driver: PatchDriver,
+    #[serde(default = "default_claude_command")]
+    pub claude_command: String,
+    #[serde(default)]
+    pub claude_args: Vec<String>,
+    #[serde(default = "default_gemini_command")]
+    pub gemini_command: String,
+    #[serde(default)]
+    pub gemini_args: Vec<String>,
+    #[serde(default = "default_ollama_base_url")]
+    pub ollama_base_url: String,
+    #[serde(default = "default_aider_command")]
+    pub aider_command: String,
+    #[serde(default)]
+    pub aider_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +262,7 @@ impl Default for PatchConfig {
             review_after_patch: true,
             review_fix_passes: default_review_fix_passes(),
             spark_fallback_on_rate_limit: true,
+            spark_weekly_headroom_threshold: default_spark_weekly_headroom_threshold(),
             rate_limit_cooldown_seconds: default_rate_limit_cooldown(),
             auth_mode: CodexAuthMode::UserLease,
             lease_budget_preset: default_lease_budget_preset(),
@@ -251,6 +270,14 @@ impl Default for PatchConfig {
             lease_failure_pause_threshold: default_lease_failure_pause_threshold(),
             lease_failure_pause_window_seconds: default_lease_failure_pause_window(),
             lease_bootstrap_enable_linger: true,
+            driver: PatchDriver::Codex,
+            claude_command: default_claude_command(),
+            claude_args: Vec::new(),
+            gemini_command: default_gemini_command(),
+            gemini_args: Vec::new(),
+            ollama_base_url: default_ollama_base_url(),
+            aider_command: default_aider_command(),
+            aider_args: Vec::new(),
         }
     }
 }
@@ -419,6 +446,26 @@ fn default_bpftrace_timeout() -> u64 {
 
 fn default_codex_command() -> String {
     "codex".to_string()
+}
+
+fn default_spark_weekly_headroom_threshold() -> f64 {
+    20.0
+}
+
+fn default_claude_command() -> String {
+    "claude".to_string()
+}
+
+fn default_gemini_command() -> String {
+    "gemini".to_string()
+}
+
+fn default_ollama_base_url() -> String {
+    "http://localhost:11434".to_string()
+}
+
+fn default_aider_command() -> String {
+    "aider".to_string()
 }
 
 fn default_lease_budget_preset() -> LeaseBudgetPreset {

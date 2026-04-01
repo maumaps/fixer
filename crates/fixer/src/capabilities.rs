@@ -1,7 +1,7 @@
 use crate::models::Capability;
 use crate::util::{find_in_path, find_postgres_binary};
 
-const CAPABILITIES: [(&str, &str, &str); 25] = [
+const CAPABILITIES: [(&str, &str, &str); 26] = [
     (
         "apt-get",
         "apt-get",
@@ -70,6 +70,11 @@ const CAPABILITIES: [(&str, &str, &str); 25] = [
         "strace",
         "strace",
         "Userspace syscall tracing for runaway-process investigations",
+    ),
+    (
+        "ethtool",
+        "ethtool",
+        "Network interface driver info and EEE status for driver hang investigations",
     ),
 ];
 

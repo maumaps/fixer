@@ -12,6 +12,7 @@ APT_URL=${FIXER_APT_URL:-https://fixer.maumap.com/apt}
 SERVER_URL=${FIXER_SERVER_URL:-https://fixer.maumap.com}
 SUITE=${FIXER_APT_SUITE:-stable}
 COMPONENT=${FIXER_APT_COMPONENT:-main}
+LIST_ARCHES=${FIXER_APT_LIST_ARCHES:-$(dpkg --print-architecture)}
 KEYRING_PATH=${FIXER_KEYRING_PATH:-/usr/share/keyrings/fixer-archive-keyring.gpg}
 LIST_PATH=${FIXER_LIST_PATH:-/etc/apt/sources.list.d/fixer.list}
 
@@ -25,7 +26,7 @@ case "$MODE" in
 esac
 
 ssh "$HOST" \
-    "sudo -n env FIXER_APT_URL='$APT_URL' FIXER_SERVER_URL='$SERVER_URL' FIXER_APT_SUITE='$SUITE' FIXER_APT_COMPONENT='$COMPONENT' FIXER_KEYRING_PATH='$KEYRING_PATH' FIXER_LIST_PATH='$LIST_PATH' FIXER_MODE='$MODE' /bin/sh -s" <<'EOF'
+    "sudo -n env FIXER_APT_URL='$APT_URL' FIXER_SERVER_URL='$SERVER_URL' FIXER_APT_SUITE='$SUITE' FIXER_APT_COMPONENT='$COMPONENT' FIXER_APT_LIST_ARCHES='$LIST_ARCHES' FIXER_KEYRING_PATH='$KEYRING_PATH' FIXER_LIST_PATH='$LIST_PATH' FIXER_MODE='$MODE' /bin/sh -s" <<'EOF'
 set -eu
 
 export DEBIAN_FRONTEND=noninteractive
@@ -36,7 +37,8 @@ apt-get install -y ca-certificates curl gnupg
 mkdir -p "$(dirname "$FIXER_KEYRING_PATH")" "$(dirname "$FIXER_LIST_PATH")"
 curl -fsSL "$FIXER_APT_URL/fixer-archive-keyring.gpg" -o "$FIXER_KEYRING_PATH"
 chmod 0644 "$FIXER_KEYRING_PATH"
-printf 'deb [signed-by=%s] %s %s %s\n' \
+printf 'deb [arch=%s signed-by=%s] %s %s %s\n' \
+    "$FIXER_APT_LIST_ARCHES" \
     "$FIXER_KEYRING_PATH" \
     "$FIXER_APT_URL" \
     "$FIXER_APT_SUITE" \
