@@ -484,6 +484,47 @@ fn prune_recent_failures(lease: &mut CodexAuthLease, window_seconds: u64) {
     });
 }
 
+fn observed_active_codex_jobs(lease: &CodexAuthLease) -> Result<Option<u32>> {
+    let machine = format!("{}@.host", lease.user);
+    let output = Command::new("systemctl")
+        .args([
+            "--machine",
+            &machine,
+            "--user",
+            "list-units",
+            "fixer-codex-*",
+            "--type=service",
+            "--state=running,activating",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+        ])
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let count = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    Ok(Some(count as u32))
+}
+
+fn reconcile_codex_auth_job_count(store: &Store, lease: &mut CodexAuthLease) -> Result<()> {
+    let Some(observed_jobs) = observed_active_codex_jobs(lease)? else {
+        return Ok(());
+    };
+    if observed_jobs != lease.active_jobs {
+        lease.active_jobs = observed_jobs;
+        store.save_codex_auth_lease(lease)?;
+    }
+    Ok(())
+}
+
 fn begin_codex_auth_job(store: &Store) -> Result<CodexAuthLease> {
     let mut lease = store
         .load_codex_auth_lease()?
@@ -497,6 +538,7 @@ fn begin_codex_auth_job(store: &Store) -> Result<CodexAuthLease> {
     if let Some(reason) = lease.paused_reason.as_deref() {
         return Err(anyhow!("the current Codex auth lease is paused: {reason}"));
     }
+    reconcile_codex_auth_job_count(store, &mut lease)?;
     reset_daily_budget_if_needed(&mut lease);
     if lease.budget.max_active_jobs == 0 || lease.budget.max_jobs_per_day == 0 {
         return Err(anyhow!(
