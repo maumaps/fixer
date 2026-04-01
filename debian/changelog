@@ -1,10 +1,10 @@
-fixer (0.51.0-1) unstable; urgency=medium
+fixer (0.52.0-1) unstable; urgency=medium
 
   * Show structured failure diagnostics on the public failed-attempts board,
-    including failure kind, review category, exit status, error details, and
-    stderr excerpts when available.
+    and fall back to diagnosis/workspace context for older failed attempts that
+    predate structured patch failure capture.
 
- -- Darafei Praliaskouski <me@komzpa.net>  Wed, 01 Apr 2026 20:55:00 +0400
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 01 Apr 2026 21:10:00 +0400
 
 fixer (0.50.0-1) unstable; urgency=medium
 

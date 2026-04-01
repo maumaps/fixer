@@ -729,6 +729,7 @@ struct PublicAttempt {
     handoff: Option<PublicTriageHandoff>,
     blocker_reason: Option<String>,
     failure_diagnostics: Option<PublicFailureDiagnostics>,
+    failure_context: Option<PublicFailureContext>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -738,6 +739,21 @@ struct PublicFailureDiagnostics {
     exit_status: Option<i32>,
     error: Option<String>,
     last_stderr_excerpt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicFailureContext {
+    note: Option<String>,
+    subsystem: Option<String>,
+    loop_classification: Option<String>,
+    hot_path_symbol: Option<String>,
+    command_line: Option<String>,
+    loop_explanation: Option<String>,
+    implicated_packages: Vec<String>,
+    source_package: Option<String>,
+    source_kind: Option<String>,
+    acquisition_note: Option<String>,
+    homepage: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -8062,6 +8078,8 @@ fn public_attempt_from_patch_attempt(attempt: PatchAttempt) -> PublicAttempt {
     let handoff = public_triage_handoff_from_attempt(&attempt, published_session.as_ref());
     let blocker_reason = attempt_blocker_reason(&attempt);
     let failure_diagnostics = public_failure_diagnostics_from_attempt(&attempt);
+    let failure_context =
+        public_failure_context_from_attempt(&attempt, failure_diagnostics.is_some());
     PublicAttempt {
         outcome: attempt.outcome,
         state: attempt.state,
@@ -8072,6 +8090,7 @@ fn public_attempt_from_patch_attempt(attempt: PatchAttempt) -> PublicAttempt {
         handoff,
         blocker_reason,
         failure_diagnostics,
+        failure_context,
     }
 }
 
@@ -8125,6 +8144,112 @@ fn public_failure_diagnostics_from_attempt(
         exit_status,
         error,
         last_stderr_excerpt,
+    })
+}
+
+fn public_failure_context_from_attempt(
+    attempt: &PatchAttempt,
+    has_structured_failure_diagnostics: bool,
+) -> Option<PublicFailureContext> {
+    if attempt.outcome != "patch" || attempt.state != "failed" {
+        return None;
+    }
+    let diagnosis = attempt.details.get("diagnosis").and_then(Value::as_object);
+    let workspace = attempt.details.get("workspace").and_then(Value::as_object);
+
+    let note = if has_structured_failure_diagnostics {
+        None
+    } else {
+        Some(
+            "This older failed attempt predates structured patch failure capture, so Fixer only retained the diagnosis and workspace context.".to_string(),
+        )
+    };
+    let subsystem = diagnosis
+        .and_then(|value| value.get("subsystem"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty());
+    let loop_classification = diagnosis
+        .and_then(|value| value.get("loop_classification"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty());
+    let hot_path_symbol = diagnosis
+        .and_then(|value| value.get("hot_path_symbol"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty());
+    let command_line = diagnosis
+        .and_then(|value| value.get("command_line"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty());
+    let loop_explanation = diagnosis
+        .and_then(|value| value.get("loop_explanation"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty());
+    let implicated_packages = diagnosis
+        .and_then(|value| value.get("implicated_package_names"))
+        .and_then(Value::as_array)
+        .map(|packages| {
+            packages
+                .iter()
+                .filter_map(Value::as_str)
+                .map(sanitize_public_text)
+                .filter(|value| !value.is_empty())
+                .take(6)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let source_package = workspace
+        .and_then(|value| value.get("source_package"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty());
+    let source_kind = workspace
+        .and_then(|value| value.get("source_kind"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty());
+    let acquisition_note = workspace
+        .and_then(|value| value.get("acquisition_note"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty());
+    let homepage = workspace
+        .and_then(|value| value.get("homepage"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty());
+
+    if note.is_none()
+        && subsystem.is_none()
+        && loop_classification.is_none()
+        && hot_path_symbol.is_none()
+        && command_line.is_none()
+        && loop_explanation.is_none()
+        && implicated_packages.is_empty()
+        && source_package.is_none()
+        && source_kind.is_none()
+        && acquisition_note.is_none()
+        && homepage.is_none()
+    {
+        return None;
+    }
+
+    Some(PublicFailureContext {
+        note,
+        subsystem,
+        loop_classification,
+        hot_path_symbol,
+        command_line,
+        loop_explanation,
+        implicated_packages,
+        source_package,
+        source_kind,
+        acquisition_note,
+        homepage,
     })
 }
 
@@ -10778,9 +10903,15 @@ fn render_public_attempt_sections(attempt: &PublicAttempt) -> String {
         .as_ref()
         .map(render_failure_diagnostics_section)
         .unwrap_or_default();
+    let failure_context_markup = attempt
+        .failure_context
+        .as_ref()
+        .map(render_failure_context_section)
+        .unwrap_or_default();
 
     format!(
         r#"<div class="meta"><span class="tag">state: {}</span><span class="tag">created: {}</span>{}</div>
+        {}
         {}
         {}
         {}
@@ -10798,6 +10929,7 @@ fn render_public_attempt_sections(attempt: &PublicAttempt) -> String {
         blocker_markup,
         handoff_markup,
         failure_markup,
+        failure_context_markup,
         session_markup
     )
 }
@@ -10842,6 +10974,85 @@ fn render_failure_diagnostics_section(diagnostics: &PublicFailureDiagnostics) ->
         "<section class=\"patch-summary\"><h4>Failure details</h4><ul class=\"attempt-list\">{}</ul>{}</section>",
         items.join(""),
         stderr_markup
+    )
+}
+
+fn render_failure_context_section(context: &PublicFailureContext) -> String {
+    let mut items = Vec::new();
+    if let Some(note) = context.note.as_deref() {
+        items.push(format!("<li>{}</li>", html_escape(note)));
+    }
+    if let Some(subsystem) = context.subsystem.as_deref() {
+        items.push(format!(
+            "<li><strong>Subsystem:</strong> {}</li>",
+            html_escape(subsystem)
+        ));
+    }
+    if let Some(classification) = context.loop_classification.as_deref() {
+        items.push(format!(
+            "<li><strong>Diagnosis family:</strong> {}</li>",
+            html_escape(classification)
+        ));
+    }
+    if let Some(symbol) = context.hot_path_symbol.as_deref() {
+        items.push(format!(
+            "<li><strong>Hot path:</strong> {}</li>",
+            html_escape(symbol)
+        ));
+    }
+    if let Some(command_line) = context.command_line.as_deref() {
+        items.push(format!(
+            "<li><strong>Command:</strong> <code>{}</code></li>",
+            html_escape(command_line)
+        ));
+    }
+    if let Some(source_package) = context.source_package.as_deref() {
+        items.push(format!(
+            "<li><strong>Source package:</strong> {}</li>",
+            html_escape(source_package)
+        ));
+    }
+    if let Some(source_kind) = context.source_kind.as_deref() {
+        items.push(format!(
+            "<li><strong>Workspace source:</strong> {}</li>",
+            html_escape(source_kind)
+        ));
+    }
+    if let Some(acquisition_note) = context.acquisition_note.as_deref() {
+        items.push(format!(
+            "<li><strong>Workspace acquisition:</strong> {}</li>",
+            html_escape(acquisition_note)
+        ));
+    }
+    if let Some(homepage) = context.homepage.as_deref() {
+        items.push(format!(
+            "<li><strong>Homepage:</strong> <a href=\"{0}\">{0}</a></li>",
+            html_escape(homepage)
+        ));
+    }
+    if !context.implicated_packages.is_empty() {
+        items.push(format!(
+            "<li><strong>Implicated packages:</strong> {}</li>",
+            html_escape(&context.implicated_packages.join(", "))
+        ));
+    }
+    let explanation_markup = context
+        .loop_explanation
+        .as_deref()
+        .map(|explanation| {
+            format!(
+                "<p class=\"issue-summary\">{}</p>",
+                html_escape(explanation)
+            )
+        })
+        .unwrap_or_default();
+    if items.is_empty() && explanation_markup.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<section class=\"patch-summary\"><h4>Collected context</h4><ul class=\"attempt-list\">{}</ul>{}</section>",
+        items.join(""),
+        explanation_markup
     )
 }
 
@@ -11790,6 +12001,7 @@ mod tests {
                     handoff: None,
                     blocker_reason: Some("workspace acquisition failed".to_string()),
                     failure_diagnostics: None,
+                    failure_context: None,
                 },
             }],
         );
@@ -11915,6 +12127,50 @@ mod tests {
         assert!(markup.contains("cargo test failed in the workspace"));
         assert!(markup.contains("stderr excerpt"));
         assert!(markup.contains("thread &#39;main&#39; panicked"));
+    }
+
+    #[test]
+    fn legacy_failed_patch_attempt_exposes_collected_context() {
+        let public_attempt = public_attempt_from_patch_attempt(PatchAttempt {
+            cluster_id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "patch".to_string(),
+            state: "failed".to_string(),
+            summary: "The diagnosis was captured, but the patch proposal did not complete cleanly."
+                .to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("failed".to_string()),
+            details: json!({
+                "diagnosis": {
+                    "subsystem": "runaway-process",
+                    "loop_classification": "unknown-userspace-loop",
+                    "hot_path_symbol": "lock_next_vma",
+                    "command_line": "/usr/bin/htop --sort-key PERCENT_CPU",
+                    "loop_explanation": "The process is CPU-hot, but the trace does not yet identify a single stable loop.",
+                    "implicated_package_names": ["linux-image-6.19.8+deb14-amd64"]
+                },
+                "workspace": {
+                    "source_package": "htop",
+                    "source_kind": "debian-source",
+                    "acquisition_note": "Fetched Debian source package via apt-get source.",
+                    "homepage": "https://htop.dev/"
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        });
+
+        let markup = render_public_attempt_card(&public_attempt);
+
+        assert!(markup.contains("Collected context"));
+        assert!(markup.contains("predates structured patch failure capture"));
+        assert!(markup.contains("runaway-process"));
+        assert!(markup.contains("unknown-userspace-loop"));
+        assert!(markup.contains("lock_next_vma"));
+        assert!(markup.contains("htop"));
+        assert!(markup.contains("debian-source"));
+        assert!(markup.contains("Fetched Debian source package via apt-get source."));
+        assert!(markup.contains("https://htop.dev/"));
     }
 
     #[test]
@@ -12055,6 +12311,7 @@ mod tests {
                 handoff: None,
                 blocker_reason: None,
                 failure_diagnostics: None,
+                failure_context: None,
             },
         });
 
@@ -12106,6 +12363,7 @@ mod tests {
                 handoff: None,
                 blocker_reason: None,
                 failure_diagnostics: None,
+                failure_context: None,
             }),
             best_triage: None,
             best_triage_handoff: None,
@@ -12162,6 +12420,7 @@ mod tests {
                 }),
                 blocker_reason: None,
                 failure_diagnostics: None,
+                failure_context: None,
             }),
             best_triage_handoff: Some(PublicTriageHandoff {
                 reason: "likely-external-root-cause".to_string(),
@@ -12244,6 +12503,7 @@ mod tests {
                 handoff: None,
                 blocker_reason: Some("no patchable workspace was available".to_string()),
                 failure_diagnostics: None,
+                failure_context: None,
             }],
             showing_all_attempts: false,
         };
@@ -12350,6 +12610,7 @@ mod tests {
                 handoff: None,
                 blocker_reason: None,
                 failure_diagnostics: None,
+                failure_context: None,
             }),
             best_triage: None,
             best_triage_handoff: None,
