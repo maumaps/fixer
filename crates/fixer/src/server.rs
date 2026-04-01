@@ -6553,7 +6553,11 @@ async fn load_public_issue_detail(
     let technical_snapshot = build_public_technical_snapshot(&candidate.representative);
     let issue = candidate.issue;
     let best_patch = load_public_issue_best_patch(db, &id).await?;
-    let best_triage = load_public_issue_best_triage(db, &id).await?;
+    let best_triage = if best_patch.is_some() {
+        None
+    } else {
+        load_public_issue_best_triage(db, &id).await?
+    };
     let best_patch_diff_url = public_best_patch_diff_url(&id, best_patch.as_ref());
     let possible_duplicates = load_possible_duplicates(db, &id, &issue, 6).await?;
     let all_attempts = load_public_attempts(db, &id, 1024).await?;
@@ -6576,7 +6580,7 @@ async fn load_public_issue_detail(
         score: issue.score,
         corroboration_count: issue.corroboration_count,
         best_patch_available: issue.best_patch_available,
-        best_triage_available: issue.best_triage_available,
+        best_triage_available: issue.best_triage_available && best_patch.is_none(),
         best_patch_diff_url,
         best_patch,
         best_triage_handoff: best_triage
@@ -7108,7 +7112,11 @@ async fn load_public_attempt_entries(
                     score: row.get(8),
                     corroboration_count: row.get(9),
                     best_patch_available: row.get(10),
-                    best_triage_available: row.get(11),
+                    best_triage_available: {
+                        let best_patch_available: bool = row.get(10);
+                        let best_triage_available: bool = row.get(11);
+                        best_triage_available && !best_patch_available
+                    },
                     attempt: public_attempt_from_patch_attempt(envelope.attempt),
                 });
                 if entries.len() >= limit as usize {
@@ -7192,7 +7200,8 @@ async fn load_public_attempt_entries(
                     score,
                     corroboration_count,
                     best_patch_available: best_patch_available != 0,
-                    best_triage_available: best_triage_available != 0,
+                    best_triage_available: (best_triage_available != 0)
+                        && (best_patch_available == 0),
                     attempt: public_attempt_from_patch_attempt(envelope.attempt),
                 });
                 if entries.len() >= limit as usize {
@@ -7206,6 +7215,8 @@ async fn load_public_attempt_entries(
 
 fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
     let last_seen: DateTime<Utc> = row.get(12);
+    let best_patch_available: bool = row.get(10);
+    let best_triage_available: bool = row.get::<_, bool>(11) && !best_patch_available;
     Ok(PublicIssue {
         id: row.get(0),
         kind: row.get(1),
@@ -7217,8 +7228,8 @@ fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
         severity: row.get(7),
         score: row.get(8),
         corroboration_count: row.get(9),
-        best_patch_available: row.get(10),
-        best_triage_available: row.get(11),
+        best_patch_available,
+        best_triage_available,
         last_seen: last_seen.to_rfc3339(),
     })
 }
@@ -12915,6 +12926,24 @@ mod tests {
         assert!(markup.contains("Pull-request-ready diff"));
         assert!(!markup.contains("Successful triage"));
         assert!(!markup.contains("Likely owner"));
+    }
+
+    #[test]
+    fn render_issue_tags_hide_triage_when_patch_exists() {
+        let tags = render_issue_tags(
+            "investigation",
+            Some("htop"),
+            Some("htop"),
+            Some("debian"),
+            Some("high"),
+            106,
+            2,
+            true,
+            true,
+        );
+
+        assert!(tags.contains("tag patch"));
+        assert!(!tags.contains("triage ready"));
     }
 
     #[test]

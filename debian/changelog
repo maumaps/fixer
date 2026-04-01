@@ -1,3 +1,10 @@
+fixer (0.60.0-1) unstable; urgency=medium
+
+  * suppress stale public triage flags once the same issue family already has
+    a real public patch
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 02 Apr 2026 02:28:00 +0400
+
 fixer (0.59.0-1) unstable; urgency=medium
 
   * Hide stale triage handoffs on public issue pages once a real public patch
