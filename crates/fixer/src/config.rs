@@ -49,6 +49,16 @@ pub struct ServiceConfig {
     pub hotspot_investigation_cooldown_seconds: u64,
     #[serde(default = "default_hotspot_investigation_strace_duration")]
     pub hotspot_investigation_strace_seconds: u64,
+    #[serde(default = "default_true")]
+    pub hotspot_investigation_backtrace_enabled: bool,
+    #[serde(default = "default_hotspot_investigation_backtrace_timeout")]
+    pub hotspot_investigation_backtrace_timeout_seconds: u64,
+    #[serde(default = "default_hotspot_investigation_backtrace_thread_limit")]
+    pub hotspot_investigation_backtrace_thread_limit: usize,
+    #[serde(default = "default_hotspot_investigation_backtrace_public_char_limit")]
+    pub hotspot_investigation_backtrace_public_char_limit: usize,
+    #[serde(default = "default_true")]
+    pub hotspot_investigation_backtrace_full_enabled: bool,
     #[serde(default = "default_hotspot_investigation_limit")]
     pub hotspot_investigation_limit: usize,
     #[serde(default = "default_stuck_process_investigation_cooldown")]
@@ -230,6 +240,14 @@ impl Default for ServiceConfig {
             auto_investigate_stuck_processes: true,
             hotspot_investigation_cooldown_seconds: default_hotspot_investigation_cooldown(),
             hotspot_investigation_strace_seconds: default_hotspot_investigation_strace_duration(),
+            hotspot_investigation_backtrace_enabled: true,
+            hotspot_investigation_backtrace_timeout_seconds:
+                default_hotspot_investigation_backtrace_timeout(),
+            hotspot_investigation_backtrace_thread_limit:
+                default_hotspot_investigation_backtrace_thread_limit(),
+            hotspot_investigation_backtrace_public_char_limit:
+                default_hotspot_investigation_backtrace_public_char_limit(),
+            hotspot_investigation_backtrace_full_enabled: true,
             hotspot_investigation_limit: default_hotspot_investigation_limit(),
             stuck_process_investigation_cooldown_seconds:
                 default_stuck_process_investigation_cooldown(),
@@ -406,6 +424,18 @@ fn default_hotspot_investigation_cooldown() -> u64 {
 
 fn default_hotspot_investigation_strace_duration() -> u64 {
     5
+}
+
+fn default_hotspot_investigation_backtrace_timeout() -> u64 {
+    8
+}
+
+fn default_hotspot_investigation_backtrace_thread_limit() -> usize {
+    24
+}
+
+fn default_hotspot_investigation_backtrace_public_char_limit() -> usize {
+    16_000
 }
 
 fn default_hotspot_investigation_limit() -> usize {

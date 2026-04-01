@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration as StdDuration;
 
@@ -36,6 +36,8 @@ const NETWORK_DRIVER_HANG_INVESTIGATION_SUBSYSTEM: &str = "network-driver-hang";
 const RUNAWAY_STRACE_EXCERPT_LIMIT: usize = 24;
 const RUNAWAY_TOP_SYSCALL_LIMIT: usize = 6;
 const RUNAWAY_SEQUENCE_WINDOW: usize = 3;
+const RUNAWAY_BACKTRACE_FRAME_LIMIT: usize = 8;
+const RUNAWAY_BACKTRACE_CLUSTER_LIMIT: usize = 6;
 const STUCK_PROCESS_FD_TARGET_LIMIT: usize = 8;
 
 #[derive(Debug, Default, Clone)]
@@ -2687,6 +2689,7 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
     )?;
     let richer_evidence_allowed = richer_evidence_enabled(config, store);
     let strace_available = store.capability_available("strace")?;
+    let gdb_available = store.capability_available("gdb")?;
     let mut count = 0;
     let mut assessed_targets = Vec::new();
     let mut current_fingerprints = Vec::new();
@@ -2823,6 +2826,7 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
                 primary_hot_path,
                 &source_profile_fingerprint,
                 richer_evidence_allowed,
+                gdb_available,
             )? {
                 current_investigation_fingerprints.push(outcome.finding_fingerprint);
                 if outcome.created {
@@ -2894,6 +2898,48 @@ struct RunawayPackageMetadata {
     report_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RunawayBacktraceCaptureStatus {
+    status: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RunawayThreadSummary {
+    thread_label: String,
+    lwp: Option<i32>,
+    top_frame: Option<String>,
+    frame_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RunawayRepresentativeBacktrace {
+    label: String,
+    lwp: Option<i32>,
+    thread_count: usize,
+    frames: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RunawayFrameCluster {
+    signature: String,
+    thread_count: usize,
+    frames: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GdbBacktraceCapture {
+    raw_bt: String,
+    maps_excerpt: Option<String>,
+    thread_summaries: Vec<RunawayThreadSummary>,
+    representative_backtraces: Vec<RunawayRepresentativeBacktrace>,
+    common_frame_clusters: Vec<RunawayFrameCluster>,
+    lock_contention_signals: Vec<String>,
+    log_path: PathBuf,
+    full_log_path: Option<PathBuf>,
+    maps_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct RunawayInvestigationSummary {
     sampled_pid: i32,
@@ -2910,6 +2956,13 @@ struct RunawayInvestigationSummary {
     status_excerpt: Option<String>,
     sched_excerpt: Option<String>,
     stack_excerpt: Option<String>,
+    backtrace_capture: RunawayBacktraceCaptureStatus,
+    representative_backtraces: Vec<RunawayRepresentativeBacktrace>,
+    common_frame_clusters: Vec<RunawayFrameCluster>,
+    thread_summaries: Vec<RunawayThreadSummary>,
+    lock_contention_signals: Vec<String>,
+    thread_backtrace_summary: Option<String>,
+    raw_backtrace_excerpt: Option<String>,
     hypothesis: RunawayHypothesis,
     raw_artifacts: BTreeMap<String, String>,
     package_metadata: Option<RunawayPackageMetadata>,
@@ -2960,6 +3013,7 @@ fn maybe_record_runaway_investigation(
     hot_path: &PerfHotPath,
     source_profile_fingerprint: &str,
     include_richer_evidence: bool,
+    gdb_available: bool,
 ) -> Result<Option<RunawayInvestigationOutcome>> {
     let state_key = runaway_investigation_state_key(source_profile_fingerprint);
     if let Some(checkpoint) = store.get_local_state::<RunawayInvestigationCheckpoint>(&state_key)? {
@@ -2992,6 +3046,8 @@ fn maybe_record_runaway_investigation(
         config.service.hotspot_investigation_strace_seconds,
         &capture_dir.join("strace.log"),
     )?;
+    let (backtrace_capture, backtrace_capture_status) =
+        capture_gdb_backtrace_sample(sampled_pid, &capture_dir, gdb_available, config)?;
     let top_hot_symbols = investigation_hot_symbol_summaries(profile);
     let strace_lines = strace_capture
         .as_ref()
@@ -3000,7 +3056,12 @@ fn maybe_record_runaway_investigation(
     let syscall_names = parse_strace_syscall_names(&strace_lines);
     let top_syscalls = summarize_top_syscalls(&syscall_names);
     let dominant_sequence = dominant_syscall_sequence(&syscall_names);
-    let hypothesis = classify_runaway_loop(&strace_lines, &top_syscalls, &top_hot_symbols);
+    let hypothesis = classify_runaway_loop(
+        &strace_lines,
+        &top_syscalls,
+        &top_hot_symbols,
+        backtrace_capture.as_ref(),
+    );
     let package_name = target.package_name.clone();
     let package_metadata = package_name
         .as_deref()
@@ -3023,8 +3084,11 @@ fn maybe_record_runaway_investigation(
         &hypothesis,
         &proc_snapshot,
         strace_capture.as_ref(),
+        backtrace_capture.as_ref(),
+        backtrace_capture_status,
         package_metadata,
         include_richer_evidence,
+        config,
     );
     let fingerprint = runaway_investigation_fingerprint(
         target,
@@ -3032,6 +3096,7 @@ fn maybe_record_runaway_investigation(
         &investigation.top_syscalls,
         &investigation.dominant_sequence,
         &investigation.hypothesis,
+        &investigation.common_frame_clusters,
     );
     let summary = runaway_investigation_summary_line(target, hot_path, &investigation);
     let artifact = ObservedArtifact {
@@ -3087,6 +3152,15 @@ fn maybe_record_runaway_investigation(
         "status_excerpt": investigation.status_excerpt,
         "sched_excerpt": investigation.sched_excerpt,
         "stack_excerpt": investigation.stack_excerpt,
+        "backtrace_capture_status": investigation.backtrace_capture.status,
+        "backtrace_capture_error": investigation.backtrace_capture.error,
+        "thread_summaries": investigation.thread_summaries,
+        "representative_backtraces": investigation.representative_backtraces,
+        "common_frame_clusters": investigation.common_frame_clusters,
+        "lock_contention_signals": investigation.lock_contention_signals,
+        "thread_backtrace_summary": investigation.thread_backtrace_summary,
+        "raw_backtrace_excerpt": investigation.raw_backtrace_excerpt,
+        "maps_excerpt": backtrace_capture.and_then(|capture| capture.maps_excerpt.clone()),
         "raw_artifacts": investigation.raw_artifacts,
     });
     if let Some(pkg) = target.package_name.as_deref() {
@@ -3493,6 +3567,413 @@ fn capture_strace_sample(
     }))
 }
 
+fn capture_gdb_backtrace_sample(
+    pid: i32,
+    capture_dir: &Path,
+    gdb_available: bool,
+    config: &FixerConfig,
+) -> Result<(Option<GdbBacktraceCapture>, RunawayBacktraceCaptureStatus)> {
+    if !gdb_available || !config.service.hotspot_investigation_backtrace_enabled {
+        return Ok((
+            None,
+            RunawayBacktraceCaptureStatus {
+                status: if config.service.hotspot_investigation_backtrace_enabled {
+                    "unavailable".to_string()
+                } else {
+                    "disabled".to_string()
+                },
+                error: None,
+            },
+        ));
+    }
+
+    let bt_path = capture_dir.join("gdb-bt.txt");
+    let bt_full_path = capture_dir.join("gdb-bt-full.txt");
+    let maps_path = capture_dir.join("maps.txt");
+    let maps_excerpt = fs::read_to_string(format!("/proc/{pid}/maps"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            let excerpt = excerpt_lines(&value, RUNAWAY_STRACE_EXCERPT_LIMIT * 2);
+            let _ = fs::write(&maps_path, &value);
+            excerpt
+        });
+    let commands = gdb_commands_for_hotspot(config);
+    let child = match Command::new("gdb")
+        .env("LC_ALL", "C")
+        .args(["--batch", "-q", "-p", &pid.to_string()])
+        .args(
+            commands
+                .iter()
+                .flat_map(|command| ["-ex", command.as_str()]),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok((
+                None,
+                RunawayBacktraceCaptureStatus {
+                    status: "failed".to_string(),
+                    error: Some(sanitize_runtime_detail(&error.to_string())),
+                },
+            ));
+        }
+    };
+    let output = wait_for_child_output_with_timeout(
+        child,
+        config
+            .service
+            .hotspot_investigation_backtrace_timeout_seconds,
+    )?;
+    if !output.status.success() && output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Ok((
+            None,
+            RunawayBacktraceCaptureStatus {
+                status: "failed".to_string(),
+                error: (!stderr.is_empty()).then(|| sanitize_runtime_detail(&stderr)),
+            },
+        ));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if stdout.trim().is_empty() {
+        return Ok((
+            None,
+            RunawayBacktraceCaptureStatus {
+                status: "failed".to_string(),
+                error: (!stderr.is_empty()).then(|| sanitize_runtime_detail(&stderr)),
+            },
+        ));
+    }
+
+    let raw_bt = extract_marked_gdb_section(&stdout, "FIXER_BT");
+    if raw_bt.trim().is_empty() {
+        return Ok((
+            None,
+            RunawayBacktraceCaptureStatus {
+                status: "failed".to_string(),
+                error: Some("gdb returned no thread backtrace section".to_string()),
+            },
+        ));
+    }
+    fs::write(&bt_path, &raw_bt)?;
+    if config.service.hotspot_investigation_backtrace_full_enabled {
+        let full_backtrace = extract_marked_gdb_section(&stdout, "FIXER_BTFULL");
+        if !full_backtrace.trim().is_empty() {
+            fs::write(&bt_full_path, &full_backtrace)?;
+        }
+    }
+    let parsed_threads = parse_gdb_thread_backtraces(
+        &raw_bt,
+        config.service.hotspot_investigation_backtrace_thread_limit,
+    );
+    let thread_summaries = parsed_threads
+        .iter()
+        .map(|thread| RunawayThreadSummary {
+            thread_label: thread.label.clone(),
+            lwp: thread.lwp,
+            top_frame: thread.frames.first().cloned(),
+            frame_count: thread.frames.len(),
+        })
+        .collect::<Vec<_>>();
+    let representative_backtraces = summarize_representative_backtraces(&parsed_threads);
+    let common_frame_clusters = summarize_common_frame_clusters(&parsed_threads);
+    let mut lock_contention_signals = summarize_lock_contention_signals(&parsed_threads);
+    if !stderr.is_empty() {
+        lock_contention_signals.push(format!("gdb-stderr: {}", sanitize_runtime_detail(&stderr)));
+    }
+
+    Ok((
+        Some(GdbBacktraceCapture {
+            raw_bt,
+            maps_excerpt,
+            thread_summaries,
+            representative_backtraces,
+            common_frame_clusters,
+            lock_contention_signals,
+            log_path: bt_path,
+            full_log_path: bt_full_path.exists().then_some(bt_full_path),
+            maps_path: maps_path.exists().then_some(maps_path),
+        }),
+        RunawayBacktraceCaptureStatus {
+            status: "captured".to_string(),
+            error: None,
+        },
+    ))
+}
+
+fn gdb_commands_for_hotspot(config: &FixerConfig) -> Vec<String> {
+    let mut commands = vec![
+        "set pagination off".to_string(),
+        "set height 0".to_string(),
+        "set width 0".to_string(),
+        "set confirm off".to_string(),
+        "set print thread-events off".to_string(),
+        "set print frame-arguments none".to_string(),
+        "echo __FIXER_BT_BEGIN__\\n".to_string(),
+        "thread apply all bt".to_string(),
+        "echo \\n__FIXER_BT_END__\\n".to_string(),
+    ];
+    if config.service.hotspot_investigation_backtrace_full_enabled {
+        commands.push("echo __FIXER_BTFULL_BEGIN__\\n".to_string());
+        commands.push("thread apply all bt full".to_string());
+        commands.push("echo \\n__FIXER_BTFULL_END__\\n".to_string());
+    }
+    commands.push("detach".to_string());
+    commands.push("quit".to_string());
+    commands
+}
+
+fn wait_for_child_output_with_timeout(
+    mut child: std::process::Child,
+    timeout_seconds: u64,
+) -> Result<Output> {
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(timeout_seconds.max(1));
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(child.wait_with_output()?);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            return Ok(child.wait_with_output()?);
+        }
+        thread::sleep(StdDuration::from_millis(100));
+    }
+}
+
+fn extract_marked_gdb_section(stdout: &str, marker: &str) -> String {
+    let begin = format!("__{marker}_BEGIN__");
+    let end = format!("__{marker}_END__");
+    let Some(start) = stdout.find(&begin) else {
+        return String::new();
+    };
+    let rest = &stdout[start + begin.len()..];
+    let Some(end_index) = rest.find(&end) else {
+        return String::new();
+    };
+    rest[..end_index].trim().to_string()
+}
+
+#[derive(Debug, Clone)]
+struct ParsedGdbThreadBacktrace {
+    label: String,
+    lwp: Option<i32>,
+    frames: Vec<String>,
+}
+
+fn parse_gdb_thread_backtraces(raw_bt: &str, thread_limit: usize) -> Vec<ParsedGdbThreadBacktrace> {
+    let mut threads = Vec::new();
+    let mut current_label: Option<String> = None;
+    let mut current_lwp: Option<i32> = None;
+    let mut current_frames = Vec::new();
+
+    for line in raw_bt.lines().map(str::trim) {
+        if line.starts_with("Thread ") {
+            if let Some(label) = current_label.take() {
+                if !current_frames.is_empty() {
+                    threads.push(ParsedGdbThreadBacktrace {
+                        label,
+                        lwp: current_lwp,
+                        frames: std::mem::take(&mut current_frames),
+                    });
+                }
+            }
+            current_label = Some(sanitize_runtime_detail(line));
+            current_lwp = parse_gdb_thread_lwp(line);
+            continue;
+        }
+        if !line.starts_with('#') {
+            continue;
+        }
+        let frame = normalize_gdb_frame(line);
+        if !frame.is_empty() {
+            current_frames.push(frame);
+        }
+    }
+
+    if let Some(label) = current_label.take() {
+        if !current_frames.is_empty() {
+            threads.push(ParsedGdbThreadBacktrace {
+                label,
+                lwp: current_lwp,
+                frames: current_frames,
+            });
+        }
+    }
+    threads.truncate(thread_limit.max(1));
+    threads
+}
+
+fn normalize_gdb_frame(frame: &str) -> String {
+    let trimmed = frame.trim();
+    let without_prefix = trimmed
+        .strip_prefix('#')
+        .and_then(|rest| rest.split_once(' '))
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or(trimmed);
+    sanitize_runtime_detail(without_prefix)
+}
+
+fn parse_gdb_thread_lwp(header: &str) -> Option<i32> {
+    let marker = "(LWP ";
+    let start = header.find(marker)? + marker.len();
+    let end = header[start..].find(')')? + start;
+    header[start..end].trim().parse::<i32>().ok()
+}
+
+fn summarize_representative_backtraces(
+    threads: &[ParsedGdbThreadBacktrace],
+) -> Vec<RunawayRepresentativeBacktrace> {
+    let mut counts = HashMap::<String, (usize, ParsedGdbThreadBacktrace)>::new();
+    for thread in threads {
+        let signature = thread_signature(&thread.frames);
+        let entry = counts
+            .entry(signature)
+            .or_insert_with(|| (0, thread.clone()));
+        entry.0 += 1;
+    }
+    let mut items = counts
+        .into_iter()
+        .map(
+            |(_, (thread_count, thread))| RunawayRepresentativeBacktrace {
+                label: thread.label,
+                lwp: thread.lwp,
+                thread_count,
+                frames: thread
+                    .frames
+                    .into_iter()
+                    .take(RUNAWAY_BACKTRACE_FRAME_LIMIT)
+                    .collect(),
+            },
+        )
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .thread_count
+            .cmp(&left.thread_count)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    items.truncate(RUNAWAY_BACKTRACE_CLUSTER_LIMIT);
+    items
+}
+
+fn summarize_common_frame_clusters(
+    threads: &[ParsedGdbThreadBacktrace],
+) -> Vec<RunawayFrameCluster> {
+    let mut counts = HashMap::<String, (usize, Vec<String>)>::new();
+    for thread in threads {
+        let frames = thread.frames.iter().take(3).cloned().collect::<Vec<_>>();
+        if frames.is_empty() {
+            continue;
+        }
+        let signature = frames.join(" | ");
+        let entry = counts.entry(signature.clone()).or_insert((0, frames));
+        entry.0 += 1;
+    }
+    let mut items = counts
+        .into_iter()
+        .map(|(signature, (thread_count, frames))| RunawayFrameCluster {
+            signature,
+            thread_count,
+            frames,
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .thread_count
+            .cmp(&left.thread_count)
+            .then_with(|| left.signature.cmp(&right.signature))
+    });
+    items.truncate(RUNAWAY_BACKTRACE_CLUSTER_LIMIT);
+    items
+}
+
+fn summarize_lock_contention_signals(threads: &[ParsedGdbThreadBacktrace]) -> Vec<String> {
+    let frames = threads
+        .iter()
+        .flat_map(|thread| thread.frames.iter())
+        .map(|frame| frame.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut signals = Vec::new();
+    if frames
+        .iter()
+        .any(|frame| frame.contains("lock_next_vma") || frame.contains("mmap_lock"))
+    {
+        signals.push("memory-map-lock-contention".to_string());
+    }
+    if frames
+        .iter()
+        .any(|frame| frame.contains("futex") || frame.contains("pthread_mutex"))
+    {
+        signals.push("futex-lock-contention".to_string());
+    }
+    if frames.iter().any(|frame| {
+        frame.contains("malloc") || frame.contains("jemalloc") || frame.contains("tcache")
+    }) {
+        signals.push("allocator-contention".to_string());
+    }
+    if frames
+        .iter()
+        .any(|frame| frame.contains("epoll") || frame.contains("poll"))
+    {
+        signals.push("event-loop-wakeups".to_string());
+    }
+    signals
+}
+
+fn thread_signature(frames: &[String]) -> String {
+    frames
+        .iter()
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn build_thread_backtrace_summary(capture: &GdbBacktraceCapture) -> String {
+    let representative = capture
+        .representative_backtraces
+        .iter()
+        .take(2)
+        .map(|thread| {
+            let top = thread
+                .frames
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unknown frame".to_string());
+            format!("{} thread(s) around {}", thread.thread_count, top)
+        })
+        .collect::<Vec<_>>();
+    if representative.is_empty() {
+        return "thread backtraces were captured, but no stable frame clusters were isolated"
+            .to_string();
+    }
+    format!("thread backtraces show {}", representative.join(" and "))
+}
+
+fn truncate_public_backtrace(raw_bt: &str, max_chars: usize) -> Option<String> {
+    let trimmed = raw_bt.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut sanitized = sanitize_runtime_detail(trimmed);
+    if sanitized.len() > max_chars {
+        sanitized.truncate(max_chars);
+        sanitized.push_str("\n... [truncated]");
+    }
+    Some(sanitized)
+}
+
+fn sanitize_runtime_detail(raw: &str) -> String {
+    let path_re = Regex::new(r"/[A-Za-z0-9._/\-]+").expect("path regex");
+    path_re.replace_all(raw, "<path>").to_string()
+}
+
 fn normalized_strace_lines(raw: &str) -> Vec<String> {
     raw.lines()
         .map(str::trim)
@@ -3575,6 +4056,7 @@ fn classify_runaway_loop(
     strace_lines: &[String],
     top_syscalls: &[RunawaySyscallStat],
     top_hot_symbols: &[String],
+    backtrace_capture: Option<&GdbBacktraceCapture>,
 ) -> RunawayHypothesis {
     let lower_lines = strace_lines.join("\n").to_ascii_lowercase();
     let lower_symbols = top_hot_symbols.join("\n").to_ascii_lowercase();
@@ -3582,6 +4064,26 @@ fn classify_runaway_loop(
         .iter()
         .map(|item| item.name.as_str())
         .collect::<Vec<_>>();
+    let lower_signals = backtrace_capture
+        .map(|capture| {
+            capture
+                .lock_contention_signals
+                .join("\n")
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+    let lower_cluster_frames = backtrace_capture
+        .map(|capture| {
+            capture
+                .common_frame_clusters
+                .iter()
+                .flat_map(|cluster| cluster.frames.iter())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
 
     if lower_lines.contains("/run/dbus")
         || lower_lines.contains("org.freedesktop")
@@ -3593,6 +4095,44 @@ fn classify_runaway_loop(
             confidence: 0.9,
             explanation:
                 "The trace is dominated by DBus-style socket activity and DBus-related symbols, which looks like a message-loop spin."
+                    .to_string(),
+        };
+    }
+    if lower_signals.contains("memory-map-lock-contention")
+        || lower_cluster_frames.contains("lock_next_vma")
+        || lower_cluster_frames.contains("mmap_lock")
+        || lower_cluster_frames.contains("vma_")
+    {
+        return RunawayHypothesis {
+            classification: "memory-map-lock-contention".to_string(),
+            confidence: 0.83,
+            explanation:
+                "The captured thread backtraces converge on memory-map locking paths, which suggests VMA or mmap-related lock acquisition contention rather than an isolated leaf symbol."
+                    .to_string(),
+        };
+    }
+    if lower_signals.contains("futex-lock-contention")
+        || lower_cluster_frames.contains("futex")
+        || lower_cluster_frames.contains("pthread_mutex")
+    {
+        return RunawayHypothesis {
+            classification: "futex-lock-contention".to_string(),
+            confidence: 0.82,
+            explanation:
+                "Multiple captured threads converge on futex or pthread mutex paths, which suggests user-space lock contention or a lock convoy."
+                    .to_string(),
+        };
+    }
+    if lower_signals.contains("allocator-contention")
+        || lower_cluster_frames.contains("malloc")
+        || lower_cluster_frames.contains("jemalloc")
+        || lower_cluster_frames.contains("tcache")
+    {
+        return RunawayHypothesis {
+            classification: "allocator-contention".to_string(),
+            confidence: 0.74,
+            explanation:
+                "The captured thread backtraces repeatedly hit allocator paths, which suggests allocator churn or allocation-side lock contention."
                     .to_string(),
         };
     }
@@ -3759,8 +4299,11 @@ fn build_runaway_investigation_summary(
     hypothesis: &RunawayHypothesis,
     proc_snapshot: &ProcSnapshot,
     strace_capture: Option<&StraceCapture>,
+    backtrace_capture: Option<&GdbBacktraceCapture>,
+    backtrace_capture_status: RunawayBacktraceCaptureStatus,
     package_metadata: Option<RunawayPackageMetadata>,
     include_richer_evidence: bool,
+    config: &FixerConfig,
 ) -> RunawayInvestigationSummary {
     let mut raw_artifacts = proc_snapshot.raw_artifacts.clone();
     if let Some(strace_capture) = strace_capture {
@@ -3775,6 +4318,18 @@ fn build_runaway_investigation_summary(
                 "strace_stderr".to_string(),
                 stderr_path.display().to_string(),
             );
+        }
+    }
+    if let Some(backtrace_capture) = backtrace_capture {
+        raw_artifacts.insert(
+            "gdb_backtrace".to_string(),
+            backtrace_capture.log_path.display().to_string(),
+        );
+        if let Some(path) = &backtrace_capture.full_log_path {
+            raw_artifacts.insert("gdb_backtrace_full".to_string(), path.display().to_string());
+        }
+        if let Some(path) = &backtrace_capture.maps_path {
+            raw_artifacts.insert("proc_maps".to_string(), path.display().to_string());
         }
     }
     let excerpt = strace_capture
@@ -3814,6 +4369,52 @@ fn build_runaway_investigation_summary(
         },
         stack_excerpt: if include_richer_evidence {
             proc_snapshot.stack_excerpt.clone()
+        } else {
+            None
+        },
+        backtrace_capture: backtrace_capture_status,
+        representative_backtraces: if include_richer_evidence {
+            backtrace_capture
+                .map(|capture| capture.representative_backtraces.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        },
+        common_frame_clusters: if include_richer_evidence {
+            backtrace_capture
+                .map(|capture| capture.common_frame_clusters.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        },
+        thread_summaries: if include_richer_evidence {
+            backtrace_capture
+                .map(|capture| capture.thread_summaries.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        },
+        lock_contention_signals: if include_richer_evidence {
+            backtrace_capture
+                .map(|capture| capture.lock_contention_signals.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        },
+        thread_backtrace_summary: if include_richer_evidence {
+            backtrace_capture.map(build_thread_backtrace_summary)
+        } else {
+            None
+        },
+        raw_backtrace_excerpt: if include_richer_evidence {
+            backtrace_capture.and_then(|capture| {
+                truncate_public_backtrace(
+                    &capture.raw_bt,
+                    config
+                        .service
+                        .hotspot_investigation_backtrace_public_char_limit,
+                )
+            })
         } else {
             None
         },
@@ -3950,9 +4551,10 @@ fn runaway_investigation_fingerprint(
     top_syscalls: &[RunawaySyscallStat],
     dominant_sequence: &[String],
     hypothesis: &RunawayHypothesis,
+    common_frame_clusters: &[RunawayFrameCluster],
 ) -> String {
     hash_text(format!(
-        "runaway-process:{}:{}:{}:{}:{}:{}:{}",
+        "runaway-process:{}:{}:{}:{}:{}:{}:{}:{}",
         target.name,
         target.path.display(),
         target.package_name.as_deref().unwrap_or("unknown"),
@@ -3970,6 +4572,12 @@ fn runaway_investigation_fingerprint(
             .join("|"),
         dominant_sequence.join(">"),
         hypothesis.classification,
+        common_frame_clusters
+            .iter()
+            .take(2)
+            .map(|cluster| cluster.signature.as_str())
+            .collect::<Vec<_>>()
+            .join("|"),
     ))
 }
 
@@ -3978,7 +4586,9 @@ fn runaway_investigation_summary_line(
     hot_path: &PerfHotPath,
     investigation: &RunawayInvestigationSummary,
 ) -> String {
-    let syscall_summary = if investigation.top_syscalls.is_empty() {
+    let syscall_summary = if let Some(summary) = investigation.thread_backtrace_summary.as_deref() {
+        summary.to_string()
+    } else if investigation.top_syscalls.is_empty() {
         "no dominant syscall sample was captured".to_string()
     } else {
         investigation
@@ -5439,6 +6049,7 @@ Stack trace of thread 222:\n\
             ],
             &top_syscalls,
             &["QDBusConnection::send".to_string()],
+            None,
         );
         assert_eq!(hypothesis.classification, "dbus-spin");
         assert!(hypothesis.confidence > 0.8);
@@ -5460,6 +6071,7 @@ Stack trace of thread 222:\n\
             ],
             &top_syscalls,
             &[],
+            None,
         );
         assert_eq!(hypothesis.classification, "file-not-found-retry");
         assert!(hypothesis.confidence > 0.8);

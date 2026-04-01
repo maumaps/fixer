@@ -749,6 +749,11 @@ struct PublicFailureContext {
     hot_path_symbol: Option<String>,
     command_line: Option<String>,
     loop_explanation: Option<String>,
+    thread_backtrace_summary: Option<String>,
+    raw_backtrace_excerpt: Option<String>,
+    representative_backtraces: Vec<String>,
+    common_frame_clusters: Vec<String>,
+    lock_contention_signals: Vec<String>,
     implicated_packages: Vec<String>,
     source_package: Option<String>,
     source_kind: Option<String>,
@@ -8157,7 +8162,36 @@ fn public_failure_context_from_attempt(
     let diagnosis = attempt.details.get("diagnosis").and_then(Value::as_object);
     let workspace = attempt.details.get("workspace").and_then(Value::as_object);
 
-    let note = if has_structured_failure_diagnostics {
+    let backtrace_capture_status = diagnosis
+        .and_then(|value| value.get("backtrace_capture_status"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty());
+    let backtrace_capture_error = diagnosis
+        .and_then(|value| value.get("backtrace_capture_error"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty());
+    let note = if let Some(status) = backtrace_capture_status.as_deref() {
+        match (status, backtrace_capture_error.as_deref()) {
+            ("failed", Some(error)) => Some(format!(
+                "Thread backtrace capture failed on the worker: {error}."
+            )),
+            ("unavailable", _) => Some(
+                "Thread backtrace capture was unavailable on the worker, so this attempt fell back to perf, strace, and /proc evidence."
+                    .to_string(),
+            ),
+            ("disabled", _) => Some(
+                "Thread backtrace capture was disabled on the worker for this attempt."
+                    .to_string(),
+            ),
+            _ if has_structured_failure_diagnostics => None,
+            _ => Some(
+                "This older failed attempt predates structured patch failure capture, so Fixer only retained the diagnosis and workspace context."
+                    .to_string(),
+            ),
+        }
+    } else if has_structured_failure_diagnostics {
         None
     } else {
         Some(
@@ -8189,6 +8223,77 @@ fn public_failure_context_from_attempt(
         .and_then(Value::as_str)
         .map(sanitize_public_text)
         .filter(|value| !value.is_empty());
+    let thread_backtrace_summary = diagnosis
+        .and_then(|value| value.get("thread_backtrace_summary"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty());
+    let raw_backtrace_excerpt = diagnosis
+        .and_then(|value| value.get("raw_backtrace_excerpt"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty());
+    let representative_backtraces = diagnosis
+        .and_then(|value| value.get("representative_backtraces"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_object)
+                .take(4)
+                .filter_map(|trace| {
+                    let count = trace.get("thread_count").and_then(Value::as_u64)?;
+                    let frames = trace
+                        .get("frames")
+                        .and_then(Value::as_array)?
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(4)
+                        .map(sanitize_public_text)
+                        .collect::<Vec<_>>();
+                    (!frames.is_empty())
+                        .then(|| format!("{count} thread(s): {}", frames.join(" -> ")))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let common_frame_clusters = diagnosis
+        .and_then(|value| value.get("common_frame_clusters"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_object)
+                .take(4)
+                .filter_map(|cluster| {
+                    let count = cluster.get("thread_count").and_then(Value::as_u64)?;
+                    let frames = cluster
+                        .get("frames")
+                        .and_then(Value::as_array)?
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(4)
+                        .map(sanitize_public_text)
+                        .collect::<Vec<_>>();
+                    (!frames.is_empty())
+                        .then(|| format!("{count} thread(s): {}", frames.join(" -> ")))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let lock_contention_signals = diagnosis
+        .and_then(|value| value.get("lock_contention_signals"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(sanitize_public_text)
+                .filter(|value| !value.is_empty())
+                .take(8)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let implicated_packages = diagnosis
         .and_then(|value| value.get("implicated_package_names"))
         .and_then(Value::as_array)
@@ -8229,6 +8334,11 @@ fn public_failure_context_from_attempt(
         && hot_path_symbol.is_none()
         && command_line.is_none()
         && loop_explanation.is_none()
+        && thread_backtrace_summary.is_none()
+        && raw_backtrace_excerpt.is_none()
+        && representative_backtraces.is_empty()
+        && common_frame_clusters.is_empty()
+        && lock_contention_signals.is_empty()
         && implicated_packages.is_empty()
         && source_package.is_none()
         && source_kind.is_none()
@@ -8245,6 +8355,11 @@ fn public_failure_context_from_attempt(
         hot_path_symbol,
         command_line,
         loop_explanation,
+        thread_backtrace_summary,
+        raw_backtrace_excerpt,
+        representative_backtraces,
+        common_frame_clusters,
+        lock_contention_signals,
         implicated_packages,
         source_package,
         source_kind,
@@ -9706,14 +9821,33 @@ fn build_public_investigation_snapshot(
         .unwrap_or("runaway-process");
     match subsystem {
         "runaway-process" => {
+            let representative_frames = details
+                .get("representative_backtraces")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_object)
+                .and_then(|trace| trace.get("frames"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             let frames = sanitize_snapshot_frames(
-                details
-                    .get("stack_excerpt")
-                    .and_then(Value::as_str)
-                    .into_iter()
-                    .flat_map(|excerpt| excerpt.lines())
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>(),
+                if representative_frames.is_empty() {
+                    details
+                        .get("stack_excerpt")
+                        .and_then(Value::as_str)
+                        .into_iter()
+                        .flat_map(|excerpt| excerpt.lines())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                } else {
+                    representative_frames
+                },
                 12,
             );
             if frames.is_empty() {
@@ -9723,10 +9857,31 @@ fn build_public_investigation_snapshot(
             if let Some(command_line) = details.get("command_line").and_then(Value::as_str) {
                 highlights.push(format!("Command: {}", sanitize_public_text(command_line)));
             }
-            if let Some(wchan) = details.get("wchan").and_then(Value::as_str) {
+            if let Some(summary) = details
+                .get("thread_backtrace_summary")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                highlights.push(format!("Thread summary: {}", sanitize_public_text(summary)));
+            } else if let Some(wchan) = details.get("wchan").and_then(Value::as_str) {
                 highlights.push(format!("Wait site: {}", normalize_stack_frame(wchan)));
             }
-            if let Some(symbol) = details
+            if let Some(signals) = details
+                .get("lock_contention_signals")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(3)
+                        .map(sanitize_public_text)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|value| !value.is_empty())
+            {
+                highlights.push(format!("Contention signals: {signals}"));
+            } else if let Some(symbol) = details
                 .get("hot_path_symbol")
                 .and_then(Value::as_str)
                 .map(normalize_stack_frame)
@@ -9764,8 +9919,17 @@ fn build_public_investigation_snapshot(
             }
             push_env_highlights(details, &mut highlights);
             Some(PublicTechnicalSnapshot {
-                title: "Sampled wait stack".to_string(),
-                summary: "This is the stack-shaped slice and hot path Fixer captured while the process was spinning.".to_string(),
+                title: if details.get("representative_backtraces").is_some() {
+                    "Representative thread backtrace".to_string()
+                } else {
+                    "Sampled wait stack".to_string()
+                },
+                summary: if details.get("representative_backtraces").is_some() {
+                    "This is the clearest retained userspace thread cluster Fixer captured while the process was spinning."
+                        .to_string()
+                } else {
+                    "This is the stack-shaped slice and hot path Fixer captured while the process was spinning.".to_string()
+                },
                 frames,
                 highlights,
             })
@@ -11006,6 +11170,12 @@ fn render_failure_context_section(context: &PublicFailureContext) -> String {
             html_escape(command_line)
         ));
     }
+    if let Some(summary) = context.thread_backtrace_summary.as_deref() {
+        items.push(format!(
+            "<li><strong>Thread backtrace summary:</strong> {}</li>",
+            html_escape(summary)
+        ));
+    }
     if let Some(source_package) = context.source_package.as_deref() {
         items.push(format!(
             "<li><strong>Source package:</strong> {}</li>",
@@ -11036,6 +11206,12 @@ fn render_failure_context_section(context: &PublicFailureContext) -> String {
             html_escape(&context.implicated_packages.join(", "))
         ));
     }
+    if !context.lock_contention_signals.is_empty() {
+        items.push(format!(
+            "<li><strong>Contention signals:</strong> {}</li>",
+            html_escape(&context.lock_contention_signals.join(", "))
+        ));
+    }
     let explanation_markup = context
         .loop_explanation
         .as_deref()
@@ -11046,13 +11222,57 @@ fn render_failure_context_section(context: &PublicFailureContext) -> String {
             )
         })
         .unwrap_or_default();
-    if items.is_empty() && explanation_markup.is_empty() {
+    let representative_markup = if context.representative_backtraces.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<h4>Representative threads</h4><ul class=\"attempt-list\">{}</ul>",
+            context
+                .representative_backtraces
+                .iter()
+                .map(|trace| format!("<li>{}</li>", html_escape(trace)))
+                .collect::<Vec<_>>()
+                .join("")
+        )
+    };
+    let cluster_markup = if context.common_frame_clusters.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<h4>Common frame clusters</h4><ul class=\"attempt-list\">{}</ul>",
+            context
+                .common_frame_clusters
+                .iter()
+                .map(|cluster| format!("<li>{}</li>", html_escape(cluster)))
+                .collect::<Vec<_>>()
+                .join("")
+        )
+    };
+    let raw_backtrace_markup = context
+        .raw_backtrace_excerpt
+        .as_deref()
+        .map(|backtrace| {
+            format!(
+                "<h4>Raw thread backtrace</h4><pre class=\"code-block\"><code>{}</code></pre>",
+                html_escape(backtrace)
+            )
+        })
+        .unwrap_or_default();
+    if items.is_empty()
+        && explanation_markup.is_empty()
+        && representative_markup.is_empty()
+        && cluster_markup.is_empty()
+        && raw_backtrace_markup.is_empty()
+    {
         return String::new();
     }
     format!(
-        "<section class=\"patch-summary\"><h4>Collected context</h4><ul class=\"attempt-list\">{}</ul>{}</section>",
+        "<section class=\"patch-summary\"><h4>Collected context</h4><ul class=\"attempt-list\">{}</ul>{}{}{}{}</section>",
         items.join(""),
-        explanation_markup
+        explanation_markup,
+        representative_markup,
+        cluster_markup,
+        raw_backtrace_markup
     )
 }
 

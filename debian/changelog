@@ -1,3 +1,12 @@
+fixer (0.53.0-1) unstable; urgency=medium
+
+  * Capture multi-thread userspace backtraces for runaway CPU investigations
+    when gdb is available, and surface backtrace-derived diagnosis summaries,
+    representative thread clusters, and sanitized raw traces in reports and the
+    public site.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 01 Apr 2026 21:45:00 +0400
+
 fixer (0.52.0-1) unstable; urgency=medium
 
   * Show legacy diagnosis and workspace context on failed patch attempts that

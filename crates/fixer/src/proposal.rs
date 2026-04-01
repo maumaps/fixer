@@ -2921,6 +2921,9 @@ fn render_process_investigation_report(
         } else {
             "Fixer collected a CPU-hot process sample but could not derive a stronger hypothesis yet."
         });
+    let thread_backtrace_summary = details
+        .get("thread_backtrace_summary")
+        .and_then(Value::as_str);
     let target_name = details
         .get("profile_target")
         .and_then(|value| value.get("name"))
@@ -3172,6 +3175,9 @@ fn render_process_investigation_report(
                 "- Target process: `{}`\n- Sampled PID: `{}`\n- Loop classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
                 target_name, sampled_pid, classification, confidence, explanation
             ));
+            if let Some(summary) = thread_backtrace_summary {
+                body.push_str(&format!("- Thread backtrace summary: `{summary}`\n"));
+            }
         }
         if let Some(process_state) = process_state {
             body.push_str(&format!("- Process state: `{process_state}`\n"));
@@ -3367,6 +3373,109 @@ fn render_process_investigation_report(
         }
     }
 
+    if let Some(signals) = details
+        .get("lock_contention_signals")
+        .and_then(Value::as_array)
+    {
+        let signals = signals
+            .iter()
+            .filter_map(Value::as_str)
+            .take(8)
+            .collect::<Vec<_>>();
+        if !signals.is_empty() {
+            body.push_str("\n## Contention Signals\n\n");
+            for signal in signals {
+                body.push_str(&format!("- `{signal}`\n"));
+            }
+        }
+    }
+
+    if let Some(clusters) = details
+        .get("common_frame_clusters")
+        .and_then(Value::as_array)
+    {
+        let clusters = clusters
+            .iter()
+            .filter_map(Value::as_object)
+            .take(4)
+            .collect::<Vec<_>>();
+        if !clusters.is_empty() {
+            body.push_str("\n## Common Thread Clusters\n\n");
+            for cluster in clusters {
+                let count = cluster
+                    .get("thread_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let frames = cluster
+                    .get("frames")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .take(4)
+                            .collect::<Vec<_>>()
+                            .join(" -> ")
+                    })
+                    .unwrap_or_default();
+                if !frames.is_empty() {
+                    body.push_str(&format!("- `{count}` thread(s): `{frames}`\n"));
+                }
+            }
+        }
+    }
+
+    if let Some(backtraces) = details
+        .get("representative_backtraces")
+        .and_then(Value::as_array)
+    {
+        let backtraces = backtraces
+            .iter()
+            .filter_map(Value::as_object)
+            .take(3)
+            .collect::<Vec<_>>();
+        if !backtraces.is_empty() {
+            body.push_str("\n## Representative Thread Backtraces\n\n");
+            for trace in backtraces {
+                let label = trace
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("thread");
+                let count = trace
+                    .get("thread_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1);
+                let frames = trace
+                    .get("frames")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .take(8)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                if !frames.is_empty() {
+                    body.push_str(&format!(
+                        "### `{label}` ({count} thread(s))\n\n```text\n{frames}\n```\n\n"
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(backtrace_excerpt) = details
+        .get("raw_backtrace_excerpt")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        body.push_str("\n## Raw Thread Backtrace Snapshot\n\n```text\n");
+        body.push_str(backtrace_excerpt);
+        body.push_str("\n```\n");
+    }
+
     if !top_syscalls.is_empty() {
         body.push_str("\n## Dominant Syscalls\n\n");
         for syscall in top_syscalls {
@@ -3406,7 +3515,8 @@ fn render_process_investigation_report(
     } else {
         body.push_str("1. Confirm the process still shows sustained CPU time with `systemd-cgtop`, `top`, or `ps -p <pid> -o %cpu,stat,comm`.\n");
         body.push_str("2. Re-run a short syscall sample and confirm the dominant syscalls still match the sequence above.\n");
-        body.push_str("3. If you change the package, compare a fresh perf sample and strace excerpt to make sure the loop disappears rather than simply moving elsewhere.\n");
+        body.push_str("3. Collect a fresh multi-thread userspace backtrace with `gdb --batch -p <pid> -ex 'thread apply all bt full' -ex detach -ex quit` and confirm the same thread clusters still dominate.\n");
+        body.push_str("4. If you change the package, compare a fresh perf sample, backtrace, and strace excerpt to make sure the loop disappears rather than simply moving elsewhere.\n");
     }
 
     body.push_str("\n## Next Step\n\n");
