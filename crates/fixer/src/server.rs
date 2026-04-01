@@ -10153,7 +10153,10 @@ fn render_best_result_panel(issue: &PublicIssueDetail) -> String {
     if let Some(panel) = render_best_patch_panel(issue) {
         return panel;
     }
-    render_best_triage_panel(issue).unwrap_or_default()
+    if let Some(panel) = render_best_triage_panel(issue) {
+        return panel;
+    }
+    render_best_report_panel(issue).unwrap_or_default()
 }
 
 fn render_technical_snapshot_section(issue: &PublicIssueDetail) -> String {
@@ -10366,6 +10369,36 @@ fn render_best_triage_panel(issue: &PublicIssueDetail) -> Option<String> {
         html_escape(&handoff.reason),
         report_url,
         next_steps,
+    ))
+}
+
+fn render_best_report_panel(issue: &PublicIssueDetail) -> Option<String> {
+    let best_report = issue
+        .attempts
+        .iter()
+        .find(|attempt| attempt.outcome == "report" && attempt.state == "ready")?;
+    let validation = best_report
+        .validation_status
+        .as_deref()
+        .map(|status| {
+            format!(
+                "<span class=\"tag\">validation: {}</span>",
+                html_escape(status)
+            )
+        })
+        .unwrap_or_default();
+    Some(format!(
+        r#"<section class="panel section patch-panel">
+            <h2>Best Available Diagnosis</h2>
+            <p class="fine-print">Fixer does not have a ready diff or triage handoff for this issue yet, but it does have a published diagnosis-only result. This is the clearest current explanation of what workers found.</p>
+            <div class="meta"><span class="tag">diagnosis available</span><span class="tag">created: {}</span>{}</div>
+            <p class="issue-summary">{}</p>
+            {}
+        </section>"#,
+        html_escape(&format_timestamp(&best_report.created_at)),
+        validation,
+        html_escape(&best_report.summary),
+        render_public_attempt_sections(best_report),
     ))
 }
 
@@ -11953,6 +11986,59 @@ mod tests {
         assert!(markup.contains("similarity: 82%"));
         assert!(markup.contains("same package, same wait site"));
         assert!(markup.contains("/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f9"));
+    }
+
+    #[test]
+    fn render_issue_detail_page_includes_best_report_panel() {
+        let issue = PublicIssueDetail {
+            id: "019d3a5e-e969-7133-80b6-4d2eee964254".to_string(),
+            kind: "investigation".to_string(),
+            title: "Stuck D-state investigation for kworker+i915_flip".to_string(),
+            summary: "The worker appears stuck in kernel wait.".to_string(),
+            package_name: Some("linux-image-6.19.8+deb14-amd64".to_string()),
+            source_package: Some("linux".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 110,
+            corroboration_count: 2,
+            best_patch_available: false,
+            best_triage_available: false,
+            best_patch_diff_url: None,
+            best_patch: None,
+            best_triage: None,
+            best_triage_handoff: None,
+            last_seen: "2026-03-29T20:38:00Z".to_string(),
+            technical_snapshot: None,
+            possible_duplicates: Vec::new(),
+            attempt_summary: PublicAttemptSummary::default(),
+            attempts_omitted_count: 0,
+            attempts: vec![PublicAttempt {
+                outcome: "report".to_string(),
+                state: "ready".to_string(),
+                summary: "A diagnosis report was created even though no patchable workspace was available.".to_string(),
+                validation_status: Some("ready".to_string()),
+                created_at: "2026-03-29T20:38:00Z".to_string(),
+                published_session: Some(PublishedAttemptSession {
+                    prompt: "Investigate the wait stack.".to_string(),
+                    response: Some("The sampled task is blocked in drm_atomic_helper_wait_for_flip_done.".to_string()),
+                    diff: None,
+                    model: Some("gpt-5.4".to_string()),
+                    models_used: vec!["gpt-5.4".to_string()],
+                    rate_limit_fallback_used: false,
+                }),
+                handoff: None,
+                blocker_reason: Some("no patchable workspace was available".to_string()),
+            }],
+            showing_all_attempts: false,
+        };
+
+        let markup = render_issue_detail_page(&issue);
+
+        assert!(markup.contains("Best Available Diagnosis"));
+        assert!(markup.contains("diagnosis available"));
+        assert!(markup.contains("Why it stopped"));
+        assert!(markup.contains("no patchable workspace was available"));
+        assert!(markup.contains("drm_atomic_helper_wait_for_flip_done"));
     }
 
     #[test]
