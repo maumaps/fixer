@@ -8790,11 +8790,14 @@ fn hidden_kernel_workspace_attempt(attempt: &PatchAttempt) -> bool {
     if !matches!(attempt.outcome.as_str(), "report" | "triage") {
         return false;
     }
-    if attempt
+    let report_only_reason = attempt
         .details
         .get("report_only_reason")
-        .and_then(Value::as_str)
-        != Some("workspace-acquisition")
+        .and_then(Value::as_str);
+    if report_only_reason != Some("workspace-acquisition")
+        && !attempt
+            .summary
+            .contains("no patchable workspace was available")
     {
         return false;
     }
@@ -8803,6 +8806,16 @@ fn hidden_kernel_workspace_attempt(attempt: &PatchAttempt) -> bool {
         .get("workspace_classification")
         .and_then(Value::as_str)
         == Some("kernel-source-unavailable")
+    {
+        return true;
+    }
+    if attempt
+        .details
+        .get("diagnosis")
+        .and_then(|value| value.get("profile_target"))
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .is_some_and(is_kernelish_target_name)
     {
         return true;
     }

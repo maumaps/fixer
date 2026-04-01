@@ -1714,6 +1714,26 @@ fn canonicalize_submission_source_package(
     }
 }
 
+fn diagnosis_target_name(diagnosis: &Value) -> Option<&str> {
+    diagnosis
+        .get("profile_target")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| diagnosis.get("process_name").and_then(Value::as_str))
+        .or_else(|| diagnosis.get("target_name").and_then(Value::as_str))
+}
+
+fn diagnosis_points_to_kernel_target(diagnosis: &Value) -> bool {
+    diagnosis_target_name(diagnosis).is_some_and(|target| {
+        let normalized = target.trim().to_ascii_lowercase();
+        normalized.starts_with("kworker")
+            || normalized.starts_with("jbd2/")
+            || normalized.starts_with("kswapd")
+            || normalized.starts_with("kcompactd")
+            || normalized.starts_with("ksoftirqd")
+    })
+}
+
 fn source_package_from_shared_evidence(item: &SharedOpportunity) -> Option<String> {
     let details = item.opportunity.evidence.get("details");
     canonicalize_submission_source_package(
@@ -1778,7 +1798,10 @@ fn workspace_blocker_classification(
                 .and_then(Value::as_str)
         })
         .unwrap_or_default();
-    if package_name.starts_with("linux-") || source_package == "linux" {
+    if package_name.starts_with("linux-")
+        || source_package == "linux"
+        || diagnosis_points_to_kernel_target(&diagnosis)
+    {
         return Some("kernel-source-unavailable".to_string());
     }
     let cloneable_homepage = diagnosis

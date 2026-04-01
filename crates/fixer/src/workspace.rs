@@ -322,6 +322,7 @@ fn package_name_from_opportunity(opportunity: &OpportunityRecord) -> Option<Stri
         .get("package_name")
         .and_then(Value::as_str)
         .map(ToString::to_string)
+        .or_else(|| kernel_source_package_from_opportunity(opportunity))
 }
 
 fn source_package_from_opportunity(opportunity: &OpportunityRecord) -> Option<String> {
@@ -345,6 +346,7 @@ fn source_package_from_opportunity(opportunity: &OpportunityRecord) -> Option<St
                 .map(|package_name| normalize_patchable_source_package(package_name, value))
                 .unwrap_or_else(|| value.to_string())
         })
+        .or_else(|| kernel_source_package_from_opportunity(opportunity))
 }
 
 fn normalize_patchable_source_package(package_name: &str, source_package: &str) -> String {
@@ -397,6 +399,28 @@ fn kernel_upstream_repo_url(source_package: &str) -> Option<&'static str> {
         .then_some("https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git")
 }
 
+fn kernel_source_package_from_opportunity(opportunity: &OpportunityRecord) -> Option<String> {
+    let details = opportunity.evidence.get("details")?;
+    let target_name = details
+        .get("profile_target")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| details.get("process_name").and_then(Value::as_str))
+        .or_else(|| details.get("target_name").and_then(Value::as_str));
+    target_name
+        .filter(|value| is_kernelish_target_name(value))
+        .map(|_| "linux".to_string())
+}
+
+fn is_kernelish_target_name(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.starts_with("kworker")
+        || normalized.starts_with("jbd2/")
+        || normalized.starts_with("kswapd")
+        || normalized.starts_with("kcompactd")
+        || normalized.starts_with("ksoftirqd")
+}
+
 fn deb_src_enabled() -> bool {
     let apt_dir = Path::new("/etc/apt");
     let mut paths = vec![apt_dir.join("sources.list")];
@@ -438,9 +462,9 @@ fn deb_src_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_cloneable_repo_url, kernel_upstream_repo_url, normalize_patchable_source_package,
-        parse_apt_origins, parse_maintainer_url, sanitize_dir_name,
-        source_package_from_opportunity,
+        is_cloneable_repo_url, kernel_source_package_from_opportunity, kernel_upstream_repo_url,
+        normalize_patchable_source_package, parse_apt_origins, parse_maintainer_url,
+        sanitize_dir_name, source_package_from_opportunity,
     };
     use crate::models::OpportunityRecord;
     use serde_json::json;
@@ -560,6 +584,38 @@ zoom:\n\
             created_at: "2026-03-31T00:00:00Z".to_string(),
             updated_at: "2026-03-31T00:00:00Z".to_string(),
         };
+        assert_eq!(
+            source_package_from_opportunity(&opportunity).as_deref(),
+            Some("linux")
+        );
+    }
+
+    #[test]
+    fn infers_linux_source_package_from_kernelish_target_name() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "stuck kernel thread".to_string(),
+            score: 100,
+            state: "open".to_string(),
+            summary: "summary".to_string(),
+            evidence: json!({
+                "details": {
+                    "profile_target": {
+                        "name": "jbd2/sda3-8"
+                    }
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+            updated_at: "2026-03-31T00:00:00Z".to_string(),
+        };
+        assert_eq!(
+            kernel_source_package_from_opportunity(&opportunity).as_deref(),
+            Some("linux")
+        );
         assert_eq!(
             source_package_from_opportunity(&opportunity).as_deref(),
             Some("linux")
