@@ -728,6 +728,16 @@ struct PublicAttempt {
     published_session: Option<PublishedAttemptSession>,
     handoff: Option<PublicTriageHandoff>,
     blocker_reason: Option<String>,
+    failure_diagnostics: Option<PublicFailureDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicFailureDiagnostics {
+    failure_kind: Option<String>,
+    review_failure_category: Option<String>,
+    exit_status: Option<i32>,
+    error: Option<String>,
+    last_stderr_excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -8051,6 +8061,7 @@ fn public_attempt_from_patch_attempt(attempt: PatchAttempt) -> PublicAttempt {
     let published_session = published_session_from_attempt_details(&attempt.details);
     let handoff = public_triage_handoff_from_attempt(&attempt, published_session.as_ref());
     let blocker_reason = attempt_blocker_reason(&attempt);
+    let failure_diagnostics = public_failure_diagnostics_from_attempt(&attempt);
     PublicAttempt {
         outcome: attempt.outcome,
         state: attempt.state,
@@ -8060,7 +8071,61 @@ fn public_attempt_from_patch_attempt(attempt: PatchAttempt) -> PublicAttempt {
         published_session,
         handoff,
         blocker_reason,
+        failure_diagnostics,
     }
+}
+
+fn public_failure_diagnostics_from_attempt(
+    attempt: &PatchAttempt,
+) -> Option<PublicFailureDiagnostics> {
+    let failure_kind = attempt
+        .details
+        .get("patch_failure_kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let review_failure_category = attempt
+        .details
+        .get("patch_review_failure_category")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let exit_status = attempt
+        .details
+        .get("patch_exit_status")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+    let error = attempt
+        .details
+        .get("patch_error")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let last_stderr_excerpt = attempt
+        .details
+        .get("patch_last_stderr_excerpt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    if failure_kind.is_none()
+        && review_failure_category.is_none()
+        && exit_status.is_none()
+        && error.is_none()
+        && last_stderr_excerpt.is_none()
+    {
+        return None;
+    }
+    Some(PublicFailureDiagnostics {
+        failure_kind,
+        review_failure_category,
+        exit_status,
+        error,
+        last_stderr_excerpt,
+    })
 }
 
 fn public_attempt_diff(attempt: &PublicAttempt) -> Option<&str> {
@@ -10708,9 +10773,15 @@ fn render_public_attempt_sections(attempt: &PublicAttempt) -> String {
             )
         })
         .unwrap_or_default();
+    let failure_markup = attempt
+        .failure_diagnostics
+        .as_ref()
+        .map(render_failure_diagnostics_section)
+        .unwrap_or_default();
 
     format!(
         r#"<div class="meta"><span class="tag">state: {}</span><span class="tag">created: {}</span>{}</div>
+        {}
         {}
         {}
         {}"#,
@@ -10726,7 +10797,51 @@ fn render_public_attempt_sections(attempt: &PublicAttempt) -> String {
             .unwrap_or_default(),
         blocker_markup,
         handoff_markup,
+        failure_markup,
         session_markup
+    )
+}
+
+fn render_failure_diagnostics_section(diagnostics: &PublicFailureDiagnostics) -> String {
+    let mut items = Vec::new();
+    if let Some(kind) = diagnostics.failure_kind.as_deref() {
+        items.push(format!(
+            "<li><strong>Failure kind:</strong> {}</li>",
+            html_escape(kind)
+        ));
+    }
+    if let Some(category) = diagnostics.review_failure_category.as_deref() {
+        items.push(format!(
+            "<li><strong>Review category:</strong> {}</li>",
+            html_escape(category)
+        ));
+    }
+    if let Some(status) = diagnostics.exit_status {
+        items.push(format!("<li><strong>Exit status:</strong> {}</li>", status));
+    }
+    if let Some(error) = diagnostics.error.as_deref() {
+        items.push(format!(
+            "<li><strong>Error:</strong> {}</li>",
+            html_escape(error)
+        ));
+    }
+    let stderr_markup = diagnostics
+        .last_stderr_excerpt
+        .as_deref()
+        .map(|stderr| {
+            format!(
+                "<h4>stderr excerpt</h4><pre class=\"code-block\"><code>{}</code></pre>",
+                html_escape(stderr)
+            )
+        })
+        .unwrap_or_default();
+    if items.is_empty() && stderr_markup.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<section class=\"patch-summary\"><h4>Failure details</h4><ul class=\"attempt-list\">{}</ul>{}</section>",
+        items.join(""),
+        stderr_markup
     )
 }
 
@@ -11674,6 +11789,7 @@ mod tests {
                     published_session: None,
                     handoff: None,
                     blocker_reason: Some("workspace acquisition failed".to_string()),
+                    failure_diagnostics: None,
                 },
             }],
         );
@@ -11764,6 +11880,41 @@ mod tests {
                 .and_then(|session| session.response.as_deref()),
             Some("Patched ./workspace/src/file.c")
         );
+    }
+
+    #[test]
+    fn failed_patch_attempt_exposes_structured_failure_diagnostics() {
+        let public_attempt = public_attempt_from_patch_attempt(PatchAttempt {
+            cluster_id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "patch".to_string(),
+            state: "failed".to_string(),
+            summary: "The diagnosis was captured, but the patch proposal did not complete cleanly."
+                .to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("failed".to_string()),
+            details: json!({
+                "patch_failure_kind": "execution",
+                "patch_review_failure_category": "test-regression",
+                "patch_exit_status": 2,
+                "patch_error": "cargo test failed in the workspace",
+                "patch_last_stderr_excerpt": "thread 'main' panicked at src/lib.rs:42"
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        });
+
+        let markup = render_public_attempt_card(&public_attempt);
+
+        assert!(markup.contains("Failure details"));
+        assert!(markup.contains("Failure kind:"));
+        assert!(markup.contains("execution"));
+        assert!(markup.contains("Review category:"));
+        assert!(markup.contains("test-regression"));
+        assert!(markup.contains("Exit status:"));
+        assert!(markup.contains("cargo test failed in the workspace"));
+        assert!(markup.contains("stderr excerpt"));
+        assert!(markup.contains("thread &#39;main&#39; panicked"));
     }
 
     #[test]
@@ -11903,6 +12054,7 @@ mod tests {
                 }),
                 handoff: None,
                 blocker_reason: None,
+                failure_diagnostics: None,
             },
         });
 
@@ -11953,6 +12105,7 @@ mod tests {
                 }),
                 handoff: None,
                 blocker_reason: None,
+                failure_diagnostics: None,
             }),
             best_triage: None,
             best_triage_handoff: None,
@@ -12008,6 +12161,7 @@ mod tests {
                     next_steps: vec!["Capture a fresh backend sample.".to_string()],
                 }),
                 blocker_reason: None,
+                failure_diagnostics: None,
             }),
             best_triage_handoff: Some(PublicTriageHandoff {
                 reason: "likely-external-root-cause".to_string(),
@@ -12089,6 +12243,7 @@ mod tests {
                 }),
                 handoff: None,
                 blocker_reason: Some("no patchable workspace was available".to_string()),
+                failure_diagnostics: None,
             }],
             showing_all_attempts: false,
         };
@@ -12194,6 +12349,7 @@ mod tests {
                 }),
                 handoff: None,
                 blocker_reason: None,
+                failure_diagnostics: None,
             }),
             best_triage: None,
             best_triage_handoff: None,
