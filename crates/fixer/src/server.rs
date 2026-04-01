@@ -5200,6 +5200,10 @@ fn repeated_workspace_blocked_triage_attempt(candidates: &[PatchAttempt]) -> Opt
 fn best_attempts_from_candidates(
     candidates: Vec<PatchAttempt>,
 ) -> (Option<PatchAttempt>, Option<PatchAttempt>) {
+    let candidates = candidates
+        .into_iter()
+        .filter(publicly_visible_attempt)
+        .collect::<Vec<_>>();
     let best_triage = select_best_attempt(&candidates, "triage")
         .into_iter()
         .chain(repeated_workspace_blocked_triage_attempt(&candidates))
@@ -5233,6 +5237,7 @@ async fn load_latest_patch_context_for_worker(
                         .ok()
                         .map(canonicalize_worker_result_envelope)
                         .map(|envelope| envelope.attempt)
+                        .filter(publicly_visible_attempt)
                 })
                 .collect::<Vec<_>>();
             Ok(select_best_attempt(&candidates, "patch"))
@@ -5255,6 +5260,7 @@ async fn load_latest_patch_context_for_worker(
                         .and_then(|raw| serde_json::from_str::<WorkerResultEnvelope>(&raw).ok())
                         .map(canonicalize_worker_result_envelope)
                         .map(|envelope| envelope.attempt)
+                        .filter(publicly_visible_attempt)
                 })
                 .collect::<Vec<_>>();
             Ok(select_best_attempt(&candidates, "patch"))
@@ -5281,6 +5287,7 @@ async fn refresh_issue_cluster_best_results(db: &Client, cluster_id: &str) -> Re
                 .ok()
                 .map(canonicalize_worker_result_envelope)
                 .map(|envelope| envelope.attempt)
+                .filter(publicly_visible_attempt)
         })
         .collect::<Vec<_>>();
     let (best_patch, best_triage) = best_attempts_from_candidates(candidates);
@@ -5319,6 +5326,7 @@ fn refresh_issue_cluster_best_results_sqlite(
                 .and_then(|raw| serde_json::from_str::<WorkerResultEnvelope>(&raw).ok())
                 .map(canonicalize_worker_result_envelope)
                 .map(|envelope| envelope.attempt)
+                .filter(publicly_visible_attempt)
         })
         .collect::<Vec<_>>();
     let (best_patch, best_triage) = best_attempts_from_candidates(candidates);
@@ -6130,6 +6138,64 @@ fn build_public_attempt_summary(attempts: &[PublicAttempt]) -> PublicAttemptSumm
     summary
 }
 
+async fn load_public_attempt_totals(db: &ServerDb) -> Result<(i64, i64, i64), ApiError> {
+    let mut ready_report_count = 0_i64;
+    let mut failed_patch_attempt_count = 0_i64;
+    let mut explained_impossible_count = 0_i64;
+    match db {
+        ServerDb::Postgres(client) => {
+            let rows = client
+                .query("SELECT bundle_json FROM patch_attempts", &[])
+                .await
+                .map_err(ApiError::internal)?;
+            for row in rows {
+                let raw: Value = row.get(0);
+                let envelope = serde_json::from_value::<WorkerResultEnvelope>(raw)
+                    .map_err(ApiError::internal)?;
+                let attempt = canonicalize_worker_result_envelope(envelope).attempt;
+                if !publicly_visible_attempt(&attempt) {
+                    continue;
+                }
+                match (attempt.outcome.as_str(), attempt.state.as_str()) {
+                    ("report", "ready") => ready_report_count += 1,
+                    ("patch", "failed") => failed_patch_attempt_count += 1,
+                    ("impossible", "explained") => explained_impossible_count += 1,
+                    _ => {}
+                }
+            }
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            let mut stmt = connection
+                .prepare("SELECT bundle_json FROM patch_attempts")
+                .map_err(ApiError::internal)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(ApiError::internal)?;
+            for row in rows {
+                let raw = row.map_err(ApiError::internal)?;
+                let envelope = serde_json::from_str::<WorkerResultEnvelope>(&raw)
+                    .map_err(ApiError::internal)?;
+                let attempt = canonicalize_worker_result_envelope(envelope).attempt;
+                if !publicly_visible_attempt(&attempt) {
+                    continue;
+                }
+                match (attempt.outcome.as_str(), attempt.state.as_str()) {
+                    ("report", "ready") => ready_report_count += 1,
+                    ("patch", "failed") => failed_patch_attempt_count += 1,
+                    ("impossible", "explained") => explained_impossible_count += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok((
+        ready_report_count,
+        failed_patch_attempt_count,
+        explained_impossible_count,
+    ))
+}
+
 fn issue_from_row(row: Row) -> Result<IssueCluster> {
     let representative: SharedOpportunity = serde_json::from_value(row.get::<_, Value>(13))?;
     let best_patch = row
@@ -6251,9 +6317,6 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 (SELECT COUNT(*) FROM issue_clusters WHERE promoted = FALSE),
                 (SELECT COUNT(*) FROM issue_clusters WHERE best_patch_json IS NOT NULL),
                 (SELECT COUNT(*) FROM issue_clusters WHERE best_patch_json IS NULL AND best_triage_json IS NOT NULL),
-                (SELECT COUNT(*) FROM patch_attempts WHERE outcome = 'report' AND state = 'ready'),
-                (SELECT COUNT(*) FROM patch_attempts WHERE outcome = 'patch' AND state = 'failed'),
-                (SELECT COUNT(*) FROM patch_attempts WHERE outcome = 'impossible' AND state = 'explained'),
                 (SELECT COUNT(*) FROM issue_clusters WHERE promoted = TRUE AND public_visible = TRUE AND corroboration_count >= 2),
                 (SELECT COALESCE(MAX(corroboration_count), 0) FROM issue_clusters WHERE promoted = TRUE AND public_visible = TRUE),
                 (SELECT MAX(received_at) FROM submissions)
@@ -6262,8 +6325,10 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 )
                 .await
                 .map_err(ApiError::internal)?;
+            let (ready_report_count, failed_patch_attempt_count, explained_impossible_count) =
+                load_public_attempt_totals(db).await?;
             let last_submission_at = row
-                .get::<_, Option<DateTime<Utc>>>(11)
+                .get::<_, Option<DateTime<Utc>>>(8)
                 .map(|value| value.to_rfc3339());
             Ok(DashboardSnapshot {
                 install_count: row.get(0),
@@ -6272,11 +6337,11 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 quarantined_issue_count: row.get(3),
                 ready_patch_count: row.get(4),
                 ready_triage_count: row.get(5),
-                ready_report_count: row.get(6),
-                failed_patch_attempt_count: row.get(7),
-                explained_impossible_count: row.get(8),
-                corroborated_public_issue_count: row.get(9),
-                largest_public_cluster_size: row.get(10),
+                ready_report_count,
+                failed_patch_attempt_count,
+                explained_impossible_count,
+                corroborated_public_issue_count: row.get(6),
+                largest_public_cluster_size: row.get(7),
                 last_submission_at,
                 top_issues: load_public_issue_candidates(db, 8).await?,
             })
@@ -6324,27 +6389,8 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                     |row| row.get(0),
                 )
                 .map_err(ApiError::internal)?;
-            let ready_report_count: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM patch_attempts WHERE outcome = 'report' AND state = 'ready'",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(ApiError::internal)?;
-            let failed_patch_attempt_count: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM patch_attempts WHERE outcome = 'patch' AND state = 'failed'",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(ApiError::internal)?;
-            let explained_impossible_count: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM patch_attempts WHERE outcome = 'impossible' AND state = 'explained'",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(ApiError::internal)?;
+            let (ready_report_count, failed_patch_attempt_count, explained_impossible_count) =
+                load_public_attempt_totals(db).await?;
             let largest_public_cluster_size: i64 = connection
                 .query_row(
                     "SELECT COALESCE(MAX(corroboration_count), 0) FROM issue_clusters WHERE promoted = 1 AND public_visible = 1",
@@ -6882,7 +6928,17 @@ async fn load_public_attempts(
                 )
                 .await
                 .map_err(ApiError::internal)?;
-            rows.into_iter().map(public_attempt_from_row).collect()
+            let mut attempts = Vec::new();
+            for row in rows {
+                let bundle_json: Value = row.get(0);
+                let envelope = serde_json::from_value::<WorkerResultEnvelope>(bundle_json)
+                    .map_err(ApiError::internal)?;
+                let envelope = canonicalize_worker_result_envelope(envelope);
+                if publicly_visible_attempt(&envelope.attempt) {
+                    attempts.push(public_attempt_from_patch_attempt(envelope.attempt));
+                }
+            }
+            Ok(attempts)
         }
         ServerDb::Sqlite(path) => {
             let connection = sqlite_connection(path).map_err(ApiError::internal)?;
@@ -6898,10 +6954,19 @@ async fn load_public_attempts(
                 )
                 .map_err(ApiError::internal)?;
             let rows = stmt
-                .query_map(params![cluster_id, limit], public_attempt_from_sqlite_row)
+                .query_map(params![cluster_id, limit], |row| row.get::<_, String>(0))
                 .map_err(ApiError::internal)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(ApiError::internal)
+            let mut attempts = Vec::new();
+            for row in rows {
+                let raw = row.map_err(ApiError::internal)?;
+                let envelope = serde_json::from_str::<WorkerResultEnvelope>(&raw)
+                    .map_err(ApiError::internal)?;
+                let envelope = canonicalize_worker_result_envelope(envelope);
+                if publicly_visible_attempt(&envelope.attempt) {
+                    attempts.push(public_attempt_from_patch_attempt(envelope.attempt));
+                }
+            }
+            Ok(attempts)
         }
     }
 }
@@ -6958,9 +7023,32 @@ async fn load_public_attempt_entries(
                 .query(&query, &[&limit])
                 .await
                 .map_err(ApiError::internal)?;
-            rows.into_iter()
-                .map(public_attempt_entry_from_row)
-                .collect()
+            let mut entries = Vec::new();
+            for row in rows {
+                let attempt_json: Value = row.get(12);
+                let envelope = serde_json::from_value::<WorkerResultEnvelope>(attempt_json)
+                    .map_err(ApiError::internal)?;
+                let envelope = canonicalize_worker_result_envelope(envelope);
+                if !publicly_visible_attempt(&envelope.attempt) {
+                    continue;
+                }
+                entries.push(PublicAttemptEntry {
+                    issue_id: row.get(0),
+                    kind: row.get(1),
+                    issue_title: row.get(2),
+                    issue_summary: row.get(3),
+                    package_name: row.get(4),
+                    source_package: row.get(5),
+                    ecosystem: row.get(6),
+                    severity: row.get(7),
+                    score: row.get(8),
+                    corroboration_count: row.get(9),
+                    best_patch_available: row.get(10),
+                    best_triage_available: row.get(11),
+                    attempt: public_attempt_from_patch_attempt(envelope.attempt),
+                });
+            }
+            Ok(entries)
         }
         ServerDb::Sqlite(path) => {
             let connection = sqlite_connection(path).map_err(ApiError::internal)?;
@@ -6982,10 +7070,64 @@ async fn load_public_attempt_entries(
             );
             let mut stmt = connection.prepare(&query).map_err(ApiError::internal)?;
             let rows = stmt
-                .query_map(params![limit], public_attempt_entry_from_sqlite_row)
+                .query_map(params![limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, String>(12)?,
+                    ))
+                })
                 .map_err(ApiError::internal)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(ApiError::internal)
+            let mut entries = Vec::new();
+            for row in rows {
+                let (
+                    issue_id,
+                    kind,
+                    issue_title,
+                    issue_summary,
+                    package_name,
+                    source_package,
+                    ecosystem,
+                    severity,
+                    score,
+                    corroboration_count,
+                    best_patch_available,
+                    best_triage_available,
+                    raw,
+                ) = row.map_err(ApiError::internal)?;
+                let envelope = serde_json::from_str::<WorkerResultEnvelope>(&raw)
+                    .map_err(ApiError::internal)?;
+                let envelope = canonicalize_worker_result_envelope(envelope);
+                if !publicly_visible_attempt(&envelope.attempt) {
+                    continue;
+                }
+                entries.push(PublicAttemptEntry {
+                    issue_id,
+                    kind,
+                    issue_title,
+                    issue_summary,
+                    package_name,
+                    source_package,
+                    ecosystem,
+                    severity,
+                    score,
+                    corroboration_count,
+                    best_patch_available: best_patch_available != 0,
+                    best_triage_available: best_triage_available != 0,
+                    attempt: public_attempt_from_patch_attempt(envelope.attempt),
+                });
+            }
+            Ok(entries)
         }
     }
 }
@@ -7006,27 +7148,6 @@ fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
         best_patch_available: row.get(10),
         best_triage_available: row.get(11),
         last_seen: last_seen.to_rfc3339(),
-    })
-}
-
-fn public_attempt_entry_from_row(row: Row) -> Result<PublicAttemptEntry, ApiError> {
-    let attempt_json: Value = row.get(12);
-    let envelope = serde_json::from_value::<WorkerResultEnvelope>(attempt_json)
-        .map_err(ApiError::internal)?;
-    Ok(PublicAttemptEntry {
-        issue_id: row.get(0),
-        kind: row.get(1),
-        issue_title: row.get(2),
-        issue_summary: row.get(3),
-        package_name: row.get(4),
-        source_package: row.get(5),
-        ecosystem: row.get(6),
-        severity: row.get(7),
-        score: row.get(8),
-        corroboration_count: row.get(9),
-        best_patch_available: row.get(10),
-        best_triage_available: row.get(11),
-        attempt: public_attempt_from_patch_attempt(envelope.attempt),
     })
 }
 
@@ -7079,13 +7200,6 @@ fn public_triage_from_row(row: Row) -> Result<PublicTriageEntry, ApiError> {
         best_triage,
         handoff,
     })
-}
-
-fn public_attempt_from_row(row: Row) -> Result<PublicAttempt, ApiError> {
-    let bundle_json: Value = row.get(0);
-    let envelope =
-        serde_json::from_value::<WorkerResultEnvelope>(bundle_json).map_err(ApiError::internal)?;
-    Ok(public_attempt_from_patch_attempt(envelope.attempt))
 }
 
 fn compare_public_issue_priority(
@@ -7887,38 +8001,6 @@ fn public_triage_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pu
     })
 }
 
-fn public_attempt_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicAttempt> {
-    let raw: String = row.get(0)?;
-    let envelope = serde_json::from_str::<WorkerResultEnvelope>(&raw).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
-    })?;
-    Ok(public_attempt_from_patch_attempt(envelope.attempt))
-}
-
-fn public_attempt_entry_from_sqlite_row(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<PublicAttemptEntry> {
-    let raw: String = row.get(12)?;
-    let envelope = serde_json::from_str::<WorkerResultEnvelope>(&raw).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(error))
-    })?;
-    Ok(PublicAttemptEntry {
-        issue_id: row.get(0)?,
-        kind: row.get(1)?,
-        issue_title: row.get(2)?,
-        issue_summary: row.get(3)?,
-        package_name: row.get(4)?,
-        source_package: row.get(5)?,
-        ecosystem: row.get(6)?,
-        severity: row.get(7)?,
-        score: row.get(8)?,
-        corroboration_count: row.get(9)?,
-        best_patch_available: row.get::<_, i64>(10)? != 0,
-        best_triage_available: row.get::<_, i64>(11)? != 0,
-        attempt: public_attempt_from_patch_attempt(envelope.attempt),
-    })
-}
-
 fn public_attempt_from_patch_attempt(attempt: PatchAttempt) -> PublicAttempt {
     let attempt = canonicalize_patch_attempt(attempt);
     let published_session = published_session_from_attempt_details(&attempt.details);
@@ -8615,6 +8697,52 @@ fn canonicalize_patch_attempt(mut attempt: PatchAttempt) -> PatchAttempt {
         attempt.outcome = "report".to_string();
     }
     attempt
+}
+
+fn text_describes_local_codex_auth_issue(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("codex auth lease has expired")
+        || lower.contains("codex auth lease is paused")
+        || lower.contains("current codex auth lease has expired")
+        || lower.contains("current codex auth lease is paused")
+        || lower.contains("auto-paused after 3 recent codex failures")
+}
+
+fn hidden_local_auth_bookkeeping_attempt(attempt: &PatchAttempt) -> bool {
+    if attempt.outcome != "report" || attempt.state != "ready" {
+        return false;
+    }
+    if attempt
+        .details
+        .get("report_only_reason")
+        .and_then(Value::as_str)
+        == Some("codex-auth-unavailable")
+    {
+        return true;
+    }
+    if attempt
+        .details
+        .get("automatic_patch_blocker_kind")
+        .and_then(Value::as_str)
+        == Some("codex-auth")
+    {
+        return true;
+    }
+    for key in ["patch_error", "workspace_error", "error"] {
+        if attempt
+            .details
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(text_describes_local_codex_auth_issue)
+        {
+            return true;
+        }
+    }
+    text_describes_local_codex_auth_issue(&attempt.summary)
+}
+
+fn publicly_visible_attempt(attempt: &PatchAttempt) -> bool {
+    !hidden_local_auth_bookkeeping_attempt(attempt)
 }
 
 fn canonicalize_worker_result_envelope(mut result: WorkerResultEnvelope) -> WorkerResultEnvelope {
@@ -11516,6 +11644,75 @@ mod tests {
                 .as_ref()
                 .and_then(|session| session.response.as_deref()),
             Some("Patched ./workspace/src/file.c")
+        );
+    }
+
+    #[test]
+    fn auth_blocked_report_is_not_publicly_visible_attempt() {
+        let attempt = PatchAttempt {
+            cluster_id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "report".to_string(),
+            state: "ready".to_string(),
+            summary: "the current Codex auth lease has expired".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "report_only_reason": "codex-auth-unavailable",
+                "automatic_patch_blocker_kind": "codex-auth",
+                "patch_error": "the current Codex auth lease is paused: auto-paused after 3 recent Codex failures"
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+
+        assert!(hidden_local_auth_bookkeeping_attempt(&attempt));
+        assert!(!publicly_visible_attempt(&attempt));
+    }
+
+    #[test]
+    fn best_attempt_selection_ignores_auth_blocked_reports() {
+        let auth_blocked = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "report".to_string(),
+            state: "ready".to_string(),
+            summary: "the current Codex auth lease has expired".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "report_only_reason": "codex-auth-unavailable",
+                "automatic_patch_blocker_kind": "codex-auth"
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let visible_triage = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "install-2".to_string(),
+            outcome: "triage".to_string(),
+            state: "ready".to_string(),
+            summary: "A diagnosis and external handoff were created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "report_only_reason": "workspace-unavailable-external-package",
+                "handoff": {
+                    "reason": "workspace-unavailable-external-package",
+                    "target": "upstream owner",
+                    "next_steps": ["file upstream"]
+                }
+            }),
+            created_at: "2026-03-29T01:00:00Z".to_string(),
+        };
+
+        let (best_patch, best_triage) =
+            best_attempts_from_candidates(vec![auth_blocked, visible_triage.clone()]);
+        assert!(best_patch.is_none());
+        assert_eq!(
+            best_triage.expect("visible triage survives").summary,
+            visible_triage.summary
         );
     }
 

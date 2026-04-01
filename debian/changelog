@@ -1,3 +1,10 @@
+fixer (0.46.0-1) unstable; urgency=medium
+
+  * Hide local Codex auth bookkeeping reports from the public site so expired
+    or auto-paused auth leases do not count as diagnosis attempts.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 01 Apr 2026 18:28:00 +0400
+
 fixer (0.45.0-1) unstable; urgency=medium
 
   * Fix the public attempts board on PostgreSQL by decoding stored worker
