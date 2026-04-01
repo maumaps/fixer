@@ -169,6 +169,12 @@ pub struct CodexJobSpec {
     pub job_id: String,
     pub opportunity_id: i64,
     pub run_as_user: String,
+    #[serde(default)]
+    pub worker_lease_id: Option<String>,
+    #[serde(default)]
+    pub worker_issue_id: Option<String>,
+    #[serde(default)]
+    pub worker_install_id: Option<String>,
     pub workspace: PreparedWorkspace,
     pub bundle_dir: PathBuf,
     pub prompt_path: PathBuf,

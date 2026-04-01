@@ -57,6 +57,7 @@ pub struct WorkerRunOutcome {
 
 const LOCAL_WORKER_BLOCKER_HISTORY_KEY: &str = "worker_local_blocker_history";
 const MAX_LOCAL_WORKER_BLOCKERS: usize = 64;
+const SUBMITTED_WORKER_RESULT_MARKER: &str = "submitted-worker-result.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalWorkerBlocker {
@@ -712,6 +713,8 @@ fn run_codex_job_as_user(
 fn create_worker_codex_proposal(
     store: &Store,
     config: &FixerConfig,
+    lease_id: &str,
+    install_id: &str,
     issue: &crate::models::IssueCluster,
     opportunity: &OpportunityRecord,
     workspace: &crate::models::PreparedWorkspace,
@@ -746,13 +749,20 @@ fn create_worker_codex_proposal(
                 let lease = store
                     .load_codex_auth_lease()?
                     .ok_or_else(|| anyhow!("no active Codex auth lease is configured"))?;
-                let job = proposal::prepare_codex_job_with_prior_patch(
+                let mut job = proposal::prepare_codex_job_with_prior_patch(
                     config,
                     opportunity,
                     workspace,
                     issue.best_patch.as_ref(),
                     &lease.user,
                     lease.allow_kernel,
+                )?;
+                job.worker_lease_id = Some(lease_id.to_string());
+                job.worker_issue_id = Some(issue.id.clone());
+                job.worker_install_id = Some(install_id.to_string());
+                fs::write(
+                    job.bundle_dir.join("job.json"),
+                    serde_json::to_vec_pretty(&job)?,
                 )?;
                 let status = run_codex_job_as_user(store, config, &job)?;
                 store.create_proposal(
@@ -895,6 +905,23 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
             result: None,
         });
     }
+    if let Some(recovered) = recover_unpublished_worker_result(config, &participation)? {
+        let endpoint = format!("v1/work/{}/result", recovered.lease_id);
+        let submitted = post_json::<_, WorkerResultEnvelope>(config, &endpoint, &recovered.result)?;
+        mark_worker_result_submitted(&recovered.bundle_dir, &submitted)?;
+        store.set_local_state("last_worker_result", &submitted)?;
+        return Ok(WorkerRunOutcome {
+            hello,
+            offer: WorkOffer {
+                message: format!(
+                    "published completed local worker bundle {} before requesting fresh work",
+                    recovered.bundle_dir.display()
+                ),
+                lease: None,
+            },
+            result: Some(submitted),
+        });
+    }
 
     let work_payload_hash = hash_text(serde_json::to_vec(&hello_request)?);
     let work_request = WorkPullRequest {
@@ -982,6 +1009,8 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
             match create_worker_codex_proposal(
                 store,
                 config,
+                &lease.lease_id,
+                &participation.identity.install_id,
                 &lease.issue,
                 &opportunity,
                 &workspace,
@@ -1316,12 +1345,189 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
 
     let endpoint = format!("v1/work/{}/result", lease.lease_id);
     let submitted = post_json::<_, WorkerResultEnvelope>(config, &endpoint, &result)?;
+    if let Some(bundle_path) = result.attempt.bundle_path.as_deref() {
+        let _ = mark_worker_result_submitted(Path::new(bundle_path), &submitted);
+    }
     store.set_local_state("last_worker_result", &submitted)?;
     Ok(WorkerRunOutcome {
         hello,
         offer,
         result: Some(submitted),
     })
+}
+
+#[derive(Debug)]
+struct RecoverableWorkerResult {
+    lease_id: String,
+    bundle_dir: PathBuf,
+    result: WorkerResultEnvelope,
+}
+
+fn recover_unpublished_worker_result(
+    config: &FixerConfig,
+    participation: &ParticipationSnapshot,
+) -> Result<Option<RecoverableWorkerResult>> {
+    let proposals_root = config.service.state_dir.join("proposals");
+    if !proposals_root.exists() {
+        return Ok(None);
+    }
+    let mut bundle_dirs = fs::read_dir(&proposals_root)?
+        .filter_map(|entry| entry.ok().map(|item| item.path()))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    bundle_dirs.sort();
+    bundle_dirs.reverse();
+    for bundle_dir in bundle_dirs.into_iter().take(32) {
+        if bundle_dir.join(SUBMITTED_WORKER_RESULT_MARKER).exists() {
+            continue;
+        }
+        let job = match proposal::load_codex_job(&bundle_dir) {
+            Ok(job) => job,
+            Err(_) => continue,
+        };
+        let Some(lease_id) = job.worker_lease_id.clone() else {
+            continue;
+        };
+        let Some(issue_id) = job.worker_issue_id.clone() else {
+            continue;
+        };
+        let status = match proposal::load_codex_job_status(&bundle_dir) {
+            Ok(status) => status,
+            Err(_) => continue,
+        };
+        if status.state != "ready" && status.state != "failed" {
+            continue;
+        }
+        let evidence_raw = match fs::read(bundle_dir.join("evidence.json")) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let evidence: Value = match serde_json::from_slice(&evidence_raw) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let opportunity: OpportunityRecord = match evidence
+            .get("opportunity")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+        {
+            Some(opportunity) => opportunity,
+            None => continue,
+        };
+        let supports_process_report =
+            proposal::supports_process_investigation_report(&opportunity);
+        let mut details = serde_json::Map::from_iter([
+            ("local_opportunity_id".to_string(), json!(opportunity.id)),
+            (
+                "worker_fixer_version".to_string(),
+                json!(current_binary_version()),
+            ),
+            (
+                "recovered_unpublished_bundle".to_string(),
+                json!(bundle_dir.display().to_string()),
+            ),
+        ]);
+        if let Some(workspace) = evidence
+            .get("source_workspace")
+            .cloned()
+            .or_else(|| evidence.get("workspace").cloned())
+        {
+            details.insert("workspace".to_string(), workspace);
+        }
+        if supports_process_report {
+            details.insert(
+                "diagnosis".to_string(),
+                process_investigation_worker_diagnosis(&opportunity),
+            );
+        }
+        append_job_status_details(&mut details, &status);
+        if let Ok(public_session) = proposal::load_published_codex_session(&bundle_dir) {
+            details.insert("published_session".to_string(), public_session);
+        }
+        let published_session = details.get("published_session").cloned();
+        let is_triage_ready = status.state == "ready"
+            && !published_session_has_diff(published_session.as_ref())
+            && published_session_marks_successful_triage(published_session.as_ref());
+        if is_triage_ready {
+            details.insert(
+                "report_only_reason".to_string(),
+                json!(worker_triage_reason(published_session.as_ref())),
+            );
+            details.insert(
+                "handoff".to_string(),
+                worker_triage_handoff(&opportunity, published_session.as_ref()),
+            );
+        }
+        let summary = if status.state == "ready" {
+            if is_triage_ready {
+                if supports_process_report {
+                    format!(
+                        "{} A diagnosis report and external handoff were created locally.",
+                        process_investigation_worker_summary(&opportunity)
+                    )
+                } else {
+                    "A diagnosis and external handoff were created locally. Review it and report it to the likely owner."
+                        .to_string()
+                }
+            } else if supports_process_report {
+                format!(
+                    "{} A diagnosis report and patch proposal were created locally.",
+                    process_investigation_worker_summary(&opportunity)
+                )
+            } else {
+                "Patch proposal created locally. Review it and submit it upstream if it looks correct."
+                    .to_string()
+            }
+        } else if supports_process_report {
+            format!(
+                "{} The diagnosis was captured, but the patch proposal did not complete cleanly.",
+                process_investigation_worker_summary(&opportunity)
+            )
+        } else {
+            "Worker attempted a patch but the local proposal did not complete cleanly."
+                .to_string()
+        };
+        return Ok(Some(RecoverableWorkerResult {
+            lease_id: lease_id.clone(),
+            bundle_dir: bundle_dir.clone(),
+            result: WorkerResultEnvelope {
+                lease_id,
+                attempt: PatchAttempt {
+                    cluster_id: issue_id,
+                    install_id: job
+                        .worker_install_id
+                        .clone()
+                        .unwrap_or_else(|| participation.identity.install_id.clone()),
+                    outcome: if is_triage_ready {
+                        "triage".to_string()
+                    } else {
+                        "patch".to_string()
+                    },
+                    state: status.state.clone(),
+                    summary,
+                    bundle_path: Some(bundle_dir.display().to_string()),
+                    output_path: status
+                        .output_path
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    validation_status: Some(status.state.clone()),
+                    details: Value::Object(details),
+                    created_at: status.finished_at.clone(),
+                },
+                impossible_reason: None,
+                evidence_request: None,
+            },
+        }));
+    }
+    Ok(None)
+}
+
+fn mark_worker_result_submitted(bundle_dir: &Path, submitted: &WorkerResultEnvelope) -> Result<()> {
+    fs::write(
+        bundle_dir.join(SUBMITTED_WORKER_RESULT_MARKER),
+        serde_json::to_vec_pretty(submitted)?,
+    )?;
+    Ok(())
 }
 
 fn build_submission_bundle(
