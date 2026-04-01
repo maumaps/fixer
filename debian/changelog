@@ -1,4 +1,4 @@
-fixer (0.52.0-1) unstable; urgency=medium
+fixer (0.51.0-1) unstable; urgency=medium
 
   * Show structured failure diagnostics on the public failed-attempts board,
     including failure kind, review category, exit status, error details, and
