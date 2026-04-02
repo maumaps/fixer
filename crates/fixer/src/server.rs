@@ -887,6 +887,19 @@ struct DuplicateCandidateIssue {
 }
 
 #[derive(Debug, Clone)]
+struct PublicIssueCandidate {
+    issue: PublicIssue,
+    signals: IssuePrioritySignals,
+}
+
+#[derive(Debug, Clone, Default)]
+struct IssuePrioritySignals {
+    subsystem: Option<String>,
+    target_name: Option<String>,
+    likely_external_root_cause: bool,
+}
+
+#[derive(Debug, Clone)]
 struct IssueHumanContext {
     kind_label: String,
     impact_label: String,
@@ -964,7 +977,7 @@ struct DashboardSnapshot {
     corroborated_public_issue_count: i64,
     largest_public_cluster_size: i64,
     last_submission_at: Option<String>,
-    top_issues: Vec<DuplicateCandidateIssue>,
+    top_issues: Vec<PublicIssueCandidate>,
 }
 
 fn sqlite_path_from_url(url: &str) -> Option<PathBuf> {
@@ -5989,7 +6002,7 @@ fn compare_worker_candidate_priority(
     left: &&WorkerCandidate,
     right: &&WorkerCandidate,
 ) -> Ordering {
-    compare_issue_priority(
+    compare_issue_priority_for_representatives(
         &left.issue.kind,
         left.issue.package_name.as_deref(),
         left.issue.source_package.as_deref(),
@@ -6485,7 +6498,7 @@ async fn load_public_issues(db: &ServerDb, limit: i64) -> Result<Vec<PublicIssue
 async fn load_public_issue_candidates(
     db: &ServerDb,
     limit: i64,
-) -> Result<Vec<DuplicateCandidateIssue>, ApiError> {
+) -> Result<Vec<PublicIssueCandidate>, ApiError> {
     let fetch_limit = (limit.max(32) * 4).clamp(64, 512);
     match db {
         ServerDb::Postgres(db) => {
@@ -6508,7 +6521,7 @@ async fn load_public_issue_candidates(
                 .map_err(ApiError::internal)?;
             let mut issues = rows
                 .into_iter()
-                .map(duplicate_candidate_from_row)
+                .map(public_issue_candidate_from_row)
                 .collect::<Result<Vec<_>, _>>()?;
             issues.sort_by(compare_public_issue_priority);
             issues.truncate(limit.max(0) as usize);
@@ -6532,7 +6545,7 @@ async fn load_public_issue_candidates(
                 )
                 .map_err(ApiError::internal)?;
             let rows = stmt
-                .query_map([fetch_limit], duplicate_candidate_from_sqlite_row)
+                .query_map([fetch_limit], public_issue_candidate_from_sqlite_row)
                 .map_err(ApiError::internal)?;
             let mut issues = rows
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -7289,11 +7302,11 @@ fn public_triage_from_row(row: Row) -> Result<Option<PublicTriageEntry>, ApiErro
 }
 
 fn compare_public_issue_priority(
-    left: &DuplicateCandidateIssue,
-    right: &DuplicateCandidateIssue,
+    left: &PublicIssueCandidate,
+    right: &PublicIssueCandidate,
 ) -> Ordering {
-    let left_impact = issue_user_impact_score(&left.issue, &left.representative);
-    let right_impact = issue_user_impact_score(&right.issue, &right.representative);
+    let left_impact = issue_user_impact_score_for_signals(&left.issue, &left.signals);
+    let right_impact = issue_user_impact_score_for_signals(&right.issue, &right.signals);
     right_impact
         .cmp(&left_impact)
         .then_with(|| {
@@ -7303,7 +7316,7 @@ fn compare_public_issue_priority(
                 .cmp(&left.issue.corroboration_count)
         })
         .then_with(|| {
-            compare_issue_priority(
+            compare_issue_priority_for_signals(
                 &left.issue.kind,
                 left.issue.package_name.as_deref(),
                 left.issue.source_package.as_deref(),
@@ -7312,7 +7325,7 @@ fn compare_public_issue_priority(
                 left.issue.best_patch_available,
                 left.issue.best_triage_available,
                 &left.issue.last_seen,
-                &left.representative,
+                &left.signals,
                 &right.issue.kind,
                 right.issue.package_name.as_deref(),
                 right.issue.source_package.as_deref(),
@@ -7321,15 +7334,17 @@ fn compare_public_issue_priority(
                 right.issue.best_patch_available,
                 right.issue.best_triage_available,
                 &right.issue.last_seen,
-                &right.representative,
+                &right.signals,
             )
         })
 }
 
-fn issue_user_impact_score(issue: &PublicIssue, representative: &SharedOpportunity) -> i64 {
-    let subsystem = representative_subsystem(representative);
-    let target_name = representative_fixability_target_name(representative);
-    let kernelish_target = target_name.as_deref().is_some_and(is_kernelish_target_name);
+fn issue_user_impact_score_for_signals(issue: &PublicIssue, signals: &IssuePrioritySignals) -> i64 {
+    let subsystem = signals.subsystem.as_deref();
+    let kernelish_target = signals
+        .target_name
+        .as_deref()
+        .is_some_and(is_kernelish_target_name);
     let mut score = match issue.kind.as_str() {
         "crash" => 92,
         "hotspot" => 44,
@@ -7367,13 +7382,12 @@ fn issue_user_impact_score(issue: &PublicIssue, representative: &SharedOpportuni
     score
 }
 
-fn issue_human_context(
-    issue: &PublicIssue,
-    representative: &SharedOpportunity,
-) -> IssueHumanContext {
-    let impact_score = issue_user_impact_score(issue, representative);
-    let subsystem = representative_subsystem(representative);
-    let target = representative_fixability_target_name(representative)
+fn issue_human_context(issue: &PublicIssue, signals: &IssuePrioritySignals) -> IssueHumanContext {
+    let impact_score = issue_user_impact_score_for_signals(issue, signals);
+    let subsystem = signals.subsystem.as_deref();
+    let target = signals
+        .target_name
+        .clone()
         .unwrap_or_else(|| issue.title.clone());
     let kind_label = match (issue.kind.as_str(), subsystem) {
         ("crash", _) => "App crash",
@@ -7499,9 +7513,9 @@ fn render_issue_queue_tags(issue: &PublicIssue, context: &IssueHumanContext) -> 
     tags.join("")
 }
 
-fn render_issue_queue_card(entry: &DuplicateCandidateIssue) -> String {
+fn render_issue_queue_card(entry: &PublicIssueCandidate) -> String {
     let issue = &entry.issue;
-    let context = issue_human_context(issue, &entry.representative);
+    let context = issue_human_context(issue, &entry.signals);
     format!(
         r#"<article class="issue-card">
             <div class="issue-topline">
@@ -7531,7 +7545,54 @@ fn render_issue_queue_card(entry: &DuplicateCandidateIssue) -> String {
     )
 }
 
-fn compare_issue_priority(
+fn compare_issue_priority_for_signals(
+    left_kind: &str,
+    left_package_name: Option<&str>,
+    left_source_package: Option<&str>,
+    left_score: i64,
+    left_corroboration_count: i64,
+    left_best_patch_available: bool,
+    left_best_triage_available: bool,
+    left_last_seen: &str,
+    left_signals: &IssuePrioritySignals,
+    right_kind: &str,
+    right_package_name: Option<&str>,
+    right_source_package: Option<&str>,
+    right_score: i64,
+    right_corroboration_count: i64,
+    right_best_patch_available: bool,
+    right_best_triage_available: bool,
+    right_last_seen: &str,
+    right_signals: &IssuePrioritySignals,
+) -> Ordering {
+    let left_priority = left_score
+        + issue_fixability_adjustment_for_signals(
+            left_kind,
+            left_package_name,
+            left_source_package,
+            left_corroboration_count,
+            left_best_patch_available,
+            left_best_triage_available,
+            left_signals,
+        );
+    let right_priority = right_score
+        + issue_fixability_adjustment_for_signals(
+            right_kind,
+            right_package_name,
+            right_source_package,
+            right_corroboration_count,
+            right_best_patch_available,
+            right_best_triage_available,
+            right_signals,
+        );
+    right_priority
+        .cmp(&left_priority)
+        .then_with(|| right_corroboration_count.cmp(&left_corroboration_count))
+        .then_with(|| parse_timestamp(right_last_seen).cmp(&parse_timestamp(left_last_seen)))
+        .then_with(|| right_score.cmp(&left_score))
+}
+
+fn compare_issue_priority_for_representatives(
     left_kind: &str,
     left_package_name: Option<&str>,
     left_source_package: Option<&str>,
@@ -7552,7 +7613,7 @@ fn compare_issue_priority(
     right_representative: &SharedOpportunity,
 ) -> Ordering {
     let left_priority = left_score
-        + issue_fixability_adjustment(
+        + issue_fixability_adjustment_for_representative(
             left_kind,
             left_package_name,
             left_source_package,
@@ -7562,7 +7623,7 @@ fn compare_issue_priority(
             left_representative,
         );
     let right_priority = right_score
-        + issue_fixability_adjustment(
+        + issue_fixability_adjustment_for_representative(
             right_kind,
             right_package_name,
             right_source_package,
@@ -7578,7 +7639,7 @@ fn compare_issue_priority(
         .then_with(|| right_score.cmp(&left_score))
 }
 
-fn issue_fixability_adjustment(
+fn issue_fixability_adjustment_for_representative(
     kind: &str,
     package_name: Option<&str>,
     source_package: Option<&str>,
@@ -7628,6 +7689,62 @@ fn issue_fixability_adjustment(
         if is_kernelish_target_name(&target_name) {
             adjustment -= 18;
         }
+    }
+    adjustment
+}
+
+fn issue_fixability_adjustment_for_signals(
+    kind: &str,
+    package_name: Option<&str>,
+    source_package: Option<&str>,
+    corroboration_count: i64,
+    best_patch_available: bool,
+    best_triage_available: bool,
+    signals: &IssuePrioritySignals,
+) -> i64 {
+    let mut adjustment = 0;
+    adjustment += match (source_package, package_name) {
+        (Some(_), _) => 14,
+        (None, Some(_)) => 10,
+        (None, None) => -12,
+    };
+    if source_package
+        .or(package_name)
+        .is_some_and(is_kernelish_package_name)
+    {
+        adjustment -= 18;
+    }
+    if best_patch_available {
+        adjustment += 6;
+    }
+    if best_triage_available {
+        adjustment -= 8;
+    }
+    adjustment += (corroboration_count.saturating_sub(1)).min(3) * 3;
+
+    match kind {
+        "crash" => adjustment += 16,
+        "hotspot" => adjustment -= 10,
+        "warning" => adjustment -= 12,
+        "investigation" => match signals.subsystem.as_deref() {
+            Some("runaway-process") => adjustment += 16,
+            Some("oom-kill") => adjustment -= 10,
+            Some("desktop-resume") => adjustment -= 18,
+            Some("stuck-process") => adjustment -= 30,
+            _ => {}
+        },
+        _ => {}
+    }
+
+    if signals.likely_external_root_cause {
+        adjustment -= 16;
+    }
+    if signals
+        .target_name
+        .as_deref()
+        .is_some_and(is_kernelish_target_name)
+    {
+        adjustment -= 18;
     }
     adjustment
 }
@@ -7723,6 +7840,20 @@ fn public_issue_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pub
     })
 }
 
+fn public_issue_candidate_from_row(row: Row) -> Result<PublicIssueCandidate, ApiError> {
+    let issue = public_issue_from_row(row.clone())?;
+    let signals = issue_priority_signals_from_value(&row.get::<_, Value>(13));
+    Ok(PublicIssueCandidate { issue, signals })
+}
+
+fn public_issue_candidate_from_sqlite_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PublicIssueCandidate> {
+    let issue = public_issue_from_sqlite_row(row)?;
+    let signals = issue_priority_signals_from_str(&row.get::<_, String>(13)?);
+    Ok(PublicIssueCandidate { issue, signals })
+}
+
 fn duplicate_candidate_from_row(row: Row) -> Result<DuplicateCandidateIssue, ApiError> {
     let issue = public_issue_from_row(row.clone())?;
     let representative = serde_json::from_value::<SharedOpportunity>(row.get::<_, Value>(13))
@@ -7731,6 +7862,51 @@ fn duplicate_candidate_from_row(row: Row) -> Result<DuplicateCandidateIssue, Api
         issue,
         representative,
     })
+}
+
+fn issue_priority_signals_from_str(raw: &str) -> IssuePrioritySignals {
+    serde_json::from_str::<Value>(raw)
+        .map(|value| issue_priority_signals_from_value(&value))
+        .unwrap_or_default()
+}
+
+fn issue_priority_signals_from_value(value: &Value) -> IssuePrioritySignals {
+    let details = value
+        .get("finding")
+        .and_then(|finding| finding.get("details"));
+    let subsystem = details
+        .and_then(|details| details.get("subsystem"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let likely_external_root_cause = details
+        .and_then(|details| details.get("likely_external_root_cause"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let target_name = if value
+        .get("finding")
+        .and_then(|finding| finding.get("kind"))
+        .and_then(Value::as_str)
+        == Some("investigation")
+    {
+        normalized_investigation_target_name_from_value(value)
+    } else {
+        details
+            .and_then(|details| details.get("process_name"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                value
+                    .get("finding")
+                    .and_then(|finding| finding.get("artifact_name"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+    };
+    IssuePrioritySignals {
+        subsystem,
+        target_name,
+        likely_external_root_cause,
+    }
 }
 
 fn duplicate_candidate_from_sqlite_row(
@@ -9797,6 +9973,39 @@ fn normalized_investigation_target_name(item: &SharedOpportunity) -> String {
         .unwrap_or_else(|| sanitize_public_text(&item.opportunity.title))
 }
 
+fn normalized_investigation_target_name_from_value(item: &Value) -> Option<String> {
+    let finding = item.get("finding")?;
+    let details = finding.get("details");
+    let path_target = details
+        .and_then(|details| details.get("profile_target"))
+        .and_then(|target| target.get("path"))
+        .and_then(Value::as_str)
+        .map(file_name_or_self)
+        .filter(|value| !value.trim().is_empty());
+    let named_target = details
+        .and_then(|details| details.get("profile_target"))
+        .and_then(|target| target.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| finding.get("artifact_name").and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .map(normalize_kernel_worker_target_name);
+    path_target
+        .map(ToString::to_string)
+        .or(named_target)
+        .or_else(|| {
+            finding
+                .get("package_name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            item.get("opportunity")
+                .and_then(|opportunity| opportunity.get("title"))
+                .and_then(Value::as_str)
+                .map(sanitize_public_text)
+        })
+}
+
 fn normalize_kernel_worker_target_name(raw: &str) -> String {
     let trimmed = raw.trim();
     if !trimmed.starts_with("kworker") {
@@ -10494,7 +10703,7 @@ fn render_attempts_page(filter: AttemptBoardFilter, entries: &[PublicAttemptEntr
     )
 }
 
-fn render_issues_page(issues: &[DuplicateCandidateIssue]) -> String {
+fn render_issues_page(issues: &[PublicIssueCandidate]) -> String {
     let issue_markup = if issues.is_empty() {
         "<p class=\"fine-print\">There are no public issues yet.</p>".to_string()
     } else {
@@ -12110,13 +12319,17 @@ mod tests {
         }
     }
 
-    fn duplicate_candidate_for_test(
+    fn public_issue_candidate_for_test(
         id: &str,
         opportunity: &SharedOpportunity,
-    ) -> DuplicateCandidateIssue {
-        DuplicateCandidateIssue {
+    ) -> PublicIssueCandidate {
+        PublicIssueCandidate {
             issue: public_issue_for_test(id, opportunity),
-            representative: opportunity.clone(),
+            signals: IssuePrioritySignals {
+                subsystem: representative_subsystem(opportunity).map(ToString::to_string),
+                target_name: representative_fixability_target_name(opportunity),
+                likely_external_root_cause: representative_likely_external_root_cause(opportunity),
+            },
         }
     }
 
@@ -12270,7 +12483,7 @@ mod tests {
 
     #[test]
     fn humane_issue_queue_card_explains_user_impact() {
-        let candidate = duplicate_candidate_for_test(
+        let candidate = public_issue_candidate_for_test(
             "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8",
             &sample_desktop_resume_investigation(
                 "radeon",
@@ -12290,7 +12503,7 @@ mod tests {
 
     #[test]
     fn issues_page_mentions_user_impact_sorting() {
-        let candidate = duplicate_candidate_for_test(
+        let candidate = public_issue_candidate_for_test(
             "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8",
             &sample_runaway_investigation("kdeconnectd", Some("kdeconnect")),
         );
@@ -12302,7 +12515,7 @@ mod tests {
 
     #[test]
     fn public_issue_sort_prefers_desktop_breakage_over_fixable_cpu_loop() {
-        let desktop = duplicate_candidate_for_test(
+        let desktop = public_issue_candidate_for_test(
             "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8",
             &sample_desktop_resume_investigation(
                 "radeon",
@@ -12310,7 +12523,7 @@ mod tests {
                 "2026-03-30T01:39:07Z",
             ),
         );
-        let runaway = duplicate_candidate_for_test(
+        let runaway = public_issue_candidate_for_test(
             "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f9",
             &sample_runaway_investigation("htop", Some("htop")),
         );
@@ -13658,8 +13871,8 @@ mod tests {
         );
         let runaway = sample_runaway_investigation("kdeconnectd", Some("kdeconnect"));
         let mut entries = vec![
-            duplicate_candidate_for_test("issue-stuck", &stuck),
-            duplicate_candidate_for_test("issue-runaway", &runaway),
+            public_issue_candidate_for_test("issue-stuck", &stuck),
+            public_issue_candidate_for_test("issue-runaway", &runaway),
         ];
 
         entries.sort_by(compare_public_issue_priority);

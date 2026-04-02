@@ -1,3 +1,10 @@
+fixer (0.67.0-1) unstable; urgency=medium
+
+  * Stop deserializing full shared issue representatives for public issue list
+    ranking so the public issues board stays responsive as the server fills up.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 02 Apr 2026 19:10:00 +0400
+
 fixer (0.66.0-1) unstable; urgency=medium
 
   * Ignore workspace `.codex` artifacts when comparing live changed files to
