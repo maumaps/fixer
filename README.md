@@ -88,6 +88,12 @@ cargo run -p fixer --bin fixerd -- --config ./fixer.toml run
 cargo run -p fixer -- --config ./fixer.toml complain "chrome is slow when opening tabs"
 ```
 
+Or open a free-form complaint draft in your editor:
+
+```bash
+cargo run -p fixer -- --config ./fixer.toml complain
+```
+
 ## Federation quick start
 
 Until you opt in, Fixer stays local-only.
@@ -182,7 +188,7 @@ Before opt-in, nothing is uploaded. After opt-in, Fixer still warns that it may 
 
 Uploads go through best-effort redaction first, but redaction is not perfect. Public pages only expose sanitized aggregate summaries, not raw evidence bundles, hostnames, install IDs, or richer artifacts.
 
-`fixer complain` stays local-only by design. Even when the system daemon owns the main database, a normal user can still describe a problem in a per-user complaint workspace under `~/.local/state/fixer/complaints/`.
+`fixer complain` always starts with local triage. On `local-only` hosts it stays private in a per-user complaint workspace under `~/.local/state/fixer/complaints/`. On hosts already opted into federation, the resulting complaint opportunity can join the next sync after local triage, but complaint text still goes through the same best-effort redaction and is not published as a public issue card by default.
 
 ## Public deployment
 

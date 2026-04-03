@@ -1,10 +1,15 @@
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use fixer::app::{App, is_permission_or_readonly_error};
 use fixer::config::FixerConfig;
 use fixer::models::{FindingRecord, LeaseBudgetPreset, ParticipationMode};
 use fixer::proposal;
+use std::env;
+use std::fs;
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(
@@ -29,7 +34,7 @@ enum Commands {
     Complain {
         #[arg(long)]
         no_collect: bool,
-        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        #[arg(num_args = 1.., trailing_var_arg = true)]
         description: Vec<String>,
     },
     Owners,
@@ -223,9 +228,21 @@ fn main() -> Result<()> {
             no_collect,
             description,
         } => {
-            let outcome = app.complain(&description.join(" "), !no_collect)?;
-            println!("complaint opportunity #{}", outcome.opportunity.id);
-            println!("state: {}", outcome.opportunity.state);
+            let description = complaint_text_from_args_or_input(description)?;
+            let outcome = app.complain(&description, !no_collect)?;
+            let can_submit = app
+                .store
+                .load_participation_state()?
+                .map(|state| state.mode.can_submit())
+                .unwrap_or(false);
+            println!("complaint #{}", outcome.opportunity.id);
+            if can_submit {
+                println!("visibility: local triage first");
+                println!("sharing: eligible for sync on next upload");
+            } else {
+                println!("visibility: private to this machine");
+                println!("sharing: not eligible for sync until you opt in");
+            }
             if let Some(report) = outcome.collection_report {
                 println!(
                     "collected: {} capabilities, {} artifacts, {} findings",
@@ -234,11 +251,11 @@ fn main() -> Result<()> {
             } else {
                 println!("collected: skipped");
             }
-            println!("plan proposal #{}", outcome.proposal.id);
+            println!("proposal #{}", outcome.proposal.id);
             println!("plan: {}", outcome.proposal.bundle_path.display());
             println!("workspace: {}", outcome.workspace_root.display());
             if outcome.used_overlay {
-                println!("workspace mode: local overlay");
+                println!("workspace fallback: using a private local complaint workspace");
             }
             if let Some(path) = outcome.proposal.output_path {
                 println!("output: {}", path.display());
@@ -572,6 +589,85 @@ fn parse_duration_seconds(raw: &str) -> Result<u64> {
     Ok(amount.saturating_mul(multiplier))
 }
 
+fn complaint_text_from_args_or_input(description: Vec<String>) -> Result<String> {
+    if !description.is_empty() {
+        return Ok(description.join(" "));
+    }
+
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        match read_complaint_from_editor() {
+            Ok(text) if !text.trim().is_empty() => return Ok(text),
+            Ok(_) => {}
+            Err(error) => eprintln!("editor input unavailable, falling back to stdin: {error}"),
+        }
+    }
+
+    read_complaint_from_stdin()
+}
+
+fn read_complaint_from_editor() -> Result<String> {
+    let editor = env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| anyhow!("no editor configured"))?;
+    let path = complaint_draft_path();
+    let template = concat!(
+        "# Describe what went wrong. You can paste commands, logs, and stderr here.\n",
+        "# Lines starting with # are ignored.\n\n"
+    );
+    fs::write(&path, template)
+        .with_context(|| format!("failed to write complaint draft {}", path.display()))?;
+    let status = Command::new(&editor)
+        .arg(&path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("failed to launch editor `{editor}`"))?;
+    if !status.success() {
+        let _ = fs::remove_file(&path);
+        return Err(anyhow!("editor `{editor}` exited with status {status}"));
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read complaint draft {}", path.display()))?;
+    let _ = fs::remove_file(&path);
+    Ok(normalize_complaint_text(&raw))
+}
+
+fn read_complaint_from_stdin() -> Result<String> {
+    if io::stdin().is_terminal() {
+        eprintln!("Enter your complaint text, then press Ctrl-D when you are done.");
+    }
+    let mut raw = String::new();
+    io::stdin()
+        .read_to_string(&mut raw)
+        .context("failed to read complaint text from stdin")?;
+    Ok(normalize_complaint_text(&raw))
+}
+
+fn normalize_complaint_text(raw: &str) -> String {
+    raw.lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn complaint_draft_path() -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    env::temp_dir().join(format!("fixer-complaint-{unique}.md"))
+}
+
 fn print_findings(items: Vec<FindingRecord>) {
     for item in items {
         println!("#{} [{}] {}", item.id, item.severity, item.title);
@@ -586,5 +682,22 @@ fn print_findings(items: Vec<FindingRecord>) {
             println!("  repo: {}", repo_root.display());
         }
         println!("  seen: {} -> {}", item.first_seen, item.last_seen);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_complaint_text;
+
+    #[test]
+    fn complaint_normalization_drops_comment_lines() {
+        let raw = "# help\nsymptom line\nmore detail\n# ignored\n";
+        assert_eq!(normalize_complaint_text(raw), "symptom line\nmore detail");
+    }
+
+    #[test]
+    fn complaint_normalization_trims_outer_whitespace() {
+        let raw = "\n  first line  \nsecond line\t\n\n";
+        assert_eq!(normalize_complaint_text(raw), "first line\nsecond line");
     }
 }

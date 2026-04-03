@@ -97,8 +97,18 @@ impl App {
         };
         let finding_id = self.store.record_finding(&complaint_finding)?;
         let opportunity = self.store.get_opportunity_by_finding(finding_id)?;
+        let opportunity_state = if self
+            .store
+            .load_participation_state()?
+            .map(|state| state.mode.can_submit())
+            .unwrap_or(false)
+        {
+            "open"
+        } else {
+            "local-only"
+        };
         self.store
-            .set_opportunity_state(opportunity.id, "local-only")?;
+            .set_opportunity_state(opportunity.id, opportunity_state)?;
         let opportunity = self.store.get_opportunity(opportunity.id)?;
 
         let related = self.related_candidates_for_complaint(description, opportunity.id)?;
@@ -504,9 +514,12 @@ mod tests {
         complaint_match_score, complaint_workspace_root, is_permission_or_readonly_error,
         should_retry_complaint_in_overlay, tokenize_complaint_text,
     };
+    use crate::config::FixerConfig;
     use crate::models::{FindingRecord, OpportunityRecord, SharedOpportunity};
+    use crate::models::{ParticipationMode, ParticipationState};
     use anyhow::anyhow;
     use serde_json::json;
+    use tempfile::tempdir;
 
     #[test]
     fn tokenizes_complaint_text_without_common_noise() {
@@ -570,5 +583,35 @@ mod tests {
         let rendered = path.display().to_string();
         assert!(rendered.contains("fixer/complaints"));
         assert!(path.file_name().is_some());
+    }
+
+    #[test]
+    fn complaints_stay_local_only_without_opt_in() {
+        let dir = tempdir().unwrap();
+        let mut config = FixerConfig::default();
+        config.service.database_path = dir.path().join("fixer.sqlite3");
+        config.service.state_dir = dir.path().join("state");
+        let app = super::App::from_config(config).unwrap();
+
+        let outcome = app.complain("spectacle fails on wayland", false).unwrap();
+        assert_eq!(outcome.opportunity.state, "local-only");
+    }
+
+    #[test]
+    fn complaints_open_when_host_can_submit() {
+        let dir = tempdir().unwrap();
+        let mut config = FixerConfig::default();
+        config.service.database_path = dir.path().join("fixer.sqlite3");
+        config.service.state_dir = dir.path().join("state");
+        let app = super::App::from_config(config).unwrap();
+        app.store
+            .save_participation_state(&ParticipationState {
+                mode: ParticipationMode::Submitter,
+                ..ParticipationState::default()
+            })
+            .unwrap();
+
+        let outcome = app.complain("spectacle fails on wayland", false).unwrap();
+        assert_eq!(outcome.opportunity.state, "open");
     }
 }

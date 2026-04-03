@@ -32,6 +32,7 @@ const COREDUMP_FETCH_MULTIPLIER: usize = 8;
 const RUNAWAY_INVESTIGATION_SUBSYSTEM: &str = "runaway-process";
 const STUCK_PROCESS_INVESTIGATION_SUBSYSTEM: &str = "stuck-process";
 const DESKTOP_RESUME_INVESTIGATION_SUBSYSTEM: &str = "desktop-resume";
+const DESKTOP_GRAPHICS_SESSION_INVESTIGATION_SUBSYSTEM: &str = "desktop-graphics-session";
 const NETWORK_DRIVER_HANG_INVESTIGATION_SUBSYSTEM: &str = "network-driver-hang";
 const RUNAWAY_STRACE_EXCERPT_LIMIT: usize = 24;
 const RUNAWAY_TOP_SYSCALL_LIMIT: usize = 6;
@@ -68,6 +69,7 @@ pub fn collect_once(config: &FixerConfig, store: &Store) -> Result<CollectReport
         report.findings_seen += collect_warning_logs(config, store)?;
         report.findings_seen += collect_kernel_oom_kill_investigations(config, store)?;
         report.findings_seen += collect_desktop_resume_investigations(config, store)?;
+        report.findings_seen += collect_desktop_graphics_session_investigations(config, store)?;
         report.findings_seen += collect_network_driver_hang_investigations(config, store)?;
         report.findings_seen += collect_kernel_warnings(config, store)?;
         report.findings_seen += collect_postgres_collation_mismatches(store)?;
@@ -218,6 +220,70 @@ struct DesktopResumeFailureEvent {
     suspend_line: Option<String>,
     resume_line: String,
     display_restart_line: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DesktopGraphicsSessionFailureEvent {
+    driver: Option<String>,
+    session_type: String,
+    current_desktop: String,
+    compositor: Option<String>,
+    affected_apps: Vec<String>,
+    crashed_processes: Vec<String>,
+    warning_lines: Vec<String>,
+    crash_lines: Vec<String>,
+    session_error_lines: Vec<String>,
+    marker_kinds: Vec<String>,
+    package_name: Option<String>,
+    package_metadata: Option<RunawayPackageMetadata>,
+}
+
+impl DesktopGraphicsSessionFailureEvent {
+    fn target_name(&self) -> String {
+        let desktop = if self.current_desktop.trim().is_empty() {
+            "desktop".to_string()
+        } else {
+            self.current_desktop.clone()
+        };
+        let session = match self.session_type.as_str() {
+            "wayland" => "Wayland",
+            "x11" => "X11",
+            _ => "desktop",
+        };
+        match self.driver.as_deref() {
+            Some(driver) if !driver.trim().is_empty() => {
+                format!("{desktop} {session} desktop ({driver})")
+            }
+            _ => format!("{desktop} {session} desktop"),
+        }
+    }
+
+    fn public_summary(&self) -> String {
+        let apps = self
+            .affected_apps
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let app_summary = if apps.is_empty() {
+            "multiple desktop apps".to_string()
+        } else {
+            apps
+        };
+        let crash_summary = if self.crashed_processes.is_empty() {
+            "without a captured coredump".to_string()
+        } else {
+            format!("with crashes in {}", self.crashed_processes.join(", "))
+        };
+        format!(
+            "Repeated EGL/Mesa/Qt desktop warnings affected {} on {} {}, {}.",
+            app_summary,
+            self.current_desktop,
+            self.session_type.to_uppercase(),
+            crash_summary
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1113,6 +1179,147 @@ fn collect_desktop_resume_investigations(config: &FixerConfig, store: &Store) ->
                 "session_type": event.session_type,
                 "display_manager": event.display_manager,
                 "crashed_processes": event.crashed_processes,
+            }),
+        }),
+        repo_root: None,
+        ecosystem: None,
+    };
+    let _ = store.record_finding(&finding)?;
+    Ok(1)
+}
+
+fn collect_desktop_graphics_session_investigations(
+    config: &FixerConfig,
+    store: &Store,
+) -> Result<usize> {
+    if !store.capability_available("journalctl")? {
+        return Ok(0);
+    }
+    let journal_lines = config.service.journal_lines.saturating_mul(8).to_string();
+    let query = "libEGL|MESA-LOADER|QThreadStorage|qt.qpa.wayland|kwin_wayland|kwin_wayland_drm|dumped core|terminated abnormally|placeholder screen|Wayland compositor doesn't seem to be processing events fast enough|main thread was hanging temporarily";
+    let mut lines = Vec::new();
+    let mut seen = BTreeSet::new();
+    for args in [
+        vec![
+            "--user",
+            "-b",
+            "-g",
+            query,
+            "-n",
+            journal_lines.as_str(),
+            "--no-pager",
+        ],
+        vec![
+            "-b",
+            "-g",
+            query,
+            "-n",
+            journal_lines.as_str(),
+            "--no-pager",
+        ],
+    ] {
+        let output = command_output("journalctl", &args).unwrap_or_default();
+        extend_unique_log_lines(&mut lines, &mut seen, &output);
+    }
+    if lines.is_empty() {
+        return Ok(0);
+    }
+    let Some(event) = parse_desktop_graphics_session_failure(&lines.join("\n")) else {
+        return Ok(0);
+    };
+
+    let mut details = json!({
+        "subsystem": DESKTOP_GRAPHICS_SESSION_INVESTIGATION_SUBSYSTEM,
+        "profile_target": {
+            "name": event.target_name(),
+            "package_name": event.package_name,
+        },
+        "loop_classification": "desktop-graphics-session-failure",
+        "loop_confidence": 0.96,
+        "loop_explanation": format!(
+            "Fixer correlated repeated EGL/Mesa/Qt warnings across {} desktop apps with session/compositor instability{}.",
+            event.affected_apps.len().max(1),
+            if event.crashed_processes.is_empty() {
+                String::new()
+            } else {
+                format!(" and crashes in {}", event.crashed_processes.join(", "))
+            }
+        ),
+        "driver": event.driver,
+        "session_type": event.session_type,
+        "current_desktop": event.current_desktop,
+        "compositor": event.compositor,
+        "affected_apps": event.affected_apps,
+        "crashed_processes": event.crashed_processes,
+        "warning_lines": event.warning_lines,
+        "crash_lines": event.crash_lines,
+        "session_error_lines": event.session_error_lines,
+        "marker_kinds": event.marker_kinds,
+        "package_name": event.package_name,
+        "package_metadata": event.package_metadata,
+        "likely_external_root_cause": true,
+    });
+    if let Some(pkg) = details.get("package_name").and_then(Value::as_str) {
+        if let Some(version) = installed_version_for_package(pkg) {
+            details["installed_package_version"] = json!(version);
+        }
+    }
+    add_env_context(&mut details);
+
+    let package_name = details
+        .get("package_name")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let target_name = details
+        .get("profile_target")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("desktop graphics session")
+        .to_string();
+    let fingerprint = hash_text(format!(
+        "desktop-graphics-session:{}:{}:{}:{}:{}",
+        details.get("driver").and_then(Value::as_str).unwrap_or("-"),
+        details
+            .get("session_type")
+            .and_then(Value::as_str)
+            .unwrap_or("-"),
+        details
+            .get("current_desktop")
+            .and_then(Value::as_str)
+            .unwrap_or("-"),
+        details
+            .get("compositor")
+            .and_then(Value::as_str)
+            .unwrap_or("-"),
+        details
+            .get("affected_apps")
+            .and_then(Value::as_array)
+            .map(|apps| {
+                apps.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .unwrap_or_default(),
+    ));
+    let finding = FindingInput {
+        kind: "investigation".to_string(),
+        title: format!("Desktop graphics/session failure investigation for {target_name}"),
+        severity: "high".to_string(),
+        fingerprint,
+        summary: parse_desktop_graphics_session_failure(&lines.join("\n"))
+            .map(|event| event.public_summary())
+            .unwrap_or_else(|| "Repeated desktop graphics/session failures detected.".to_string()),
+        details,
+        artifact: Some(ObservedArtifact {
+            kind: "display-stack".to_string(),
+            name: target_name,
+            path: None,
+            package_name,
+            repo_root: None,
+            ecosystem: None,
+            metadata: json!({
+                "source": "desktop-graphics-session",
             }),
         }),
         repo_root: None,
@@ -2432,6 +2639,18 @@ fn is_desktop_resume_session_error_line(line: &str) -> bool {
 fn desktop_resume_driver(lines: &[String]) -> Option<String> {
     if lines
         .iter()
+        .any(|line| line.to_ascii_lowercase().contains("nvidia"))
+    {
+        return Some("nvidia".to_string());
+    }
+    if lines
+        .iter()
+        .any(|line| line.to_ascii_lowercase().contains("nouveau"))
+    {
+        return Some("nouveau".to_string());
+    }
+    if lines
+        .iter()
         .any(|line| line.to_ascii_lowercase().contains("radeon"))
     {
         return Some("radeon".to_string());
@@ -2441,6 +2660,12 @@ fn desktop_resume_driver(lines: &[String]) -> Option<String> {
         .any(|line| line.to_ascii_lowercase().contains("amdgpu"))
     {
         return Some("amdgpu".to_string());
+    }
+    if lines
+        .iter()
+        .any(|line| line.to_ascii_lowercase().contains("i915"))
+    {
+        return Some("i915".to_string());
     }
     None
 }
@@ -2469,6 +2694,195 @@ fn desktop_resume_display_manager(lines: &[String]) -> String {
         return "lightdm".to_string();
     }
     "display-manager".to_string()
+}
+
+fn parse_desktop_graphics_session_failure(raw: &str) -> Option<DesktopGraphicsSessionFailureEvent> {
+    let lines = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let process_re = Regex::new(
+        r"^[A-Z][a-z]{2}\s+\d+\s+\d+:\d+:\d+\s+\S+\s+(?P<process>[A-Za-z0-9_.@/-]+)\[\d+\]:",
+    )
+    .expect("valid process regex");
+    let coredump_re =
+        Regex::new(r"Process (?:\d+ \()?(?P<process>[A-Za-z0-9_.-]+)\)? .* (?:terminated abnormally|dumped core)")
+            .expect("valid graphics session coredump regex");
+    let mut affected_apps = Vec::new();
+    let mut seen_apps = BTreeSet::new();
+    let mut crashed_processes = Vec::new();
+    let mut seen_crashes = BTreeSet::new();
+    let mut warning_lines = Vec::new();
+    let mut seen_warning_lines = BTreeSet::new();
+    let mut crash_lines = Vec::new();
+    let mut seen_crash_lines = BTreeSet::new();
+    let mut session_error_lines = Vec::new();
+    let mut seen_session_lines = BTreeSet::new();
+    let mut marker_kinds = BTreeSet::new();
+
+    for line in &lines {
+        let lower = line.to_ascii_lowercase();
+        let process_name = process_re
+            .captures(line)
+            .and_then(|captures| captures.name("process"))
+            .map(|value| value.as_str())
+            .and_then(normalize_desktop_graphics_process_name);
+        let line_is_warning = lower.contains("libegl warning")
+            || lower.contains("mesa-loader")
+            || lower.contains("qthreadstorage")
+            || lower.contains("qt.qpa.wayland")
+            || lower.contains("placeholder screen")
+            || lower
+                .contains("wayland compositor doesn't seem to be processing events fast enough")
+            || lower.contains("main thread was hanging temporarily");
+        let line_is_session_error = lower.contains("qt.qpa.wayland")
+            || lower.contains("placeholder screen")
+            || lower.contains("kwin_wayland")
+            || lower.contains("kwin_wayland_drm")
+            || lower
+                .contains("wayland compositor doesn't seem to be processing events fast enough")
+            || lower.contains("main thread was hanging temporarily");
+        let line_is_crash =
+            lower.contains("terminated abnormally") || lower.contains("dumped core");
+
+        if line_is_warning {
+            if seen_warning_lines.insert(line.clone()) {
+                warning_lines.push(line.clone());
+            }
+            if lower.contains("libegl") || lower.contains("mesa-loader") {
+                marker_kinds.insert("egl-mesa".to_string());
+            }
+            if lower.contains("qthreadstorage") {
+                marker_kinds.insert("qt-thread-teardown".to_string());
+            }
+        }
+        if line_is_session_error {
+            if seen_session_lines.insert(line.clone()) {
+                session_error_lines.push(line.clone());
+            }
+            if lower.contains("wayland") {
+                marker_kinds.insert("wayland-session".to_string());
+            }
+            if lower.contains("kwin") {
+                marker_kinds.insert("kwin-compositor".to_string());
+            }
+        }
+        if line_is_crash {
+            if seen_crash_lines.insert(line.clone()) {
+                crash_lines.push(line.clone());
+            }
+            marker_kinds.insert("coredump".to_string());
+        }
+        if let Some(process) = process_name {
+            if (line_is_warning || line_is_session_error) && seen_apps.insert(process.to_string()) {
+                affected_apps.push(process.to_string());
+            }
+        }
+        if let Some(process) = coredump_re
+            .captures(line)
+            .and_then(|captures| captures.name("process"))
+            .map(|value| value.as_str())
+            .and_then(normalize_desktop_graphics_process_name)
+        {
+            if seen_crashes.insert(process.to_string()) {
+                crashed_processes.push(process.to_string());
+            }
+            if seen_apps.insert(process.to_string()) {
+                affected_apps.push(process.to_string());
+            }
+        }
+    }
+
+    let enough_signal = (affected_apps.len() >= 2 && warning_lines.len() >= 2)
+        || (!crash_lines.is_empty() && !warning_lines.is_empty());
+    if !enough_signal {
+        return None;
+    }
+
+    let package_name = desktop_graphics_session_package_hint(&lines, &affected_apps);
+    let package_metadata = package_name
+        .as_deref()
+        .and_then(resolve_installed_package_metadata_for_investigation);
+    Some(DesktopGraphicsSessionFailureEvent {
+        driver: desktop_resume_driver(&lines),
+        session_type: desktop_resume_session_type(&lines),
+        current_desktop: current_desktop_name(&lines),
+        compositor: detect_desktop_graphics_compositor(&lines),
+        affected_apps,
+        crashed_processes,
+        warning_lines,
+        crash_lines,
+        session_error_lines,
+        marker_kinds: marker_kinds.into_iter().collect(),
+        package_name,
+        package_metadata,
+    })
+}
+
+fn normalize_desktop_graphics_process_name(raw: &str) -> Option<&str> {
+    match raw {
+        "kwin_wayland_wrapper" | "kwin_wayland_drm" => Some("kwin_wayland"),
+        value if value.is_empty() => None,
+        value => Some(value),
+    }
+}
+
+fn current_desktop_name(lines: &[String]) -> String {
+    if let Ok(value) = std::env::var("XDG_CURRENT_DESKTOP") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if lines.iter().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("plasma") || lower.contains("kwin")
+    }) {
+        return "KDE".to_string();
+    }
+    "desktop".to_string()
+}
+
+fn detect_desktop_graphics_compositor(lines: &[String]) -> Option<String> {
+    if lines.iter().any(|line| line.contains("kwin_wayland")) {
+        return Some("kwin_wayland".to_string());
+    }
+    if lines.iter().any(|line| line.contains("kwin_x11")) {
+        return Some("kwin_x11".to_string());
+    }
+    None
+}
+
+fn desktop_graphics_session_package_hint(
+    lines: &[String],
+    affected_apps: &[String],
+) -> Option<String> {
+    let lower_lines = lines
+        .iter()
+        .map(|line| line.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if lower_lines.iter().any(|line| line.contains("kwin_wayland")) {
+        return Some("kwin-wayland".to_string());
+    }
+    if lower_lines
+        .iter()
+        .any(|line| line.contains("xdg-desktop-portal-kde"))
+    {
+        return Some("xdg-desktop-portal-kde".to_string());
+    }
+    affected_apps.iter().find_map(|app| match app.as_str() {
+        "spectacle" => Some("kde-spectacle".to_string()),
+        "dolphin" => Some("dolphin".to_string()),
+        "kate" => Some("kate".to_string()),
+        "plasmashell" => Some("plasma-workspace".to_string()),
+        _ => None,
+    })
 }
 
 fn current_kernel_image_package_name() -> String {
@@ -4950,6 +5364,18 @@ fn add_env_context(details: &mut Value) {
     if let Some(version) = distro_version_id {
         map.entry("distro_version_id").or_insert(json!(version));
     }
+    if let Ok(session_type) = std::env::var("XDG_SESSION_TYPE") {
+        if !session_type.trim().is_empty() {
+            map.entry("env_session_type")
+                .or_insert(json!(session_type.trim().to_string()));
+        }
+    }
+    if let Ok(current_desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
+        if !current_desktop.trim().is_empty() {
+            map.entry("env_current_desktop")
+                .or_insert(json!(current_desktop.trim().to_string()));
+        }
+    }
 }
 
 fn kernel_reference_path(release: &str) -> Option<PathBuf> {
@@ -5490,7 +5916,8 @@ mod tests {
         kernel_warning_module_candidates, looks_like_warning, netdev_watchdog_driver,
         normalize_oom_task_memcg_target, normalize_perf_symbol,
         normalize_stuck_process_target_name, parse_apparmor_denial, parse_coredump_info,
-        parse_dkms_status_line, parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
+        parse_desktop_graphics_session_failure, parse_dkms_status_line,
+        parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
         parse_network_driver_hang_events, parse_perf_hot_paths,
         parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
         prioritize_coredump_events, process_runtime_seconds, safe_perf_name,
@@ -5716,6 +6143,31 @@ Mar 30 01:39:00 tinycat sddm[829]: Attempt 1 starting the Display server on vt 1
         );
         assert_eq!(event.display_target(), "radeon X11 desktop");
         assert!(event.public_summary().contains("Xorg, kwin_x11 crashed"));
+    }
+
+    #[test]
+    fn parses_desktop_graphics_session_failures_into_structured_investigations() {
+        let raw = "\
+Apr 03 14:00:01 nucat spectacle[1144]: libEGL warning: failed to get driver name for fd -1\n\
+Apr 03 14:00:01 nucat spectacle[1144]: libEGL warning: MESA-LOADER: failed to retrieve device information\n\
+Apr 03 14:00:01 nucat spectacle[1144]: QThreadStorage: entry 2 destroyed before end of thread 0x557a74f6cf70\n\
+Apr 03 14:00:02 nucat dolphin[1300]: libEGL warning: failed to get driver name for fd -1\n\
+Apr 03 14:00:02 nucat kate[1400]: libEGL warning: MESA-LOADER: failed to retrieve device information\n\
+Apr 03 14:00:03 nucat kwin_wayland_wrapper[1500]: kwin_wayland_drm: The main thread was hanging temporarily!\n\
+Apr 03 14:00:03 nucat kwin_wayland_wrapper[1500]: kwin_core: Key repeat discarded, Wayland compositor doesn't seem to be processing events fast enough!\n\
+Apr 03 14:00:04 nucat systemd-coredump[1600]: Process 1144 (spectacle) of user 1000 terminated abnormally with signal 6/ABRT, processing...\n";
+        let event =
+            parse_desktop_graphics_session_failure(raw).expect("desktop graphics session event");
+        assert_eq!(event.session_type, "wayland");
+        assert_eq!(event.current_desktop, "KDE");
+        assert_eq!(event.driver.as_deref(), None);
+        assert_eq!(event.compositor.as_deref(), Some("kwin_wayland"));
+        assert!(event.affected_apps.contains(&"spectacle".to_string()));
+        assert!(event.affected_apps.contains(&"dolphin".to_string()));
+        assert!(event.crashed_processes.contains(&"spectacle".to_string()));
+        assert!(event.marker_kinds.contains(&"egl-mesa".to_string()));
+        assert!(event.marker_kinds.contains(&"wayland-session".to_string()));
+        assert_eq!(event.package_name.as_deref(), Some("kwin-wayland"));
     }
 
     #[test]

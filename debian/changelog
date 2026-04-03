@@ -1,3 +1,13 @@
+fixer (0.68.0-1) unstable; urgency=medium
+
+  * Add a first-class desktop graphics/session investigation for shared
+    KDE/Wayland/EGL incidents, including collection, report rendering, and
+    public issue clustering.
+  * Keep complaint intake improvements and complaint visibility rules aligned
+    with submitter participation and safer public exposure defaults.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 03 Apr 2026 18:55:00 +0400
+
 fixer (0.67.0-1) unstable; urgency=medium
 
   * Stop deserializing full shared issue representatives for public issue list

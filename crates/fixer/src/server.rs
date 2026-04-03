@@ -7350,6 +7350,7 @@ fn issue_user_impact_score_for_signals(issue: &PublicIssue, signals: &IssuePrior
         "hotspot" => 44,
         "warning" => 18,
         "investigation" => match subsystem {
+            Some("desktop-graphics-session") => 98,
             Some("desktop-resume") => 100,
             Some("oom-kill") => 88,
             Some("runaway-process") => 82,
@@ -7371,6 +7372,7 @@ fn issue_user_impact_score_for_signals(issue: &PublicIssue, signals: &IssuePrior
     }
     if issue.kind == "investigation"
         && subsystem != Some("desktop-resume")
+        && subsystem != Some("desktop-graphics-session")
         && issue
             .source_package
             .as_deref()
@@ -7393,6 +7395,7 @@ fn issue_human_context(issue: &PublicIssue, signals: &IssuePrioritySignals) -> I
         ("crash", _) => "App crash",
         ("hotspot", _) => "High CPU hotspot",
         ("warning", _) => "System warning",
+        ("investigation", Some("desktop-graphics-session")) => "Desktop graphics failure",
         ("investigation", Some("runaway-process")) => "Runaway CPU",
         ("investigation", Some("oom-kill")) => "Out of memory kill",
         ("investigation", Some("desktop-resume")) => "Wake-from-sleep failure",
@@ -7415,6 +7418,10 @@ fn issue_human_context(issue: &PublicIssue, signals: &IssuePrioritySignals) -> I
             "{} likely crashed or disappeared unexpectedly.",
             humanize_target_name(&target)
         ),
+        ("investigation", Some("desktop-graphics-session")) => {
+            "The desktop graphics session likely felt broadly broken: multiple apps may have failed to launch, windows may have stopped painting correctly, or the session may have become unstable."
+                .to_string()
+        }
         ("investigation", Some("desktop-resume")) => {
             "After wake-from-sleep, the desktop likely came back blank, broken, or dropped the user back to login."
                 .to_string()
@@ -7673,6 +7680,7 @@ fn issue_fixability_adjustment_for_representative(
         "hotspot" => adjustment -= 10,
         "warning" => adjustment -= 12,
         "investigation" => match representative_subsystem(representative) {
+            Some("desktop-graphics-session") => adjustment -= 24,
             Some("runaway-process") => adjustment += 16,
             Some("oom-kill") => adjustment -= 10,
             Some("desktop-resume") => adjustment -= 18,
@@ -7727,6 +7735,7 @@ fn issue_fixability_adjustment_for_signals(
         "hotspot" => adjustment -= 10,
         "warning" => adjustment -= 12,
         "investigation" => match signals.subsystem.as_deref() {
+            Some("desktop-graphics-session") => adjustment -= 24,
             Some("runaway-process") => adjustment += 16,
             Some("oom-kill") => adjustment -= 10,
             Some("desktop-resume") => adjustment -= 18,
@@ -9752,6 +9761,31 @@ fn normalized_investigation_cluster_key(item: &SharedOpportunity) -> String {
                 target, driver, session_type, display_manager,
             ))
         }
+        "desktop-graphics-session" => {
+            let target = normalized_investigation_target_name(item);
+            let driver = item
+                .finding
+                .details
+                .get("driver")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let session_type = item
+                .finding
+                .details
+                .get("session_type")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let compositor = item
+                .finding
+                .details
+                .get("compositor")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            hash_text(format!(
+                "investigation|desktop-graphics-session|{}|{}|{}|{}",
+                target, driver, session_type, compositor,
+            ))
+        }
         _ => hash_text(format!(
             "investigation|{}|{}|{}|{}",
             subsystem,
@@ -9881,6 +9915,30 @@ fn investigation_public_issue_fields(item: &SharedOpportunity) -> Option<PublicI
                 visible: is_publicly_visible(item),
             })
         }
+        "desktop-graphics-session" => {
+            let target = normalized_investigation_target_name(item);
+            let apps = item
+                .finding
+                .details
+                .get("affected_apps")
+                .and_then(Value::as_array)
+                .map(|apps| {
+                    apps.iter()
+                        .filter_map(Value::as_str)
+                        .take(5)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "multiple desktop apps".to_string());
+            Some(PublicIssueFields {
+                title: format!("Desktop graphics/session failure investigation for {target}"),
+                summary: format!(
+                    "Repeated EGL/Mesa/Qt desktop warnings affected {apps} on {target}, suggesting a shared compositor or graphics-session failure."
+                ),
+                visible: is_publicly_visible(item),
+            })
+        }
         _ => None,
     }
 }
@@ -9890,6 +9948,7 @@ fn is_publicly_visible(item: &SharedOpportunity) -> bool {
         "crash" => true,
         "hotspot" => true,
         "investigation" => true,
+        "complaint" => false,
         "warning" => {
             if item.finding.title == "Kernel warning" {
                 return false;
@@ -10328,6 +10387,70 @@ fn build_public_investigation_snapshot(
                 title: "Kernel wait stack".to_string(),
                 summary: "This is where Fixer saw the sampled task blocked in the kernel."
                     .to_string(),
+                frames,
+                highlights,
+            })
+        }
+        "desktop-graphics-session" => {
+            let frames = sanitize_snapshot_frames(
+                details
+                    .get("warning_lines")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .chain(
+                        details
+                            .get("crash_lines")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(ToString::to_string),
+                    )
+                    .collect::<Vec<_>>(),
+                10,
+            );
+            let mut highlights = Vec::new();
+            if let Some(apps) = details
+                .get("affected_apps")
+                .and_then(Value::as_array)
+                .map(|apps| {
+                    apps.iter()
+                        .filter_map(Value::as_str)
+                        .take(6)
+                        .map(sanitize_public_text)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|value| !value.is_empty())
+            {
+                highlights.push(format!("Affected apps: {apps}"));
+            }
+            if let Some(driver) = details.get("driver").and_then(Value::as_str) {
+                highlights.push(format!("Graphics driver: {}", sanitize_public_text(driver)));
+            }
+            if let Some(compositor) = details.get("compositor").and_then(Value::as_str) {
+                highlights.push(format!("Compositor: {}", sanitize_public_text(compositor)));
+            }
+            if let Some(explanation) = details
+                .get("loop_explanation")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                highlights.push(format!(
+                    "Why Fixer classified it this way: {}",
+                    sanitize_public_text(explanation)
+                ));
+            }
+            push_env_highlights(details, &mut highlights);
+            if frames.is_empty() && highlights.is_empty() {
+                return None;
+            }
+            Some(PublicTechnicalSnapshot {
+                title: "Desktop graphics/session markers".to_string(),
+                summary: "These are the public-safe log lines and high-level signals Fixer kept while correlating a shared desktop graphics/session failure.".to_string(),
                 frames,
                 highlights,
             })
@@ -12300,6 +12423,69 @@ mod tests {
         }
     }
 
+    fn sample_desktop_graphics_session_investigation(
+        target: &str,
+        affected_apps: &[&str],
+        last_seen: &str,
+    ) -> SharedOpportunity {
+        SharedOpportunity {
+            local_opportunity_id: 1,
+            opportunity: OpportunityRecord {
+                id: 1,
+                finding_id: 1,
+                kind: "investigation".to_string(),
+                title: format!("Desktop graphics/session failure investigation for {target}"),
+                score: 118,
+                state: "open".to_string(),
+                summary: format!(
+                    "Repeated EGL/Mesa/Qt desktop warnings affected {} on {target}, suggesting a shared compositor or graphics-session failure.",
+                    affected_apps.join(", ")
+                ),
+                evidence: json!({}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: last_seen.to_string(),
+                updated_at: last_seen.to_string(),
+            },
+            finding: FindingRecord {
+                id: 1,
+                kind: "investigation".to_string(),
+                title: format!("Desktop graphics/session failure investigation for {target}"),
+                severity: "high".to_string(),
+                fingerprint: format!("desktop-graphics-session-{target}"),
+                summary: format!(
+                    "Repeated EGL/Mesa/Qt desktop warnings affected {} on {target}, suggesting a shared compositor or graphics-session failure.",
+                    affected_apps.join(", ")
+                ),
+                details: json!({
+                    "subsystem": "desktop-graphics-session",
+                    "profile_target": { "name": target },
+                    "loop_classification": "desktop-graphics-session-failure",
+                    "driver": "nvidia",
+                    "session_type": "wayland",
+                    "current_desktop": "KDE",
+                    "compositor": "kwin_wayland",
+                    "affected_apps": affected_apps,
+                    "warning_lines": [
+                        "Apr 03 14:00:01 nucat spectacle[1144]: libEGL warning: failed to get driver name for fd -1",
+                        "Apr 03 14:00:01 nucat spectacle[1144]: libEGL warning: MESA-LOADER: failed to retrieve device information"
+                    ],
+                    "crash_lines": [
+                        "Apr 03 14:00:04 nucat systemd-coredump[1600]: Process 1144 (spectacle) of user 1000 terminated abnormally with signal 6/ABRT, processing..."
+                    ],
+                    "loop_explanation": "Fixer correlated repeated EGL/Mesa/Qt warnings across multiple desktop apps with compositor or session instability."
+                }),
+                artifact_name: Some(target.to_string()),
+                artifact_path: None,
+                package_name: Some("kwin-wayland".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: last_seen.to_string(),
+                last_seen: last_seen.to_string(),
+            },
+        }
+    }
+
     fn public_issue_for_test(id: &str, opportunity: &SharedOpportunity) -> PublicIssue {
         let public = build_public_issue_fields(opportunity);
         PublicIssue {
@@ -14138,6 +14324,45 @@ mod tests {
     }
 
     #[test]
+    fn complaint_findings_are_hidden_from_public_queue() {
+        let complaint = SharedOpportunity {
+            local_opportunity_id: 3,
+            opportunity: OpportunityRecord {
+                id: 3,
+                finding_id: 3,
+                kind: "complaint".to_string(),
+                title: "User complaint: spectacle crashes on Wayland".to_string(),
+                score: 50,
+                state: "open".to_string(),
+                summary: "spectacle fails to start and prints libEGL warnings".to_string(),
+                evidence: json!({}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "2026-04-03T00:00:00Z".to_string(),
+                updated_at: "2026-04-03T00:00:00Z".to_string(),
+            },
+            finding: FindingRecord {
+                id: 3,
+                kind: "complaint".to_string(),
+                title: "User complaint: spectacle crashes on Wayland".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "complaint".to_string(),
+                summary: "spectacle fails to start and prints libEGL warnings".to_string(),
+                details: json!({"subsystem": "user-complaint"}),
+                artifact_name: None,
+                artifact_path: None,
+                package_name: Some("spectacle".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "2026-04-03T00:00:00Z".to_string(),
+                last_seen: "2026-04-03T00:00:00Z".to_string(),
+            },
+        };
+
+        assert!(!build_public_issue_fields(&complaint).visible);
+    }
+
+    #[test]
     fn crash_cluster_key_ignores_event_specific_noise() {
         let a = sample_crash(
             "zoom",
@@ -14219,6 +14444,49 @@ mod tests {
         );
         assert!(public.summary.contains("suspend/resume"));
         assert!(public.summary.contains("Xorg, kwin_x11"));
+    }
+
+    #[test]
+    fn desktop_graphics_session_cluster_key_prefers_shared_session_family() {
+        let a = sample_desktop_graphics_session_investigation(
+            "KDE Wayland desktop",
+            &["spectacle", "dolphin", "kate"],
+            "2026-04-03T10:00:00Z",
+        );
+        let b = sample_desktop_graphics_session_investigation(
+            "KDE Wayland desktop",
+            &["kate", "spectacle", "dolphin"],
+            "2026-04-03T10:00:02Z",
+        );
+
+        assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
+
+        let public = build_public_issue_fields(&a);
+        assert_eq!(
+            public.title,
+            "Desktop graphics/session failure investigation for KDE Wayland desktop"
+        );
+        assert!(
+            public
+                .summary
+                .contains("shared compositor or graphics-session failure")
+        );
+    }
+
+    #[test]
+    fn desktop_graphics_session_issue_cards_explain_broad_user_impact() {
+        let candidate = public_issue_candidate_for_test(
+            "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5fa",
+            &sample_desktop_graphics_session_investigation(
+                "KDE Wayland desktop",
+                &["spectacle", "dolphin", "kate"],
+                "2026-04-03T10:00:00Z",
+            ),
+        );
+
+        let markup = render_issue_queue_card(&candidate);
+        assert!(markup.contains("Desktop graphics failure"));
+        assert!(markup.contains("multiple apps may have failed to launch"));
     }
 
     #[test]

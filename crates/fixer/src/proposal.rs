@@ -12,7 +12,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::io::Write;
@@ -927,6 +927,7 @@ pub fn supports_process_investigation_report(opportunity: &OpportunityRecord) ->
                         | "stuck-process"
                         | "oom-kill"
                         | "desktop-resume"
+                        | "desktop-graphics-session"
                         | "network-driver-hang"
                 )
             })
@@ -1063,12 +1064,18 @@ pub fn create_complaint_plan_proposal(
 
     let evidence_path = bundle_dir.join("evidence.json");
     let summary_path = bundle_dir.join("plan.md");
+    let system = collect_system_context();
+    let desktop_diagnosis = diagnose_desktop_app_failure(complaint_text, &system);
+    let related_desktop_summary = summarize_related_desktop_signals(related);
     let evidence = json!({
         "report_kind": "complaint-plan",
         "opportunity": opportunity,
         "complaint_text": complaint_text,
         "collection_report": collection_report,
         "related_opportunities": related,
+        "system": system,
+        "desktop_diagnosis": desktop_diagnosis,
+        "related_desktop_summary": related_desktop_summary,
     });
     fs::write(&evidence_path, serde_json::to_vec_pretty(&evidence)?)?;
     fs::write(
@@ -1078,6 +1085,11 @@ pub fn create_complaint_plan_proposal(
             complaint_text,
             collection_report,
             related,
+            evidence.get("system").unwrap_or(&Value::Null),
+            evidence.get("desktop_diagnosis").unwrap_or(&Value::Null),
+            evidence
+                .get("related_desktop_summary")
+                .unwrap_or(&Value::Null),
             &evidence_path,
         ),
     )?;
@@ -3156,7 +3168,13 @@ fn render_process_investigation_report(
     let is_stuck_process = subsystem == "stuck-process";
     let is_oom_kill = subsystem == "oom-kill";
     let is_desktop_resume = subsystem == "desktop-resume";
+    let is_desktop_graphics_session = subsystem == "desktop-graphics-session";
     let is_network_driver_hang = subsystem == "network-driver-hang";
+    let desktop_issue_variant = details
+        .get("issue_variant")
+        .and_then(Value::as_str)
+        .unwrap_or("resume-display-failure");
+    let suspected_root_cause = details.get("suspected_root_cause").and_then(Value::as_str);
     let classification = details
         .get("loop_classification")
         .and_then(Value::as_str)
@@ -3164,6 +3182,8 @@ fn render_process_investigation_report(
             "unknown-uninterruptible-wait"
         } else if is_desktop_resume {
             "resume-display-failure"
+        } else if is_desktop_graphics_session {
+            "desktop-graphics-session-failure"
         } else if is_oom_kill {
             "kernel-oom-kill"
         } else if is_network_driver_hang {
@@ -3181,7 +3201,13 @@ fn render_process_investigation_report(
         .unwrap_or(if is_stuck_process {
             "Fixer collected `/proc` evidence for a process wedged in `D` state but could not derive a stronger kernel-side hypothesis yet."
         } else if is_desktop_resume {
-            "Fixer correlated suspend/resume timing with graphics stack errors, desktop-process crashes, and display-manager restart attempts."
+            if desktop_issue_variant == "sddm-greeter-nss-compat-crash" {
+                "Fixer correlated the SDDM greeter crash with NVIDIA-linked fault markers and NSS account-resolution frames, which points at a login-stack configuration mismatch rather than a pure GPU rendering bug."
+            } else {
+                "Fixer correlated suspend/resume timing with graphics stack errors, desktop-process crashes, and display-manager restart attempts."
+            }
+        } else if is_desktop_graphics_session {
+            "Fixer correlated repeated EGL/Mesa/Qt warnings across multiple desktop apps with compositor or session instability, which points at a shared graphics/session failure rather than one broken app."
         } else if is_oom_kill {
             "Fixer collected kernel log evidence showing that the OOM killer selected and terminated this process."
         } else if is_network_driver_hang {
@@ -3260,6 +3286,13 @@ fn render_process_investigation_report(
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         })
+        .or_else(|| {
+            details
+                .get("package_metadata")
+                .and_then(|value| value.get("package_name"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
         .unwrap_or_else(|| "unknown".to_string());
     let source_package = package
         .map(|pkg| pkg.source_package.clone())
@@ -3277,6 +3310,8 @@ fn render_process_investigation_report(
         body.push_str("# Stuck Process Investigation Report\n\n");
     } else if is_desktop_resume {
         body.push_str("# Desktop Resume Failure Investigation Report\n\n");
+    } else if is_desktop_graphics_session {
+        body.push_str("# Desktop Graphics/Session Failure Investigation Report\n\n");
     } else if is_oom_kill {
         body.push_str("# OOM Kill Investigation Report\n\n");
     } else if is_network_driver_hang {
@@ -3297,7 +3332,15 @@ fn render_process_investigation_report(
                 body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
                 body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
             } else if blocker_kind == "workspace" && is_desktop_resume {
-                body.push_str("Fixer diagnosed a suspend/resume display-stack failure, but it could not automatically acquire a patchable graphics or desktop source workspace on this host.\n\n");
+                if desktop_issue_variant == "sddm-greeter-nss-compat-crash" {
+                    body.push_str("Fixer diagnosed an SDDM greeter startup failure, but it could not automatically acquire a patchable display-manager or system-configuration workspace on this host.\n\n");
+                } else {
+                    body.push_str("Fixer diagnosed a suspend/resume display-stack failure, but it could not automatically acquire a patchable graphics or desktop source workspace on this host.\n\n");
+                }
+                body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
+                body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
+            } else if blocker_kind == "workspace" && is_desktop_graphics_session {
+                body.push_str("Fixer diagnosed a shared desktop graphics/session failure, but it could not automatically acquire a patchable compositor, Mesa, Qt, or desktop source workspace on this host.\n\n");
                 body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
                 body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
             } else if blocker_kind == "workspace" && is_network_driver_hang {
@@ -3322,7 +3365,13 @@ fn render_process_investigation_report(
             if is_stuck_process {
                 body.push_str("Fixer gathered enough evidence to describe the wait. Review the diagnosis below, then decide whether this looks like a package bug or a lower-level filesystem or kernel stall.\n\n");
             } else if is_desktop_resume {
-                body.push_str("Fixer gathered enough evidence to describe the suspend/resume failure. Review the diagnosis below, then decide whether this looks like a graphics-driver, X11, compositor, or display-manager regression.\n\n");
+                if desktop_issue_variant == "sddm-greeter-nss-compat-crash" {
+                    body.push_str("Fixer gathered enough evidence to describe the greeter startup failure. Review the diagnosis below, then decide whether this looks like an SDDM/NSS configuration mismatch, an NVIDIA userspace mismatch, or a broader display-manager regression.\n\n");
+                } else {
+                    body.push_str("Fixer gathered enough evidence to describe the suspend/resume failure. Review the diagnosis below, then decide whether this looks like a graphics-driver, X11, compositor, or display-manager regression.\n\n");
+                }
+            } else if is_desktop_graphics_session {
+                body.push_str("Fixer gathered enough evidence to describe the shared desktop failure. Review the diagnosis below, then decide whether this looks like a Wayland/compositor regression, a Mesa or driver issue, or a Qt desktop-stack mismatch.\n\n");
             } else if is_oom_kill {
                 body.push_str("Fixer gathered enough evidence to describe the OOM kill. Review the diagnosis below, then decide whether this points at application memory growth, an unusually heavy workload, or broader system memory pressure.\n\n");
             } else if is_network_driver_hang {
@@ -3411,6 +3460,8 @@ fn render_process_investigation_report(
     } else {
         if is_desktop_resume {
             body.push_str("\n## Why Fixer Believes Resume Broke The Desktop\n\n");
+        } else if is_desktop_graphics_session {
+            body.push_str("\n## Why Fixer Believes The Desktop Graphics Session Is Breaking\n\n");
         } else if is_network_driver_hang {
             body.push_str("\n## Why Fixer Believes This Is A Hardware Hang\n\n");
         } else {
@@ -3433,11 +3484,14 @@ fn render_process_investigation_report(
                 confidence,
                 explanation
             ));
-        } else if is_desktop_resume {
+        } else if is_desktop_resume || is_desktop_graphics_session {
             body.push_str(&format!(
                 "- Affected desktop target: `{}`\n- Failure classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
                 target_name, classification, confidence, explanation
             ));
+            if let Some(root_cause) = suspected_root_cause {
+                body.push_str(&format!("- Suspected root cause: `{root_cause}`\n"));
+            }
         } else {
             body.push_str(&format!(
                 "- Target process: `{}`\n- Sampled PID: `{}`\n- Loop classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
@@ -3461,7 +3515,7 @@ fn render_process_investigation_report(
                 "- Strace capture duration: `{strace_duration}` seconds\n"
             ));
         }
-        if is_desktop_resume {
+        if is_desktop_resume || is_desktop_graphics_session {
             if let Some(driver) = details.get("driver").and_then(Value::as_str) {
                 body.push_str(&format!("- Graphics driver: `{driver}`\n"));
             }
@@ -3471,8 +3525,20 @@ fn render_process_investigation_report(
                     session_type.to_uppercase()
                 ));
             }
+            if let Some(current_desktop) = details.get("current_desktop").and_then(Value::as_str) {
+                body.push_str(&format!("- Desktop shell: `{current_desktop}`\n"));
+            }
+            if let Some(compositor) = details.get("compositor").and_then(Value::as_str) {
+                body.push_str(&format!("- Compositor: `{compositor}`\n"));
+            }
             if let Some(display_manager) = details.get("display_manager").and_then(Value::as_str) {
                 body.push_str(&format!("- Display manager: `{display_manager}`\n"));
+            }
+            if let Some(apps) = details.get("affected_apps").and_then(Value::as_array) {
+                let apps = apps.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+                if !apps.is_empty() {
+                    body.push_str(&format!("- Affected apps: `{}`\n", apps.join(", ")));
+                }
             }
             if let Some(crashes) = details.get("crashed_processes").and_then(Value::as_array) {
                 let crashes = crashes.iter().filter_map(Value::as_str).collect::<Vec<_>>();
@@ -3511,7 +3577,20 @@ fn render_process_investigation_report(
             }
         }
     }
-    if is_desktop_resume {
+    if is_desktop_resume || is_desktop_graphics_session {
+        if let Some(marker_kinds) = details.get("marker_kinds").and_then(Value::as_array) {
+            let markers = marker_kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .take(8)
+                .collect::<Vec<_>>();
+            if !markers.is_empty() {
+                body.push_str("\n## Diagnostic Markers\n\n");
+                for marker in markers {
+                    body.push_str(&format!("- `{marker}`\n"));
+                }
+            }
+        }
         if let Some(gpu_error_lines) = details.get("gpu_error_lines").and_then(Value::as_array) {
             let lines = gpu_error_lines
                 .iter()
@@ -3535,6 +3614,45 @@ fn render_process_investigation_report(
                 .collect::<Vec<_>>();
             if !lines.is_empty() {
                 body.push_str("\n## Session And Display-Manager Errors\n\n");
+                for line in lines {
+                    body.push_str(&format!("- `{line}`\n"));
+                }
+            }
+        }
+        if let Some(root_cause_lines) = details.get("root_cause_lines").and_then(Value::as_array) {
+            let lines = root_cause_lines
+                .iter()
+                .filter_map(Value::as_str)
+                .take(6)
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                body.push_str("\n## Suspected Root-Cause Markers\n\n");
+                for line in lines {
+                    body.push_str(&format!("- `{line}`\n"));
+                }
+            }
+        }
+        if let Some(crash_lines) = details.get("crash_lines").and_then(Value::as_array) {
+            let lines = crash_lines
+                .iter()
+                .filter_map(Value::as_str)
+                .take(6)
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                body.push_str("\n## Crash Correlation\n\n");
+                for line in lines {
+                    body.push_str(&format!("- `{line}`\n"));
+                }
+            }
+        }
+        if let Some(warning_lines) = details.get("warning_lines").and_then(Value::as_array) {
+            let lines = warning_lines
+                .iter()
+                .filter_map(Value::as_str)
+                .take(8)
+                .collect::<Vec<_>>();
+            if !lines.is_empty() && is_desktop_graphics_session {
+                body.push_str("\n## Desktop Graphics Warnings\n\n");
                 for line in lines {
                     body.push_str(&format!("- `{line}`\n"));
                 }
@@ -3773,9 +3891,19 @@ fn render_process_investigation_report(
         body.push_str("2. Re-read `/proc/<pid>/stack`, `/proc/<pid>/wchan`, and `/proc/<pid>/fd` to confirm the blocking path still points at the same wait site.\n");
         body.push_str("3. If you intervene on the suspected filesystem or mount backend, verify the process leaves `D` state instead of simply moving to a different wait site.\n");
     } else if is_desktop_resume {
-        body.push_str("1. Reproduce one suspend/resume cycle and confirm the journal still shows the same graphics-driver errors right before or right after resume.\n");
-        body.push_str("2. Check whether `Xorg`, `kwin_x11`, or the display manager are crashing with the same signals and backtraces.\n");
-        body.push_str("3. If you change the kernel, Mesa, Xorg driver, or session type, verify the desktop comes back cleanly after resume and the journal no longer shows the same display-stack failure markers.\n");
+        if desktop_issue_variant == "sddm-greeter-nss-compat-crash" {
+            body.push_str("1. Re-read the latest greeter coredump with `coredumpctl debug <pid> --debugger-arguments='-batch -ex \"thread apply all bt\"'` and confirm the stack still includes `libnvidia-tls`, `getpwnam`, or `nss_compat` frames.\n");
+            body.push_str("2. Inspect `/etc/nsswitch.conf` and verify whether `passwd`, `group`, or `shadow` still use `compat`; if they do, check whether `/etc/passwd`, `/etc/group`, and `/etc/shadow` actually contain any `+` or `-` compat entries.\n");
+            body.push_str("3. After switching to `files systemd` or otherwise correcting the NSS configuration, restart `sddm` and verify the greeter stays up, connects to the daemon, and no longer logs `HelperExitStatus(11)`.\n");
+        } else {
+            body.push_str("1. Reproduce one suspend/resume cycle and confirm the journal still shows the same graphics-driver errors right before or right after resume.\n");
+            body.push_str("2. Check whether `Xorg`, `kwin_x11`, or the display manager are crashing with the same signals and backtraces.\n");
+            body.push_str("3. If you change the kernel, Mesa, Xorg driver, or session type, verify the desktop comes back cleanly after resume and the journal no longer shows the same display-stack failure markers.\n");
+        }
+    } else if is_desktop_graphics_session {
+        body.push_str("1. Reproduce the launch failure and confirm the journal still shows the same `libEGL`, `MESA-LOADER`, `qt.qpa.wayland`, or compositor-hang markers.\n");
+        body.push_str("2. Check whether the same set of apps fail under Wayland but recover under `QT_QPA_PLATFORM=xcb` or a software-rendered fallback, which helps separate session/compositor breakage from one broken app.\n");
+        body.push_str("3. Compare `kwin_wayland`, Mesa, Qt, portal, and GPU-driver package versions, then verify whether a coherent desktop-stack upgrade or downgrade removes the shared warnings and crashes.\n");
     } else if is_oom_kill {
         body.push_str("1. Confirm the kernel is still logging OOM activity with `journalctl -k -g 'Out of memory|Killed process|oom-kill'`.\n");
         body.push_str("2. Check whether the same package or cgroup repeatedly gets selected as the OOM victim under the same workload.\n");
@@ -3799,7 +3927,13 @@ fn render_process_investigation_report(
         {
             body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points below user space, so the next action is usually a kernel, mount, or storage investigation rather than a package patch.\n");
         } else if is_desktop_resume {
-            body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points at the graphics stack around suspend/resume, so the next action is usually a kernel, Mesa, Xorg-driver, or compositor investigation rather than a narrow package patch.\n");
+            if desktop_issue_variant == "sddm-greeter-nss-compat-crash" {
+                body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points at display-manager startup and NSS configuration, so the next action is usually a system-configuration fix or distro integration bug report rather than a narrow application patch.\n");
+            } else {
+                body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points at the graphics stack around suspend/resume, so the next action is usually a kernel, Mesa, Xorg-driver, or compositor investigation rather than a narrow package patch.\n");
+            }
+        } else if is_desktop_graphics_session {
+            body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points at the shared Wayland/compositor/graphics stack, so the next action is usually a KWin, Mesa, Qt, portal, or GPU-driver investigation rather than a narrow application patch.\n");
         } else if is_oom_kill {
             body.push_str("Treat this as the diagnosis half of the pipeline. The next action is to decide whether the application is growing unreasonably, the workload needs limits, or the host is simply under-provisioned for the current memory demand.\n");
         } else {
@@ -4047,18 +4181,22 @@ fn render_complaint_plan(
     complaint_text: &str,
     collection_report: Option<&ComplaintCollectionReport>,
     related: &[SharedOpportunity],
+    system: &Value,
+    desktop_diagnosis: &Value,
+    related_desktop_summary: &Value,
     evidence_path: &std::path::Path,
 ) -> String {
     let mut body = String::new();
+    let (visibility, sharing) = complaint_visibility_summary(&opportunity.state);
     body.push_str("# Complaint Triage Plan\n\n");
     body.push_str("## Complaint\n\n");
     body.push_str(complaint_text.trim());
     body.push_str("\n\n");
 
-    body.push_str("## Local Intake\n\n");
+    body.push_str("## What Fixer Did\n\n");
     body.push_str(&format!(
-        "- Complaint opportunity: `#{}`\n- State: `{}`\n- Score: `{}`\n",
-        opportunity.id, opportunity.state, opportunity.score
+        "- Complaint opportunity: `#{}`\n- Score: `{}`\n- Visibility: {}\n- Sharing: {}\n",
+        opportunity.id, opportunity.score, visibility, sharing
     ));
     if let Some(report) = collection_report {
         body.push_str(&format!(
@@ -4068,17 +4206,127 @@ fn render_complaint_plan(
     } else {
         body.push_str("- Immediate collection: skipped\n");
     }
+    if let Some(session_type) = system.get("session_type").and_then(Value::as_str) {
+        body.push_str(&format!(
+            "- Session type: `{}`\n",
+            session_type.to_uppercase()
+        ));
+    }
+    if let Some(desktop) = system.get("current_desktop").and_then(Value::as_str) {
+        body.push_str(&format!("- Desktop session: `{desktop}`\n"));
+    }
+
+    if let Some(summary) = desktop_diagnosis.get("summary").and_then(Value::as_str) {
+        body.push_str("\n## Initial Diagnosis\n\n");
+        body.push_str(summary);
+        body.push_str("\n\n");
+        if let Some(app_name) = desktop_diagnosis.get("app_name").and_then(Value::as_str) {
+            body.push_str(&format!("- Likely affected app: `{app_name}`\n"));
+        }
+        if let Some(package_name) = desktop_diagnosis
+            .get("package_name")
+            .and_then(Value::as_str)
+        {
+            body.push_str(&format!("- Likely package: `{package_name}`\n"));
+        }
+        if let Some(session_hint) = desktop_diagnosis
+            .get("session_hint")
+            .and_then(Value::as_str)
+        {
+            body.push_str(&format!("- Session hint: `{session_hint}`\n"));
+        }
+        if let Some(subsystems) = desktop_diagnosis
+            .get("suspected_subsystems")
+            .and_then(Value::as_array)
+        {
+            let subsystems = subsystems
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            if !subsystems.is_empty() {
+                body.push_str(&format!(
+                    "- Suspected subsystem: `{}`\n",
+                    subsystems.join(", ")
+                ));
+            }
+        }
+        if let Some(markers) = desktop_diagnosis.get("markers").and_then(Value::as_array) {
+            let markers = markers.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+            if !markers.is_empty() {
+                body.push_str(&format!(
+                    "- Markers seen in complaint: `{}`\n",
+                    markers.join(", ")
+                ));
+            }
+        }
+        if let Some(package_metadata) = desktop_diagnosis.get("package_metadata") {
+            if let Some(installed_version) = package_metadata
+                .get("installed_version")
+                .and_then(Value::as_str)
+            {
+                body.push_str(&format!("- Installed version: `{installed_version}`\n"));
+            }
+            if let Some(candidate_version) = package_metadata
+                .get("candidate_version")
+                .and_then(Value::as_str)
+            {
+                body.push_str(&format!("- Candidate version: `{candidate_version}`\n"));
+            }
+            if let Some(report_url) = package_metadata.get("report_url").and_then(Value::as_str) {
+                body.push_str(&format!("- Suggested report URL: `{report_url}`\n"));
+            }
+        }
+    }
+    if let Some(summary) = related_desktop_summary
+        .get("summary")
+        .and_then(Value::as_str)
+    {
+        body.push_str("\n## Correlated Desktop Signals\n\n");
+        body.push_str(summary);
+        body.push_str("\n\n");
+        if let Some(apps) = related_desktop_summary
+            .get("affected_apps")
+            .and_then(Value::as_array)
+        {
+            let apps = apps.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+            if !apps.is_empty() {
+                body.push_str(&format!("- Affected apps: `{}`\n", apps.join(", ")));
+            }
+        }
+        if let Some(marker_count) = related_desktop_summary
+            .get("marker_match_count")
+            .and_then(Value::as_u64)
+        {
+            body.push_str(&format!(
+                "- Matching desktop warning records: `{marker_count}`\n"
+            ));
+        }
+        if let Some(crash_count) = related_desktop_summary
+            .get("crash_count")
+            .and_then(Value::as_u64)
+            .filter(|count| *count > 0)
+        {
+            body.push_str(&format!("- Matched crash records: `{crash_count}`\n"));
+        }
+    }
 
     if related.is_empty() {
         body.push_str("\n## Related Local Evidence\n\n");
         body.push_str("Fixer did not find any strong local matches for this complaint yet.\n\n");
         body.push_str("## Suggested Next Steps\n\n");
-        body.push_str("1. Reproduce the issue while `fixerd` is running.\n");
-        body.push_str("2. Run `fixer collect` again right after reproduction.\n");
-        body.push_str(
-            "3. Check `fixer crashes`, `fixer warnings`, and `fixer hotspots` for new evidence.\n",
-        );
-        body.push_str("4. Re-run `fixer complain ...` with more concrete wording such as package names, commands, or symptoms.\n");
+        if desktop_diagnosis.get("summary").is_some() {
+            body.push_str("1. Reproduce the launch failure while `fixerd` is running so Fixer can catch a matching crash or warning.\n");
+            body.push_str("2. Run `fixer collect` immediately after the failure, then check `fixer crashes` and `fixer warnings` for fresh Qt, Mesa, Wayland, or compositor evidence.\n");
+            body.push_str("3. If this looks Wayland-specific, retest once under X11 if available, or note explicitly that it only fails on Wayland.\n");
+            body.push_str("4. Re-run `fixer complain` and paste the exact command, package version, and any new stderr or journal excerpts.\n");
+        } else {
+            body.push_str("1. Reproduce the issue while `fixerd` is running.\n");
+            body.push_str("2. Run `fixer collect` again right after reproduction.\n");
+            body.push_str(
+                "3. Check `fixer crashes`, `fixer warnings`, and `fixer hotspots` for new evidence.\n",
+            );
+            body.push_str("4. Re-run `fixer complain` with more concrete wording such as package names, commands, or symptoms.\n");
+        }
     } else {
         body.push_str("\n## Related Local Evidence\n\n");
         for item in related.iter().take(8) {
@@ -4122,6 +4370,12 @@ fn render_complaint_plan(
             ));
             step += 1;
         }
+        if related_desktop_summary.get("summary").is_some() {
+            body.push_str(&format!(
+                "{step}. Treat repeated EGL or Qt startup warnings across multiple apps as a shared graphics-session problem first, and compare KWin, portal, and GPU-driver state before blaming a single application.\n"
+            ));
+            step += 1;
+        }
         if hotspot_count > 0 {
             body.push_str(&format!(
                 "{step}. Review the matched hotspots for hot functions and owning packages, then decide whether this is a performance regression or expected workload.\n"
@@ -4141,6 +4395,216 @@ fn render_complaint_plan(
     body
 }
 
+fn complaint_visibility_summary(state: &str) -> (&'static str, &'static str) {
+    if state == "local-only" {
+        (
+            "private to this machine",
+            "not eligible for sync until you opt in",
+        )
+    } else {
+        ("local triage first", "eligible for sync on next upload")
+    }
+}
+
+fn diagnose_desktop_app_failure(complaint_text: &str, system: &Value) -> Value {
+    let lower = complaint_text.to_ascii_lowercase();
+    let marker_specs = [
+        ("libegl", "libEGL"),
+        ("mesa-loader", "MESA-LOADER"),
+        ("qthreadstorage", "QThreadStorage"),
+        ("qt.qpa", "qt.qpa"),
+        ("wayland", "Wayland"),
+        ("wayland_display", "WAYLAND_DISPLAY"),
+        ("drm", "DRM"),
+        ("gbm", "GBM"),
+        ("egl", "EGL"),
+    ];
+    let markers = marker_specs
+        .into_iter()
+        .filter_map(|(needle, label)| lower.contains(needle).then_some(label.to_string()))
+        .collect::<BTreeSet<_>>();
+    let app_specs = [
+        ("spectacle", "spectacle", "spectacle"),
+        ("plasmashell", "plasmashell", "plasma-workspace"),
+        ("kwin_wayland", "kwin_wayland", "kwin-wayland"),
+        ("kwin-wayland", "kwin_wayland", "kwin-wayland"),
+        ("kwin_x11", "kwin_x11", "kwin-x11"),
+        ("kwin-x11", "kwin_x11", "kwin-x11"),
+        ("pipewire", "pipewire", "pipewire"),
+        (
+            "xdg-desktop-portal",
+            "xdg-desktop-portal",
+            "xdg-desktop-portal",
+        ),
+        ("qt6", "qt6", "qt6-base"),
+        ("mesa", "mesa", "mesa-utils"),
+    ];
+    let app_match = app_specs
+        .into_iter()
+        .find(|(needle, _, _)| lower.contains(needle));
+    let app_name = app_match.map(|(_, app_name, _)| app_name.to_string());
+    let package_name = app_match.map(|(_, _, package_name)| package_name.to_string());
+
+    let mut suspected_subsystems = BTreeSet::new();
+    if lower.contains("libegl")
+        || lower.contains("mesa-loader")
+        || lower.contains("egl")
+        || lower.contains("drm")
+        || lower.contains("gbm")
+    {
+        suspected_subsystems.insert("graphics stack".to_string());
+    }
+    if lower.contains("wayland")
+        || system
+            .get("session_type")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
+        || system
+            .get("wayland_display")
+            .and_then(Value::as_str)
+            .is_some()
+    {
+        suspected_subsystems.insert("wayland session".to_string());
+    }
+    if lower.contains("qthreadstorage")
+        || lower.contains("qt.qpa")
+        || lower.contains("qt")
+        || app_name.as_deref() == Some("spectacle")
+    {
+        suspected_subsystems.insert("qt desktop app".to_string());
+    }
+    if lower.contains("portal") || lower.contains("screen") || lower.contains("screenshot") {
+        suspected_subsystems.insert("desktop portal or capture path".to_string());
+    }
+
+    if app_name.is_none() && markers.is_empty() && suspected_subsystems.is_empty() {
+        return Value::Null;
+    }
+
+    let session_hint = if lower.contains("wayland")
+        || system
+            .get("session_type")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
+    {
+        Some("Wayland".to_string())
+    } else if lower.contains("x11")
+        || system
+            .get("session_type")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("x11"))
+    {
+        Some("X11".to_string())
+    } else {
+        None
+    };
+    let package_metadata = package_name
+        .as_deref()
+        .and_then(|name| resolve_installed_package_metadata(name).ok())
+        .map(|metadata| json!(metadata))
+        .unwrap_or(Value::Null);
+    let target = app_name
+        .clone()
+        .unwrap_or_else(|| "the affected app".to_string());
+    let summary = if suspected_subsystems.contains("graphics stack")
+        && suspected_subsystems.contains("wayland session")
+    {
+        format!(
+            "The complaint text looks like a desktop-app launch failure in `{target}` with Wayland and graphics-stack markers. This could be a Wayland, Mesa, compositor, or Qt integration issue rather than a Fixer-local problem."
+        )
+    } else if suspected_subsystems.contains("graphics stack") {
+        format!(
+            "The complaint text looks like `{target}` is failing in the local graphics stack. The pasted stderr mentions EGL or Mesa loader problems, which often point at Mesa, the compositor, or a driver mismatch."
+        )
+    } else {
+        format!(
+            "The complaint text looks like `{target}` is failing during desktop-app startup. The pasted markers suggest a Qt or session-integration issue worth checking in local crashes, warnings, and package metadata."
+        )
+    };
+
+    json!({
+        "app_name": app_name,
+        "package_name": package_name,
+        "summary": summary,
+        "session_hint": session_hint,
+        "markers": markers.into_iter().collect::<Vec<_>>(),
+        "suspected_subsystems": suspected_subsystems.into_iter().collect::<Vec<_>>(),
+        "package_metadata": package_metadata,
+    })
+}
+
+fn summarize_related_desktop_signals(related: &[SharedOpportunity]) -> Value {
+    let marker_needles = [
+        "libegl",
+        "mesa-loader",
+        "qthreadstorage",
+        "qt.qpa",
+        "wayland",
+    ];
+    let mut affected_apps = BTreeSet::new();
+    let mut marker_match_count = 0u64;
+    let mut crash_count = 0u64;
+
+    for item in related {
+        let haystack = format!(
+            "{}\n{}\n{}",
+            item.finding.title, item.finding.summary, item.finding.details
+        )
+        .to_ascii_lowercase();
+        if marker_needles
+            .iter()
+            .any(|needle| haystack.contains(needle))
+        {
+            marker_match_count += 1;
+            if item.finding.kind == "crash" {
+                crash_count += 1;
+            }
+            if let Some(name) = item
+                .finding
+                .artifact_name
+                .as_deref()
+                .or(item.finding.package_name.as_deref())
+                .or_else(|| {
+                    item.opportunity
+                        .evidence
+                        .get("package_name")
+                        .and_then(Value::as_str)
+                })
+            {
+                affected_apps.insert(name.to_string());
+            }
+        }
+    }
+
+    if marker_match_count == 0 {
+        return Value::Null;
+    }
+
+    let summary = if affected_apps.len() >= 2 {
+        format!(
+            "Fixer found the same EGL, Mesa, Qt, or Wayland startup markers in {} related opportunities across multiple apps. That pattern usually points at the current desktop session, compositor, portal, or graphics stack rather than a single app-specific bug.",
+            marker_match_count
+        )
+    } else if crash_count > 0 {
+        format!(
+            "Fixer found matching desktop startup markers alongside {} related crash record(s). That combination suggests a shared Qt or graphics-session startup failure, not just a one-off warning.",
+            crash_count
+        )
+    } else {
+        format!(
+            "Fixer found {} related warning record(s) with the same desktop startup markers, which is enough to suspect a shared session or graphics-stack issue.",
+            marker_match_count
+        )
+    };
+
+    json!({
+        "summary": summary,
+        "affected_apps": affected_apps.into_iter().collect::<Vec<_>>(),
+        "marker_match_count": marker_match_count,
+        "crash_count": crash_count,
+    })
+}
+
 fn collect_system_context() -> Value {
     let os_release = read_text(std::path::Path::new("/etc/os-release")).unwrap_or_default();
     let os_pretty_name = parse_os_release_field(&os_release, "PRETTY_NAME");
@@ -4150,6 +4614,12 @@ fn collect_system_context() -> Value {
         "os_pretty_name": os_pretty_name,
         "os_bug_report_url": os_bug_report_url,
         "kernel": kernel,
+        "session_type": std::env::var("XDG_SESSION_TYPE").ok(),
+        "wayland_display": std::env::var("WAYLAND_DISPLAY").ok(),
+        "display": std::env::var("DISPLAY").ok(),
+        "current_desktop": std::env::var("XDG_CURRENT_DESKTOP")
+            .ok()
+            .or_else(|| std::env::var("DESKTOP_SESSION").ok()),
     })
 }
 
@@ -4303,21 +4773,22 @@ fn pg_amcheck_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_compact_patch_retry_prompt, classify_codex_failure,
+        build_compact_patch_retry_prompt, classify_codex_failure, diagnose_desktop_app_failure,
         extract_git_add_paths_from_response, filter_generated_public_diff_blocks,
         initialize_workspace_git_baseline, is_generated_public_diff_path,
         load_published_codex_session, parse_review_verdict, pg_amcheck_command,
         prepare_codex_job_with_prior_patch, primary_model_rate_limit_active,
-        remember_primary_model_rate_limit, render_external_bug_report,
+        remember_primary_model_rate_limit, render_complaint_plan, render_external_bug_report,
         render_local_remediation_report, render_local_remediation_sql,
         render_process_investigation_report, render_public_session_git_diff,
         sanitize_command_line_for_report, should_retry_after_compaction_failure,
         should_use_spark_for_weak_weekly_budget, suggested_report_destination,
+        summarize_related_desktop_signals,
     };
     use crate::config::FixerConfig;
     use crate::models::{
-        CodexJobStatus, InstalledPackageMetadata, OpportunityRecord, PatchAttempt,
-        PreparedWorkspace,
+        CodexJobStatus, FindingRecord, InstalledPackageMetadata, OpportunityRecord, PatchAttempt,
+        PreparedWorkspace, SharedOpportunity,
     };
     use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
@@ -4786,6 +5257,129 @@ mod tests {
     }
 
     #[test]
+    fn sddm_greeter_reports_explain_nss_compat_mismatch() {
+        let opportunity = OpportunityRecord {
+            id: 12,
+            finding_id: 12,
+            kind: "investigation".to_string(),
+            title: "Desktop resume failure investigation for nvidia sddm greeter".to_string(),
+            score: 120,
+            state: "open".to_string(),
+            summary: "sddm-greeter-qt6 crashed while resolving account data through NSS, and sddm kept restarting before the login prompt appeared.".to_string(),
+            evidence: json!({
+                "package_name": "nvidia-driver",
+                "details": {
+                    "subsystem": "desktop-resume",
+                    "profile_target": { "name": "nvidia sddm greeter" },
+                    "loop_classification": "sddm-greeter-nss-compat-crash",
+                    "loop_confidence": 0.99,
+                    "loop_explanation": "sddm-greeter-qt6 crashed while resolving account data through NSS, and sddm kept restarting before the login prompt appeared.",
+                    "driver": "nvidia",
+                    "session_type": "x11",
+                    "display_manager": "sddm",
+                    "issue_variant": "sddm-greeter-nss-compat-crash",
+                    "suspected_root_cause": "NSS compat lookup mismatch",
+                    "crashed_processes": ["sddm-greeter-qt6"],
+                    "gpu_error_lines": [
+                        "Apr 02 22:16:03 blackcat kernel: sddm-greeter-qt6[16832]: segfault at 0 ip 00007f5d3d113abc sp 00007ffd4e4b1cb0 error 4 in libnvidia-tls.so.555.58.02[7f5d3d112000+4000]"
+                    ],
+                    "session_error_lines": [
+                        "Apr 02 22:16:03 blackcat sddm[15118]: Greeter stopped. SDDM::Auth::HelperExitStatus(11)"
+                    ],
+                    "root_cause_lines": [
+                        "Apr 02 22:16:04 blackcat coredumpctl[17000]: #4  0x00007f5d3cb1c111 in _nss_compat_getpwnam_r () from /lib/x86_64-linux-gnu/libnss_compat.so.2",
+                        "Apr 02 22:16:04 blackcat coredumpctl[17000]: passwd: compat systemd"
+                    ],
+                    "resume_line": "No suspend marker captured; greeter failed during display-manager startup.",
+                    "likely_external_root_cause": true
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-04-02T00:00:00Z".to_string(),
+            updated_at: "2026-04-02T00:00:00Z".to_string(),
+        };
+        let system = json!({
+            "os_pretty_name": "Debian GNU/Linux trixie/sid",
+            "kernel": "Linux 6.19.8+deb14-amd64"
+        });
+        let rendered = render_process_investigation_report(
+            &opportunity,
+            None,
+            &system,
+            Path::new("/tmp/evidence.json"),
+            None,
+        );
+        assert!(rendered.contains("greeter startup failure"));
+        assert!(rendered.contains("NSS compat lookup mismatch"));
+        assert!(rendered.contains("coredumpctl debug"));
+        assert!(rendered.contains("/etc/nsswitch.conf"));
+        assert!(rendered.contains("HelperExitStatus(11)"));
+    }
+
+    #[test]
+    fn desktop_graphics_session_reports_explain_shared_wayland_failure() {
+        let opportunity = OpportunityRecord {
+            id: 13,
+            finding_id: 13,
+            kind: "investigation".to_string(),
+            title: "Desktop graphics/session failure investigation for KDE Wayland desktop".to_string(),
+            score: 118,
+            state: "open".to_string(),
+            summary: "Repeated EGL/Mesa/Qt desktop warnings affected spectacle, dolphin, kate on KDE WAYLAND, with crashes in spectacle.".to_string(),
+            evidence: json!({
+                "package_name": "kwin-wayland",
+                "details": {
+                    "subsystem": "desktop-graphics-session",
+                    "profile_target": { "name": "KDE Wayland desktop" },
+                    "loop_classification": "desktop-graphics-session-failure",
+                    "loop_confidence": 0.96,
+                    "loop_explanation": "Fixer correlated repeated EGL/Mesa/Qt warnings across multiple desktop apps with compositor or session instability, which points at a shared graphics/session failure rather than one broken app.",
+                    "driver": "nvidia",
+                    "session_type": "wayland",
+                    "current_desktop": "KDE",
+                    "compositor": "kwin_wayland",
+                    "affected_apps": ["spectacle", "dolphin", "kate"],
+                    "crashed_processes": ["spectacle"],
+                    "warning_lines": [
+                        "Apr 03 14:00:01 nucat spectacle[1144]: libEGL warning: failed to get driver name for fd -1",
+                        "Apr 03 14:00:01 nucat spectacle[1144]: libEGL warning: MESA-LOADER: failed to retrieve device information"
+                    ],
+                    "session_error_lines": [
+                        "Apr 03 14:00:03 nucat kwin_wayland_wrapper[1500]: kwin_wayland_drm: The main thread was hanging temporarily!"
+                    ],
+                    "crash_lines": [
+                        "Apr 03 14:00:04 nucat systemd-coredump[1600]: Process 1144 (spectacle) of user 1000 terminated abnormally with signal 6/ABRT, processing..."
+                    ],
+                    "marker_kinds": ["egl-mesa", "wayland-session", "kwin-compositor", "coredump"],
+                    "likely_external_root_cause": true
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-04-03T10:00:00Z".to_string(),
+            updated_at: "2026-04-03T10:00:00Z".to_string(),
+        };
+        let system = json!({
+            "os_pretty_name": "Debian GNU/Linux trixie/sid",
+            "kernel": "Linux 6.19.8+deb14-amd64"
+        });
+        let rendered = render_process_investigation_report(
+            &opportunity,
+            None,
+            &system,
+            Path::new("/tmp/evidence.json"),
+            None,
+        );
+        assert!(rendered.contains("Desktop Graphics/Session Failure Investigation Report"));
+        assert!(rendered.contains("Why Fixer Believes The Desktop Graphics Session Is Breaking"));
+        assert!(rendered.contains("Affected apps: `spectacle, dolphin, kate`"));
+        assert!(rendered.contains("Diagnostic Markers"));
+        assert!(rendered.contains("Desktop Graphics Warnings"));
+        assert!(rendered.contains("KWin, Mesa, Qt, portal, or GPU-driver investigation"));
+    }
+
+    #[test]
     fn process_investigation_report_mentions_codex_auth_blockers_explicitly() {
         let opportunity = OpportunityRecord {
             id: 11,
@@ -4830,6 +5424,161 @@ mod tests {
         assert!(rendered.contains("could not start the automated Codex pass"));
         assert!(rendered.contains("Automatic patch attempt blocker"));
         assert!(rendered.contains("Codex auth lease is paused"));
+    }
+
+    #[test]
+    fn desktop_app_complaint_diagnosis_detects_spectacle_wayland_markers() {
+        let system = json!({
+            "session_type": "wayland",
+            "current_desktop": "KDE",
+        });
+        let diagnosis = diagnose_desktop_app_failure(
+            "spectacle dies on wayland with libEGL warning and MESA-LOADER noise\nQThreadStorage: entry 2 destroyed before end of thread",
+            &system,
+        );
+        assert_eq!(
+            diagnosis.get("app_name").and_then(Value::as_str),
+            Some("spectacle")
+        );
+        assert_eq!(
+            diagnosis.get("session_hint").and_then(Value::as_str),
+            Some("Wayland")
+        );
+        let items = diagnosis
+            .get("suspected_subsystems")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(
+            items
+                .iter()
+                .any(|item| item.as_str() == Some("graphics stack"))
+        );
+    }
+
+    #[test]
+    fn complaint_plan_reports_visibility_and_desktop_diagnosis() {
+        let opportunity = OpportunityRecord {
+            id: 12553,
+            finding_id: 12553,
+            kind: "complaint".to_string(),
+            title: "User complaint: spectacle dies on Wayland".to_string(),
+            score: 54,
+            state: "open".to_string(),
+            summary: "spectacle prints libEGL warnings and quits".to_string(),
+            evidence: json!({}),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-04-03T00:00:00Z".to_string(),
+            updated_at: "2026-04-03T00:00:00Z".to_string(),
+        };
+        let system = json!({
+            "session_type": "wayland",
+            "current_desktop": "KDE",
+        });
+        let diagnosis = diagnose_desktop_app_failure(
+            "spectacle dies on wayland with libEGL warning and MESA-LOADER noise\nQThreadStorage: entry 2 destroyed before end of thread",
+            &system,
+        );
+        let related_summary = summarize_related_desktop_signals(&[]);
+        let rendered = render_complaint_plan(
+            &opportunity,
+            "spectacle dies on wayland with libEGL warning and MESA-LOADER noise",
+            None,
+            &[],
+            &system,
+            &diagnosis,
+            &related_summary,
+            Path::new("/tmp/evidence.json"),
+        );
+        assert!(rendered.contains("Visibility: local triage first"));
+        assert!(rendered.contains("Sharing: eligible for sync on next upload"));
+        assert!(rendered.contains("Likely affected app: `spectacle`"));
+        assert!(rendered.contains("Wayland"));
+    }
+
+    #[test]
+    fn related_desktop_signal_summary_detects_cross_app_egl_pattern() {
+        let related = vec![
+            SharedOpportunity {
+                local_opportunity_id: 1,
+                opportunity: OpportunityRecord {
+                    id: 1,
+                    finding_id: 1,
+                    kind: "warning".to_string(),
+                    title: "System warning".to_string(),
+                    score: 64,
+                    state: "open".to_string(),
+                    summary: "dolphin prints libEGL warnings on startup".to_string(),
+                    evidence: json!({"package_name": "dolphin"}),
+                    repo_root: None,
+                    ecosystem: None,
+                    created_at: "now".to_string(),
+                    updated_at: "now".to_string(),
+                },
+                finding: FindingRecord {
+                    id: 1,
+                    kind: "warning".to_string(),
+                    title: "System warning".to_string(),
+                    severity: "medium".to_string(),
+                    fingerprint: "w1".to_string(),
+                    summary: "libEGL warning: MESA-LOADER: failed to retrieve device information"
+                        .to_string(),
+                    details: json!({"line": "libEGL warning: failed to get driver name for fd -1"}),
+                    artifact_name: Some("dolphin".to_string()),
+                    artifact_path: None,
+                    package_name: Some("dolphin".to_string()),
+                    repo_root: None,
+                    ecosystem: None,
+                    first_seen: "now".to_string(),
+                    last_seen: "now".to_string(),
+                },
+            },
+            SharedOpportunity {
+                local_opportunity_id: 2,
+                opportunity: OpportunityRecord {
+                    id: 2,
+                    finding_id: 2,
+                    kind: "crash".to_string(),
+                    title: "Crash with stack trace in spectacle".to_string(),
+                    score: 90,
+                    state: "open".to_string(),
+                    summary: "spectacle aborts during Qt startup".to_string(),
+                    evidence: json!({"package_name": "spectacle"}),
+                    repo_root: None,
+                    ecosystem: None,
+                    created_at: "now".to_string(),
+                    updated_at: "now".to_string(),
+                },
+                finding: FindingRecord {
+                    id: 2,
+                    kind: "crash".to_string(),
+                    title: "Crash with stack trace in spectacle".to_string(),
+                    severity: "high".to_string(),
+                    fingerprint: "c1".to_string(),
+                    summary: "QThreadStorage fatal after libEGL warnings".to_string(),
+                    details: json!({"line": "QThreadStorage: entry 2 destroyed before end of thread"}),
+                    artifact_name: Some("spectacle".to_string()),
+                    artifact_path: None,
+                    package_name: Some("spectacle".to_string()),
+                    repo_root: None,
+                    ecosystem: None,
+                    first_seen: "now".to_string(),
+                    last_seen: "now".to_string(),
+                },
+            },
+        ];
+        let summary = summarize_related_desktop_signals(&related);
+        assert!(summary.get("summary").is_some());
+        assert_eq!(
+            summary.get("marker_match_count").and_then(Value::as_u64),
+            Some(2)
+        );
+        let apps = summary
+            .get("affected_apps")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(apps.iter().any(|item| item.as_str() == Some("dolphin")));
+        assert!(apps.iter().any(|item| item.as_str() == Some("spectacle")));
     }
 
     #[test]
