@@ -385,6 +385,12 @@ pub struct SharedOpportunity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmittedProposal {
+    pub local_opportunity_id: i64,
+    pub result: WorkerResultEnvelope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
     pub install_id: String,
     pub version: String,
@@ -420,6 +426,8 @@ pub struct FindingBundle {
     pub status: StatusSnapshot,
     pub capabilities: Vec<Capability>,
     pub items: Vec<SharedOpportunity>,
+    #[serde(default)]
+    pub proposals: Vec<SubmittedProposal>,
     pub redactions: Vec<String>,
 }
 

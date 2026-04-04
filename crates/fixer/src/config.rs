@@ -163,6 +163,10 @@ pub struct NetworkConfig {
     pub worker_pow_difficulty: u32,
     #[serde(default = "default_max_submission_items")]
     pub max_submission_items: usize,
+    #[serde(default = "default_max_submission_proposals")]
+    pub max_submission_proposals: usize,
+    #[serde(default = "default_max_submission_proposal_bytes")]
+    pub max_submission_proposal_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +319,8 @@ impl Default for NetworkConfig {
             submission_pow_difficulty: default_submission_pow_difficulty(),
             worker_pow_difficulty: default_worker_pow_difficulty(),
             max_submission_items: default_max_submission_items(),
+            max_submission_proposals: default_max_submission_proposals(),
+            max_submission_proposal_bytes: default_max_submission_proposal_bytes(),
         }
     }
 }
@@ -558,6 +564,14 @@ fn default_worker_pow_difficulty() -> u32 {
 
 fn default_max_submission_items() -> usize {
     50
+}
+
+fn default_max_submission_proposals() -> usize {
+    5
+}
+
+fn default_max_submission_proposal_bytes() -> usize {
+    256 * 1024
 }
 
 fn default_policy_version() -> String {

@@ -1360,6 +1360,7 @@ async fn submit_bundle(
         .map_err(ApiError::internal)?
         .0;
     let mut issue_ids = Vec::new();
+    let mut issue_by_local_opportunity_id = HashMap::new();
     let mut promoted_clusters = 0_usize;
     for item in &envelope.bundle.items {
         let cluster_key = cluster_key_for(item);
@@ -1380,7 +1381,17 @@ async fn submit_bundle(
         if promoted {
             promoted_clusters += 1;
         }
+        issue_by_local_opportunity_id.insert(item.local_opportunity_id, issue_id.clone());
         issue_ids.push(issue_id);
+    }
+    for proposal in &envelope.bundle.proposals {
+        let Some(issue_id) = issue_by_local_opportunity_id.get(&proposal.local_opportunity_id)
+        else {
+            continue;
+        };
+        store_submitted_proposal_result(&state.db, issue_id, &proposal.result)
+            .await
+            .map_err(ApiError::internal)?;
     }
     if promoted_clusters > 0 {
         bump_submission_trust(&state.db, &install_id)
@@ -5160,6 +5171,115 @@ async fn store_worker_result(
                     [result.attempt.install_id.as_str()],
                 )?;
             }
+        }
+    }
+    Ok(())
+}
+
+async fn store_submitted_proposal_result(
+    db: &ServerDb,
+    cluster_id: &str,
+    result: &WorkerResultEnvelope,
+) -> Result<()> {
+    let mut submitted = canonicalize_worker_result_envelope(result.clone());
+    submitted.lease_id.clear();
+    submitted.attempt.cluster_id = cluster_id.to_string();
+    match db {
+        ServerDb::Postgres(db) => {
+            let already_stored = db
+                .query_opt(
+                    "
+                SELECT 1
+                FROM patch_attempts
+                WHERE cluster_id = $1
+                  AND install_id = $2
+                  AND outcome = $3
+                  AND state = $4
+                  AND created_at = $5
+                LIMIT 1
+                ",
+                    &[
+                        &cluster_id,
+                        &submitted.attempt.install_id,
+                        &submitted.attempt.outcome,
+                        &submitted.attempt.state,
+                        &parse_timestamp(&submitted.attempt.created_at).unwrap_or_else(Utc::now),
+                    ],
+                )
+                .await?
+                .is_some();
+            if already_stored {
+                return Ok(());
+            }
+            let patch_attempt_id = new_server_id();
+            db.execute(
+                "
+            INSERT INTO patch_attempts (id, cluster_id, lease_id, install_id, outcome, state, summary, bundle_json, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ",
+                &[
+                    &patch_attempt_id,
+                    &cluster_id,
+                    &Option::<String>::None,
+                    &submitted.attempt.install_id,
+                    &submitted.attempt.outcome,
+                    &submitted.attempt.state,
+                    &submitted.attempt.summary,
+                    &serde_json::to_value(&submitted)?,
+                    &parse_timestamp(&submitted.attempt.created_at)
+                        .unwrap_or_else(Utc::now),
+                ],
+            )
+            .await?;
+            refresh_issue_cluster_best_results(db, cluster_id).await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let already_stored = connection
+                .query_row(
+                    "
+                SELECT 1
+                FROM patch_attempts
+                WHERE cluster_id = ?1
+                  AND install_id = ?2
+                  AND outcome = ?3
+                  AND state = ?4
+                  AND created_at = ?5
+                LIMIT 1
+                ",
+                    params![
+                        cluster_id,
+                        submitted.attempt.install_id,
+                        submitted.attempt.outcome,
+                        submitted.attempt.state,
+                        submitted.attempt.created_at,
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if already_stored {
+                return Ok(());
+            }
+            let patch_attempt_id = new_server_id();
+            connection.execute(
+                "
+            INSERT INTO patch_attempts (id, cluster_id, lease_id, install_id, outcome, state, summary, bundle_json, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ",
+                params![
+                    patch_attempt_id,
+                    cluster_id,
+                    Option::<String>::None,
+                    submitted.attempt.install_id,
+                    submitted.attempt.outcome,
+                    submitted.attempt.state,
+                    submitted.attempt.summary,
+                    serde_json::to_string(&submitted)?,
+                    submitted.attempt.created_at.clone(),
+                ],
+            )?;
+            refresh_issue_cluster_best_results_sqlite(&connection, cluster_id)?;
         }
     }
     Ok(())
@@ -12169,7 +12289,12 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use crate::config::FixerConfig;
-    use crate::models::{FindingRecord, OpportunityRecord};
+    use crate::models::{
+        ClientHello, FindingBundle, FindingRecord, OpportunityRecord, ParticipationMode,
+        PatchAttempt, StatusSnapshot, SubmissionEnvelope, SubmittedProposal, WorkerResultEnvelope,
+    };
+    use crate::pow::mine_pow;
+    use crate::util::hash_text;
     use tempfile::tempdir;
     use tokio::runtime::Runtime;
 
@@ -12621,6 +12746,130 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn submit_bundle_publishes_ready_local_patch_attempts() {
+        let (_dir, db) = init_test_server_db();
+        let mut config = FixerConfig::default();
+        if let ServerDb::Sqlite(path) = &db {
+            config.server.postgres_url = format!("sqlite://{}", path.display());
+        }
+        let state = Arc::new(ServerState {
+            config: config.clone(),
+            db,
+        });
+        let item = sample_desktop_graphics_session_investigation(
+            "plasma-desktop",
+            &["systemsettings"],
+            "2026-04-04T12:00:00Z",
+        );
+        let result = WorkerResultEnvelope {
+            lease_id: String::new(),
+            attempt: PatchAttempt {
+                cluster_id: String::new(),
+                install_id: "submitter-1".to_string(),
+                outcome: "patch".to_string(),
+                state: "ready".to_string(),
+                summary: "Patch proposal created locally.".to_string(),
+                bundle_path: Some("/tmp/bundle".to_string()),
+                output_path: Some("/tmp/bundle/codex-output.txt".to_string()),
+                validation_status: Some("ready".to_string()),
+                details: json!({
+                    "submitted_via_sync": true,
+                    "published_session": {
+                        "prompt": "Patch the keyboard daemon.",
+                        "response": "Applied a bounded fix.",
+                        "diff": "diff --git a/kcms/keyboard/keyboard_daemon.cpp b/kcms/keyboard/keyboard_daemon.cpp\n--- a/kcms/keyboard/keyboard_daemon.cpp\n+++ b/kcms/keyboard/keyboard_daemon.cpp\n@@\n-old\n+new\n",
+                        "model": "codex-default",
+                        "models_used": ["codex-default"],
+                        "rate_limit_fallback_used": false
+                    }
+                }),
+                created_at: "2026-04-04T12:05:00Z".to_string(),
+            },
+            impossible_reason: None,
+            evidence_request: None,
+        };
+        let bundle = FindingBundle {
+            captured_at: "2026-04-04T12:06:00Z".to_string(),
+            policy_version: "2026-03-29".to_string(),
+            richer_evidence_allowed: false,
+            status: StatusSnapshot {
+                capabilities: 1,
+                artifacts: 1,
+                findings: 1,
+                opportunities: 1,
+                proposals: 1,
+            },
+            capabilities: Vec::new(),
+            items: vec![item.clone()],
+            proposals: vec![SubmittedProposal {
+                local_opportunity_id: item.local_opportunity_id,
+                result,
+            }],
+            redactions: Vec::new(),
+        };
+        let client = ClientHello {
+            install_id: "submitter-1".to_string(),
+            version: current_binary_version().to_string(),
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            mode: ParticipationMode::SubmitterWorker,
+            hostname: Some("test-host".to_string()),
+            capabilities: Vec::new(),
+            has_codex: true,
+            richer_evidence_allowed: false,
+            patch_driver: Some("codex".to_string()),
+            patch_model: Some("codex-default".to_string()),
+        };
+        let content_hash = hash_text(serde_json::to_vec(&bundle).unwrap());
+        let proof_of_work = mine_pow(
+            &client.install_id,
+            &content_hash,
+            config.server.submission_pow_difficulty,
+        );
+        let envelope = SubmissionEnvelope {
+            client,
+            content_hash,
+            proof_of_work,
+            bundle,
+        };
+
+        let receipt = match test_runtime().block_on(submit_bundle(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:43210".parse().unwrap()),
+            Json(envelope),
+        )) {
+            Ok(value) => value.0,
+            Err(error) => panic!("submit_bundle failed: {}", error.message),
+        };
+        assert_eq!(receipt.issue_ids.len(), 1);
+
+        let connection = sqlite_test_connection(&state.db);
+        let best_patch_json: Option<String> = connection
+            .query_row(
+                "SELECT best_patch_json FROM issue_clusters WHERE id = ?1",
+                [receipt.issue_ids[0].as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let best_patch: PatchAttempt =
+            serde_json::from_str(&best_patch_json.expect("best_patch_json should be set")).unwrap();
+        let diff = best_patch
+            .details
+            .get("published_session")
+            .and_then(|value| value.get("diff"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(diff.contains("keyboard_daemon.cpp"));
+        let patch_attempt_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM patch_attempts WHERE cluster_id = ?1",
+                [receipt.issue_ids[0].as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(patch_attempt_count, 1);
     }
 
     fn insert_test_attempt(

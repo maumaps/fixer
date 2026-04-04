@@ -1060,6 +1060,39 @@ impl Store {
         ).map_err(Into::into)
     }
 
+    pub fn latest_ready_codex_proposal_for_opportunity(
+        &self,
+        opportunity_id: i64,
+    ) -> Result<Option<ProposalRecord>> {
+        self.conn
+            .query_row(
+                "
+                SELECT id, opportunity_id, engine, state, bundle_path, output_path, created_at, updated_at
+                FROM proposals
+                WHERE opportunity_id = ?1
+                  AND engine = 'codex'
+                  AND state = 'ready'
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                ",
+                [opportunity_id],
+                |row| {
+                    Ok(ProposalRecord {
+                        id: row.get(0)?,
+                        opportunity_id: row.get(1)?,
+                        engine: row.get(2)?,
+                        state: row.get(3)?,
+                        bundle_path: PathBuf::from(row.get::<_, String>(4)?),
+                        output_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn set_local_state<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
         let updated_at = now_rfc3339();
         let value_json = serde_json::to_string(value)?;

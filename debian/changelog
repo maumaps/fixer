@@ -1,3 +1,13 @@
+fixer (0.70.0-1) unstable; urgency=medium
+
+  * Publish ready local Codex proposals with synced issues by default, so
+    public issue pages and best.patch links appear as soon as a reviewed local
+    result is uploaded.
+  * Bound proposal attachment size during sync and carry the same published
+    session data through the server's normal patch-attempt path.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sat, 04 Apr 2026 21:20:00 +0400
+
 fixer (0.69.0-1) unstable; urgency=medium
 
   * Make desktop input configuration repairs fully autonomous end to end by

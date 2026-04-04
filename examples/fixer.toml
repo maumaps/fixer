@@ -38,6 +38,10 @@ connect_timeout_seconds = 20
 submission_pow_difficulty = 3
 worker_pow_difficulty = 4
 max_submission_items = 25
+max_submission_proposals = 5
+max_submission_proposal_bytes = 262144
+# Ready local Codex proposals are published with their synced issues by default.
+# Keep these caps in place so patch bundles do not crowd out ordinary findings.
 
 [participation]
 mode = "local-only"

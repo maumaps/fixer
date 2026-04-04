@@ -36,6 +36,7 @@ In federation mode, opted-in hosts can:
 - corroborate the same issue across machines
 - pull promoted issues as workers
 - publish a patch attempt or a successful triage result back to the server
+- sync a ready local Codex proposal with its issue so the public patch or triage artifact appears immediately after upload
 
 ## How to think about it
 
@@ -104,6 +105,8 @@ To let one host submit findings:
 cargo run -p fixer -- --config ./fixer.toml opt-in --mode submitter
 cargo run -p fixer -- --config ./fixer.toml sync
 ```
+
+If a submitted opportunity already has a ready local Codex proposal, `sync` now includes a sanitized published session for that proposal by default. The server stores it as the issue's latest patch or triage attempt immediately, so `best.patch` and the public issue detail no longer wait for a separate worker lease just to publish an already-reviewed local result.
 
 To let a Codex-capable host volunteer as a worker:
 
