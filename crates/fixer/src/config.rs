@@ -91,10 +91,14 @@ pub struct ServiceConfig {
 pub struct PatchConfig {
     #[serde(default = "default_codex_command")]
     pub codex_command: String,
+    #[serde(default = "default_codex_timeout")]
+    pub codex_timeout_seconds: u64,
     #[serde(default)]
     pub codex_args: Vec<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     #[serde(default = "default_spark_model")]
     pub spark_model: Option<String>,
     #[serde(default)]
@@ -270,8 +274,10 @@ impl Default for PatchConfig {
     fn default() -> Self {
         Self {
             codex_command: default_codex_command(),
+            codex_timeout_seconds: default_codex_timeout(),
             codex_args: Vec::new(),
             model: None,
+            reasoning_effort: None,
             spark_model: default_spark_model(),
             sandbox: Some("workspace-write".to_string()),
             approval_policy: Some("never".to_string()),
@@ -476,6 +482,10 @@ fn default_bpftrace_timeout() -> u64 {
 
 fn default_codex_command() -> String {
     "codex".to_string()
+}
+
+fn default_codex_timeout() -> u64 {
+    900
 }
 
 fn default_spark_weekly_headroom_threshold() -> f64 {

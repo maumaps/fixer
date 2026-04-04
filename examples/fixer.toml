@@ -18,6 +18,7 @@ warning_logs = []
 [patch]
 codex_command = "codex"
 codex_args = []
+reasoning_effort = "high"
 spark_model = "gpt-5.3-codex-spark"
 sandbox = "workspace-write"
 approval_policy = "never"
@@ -27,6 +28,8 @@ review_after_patch = true
 review_fix_passes = 1
 spark_fallback_on_rate_limit = true
 rate_limit_cooldown_seconds = 21600
+# For full multi-step repairs, prefer normal Codex with planning.
+# Keep spark_model available as a fallback or for narrow one-liner fixes.
 
 [network]
 server_url = "http://127.0.0.1:8080/"

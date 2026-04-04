@@ -1,3 +1,15 @@
+fixer (0.69.0-1) unstable; urgency=medium
+
+  * Make desktop input configuration repairs fully autonomous end to end by
+    keeping full Codex planning for complex fixes, isolating proposal
+    workspaces, expanding refinement passes, and validating Plasma keyboard
+    patches with real local builds.
+  * Improve desktop-input-config complaint targeting, runtime-constraint
+    reporting, and deterministic fallback reports so KDE layout complaints land
+    on patchable package evidence instead of generic Wayland noise.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sat, 04 Apr 2026 19:38:51 +0400
+
 fixer (0.68.0-1) unstable; urgency=medium
 
   * Add a first-class desktop graphics/session investigation for shared

@@ -33,6 +33,7 @@ const RUNAWAY_INVESTIGATION_SUBSYSTEM: &str = "runaway-process";
 const STUCK_PROCESS_INVESTIGATION_SUBSYSTEM: &str = "stuck-process";
 const DESKTOP_RESUME_INVESTIGATION_SUBSYSTEM: &str = "desktop-resume";
 const DESKTOP_GRAPHICS_SESSION_INVESTIGATION_SUBSYSTEM: &str = "desktop-graphics-session";
+const DESKTOP_INPUT_CONFIG_INVESTIGATION_SUBSYSTEM: &str = "desktop-input-config";
 const NETWORK_DRIVER_HANG_INVESTIGATION_SUBSYSTEM: &str = "network-driver-hang";
 const RUNAWAY_STRACE_EXCERPT_LIMIT: usize = 24;
 const RUNAWAY_TOP_SYSCALL_LIMIT: usize = 6;
@@ -79,6 +80,110 @@ pub fn collect_once(config: &FixerConfig, store: &Store) -> Result<CollectReport
     }
     if config.service.collect_bpftrace {
         report.findings_seen += collect_bpftrace(config, store)?;
+    }
+    Ok(report)
+}
+
+pub fn collect_complaint_context(description: &str, store: &Store) -> Result<CollectReport> {
+    let mut report = CollectReport::default();
+    if let Some(event) = collect_kde_keyboard_layout_complaint_context(description) {
+        report.artifacts_seen += 1;
+        let package_name = event.package_name.clone();
+        let mut details = json!({
+            "subsystem": DESKTOP_INPUT_CONFIG_INVESTIGATION_SUBSYSTEM,
+            "profile_target": {
+                "name": event.target_name(),
+                "package_name": event.package_name,
+            },
+            "loop_classification": "desktop-input-config-mismatch",
+            "loop_confidence": 0.97,
+            "loop_explanation": event.public_summary(),
+            "complaint_hint": "keyboard-layout",
+            "current_desktop": event.current_desktop,
+            "session_type": event.session_type,
+            "config_path": event.config_path,
+            "shortcut_config_path": event.shortcut_config_path,
+            "system_keyboard_path": event.system_keyboard_path,
+            "layout_list": event.layout_list,
+            "layout_count": event.layout_count(),
+            "layout_loop_count": event.layout_loop_count,
+            "xkb_options": event.xkb_options,
+            "caps_switch_enabled": event.caps_switch_enabled,
+            "spare_layouts_enabled": event.spare_layouts_enabled(),
+            "system_layout_list": event.system_layout_list,
+            "system_xkb_options": event.system_xkb_options,
+            "system_layout_mismatch": event.system_layout_mismatch(),
+            "switch_to_next_shortcut": event.switch_to_next_shortcut,
+            "switch_to_last_used_shortcut": event.switch_to_last_used_shortcut,
+            "package_name": event.package_name,
+            "package_metadata": event.package_metadata,
+            "related_packages": event.related_packages,
+            "likely_external_root_cause": false,
+        });
+        if let Some(pkg) = details.get("package_name").and_then(Value::as_str) {
+            if let Some(version) = installed_version_for_package(pkg) {
+                details["installed_package_version"] = json!(version);
+            }
+        }
+        add_env_context(&mut details);
+        let fingerprint = hash_text(format!(
+            "desktop-input-config:{}:{}:{}:{}:{}:{}",
+            details
+                .get("current_desktop")
+                .and_then(Value::as_str)
+                .unwrap_or("-"),
+            details
+                .get("session_type")
+                .and_then(Value::as_str)
+                .unwrap_or("-"),
+            details
+                .get("layout_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            details
+                .get("layout_loop_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            details
+                .get("caps_switch_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            details
+                .get("system_layout_mismatch")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ));
+        let finding = FindingInput {
+            kind: "investigation".to_string(),
+            title: format!(
+                "KDE keyboard layout config investigation for {}",
+                event.target_name()
+            ),
+            severity: "medium".to_string(),
+            fingerprint,
+            summary: event.public_summary(),
+            details,
+            artifact: Some(ObservedArtifact {
+                kind: "config".to_string(),
+                name: event
+                    .config_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("kxkbrc")
+                    .to_string(),
+                path: Some(event.config_path.clone()),
+                package_name,
+                repo_root: None,
+                ecosystem: None,
+                metadata: json!({
+                    "source": "complaint-kde-keyboard-layout",
+                }),
+            }),
+            repo_root: None,
+            ecosystem: None,
+        };
+        let _ = store.record_finding(&finding)?;
+        report.findings_seen += 1;
     }
     Ok(report)
 }
@@ -283,6 +388,78 @@ impl DesktopGraphicsSessionFailureEvent {
             self.session_type.to_uppercase(),
             crash_summary
         )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DesktopInputConfigEvent {
+    current_desktop: String,
+    session_type: String,
+    config_path: PathBuf,
+    shortcut_config_path: Option<PathBuf>,
+    system_keyboard_path: Option<PathBuf>,
+    layout_list: Vec<String>,
+    layout_loop_count: Option<usize>,
+    xkb_options: Vec<String>,
+    system_layout_list: Vec<String>,
+    system_xkb_options: Vec<String>,
+    caps_switch_enabled: bool,
+    switch_to_next_shortcut: Option<String>,
+    switch_to_last_used_shortcut: Option<String>,
+    package_name: Option<String>,
+    package_metadata: Option<RunawayPackageMetadata>,
+    related_packages: Vec<String>,
+}
+
+impl DesktopInputConfigEvent {
+    fn layout_count(&self) -> usize {
+        self.layout_list.len()
+    }
+
+    fn spare_layouts_enabled(&self) -> bool {
+        self.layout_loop_count
+            .is_some_and(|count| count > 0 && count < self.layout_count())
+    }
+
+    fn system_layout_mismatch(&self) -> bool {
+        !self.system_layout_list.is_empty() && self.system_layout_list != self.layout_list
+    }
+
+    fn target_name(&self) -> String {
+        let desktop = if self.current_desktop.trim().is_empty() {
+            "desktop".to_string()
+        } else {
+            self.current_desktop.clone()
+        };
+        let session = match self.session_type.as_str() {
+            "wayland" => "Wayland",
+            "x11" => "X11",
+            _ => "desktop",
+        };
+        format!("{desktop} {session} keyboard layout stack")
+    }
+
+    fn public_summary(&self) -> String {
+        let mut summary = format!(
+            "KDE keyboard layout config enables {} layout(s)",
+            self.layout_count()
+        );
+        if self.spare_layouts_enabled() {
+            summary.push_str(&format!(
+                " with Spare Layouts loop count {}",
+                self.layout_loop_count.unwrap_or_default()
+            ));
+        }
+        if self.caps_switch_enabled {
+            summary.push_str(" and Caps Lock is configured as a layout switch");
+        }
+        if self.system_layout_mismatch() {
+            summary.push_str(
+                ", while /etc/default/keyboard still describes a different XKB layout set",
+            );
+        }
+        summary.push_str(", which points at plasma-desktop keyboard layout handling rather than a generic Wayland graphics failure.");
+        summary
     }
 }
 
@@ -1417,6 +1594,189 @@ fn collect_network_driver_hang_investigations(
         count += 1;
     }
     Ok(count)
+}
+
+fn collect_kde_keyboard_layout_complaint_context(
+    description: &str,
+) -> Option<DesktopInputConfigEvent> {
+    if !complaint_mentions_keyboard_layout_issue(description) {
+        return None;
+    }
+
+    let config_path = PathBuf::from(std::env::var_os("HOME")?).join(".config/kxkbrc");
+    let config_raw = fs::read_to_string(&config_path).ok()?;
+    let ini = parse_ini_sections(&config_raw);
+    let layout = ini.get("Layout")?;
+    let enabled = ini
+        .get("Layout")
+        .and_then(|section| section.get("Use"))
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+
+    let layout_list = csv_config_values(layout.get("LayoutList")?);
+    if layout_list.len() < 2 {
+        return None;
+    }
+    let layout_loop_count = layout
+        .get("LayoutLoopCount")
+        .and_then(|value| value.parse::<usize>().ok());
+    let xkb_options = csv_config_values(layout.get("Options").map(String::as_str).unwrap_or(""));
+    let caps_switch_enabled = xkb_options.iter().any(|option| option.contains("caps"));
+    let spare_layouts_enabled =
+        layout_loop_count.is_some_and(|count| count > 0 && count < layout_list.len());
+
+    let system_keyboard_path = PathBuf::from("/etc/default/keyboard");
+    let (system_layout_list, system_xkb_options, system_keyboard_path) =
+        if system_keyboard_path.exists() {
+            let raw = fs::read_to_string(&system_keyboard_path).unwrap_or_default();
+            let layouts = shell_assignment_csv_value(&raw, "XKBLAYOUT");
+            let options = shell_assignment_csv_value(&raw, "XKBOPTIONS");
+            (layouts, options, Some(system_keyboard_path))
+        } else {
+            (Vec::new(), Vec::new(), None)
+        };
+    let system_layout_mismatch =
+        !system_layout_list.is_empty() && system_layout_list != layout_list;
+
+    if !caps_switch_enabled && !spare_layouts_enabled && !system_layout_mismatch {
+        return None;
+    }
+
+    let shortcut_config_path =
+        PathBuf::from(std::env::var_os("HOME")?).join(".config/kglobalshortcutsrc");
+    let (switch_to_next_shortcut, switch_to_last_used_shortcut, shortcut_config_path) =
+        if shortcut_config_path.exists() {
+            let raw = fs::read_to_string(&shortcut_config_path).unwrap_or_default();
+            let ini = parse_ini_sections(&raw);
+            let section = ini.get("KDE Keyboard Layout Switcher");
+            let next = section
+                .and_then(|value| value.get("Switch to Next Keyboard Layout"))
+                .and_then(|value| shortcut_binding(value));
+            let last = section
+                .and_then(|value| value.get("Switch to Last-Used Keyboard Layout"))
+                .and_then(|value| shortcut_binding(value));
+            (next, last, Some(shortcut_config_path))
+        } else {
+            (None, None, None)
+        };
+
+    let mut related_packages = Vec::new();
+    let package_name = keyboard_layout_owner_package(&mut related_packages);
+    let package_metadata = package_name
+        .as_deref()
+        .and_then(resolve_installed_package_metadata_for_investigation);
+
+    Some(DesktopInputConfigEvent {
+        current_desktop: std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
+        session_type: std::env::var("XDG_SESSION_TYPE").unwrap_or_default(),
+        config_path,
+        shortcut_config_path,
+        system_keyboard_path,
+        layout_list,
+        layout_loop_count,
+        xkb_options,
+        system_layout_list,
+        system_xkb_options,
+        caps_switch_enabled,
+        switch_to_next_shortcut,
+        switch_to_last_used_shortcut,
+        package_name,
+        package_metadata,
+        related_packages,
+    })
+}
+
+fn complaint_mentions_keyboard_layout_issue(description: &str) -> bool {
+    let lower = description.to_ascii_lowercase();
+    let mentions_keyboard = lower.contains("keyboard")
+        || lower.contains("layout")
+        || lower.contains("caps lock")
+        || lower.contains("language switch");
+    let mentions_kde = lower.contains("kde")
+        || lower.contains("wayland")
+        || lower.contains("x11")
+        || lower.contains("system settings")
+        || lower.contains("spare layout");
+    mentions_keyboard && mentions_kde
+}
+
+fn parse_ini_sections(raw: &str) -> BTreeMap<String, BTreeMap<String, String>> {
+    let mut sections = BTreeMap::<String, BTreeMap<String, String>>::new();
+    let mut current = String::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            current = line[1..line.len() - 1].trim().to_string();
+            sections.entry(current.clone()).or_default();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        sections
+            .entry(current.clone())
+            .or_default()
+            .insert(key.trim().to_string(), value.trim().to_string());
+    }
+    sections
+}
+
+fn csv_config_values(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn shell_assignment_csv_value(raw: &str, name: &str) -> Vec<String> {
+    raw.lines()
+        .find_map(|line| {
+            let line = line.trim();
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == name).then_some(value.trim().trim_matches('"'))
+        })
+        .map(csv_config_values)
+        .unwrap_or_default()
+}
+
+fn shortcut_binding(value: &str) -> Option<String> {
+    value
+        .split(',')
+        .find(|part| {
+            let trimmed = part.trim();
+            !trimmed.is_empty() && trimmed != "none"
+        })
+        .map(|value| value.trim().to_string())
+}
+
+fn keyboard_layout_owner_package(related_packages: &mut Vec<String>) -> Option<String> {
+    let candidates = [
+        "/usr/lib/x86_64-linux-gnu/qt6/plugins/plasma/kcms/systemsettings/kcm_keyboard.so",
+        "/usr/lib64/qt6/plugins/plasma/kcms/systemsettings/kcm_keyboard.so",
+        "/usr/lib/qt6/plugins/plasma/kcms/systemsettings/kcm_keyboard.so",
+        "/usr/lib/x86_64-linux-gnu/qt6/qml/org/kde/plasma/private/kcm_keyboard/libkcm_keyboard_declarative.so",
+        "/usr/bin/systemsettings",
+    ];
+    let mut primary = None;
+    for path in candidates {
+        let Some(package_name) = map_path_to_package(Path::new(path)) else {
+            continue;
+        };
+        if !related_packages.contains(&package_name) {
+            related_packages.push(package_name.clone());
+        }
+        if primary.is_none() {
+            primary = Some(package_name);
+        }
+    }
+    primary
 }
 
 fn parse_network_driver_hang_events(raw: &str) -> Vec<NetworkDriverHangEvent> {
@@ -5440,7 +5800,20 @@ fn collect_bpftrace(config: &FixerConfig, store: &Store) -> Result<usize> {
 }
 
 fn map_path_to_package(path: &Path) -> Option<String> {
-    let output = command_output_os("dpkg-query", &[OsStr::new("-S"), path.as_os_str()]).ok()?;
+    let output = if command_exists("timeout") {
+        command_output_os(
+            "timeout",
+            &[
+                OsStr::new("5s"),
+                OsStr::new("dpkg-query"),
+                OsStr::new("-S"),
+                path.as_os_str(),
+            ],
+        )
+        .ok()?
+    } else {
+        command_output_os("dpkg-query", &[OsStr::new("-S"), path.as_os_str()]).ok()?
+    };
     output
         .lines()
         .next()
@@ -5909,20 +6282,20 @@ mod tests {
     use super::{
         RunawayHypothesis, StuckProcessGroup, StuckProcessInvestigationSummary,
         apparmor_finding_from_kernel_line, classify_runaway_loop, classify_stuck_process,
-        crash_event_executable, crash_event_label, crash_event_process_name,
-        current_kernel_image_package_name, dominant_syscall_sequence, extend_unique_log_lines,
-        investigation_cooldown_active, is_low_signal_kernel_warning, is_profile_candidate,
-        kernel_module_lookup_names, kernel_module_package_hint, kernel_thread_package_name,
-        kernel_warning_module_candidates, looks_like_warning, netdev_watchdog_driver,
-        normalize_oom_task_memcg_target, normalize_perf_symbol,
-        normalize_stuck_process_target_name, parse_apparmor_denial, parse_coredump_info,
-        parse_desktop_graphics_session_failure, parse_dkms_status_line,
-        parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
+        complaint_mentions_keyboard_layout_issue, crash_event_executable, crash_event_label,
+        crash_event_process_name, csv_config_values, current_kernel_image_package_name,
+        dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
+        is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
+        kernel_module_package_hint, kernel_thread_package_name, kernel_warning_module_candidates,
+        looks_like_warning, netdev_watchdog_driver, normalize_oom_task_memcg_target,
+        normalize_perf_symbol, normalize_stuck_process_target_name, parse_apparmor_denial,
+        parse_coredump_info, parse_desktop_graphics_session_failure, parse_dkms_status_line,
+        parse_ini_sections, parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
         parse_network_driver_hang_events, parse_perf_hot_paths,
         parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
         prioritize_coredump_events, process_runtime_seconds, safe_perf_name,
-        stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
-        summarize_top_syscalls, system_uptime_seconds,
+        shell_assignment_csv_value, stuck_process_investigation_fingerprint,
+        stuck_process_source_fingerprint, summarize_top_syscalls, system_uptime_seconds,
     };
     use crate::models::PopularBinaryProfile;
     use serde_json::{Value, json};
@@ -5934,6 +6307,53 @@ mod tests {
         assert!(looks_like_warning("warning: something happened"));
         assert!(looks_like_warning("ERROR: boom"));
         assert!(!looks_like_warning("all good"));
+    }
+
+    #[test]
+    fn complaint_keyboard_layout_hint_matches_caps_lock_reports() {
+        assert!(complaint_mentions_keyboard_layout_issue(
+            "KDE keyboard switcher on Wayland breaks Spare Layouts when Caps Lock is the language switch"
+        ));
+        assert!(!complaint_mentions_keyboard_layout_issue(
+            "Spectacle crashes on Wayland when taking a screenshot"
+        ));
+    }
+
+    #[test]
+    fn parses_ini_sections_for_kde_keyboard_layout_config() {
+        let raw = "\
+[Layout]
+LayoutList=us,ru,by
+LayoutLoopCount=2
+Options=grp_led:scroll,grp:caps_toggle
+";
+        let ini = parse_ini_sections(raw);
+        assert_eq!(
+            ini.get("Layout")
+                .and_then(|section| section.get("LayoutList"))
+                .map(String::as_str),
+            Some("us,ru,by")
+        );
+        assert_eq!(
+            ini.get("Layout")
+                .and_then(|section| section.get("LayoutLoopCount"))
+                .map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn parses_csv_values_from_shell_assignments() {
+        let raw = "XKBLAYOUT=\"us,ru\"\nXKBOPTIONS=\"grp:caps_toggle,grp_led:scroll\"\n";
+        assert_eq!(csv_config_values("us,ru,by"), vec!["us", "ru", "by"]);
+        assert_eq!(
+            shell_assignment_csv_value(raw, "XKBLAYOUT"),
+            vec!["us", "ru"]
+        );
+        assert_eq!(
+            shell_assignment_csv_value(raw, "XKBOPTIONS"),
+            vec!["grp:caps_toggle", "grp_led:scroll"]
+        );
     }
 
     #[test]

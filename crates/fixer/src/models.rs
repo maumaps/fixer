@@ -168,6 +168,8 @@ pub struct CodexAuthLeaseStatus {
 pub struct CodexJobSpec {
     pub job_id: String,
     pub opportunity_id: i64,
+    #[serde(default)]
+    pub subsystem: Option<String>,
     pub run_as_user: String,
     #[serde(default)]
     pub worker_lease_id: Option<String>,

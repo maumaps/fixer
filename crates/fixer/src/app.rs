@@ -1,6 +1,6 @@
 use crate::adapters::inspect_repo;
 use crate::capabilities::detect_capabilities;
-use crate::collectors::{CollectReport, collect_once};
+use crate::collectors::{CollectReport, collect_complaint_context, collect_once};
 use crate::config::FixerConfig;
 use crate::models::{
     CodexAuthLease, CodexAuthLeaseStatus, ComplaintCollectionReport, ComplaintOutcome,
@@ -71,7 +71,11 @@ impl App {
         used_overlay: bool,
     ) -> Result<ComplaintOutcome> {
         let collection_report = if collect_now {
-            Some(self.collect_once()?)
+            let mut report = self.collect_once()?;
+            let complaint_report = collect_complaint_context(description, &self.store)?;
+            report.artifacts_seen += complaint_report.artifacts_seen;
+            report.findings_seen += complaint_report.findings_seen;
+            Some(report)
         } else {
             None
         };
@@ -363,7 +367,7 @@ impl App {
         complaint_opportunity_id: i64,
     ) -> Result<Vec<SharedOpportunity>> {
         let keywords = tokenize_complaint_text(description);
-        let mut candidates = self.store.list_submission_candidates(40)?;
+        let mut candidates = self.store.list_submission_candidates(200)?;
         candidates.retain(|item| item.opportunity.id != complaint_opportunity_id);
         if keywords.is_empty() {
             candidates.truncate(5);
@@ -429,7 +433,9 @@ fn tokenize_complaint_text(input: &str) -> BTreeSet<String> {
     const STOP_WORDS: &[&str] = &[
         "the", "and", "that", "this", "with", "have", "from", "into", "when", "then", "after",
         "before", "just", "like", "does", "dont", "doesnt", "cant", "wont", "issue", "problem",
-        "broken", "wrong", "please", "need", "make", "sure",
+        "broken", "wrong", "please", "need", "make", "sure", "all", "also", "not", "for", "one",
+        "two", "three", "via", "menu", "main", "extended", "properly", "weird", "keeps", "keep",
+        "work", "disable",
     ];
     input
         .split(|ch: char| !ch.is_ascii_alphanumeric())
@@ -439,14 +445,27 @@ fn tokenize_complaint_text(input: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn complaint_keyword_weight(keyword: &str) -> usize {
+    match keyword {
+        "wayland" | "x11" | "kde" | "desktop" | "session" | "dialog" => 0,
+        "settings" => 2,
+        "lock" => 0,
+        "keyboard" | "layout" | "switch" | "caps" | "spare" | "language" | "migration"
+        | "input" => 2,
+        _ => 1,
+    }
+}
+
 fn complaint_match_score(keywords: &BTreeSet<String>, candidate: &SharedOpportunity) -> usize {
     let mut haystacks = vec![
         candidate.opportunity.title.to_ascii_lowercase(),
         candidate.opportunity.summary.to_ascii_lowercase(),
         candidate.finding.title.to_ascii_lowercase(),
         candidate.finding.summary.to_ascii_lowercase(),
-        candidate.finding.details.to_string().to_ascii_lowercase(),
     ];
+    if let Some(artifact_name) = candidate.finding.artifact_name.as_deref() {
+        haystacks.push(artifact_name.to_ascii_lowercase());
+    }
     if let Some(package_name) = candidate.finding.package_name.as_deref() {
         haystacks.push(package_name.to_ascii_lowercase());
     }
@@ -461,12 +480,17 @@ fn complaint_match_score(keywords: &BTreeSet<String>, candidate: &SharedOpportun
 
     let mut score = 0usize;
     for keyword in keywords {
+        let weight = complaint_keyword_weight(keyword);
+        if weight == 0 {
+            continue;
+        }
         if haystacks.iter().any(|haystack| haystack.contains(keyword)) {
-            score += 1;
+            score += weight;
         }
     }
     if keywords
         .iter()
+        .filter(|keyword| complaint_keyword_weight(keyword) > 0)
         .any(|keyword| candidate.opportunity.kind.eq_ignore_ascii_case(keyword))
     {
         score += 1;
@@ -529,6 +553,94 @@ mod tests {
         assert!(tokens.contains("sharing"));
         assert!(!tokens.contains("when"));
         assert!(!tokens.contains("after"));
+    }
+
+    #[test]
+    fn tokenizes_complaint_text_keeps_environment_words_available_for_weighting() {
+        let tokens = tokenize_complaint_text(
+            "KDE keyboard switcher on Wayland breaks in settings dialog for Caps Lock",
+        );
+        assert!(tokens.contains("keyboard"));
+        assert!(tokens.contains("caps"));
+        assert!(tokens.contains("lock"));
+        assert!(tokens.contains("kde"));
+        assert!(tokens.contains("wayland"));
+        assert!(tokens.contains("settings"));
+    }
+
+    #[test]
+    fn complaint_matching_downweights_generic_environment_terms() {
+        let keywords = tokenize_complaint_text("wayland kde session keyboard layout");
+        let generic_candidate = SharedOpportunity {
+            local_opportunity_id: 7,
+            opportunity: OpportunityRecord {
+                id: 7,
+                finding_id: 11,
+                kind: "warning".to_string(),
+                title: "Generic Wayland session warning".to_string(),
+                score: 90,
+                state: "open".to_string(),
+                summary: "desktop session warning in kde".to_string(),
+                evidence: json!({"package_name": "kwin-wayland"}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "now".to_string(),
+                updated_at: "now".to_string(),
+            },
+            finding: FindingRecord {
+                id: 11,
+                kind: "warning".to_string(),
+                title: "Generic Wayland session warning".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "abc".to_string(),
+                summary: "wayland session warning".to_string(),
+                details: json!({}),
+                artifact_name: Some("kwin_wayland".to_string()),
+                artifact_path: None,
+                package_name: Some("kwin-wayland".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "now".to_string(),
+                last_seen: "now".to_string(),
+            },
+        };
+        let symptom_candidate = SharedOpportunity {
+            local_opportunity_id: 8,
+            opportunity: OpportunityRecord {
+                id: 8,
+                finding_id: 12,
+                kind: "warning".to_string(),
+                title: "Keyboard layout setting mismatch".to_string(),
+                score: 60,
+                state: "open".to_string(),
+                summary: "caps lock switches keyboard layout incorrectly".to_string(),
+                evidence: json!({"package_name": "systemsettings"}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "now".to_string(),
+                updated_at: "now".to_string(),
+            },
+            finding: FindingRecord {
+                id: 12,
+                kind: "warning".to_string(),
+                title: "Keyboard layout setting mismatch".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "def".to_string(),
+                summary: "keyboard layout switch uses caps lock".to_string(),
+                details: json!({}),
+                artifact_name: Some("systemsettings".to_string()),
+                artifact_path: None,
+                package_name: Some("systemsettings".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "now".to_string(),
+                last_seen: "now".to_string(),
+            },
+        };
+        assert!(
+            complaint_match_score(&keywords, &symptom_candidate)
+                > complaint_match_score(&keywords, &generic_candidate)
+        );
     }
 
     #[test]

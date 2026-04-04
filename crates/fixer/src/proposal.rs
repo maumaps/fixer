@@ -21,17 +21,17 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 fn create_bundle_dir(config: &FixerConfig, opportunity_id: i64) -> Result<PathBuf> {
+    let fallback_root = std::env::temp_dir().join("fixer-proposals");
     let proposals_root = match fs::create_dir_all(config.service.state_dir.join("proposals")) {
         Ok(()) => config.service.state_dir.join("proposals"),
         Err(error) if error.kind() == ErrorKind::PermissionDenied => {
-            let fallback = std::env::temp_dir().join("fixer-proposals");
-            fs::create_dir_all(&fallback).with_context(|| {
+            fs::create_dir_all(&fallback_root).with_context(|| {
                 format!(
                     "failed to create fallback proposal directory {}",
-                    fallback.display()
+                    fallback_root.display()
                 )
             })?;
-            fallback
+            fallback_root.clone()
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -42,11 +42,38 @@ fn create_bundle_dir(config: &FixerConfig, opportunity_id: i64) -> Result<PathBu
             });
         }
     };
-    prune_proposal_bundles(
+    if let Err(error) = prune_proposal_bundles(
         &proposals_root,
         config.service.proposal_bundle_retention_days,
         config.service.proposal_bundle_keep_per_opportunity,
-    )?;
+    ) {
+        if error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == ErrorKind::PermissionDenied)
+        }) && proposals_root != fallback_root
+        {
+            fs::create_dir_all(&fallback_root).with_context(|| {
+                format!(
+                    "failed to create fallback proposal directory {}",
+                    fallback_root.display()
+                )
+            })?;
+            prune_proposal_bundles(
+                &fallback_root,
+                config.service.proposal_bundle_retention_days,
+                config.service.proposal_bundle_keep_per_opportunity,
+            )?;
+            let bundle_dir = fallback_root.join(format!(
+                "{}-{}",
+                opportunity_id,
+                now_rfc3339().replace(':', "-")
+            ));
+            fs::create_dir_all(&bundle_dir)?;
+            return Ok(bundle_dir);
+        }
+        return Err(error);
+    }
     let bundle_dir = proposals_root.join(format!(
         "{}-{}",
         opportunity_id,
@@ -74,11 +101,29 @@ pub fn create_proposal_with_prior_patch(
     prior_best_patch: Option<&PatchAttempt>,
     engine: &str,
 ) -> Result<ProposalRecord> {
+    if engine == "codex" {
+        let job = prepare_codex_job_with_prior_patch(
+            config,
+            opportunity,
+            workspace,
+            prior_best_patch,
+            "",
+            false,
+        )?;
+        let status = execute_codex_job(config, &job)?;
+        return store.create_proposal(
+            opportunity.id,
+            "codex",
+            &status.state,
+            &job.bundle_dir,
+            Some(&job.output_path),
+        );
+    }
+
     let bundle_dir = create_bundle_dir(config, opportunity.id)?;
 
     let evidence_path = bundle_dir.join("evidence.json");
     let prompt_path = bundle_dir.join("prompt.md");
-    let output_path = bundle_dir.join("codex-output.txt");
     let prior_patch_context = materialize_prior_patch_context(&bundle_dir, prior_best_patch)?;
 
     let mut evidence = json!({
@@ -118,24 +163,7 @@ pub fn create_proposal_with_prior_patch(
                 Some(&summary_path),
             )
         }
-        "codex" => {
-            let job = write_codex_job_spec(
-                config,
-                opportunity,
-                workspace,
-                &bundle_dir,
-                &prompt_path,
-                &output_path,
-            )?;
-            let status = execute_codex_job(config, &job)?;
-            store.create_proposal(
-                opportunity.id,
-                "codex",
-                &status.state,
-                &bundle_dir,
-                Some(&output_path),
-            )
-        }
+        "codex" => unreachable!("codex proposals are handled before deterministic bundle setup"),
         other => Err(anyhow!("unknown proposal engine `{other}`")),
     }
 }
@@ -463,8 +491,9 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
     let mut rate_limit_fallback_used = false;
     let mut selected_model: Option<String> = None;
 
-    if config.patch.plan_before_patch {
+    if should_run_plan_before_patch(config, job.subsystem.as_deref()) {
         let plan_prompt = build_plan_prompt(
+            job.subsystem.as_deref(),
             &evidence_path,
             &job.workspace,
             source_workspace_root.as_deref(),
@@ -478,6 +507,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
             &current_plan_output_path,
             "Plan Pass",
             &plan_prompt,
+            job.subsystem.as_deref(),
         )?;
         logs.push(render_stage_log(&plan_stage));
         models_used.extend(plan_stage.models_used.clone());
@@ -535,6 +565,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         &patch_stage_output_path,
         "Patch Pass",
         &patch_prompt,
+        job.subsystem.as_deref(),
     )?;
     logs.push(render_stage_log(&initial_patch_stage));
     models_used.extend(initial_patch_stage.models_used.clone());
@@ -555,6 +586,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
             &retry_output_path,
             "Patch Pass Retry 1",
             &retry_prompt,
+            job.subsystem.as_deref(),
         )?;
         logs.push(render_stage_log(&retry_stage));
         models_used.extend(retry_stage.models_used.clone());
@@ -611,6 +643,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
     let mut workflow_stderr_excerpt: Option<String> = None;
     let mut workflow_review_failure_category: Option<String> = None;
     let patch_output_indicates_triage = stage_output_marks_successful_triage(&patch_stage.output);
+    let review_fix_passes = effective_review_fix_passes(config, job.subsystem.as_deref());
     let mut current_author_output_path = patch_stage_output_path;
     if config.patch.review_after_patch && !patch_output_indicates_triage {
         let mut refinement_round = 0;
@@ -630,7 +663,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                     prompt: "Local metadata consistency check".to_string(),
                     response: local_review_output.clone(),
                 });
-                if refinement_round >= config.patch.review_fix_passes {
+                if refinement_round >= review_fix_passes {
                     workflow_failure = Some((
                         "review".to_string(),
                         format!(
@@ -668,6 +701,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                     &refine_output_path,
                     &refine_label,
                     &refine_prompt,
+                    job.subsystem.as_deref(),
                 )?;
                 logs.push(render_stage_log(&refine_stage));
                 models_used.extend(refine_stage.models_used.clone());
@@ -709,6 +743,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                 &review_output_path,
                 &review_label,
                 &review_prompt,
+                job.subsystem.as_deref(),
             )?;
             logs.push(render_stage_log(&review_stage));
             models_used.extend(review_stage.models_used.clone());
@@ -733,7 +768,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
             match verdict {
                 Some(CodexReviewVerdict::Ok) => break,
                 Some(CodexReviewVerdict::FixNeeded) => {
-                    if refinement_round >= config.patch.review_fix_passes {
+                    if refinement_round >= review_fix_passes {
                         workflow_failure = Some((
                             "review".to_string(),
                             format!(
@@ -776,6 +811,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                         &refine_output_path,
                         &refine_label,
                         &refine_prompt,
+                        job.subsystem.as_deref(),
                     )?;
                     logs.push(render_stage_log(&refine_stage));
                     models_used.extend(refine_stage.models_used.clone());
@@ -928,6 +964,7 @@ pub fn supports_process_investigation_report(opportunity: &OpportunityRecord) ->
                         | "oom-kill"
                         | "desktop-resume"
                         | "desktop-graphics-session"
+                        | "desktop-input-config"
                         | "network-driver-hang"
                 )
             })
@@ -1066,7 +1103,13 @@ pub fn create_complaint_plan_proposal(
     let summary_path = bundle_dir.join("plan.md");
     let system = collect_system_context();
     let desktop_diagnosis = diagnose_desktop_app_failure(complaint_text, &system);
-    let related_desktop_summary = summarize_related_desktop_signals(related);
+    let candidate_packages = rank_complaint_package_candidates(complaint_text, related);
+    let runtime_constraints = summarize_related_input_config_constraints(&system, related);
+    let related_desktop_summary = if desktop_diagnosis.get("summary").is_some() {
+        summarize_related_desktop_signals(related)
+    } else {
+        Value::Null
+    };
     let evidence = json!({
         "report_kind": "complaint-plan",
         "opportunity": opportunity,
@@ -1075,6 +1118,8 @@ pub fn create_complaint_plan_proposal(
         "related_opportunities": related,
         "system": system,
         "desktop_diagnosis": desktop_diagnosis,
+        "candidate_packages": candidate_packages,
+        "runtime_constraints": runtime_constraints,
         "related_desktop_summary": related_desktop_summary,
     });
     fs::write(&evidence_path, serde_json::to_vec_pretty(&evidence)?)?;
@@ -1087,6 +1132,8 @@ pub fn create_complaint_plan_proposal(
             related,
             evidence.get("system").unwrap_or(&Value::Null),
             evidence.get("desktop_diagnosis").unwrap_or(&Value::Null),
+            evidence.get("candidate_packages").unwrap_or(&Value::Null),
+            evidence.get("runtime_constraints").unwrap_or(&Value::Null),
             evidence
                 .get("related_desktop_summary")
                 .unwrap_or(&Value::Null),
@@ -1145,6 +1192,7 @@ fn write_codex_job_spec(
     let job = CodexJobSpec {
         job_id: format!("{}-{}", opportunity.id, now_rfc3339().replace(':', "-")),
         opportunity_id: opportunity.id,
+        subsystem: investigation_subsystem(opportunity).map(ToString::to_string),
         run_as_user: String::new(),
         worker_lease_id: None,
         worker_issue_id: None,
@@ -1811,6 +1859,65 @@ fn configured_spark_model(config: &FixerConfig) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn configured_reasoning_effort(config: &FixerConfig) -> Option<String> {
+    config
+        .patch
+        .reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn model_is_spark(config: &FixerConfig, model: Option<&str>) -> bool {
+    let Some(model) = model else {
+        return false;
+    };
+    configured_spark_model(config).as_deref() == Some(model)
+}
+
+fn should_run_plan_before_patch(config: &FixerConfig, subsystem: Option<&str>) -> bool {
+    let _ = subsystem;
+    config.patch.plan_before_patch
+}
+
+fn effective_review_fix_passes(config: &FixerConfig, subsystem: Option<&str>) -> u32 {
+    if matches!(subsystem, Some("desktop-input-config")) {
+        return config.patch.review_fix_passes.max(3);
+    }
+    config.patch.review_fix_passes
+}
+
+fn effective_codex_reasoning_effort(
+    config: &FixerConfig,
+    subsystem: Option<&str>,
+    model: Option<&str>,
+) -> Option<String> {
+    if let Some(reasoning_effort) = configured_reasoning_effort(config) {
+        return Some(reasoning_effort);
+    }
+    if matches!(subsystem, Some("desktop-input-config")) && !model_is_spark(config, model) {
+        return Some("xhigh".to_string());
+    }
+    None
+}
+
+fn codex_supports_reasoning_effort_flag(config: &FixerConfig) -> bool {
+    let Ok(output) = Command::new(&config.patch.codex_command)
+        .arg("exec")
+        .arg("--help")
+        .output()
+    else {
+        return false;
+    };
+    let help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    help.contains("--reasoning-effort")
+}
+
 fn codex_model_limit_state_path(config: &FixerConfig) -> PathBuf {
     config.service.state_dir.join("codex-model-state.json")
 }
@@ -1867,7 +1974,8 @@ fn clear_primary_model_rate_limit(config: &FixerConfig) -> Result<()> {
     Ok(())
 }
 
-fn initial_stage_model(config: &FixerConfig) -> Option<String> {
+fn initial_stage_model(config: &FixerConfig, subsystem: Option<&str>) -> Option<String> {
+    let _ = subsystem;
     if config.patch.driver != PatchDriver::Codex {
         return config.patch.model.clone();
     }
@@ -1917,18 +2025,20 @@ fn run_codex_stage(
     output_path: &Path,
     label: impl Into<String>,
     prompt: &str,
+    subsystem: Option<&str>,
 ) -> Result<CodexStageOutcome> {
     let label = label.into();
     fs::write(prompt_path, prompt.as_bytes())?;
     let mut models_used = Vec::new();
     let mut logs = Vec::new();
-    let initial_model = initial_stage_model(config);
+    let initial_model = initial_stage_model(config, subsystem);
     let mut outcome = run_driver_process(
         config,
         repo_root,
         prompt_path,
         output_path,
         prompt,
+        subsystem,
         initial_model.as_deref(),
     )?;
     if let Some(model) = outcome.model_used.clone() {
@@ -1971,6 +2081,7 @@ fn run_codex_stage(
                 prompt_path,
                 output_path,
                 prompt,
+                subsystem,
                 Some(&spark_model),
             )?;
             if let Some(model) = retry_outcome.model_used.clone() {
@@ -1993,11 +2104,16 @@ fn run_codex_stage(
     };
     let error = if outcome.success {
         String::new()
+    } else if let Some(summary) = timeout_error_summary(&outcome.log) {
+        summary
     } else {
         summarize_failure_log(&logs.join("\n\n"))
     };
-    let stderr_excerpt =
-        (!outcome.stderr.trim().is_empty()).then(|| summarize_failure_log(&outcome.stderr));
+    let stderr_excerpt = if let Some(summary) = timeout_error_summary(&outcome.log) {
+        Some(summary)
+    } else {
+        (!outcome.stderr.trim().is_empty()).then(|| summarize_failure_log(&outcome.stderr))
+    };
     Ok(CodexStageOutcome {
         label,
         success: outcome.success,
@@ -2096,6 +2212,7 @@ fn run_codex_process(
     repo_root: &std::path::Path,
     output_path: &std::path::Path,
     prompt: &str,
+    subsystem: Option<&str>,
     model: Option<&str>,
 ) -> Result<CodexProcessOutcome> {
     if !command_exists(&config.patch.codex_command) {
@@ -2104,7 +2221,17 @@ fn run_codex_process(
             config.patch.codex_command
         ));
     }
-    let mut cmd = Command::new(&config.patch.codex_command);
+    let use_timeout_wrapper = config.patch.codex_timeout_seconds > 0 && command_exists("timeout");
+    let mut cmd = if use_timeout_wrapper {
+        let mut wrapped = Command::new("timeout");
+        wrapped
+            .arg("--signal=TERM")
+            .arg(format!("{}s", config.patch.codex_timeout_seconds))
+            .arg(&config.patch.codex_command);
+        wrapped
+    } else {
+        Command::new(&config.patch.codex_command)
+    };
     if let Some(approval_policy) = &config.patch.approval_policy {
         cmd.arg("-a").arg(approval_policy);
     }
@@ -2112,6 +2239,11 @@ fn run_codex_process(
     cmd.arg("--skip-git-repo-check");
     if let Some(model) = model {
         cmd.arg("-m").arg(model);
+    }
+    if let Some(reasoning_effort) = effective_codex_reasoning_effort(config, subsystem, model)
+        .filter(|_| codex_supports_reasoning_effort_flag(config))
+    {
+        cmd.arg("--reasoning-effort").arg(reasoning_effort);
     }
     if let Some(sandbox) = &config.patch.sandbox {
         cmd.arg("-s").arg(sandbox);
@@ -2129,12 +2261,22 @@ fn run_codex_process(
         .spawn()
         .with_context(|| format!("failed to launch {}", config.patch.codex_command))?;
     if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(prompt.as_bytes())?;
+        write_prompt_to_child(stdin, prompt)?;
     }
     let output = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let log = format!("{stdout}{stderr}");
+    let timed_out = output.status.code() == Some(124) && use_timeout_wrapper;
+    let mut log = format!("{stdout}{stderr}");
+    if timed_out {
+        if !log.trim().is_empty() {
+            log.push('\n');
+        }
+        log.push_str(&format!(
+            "Codex stage timed out after {} second(s).",
+            config.patch.codex_timeout_seconds
+        ));
+    }
     Ok(CodexProcessOutcome {
         success: output.status.success(),
         log,
@@ -2154,10 +2296,13 @@ fn run_driver_process(
     prompt_path: &Path,
     output_path: &Path,
     prompt: &str,
+    subsystem: Option<&str>,
     model: Option<&str>,
 ) -> Result<CodexProcessOutcome> {
     match config.patch.driver {
-        PatchDriver::Codex => run_codex_process(config, repo_root, output_path, prompt, model),
+        PatchDriver::Codex => {
+            run_codex_process(config, repo_root, output_path, prompt, subsystem, model)
+        }
         PatchDriver::Claude => run_claude_process(config, repo_root, output_path, prompt, model),
         PatchDriver::Gemini => run_gemini_process(config, repo_root, output_path, prompt, model),
         PatchDriver::Aider => run_aider_process(config, repo_root, prompt_path, output_path, model),
@@ -2203,7 +2348,7 @@ fn run_claude_process(
         .spawn()
         .with_context(|| format!("failed to launch {}", config.patch.claude_command))?;
     if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(prompt.as_bytes())?;
+        write_prompt_to_child(stdin, prompt)?;
     }
     let output = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -2254,7 +2399,7 @@ fn run_gemini_process(
         .spawn()
         .with_context(|| format!("failed to launch {}", config.patch.gemini_command))?;
     if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(prompt.as_bytes())?;
+        write_prompt_to_child(stdin, prompt)?;
     }
     let output = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -2321,9 +2466,19 @@ fn run_aider_process(
     })
 }
 
+fn write_prompt_to_child(stdin: &mut impl Write, prompt: &str) -> Result<()> {
+    match stdin.write_all(prompt.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn classify_codex_failure(log: &str) -> String {
     let lower = log.to_ascii_lowercase();
-    if lower.contains("401 unauthorized") || lower.contains("missing bearer") {
+    if lower.contains("timed out after") || lower.contains("timeout: sending signal") {
+        "timeout".to_string()
+    } else if lower.contains("401 unauthorized") || lower.contains("missing bearer") {
         "auth".to_string()
     } else if lower.contains("rate-limit")
         || lower.contains("rate limit")
@@ -2345,6 +2500,17 @@ fn classify_codex_failure(log: &str) -> String {
     } else {
         "execution".to_string()
     }
+}
+
+fn timeout_error_summary(log: &str) -> Option<String> {
+    (classify_codex_failure(log) == "timeout").then(|| {
+        log.lines()
+            .rev()
+            .find(|line| line.to_ascii_lowercase().contains("timed out after"))
+            .map(str::trim)
+            .unwrap_or("Codex stage timed out.")
+            .to_string()
+    })
 }
 
 fn should_retry_after_compaction_failure(log: &str) -> bool {
@@ -2639,11 +2805,7 @@ fn build_prompt(
     let extra = config.patch.extra_instructions.as_deref().unwrap_or(
         "Keep the patch narrowly scoped, validate locally, and explain any uncertainty.",
     );
-    let investigation_hint = if supports_process_investigation_report(opportunity) {
-        "\n\nStart by explaining the likely root cause from the collected perf, strace, and /proc evidence. If you cannot land a safe patch, leave a diagnosis that is strong enough for an upstream bug report."
-    } else {
-        ""
-    };
+    let investigation_hint = investigation_prompt_hint(opportunity);
     let prior_patch_hint = prior_patch_context
         .map(|context| {
             let version = context
@@ -2668,19 +2830,22 @@ fn build_prompt(
             )
         })
         .unwrap_or_default();
+    let validation_hint = investigation_validation_hint(opportunity, workspace);
     format!(
-        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, keep the change upstreamable, prefer the clearest control flow available, and do not keep avoidable `goto` when a simpler structure would read better. The final explanation must connect the observed issue evidence to the actual code change, not just paraphrase the diff.{}{} \n\n{}\n\n{}",
+        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, keep the change upstreamable, prefer the clearest control flow available, and do not keep avoidable `goto` when a simpler structure would read better. The final explanation must connect the observed issue evidence to the actual code change, not just paraphrase the diff.{}{}{} \n\n{}\n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
         investigation_hint,
         prior_patch_hint,
+        validation_hint,
         extra,
         patch_response_contract(),
     )
 }
 
 fn build_plan_prompt(
+    subsystem: Option<&str>,
     evidence_path: &Path,
     workspace: &PreparedWorkspace,
     source_workspace_root: Option<&Path>,
@@ -2693,12 +2858,16 @@ fn build_plan_prompt(
             )
         })
         .unwrap_or_default();
+    let investigation_focus = investigation_plan_focus_hint(subsystem);
+    let validation_hint = plan_validation_hint(subsystem, workspace);
     format!(
-        "You are planning a fixer patch before any edits happen.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`.{} Inspect the relevant code, but do not edit files in this pass.\n\nReturn a short markdown plan with these exact sections:\n\n## Problem\n## Proposed Subject\n## Patch Plan\n## Risks\n## Validation\n\nThe plan must explain how the proposed code change addresses the observed issue evidence, call out any prior Fixer patch that should be improved or replaced, and reject awkward control flow such as avoidable `goto` if there is a cleaner bounded alternative.",
+        "You are planning a fixer patch before any edits happen.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`.{}{}{} Inspect the relevant code, but do not edit files in this pass.\n\nReturn a short markdown plan with these exact sections:\n\n## Problem\n## Proposed Subject\n## Patch Plan\n## Risks\n## Validation\n\nThe plan must explain how the proposed code change addresses the observed issue evidence, call out any prior Fixer patch that should be improved or replaced, and reject awkward control flow such as avoidable `goto` if there is a cleaner bounded alternative.",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
         source_hint,
+        investigation_focus,
+        validation_hint,
     )
 }
 
@@ -2714,6 +2883,62 @@ fn build_compact_patch_retry_prompt(base_patch_prompt: &str) -> String {
     format!(
         "{base_patch_prompt}\n\nWorkflow note: A previous patch pass failed during Codex remote compaction under high demand. Re-run this patch pass from a fresh context, keep the explanation concise, and avoid rehashing long evidence verbatim."
     )
+}
+
+fn investigation_subsystem(opportunity: &OpportunityRecord) -> Option<&str> {
+    opportunity
+        .evidence
+        .get("details")
+        .and_then(|details| details.get("subsystem"))
+        .and_then(Value::as_str)
+}
+
+fn investigation_prompt_hint(opportunity: &OpportunityRecord) -> &'static str {
+    match investigation_subsystem(opportunity) {
+        Some("desktop-input-config") => {
+            "\n\nStart by explaining the likely root cause from the collected keyboard-layout configuration evidence, including Plasma `kxkbrc`, shortcut state, loop-count settings, and `/etc/default/keyboard`. Focus on `kcms/keyboard` and closely related keyboard-layout code paths first. Ignore unrelated panel, wallpaper, graphics, and generic desktop-session code unless the evidence explicitly pulls you there. If you cannot land a safe patch, leave a diagnosis that is strong enough for an upstream bug report."
+        }
+        _ if supports_process_investigation_report(opportunity) => {
+            "\n\nStart by explaining the likely root cause from the collected perf, strace, and /proc evidence. If you cannot land a safe patch, leave a diagnosis that is strong enough for an upstream bug report."
+        }
+        _ => "",
+    }
+}
+
+fn investigation_plan_focus_hint(subsystem: Option<&str>) -> &'static str {
+    match subsystem {
+        Some("desktop-input-config") => {
+            " Focus first on keyboard-layout code under `kcms/keyboard` and any directly related keyboard layout UI or daemon helpers. Treat the evidence as a Plasma keyboard configuration/runtime mismatch, not a generic graphics or panel issue."
+        }
+        _ => "",
+    }
+}
+
+fn investigation_validation_hint(
+    opportunity: &OpportunityRecord,
+    workspace: &PreparedWorkspace,
+) -> String {
+    match (
+        investigation_subsystem(opportunity),
+        workspace.package_name.as_deref().or(workspace.source_package.as_deref()),
+    ) {
+        (Some("desktop-input-config"), Some("plasma-desktop")) => {
+            "\n\nValidation expectation: after editing, configure and build the relevant Plasma keyboard targets in this workspace unless your patch makes that impossible. Prefer these commands: `cmake -S . -B build-fix -G Ninja -DBUILD_DOC=OFF`, `cmake --build build-fix --target kded_keyboard -j2`, and `cmake --build build-fix --target kcm_keyboard -j2`. If one step fails, report the exact failing command and why.".to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+fn plan_validation_hint(subsystem: Option<&str>, workspace: &PreparedWorkspace) -> String {
+    match (
+        subsystem,
+        workspace.package_name.as_deref().or(workspace.source_package.as_deref()),
+    ) {
+        (Some("desktop-input-config"), Some("plasma-desktop")) => {
+            " In `## Validation`, name the concrete commands you expect to run after editing: `cmake -S . -B build-fix -G Ninja -DBUILD_DOC=OFF`, `cmake --build build-fix --target kded_keyboard -j2`, and `cmake --build build-fix --target kcm_keyboard -j2`.".to_string()
+        }
+        _ => String::new(),
+    }
 }
 
 fn build_review_prompt(
@@ -2792,7 +3017,7 @@ fn build_refinement_prompt(
         )
     };
     format!(
-        "You are refining a fixer patch after an explicit code review.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the latest author response at `{}`. Read the review report at `{}`. This is refinement round {}.{}{}{} Address the review findings with the smallest reasonable follow-up changes. Keep the patch upstream-friendly, avoid awkward control flow when a simpler structure will do, keep the final response gittable, run relevant tests if available, and summarize which review findings you addressed.\n\n{}",
+        "You are refining a fixer patch after an explicit code review.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the latest author response at `{}`. Read the review report at `{}`. This is refinement round {}.{}{}{} Address the review findings with the smallest reasonable follow-up changes. If the review identifies a runtime or correctness bug in the changed code, you must update the code itself before answering; a metadata-only response is not sufficient. Keep the patch upstream-friendly, avoid awkward control flow when a simpler structure will do, keep the final response gittable, run relevant tests if available, and summarize which review findings you addressed.\n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -3169,6 +3394,7 @@ fn render_process_investigation_report(
     let is_oom_kill = subsystem == "oom-kill";
     let is_desktop_resume = subsystem == "desktop-resume";
     let is_desktop_graphics_session = subsystem == "desktop-graphics-session";
+    let is_desktop_input_config = subsystem == "desktop-input-config";
     let is_network_driver_hang = subsystem == "network-driver-hang";
     let desktop_issue_variant = details
         .get("issue_variant")
@@ -3182,6 +3408,8 @@ fn render_process_investigation_report(
             "unknown-uninterruptible-wait"
         } else if is_desktop_resume {
             "resume-display-failure"
+        } else if is_desktop_input_config {
+            "desktop-input-config-mismatch"
         } else if is_desktop_graphics_session {
             "desktop-graphics-session-failure"
         } else if is_oom_kill {
@@ -3194,7 +3422,7 @@ fn render_process_investigation_report(
     let confidence = details
         .get("loop_confidence")
         .and_then(Value::as_f64)
-        .unwrap_or(0.0);
+        .unwrap_or(if is_desktop_input_config { 0.97 } else { 0.0 });
     let explanation = details
         .get("loop_explanation")
         .and_then(Value::as_str)
@@ -3208,6 +3436,8 @@ fn render_process_investigation_report(
             }
         } else if is_desktop_graphics_session {
             "Fixer correlated repeated EGL/Mesa/Qt warnings across multiple desktop apps with compositor or session instability, which points at a shared graphics/session failure rather than one broken app."
+        } else if is_desktop_input_config {
+            "Fixer collected live keyboard-layout config from Plasma, including loop-count, XKB options, and shortcut state, and found a mismatch between the KDE config path, legacy XKB options, and the active Wayland session."
         } else if is_oom_kill {
             "Fixer collected kernel log evidence showing that the OOM killer selected and terminated this process."
         } else if is_network_driver_hang {
@@ -3310,6 +3540,8 @@ fn render_process_investigation_report(
         body.push_str("# Stuck Process Investigation Report\n\n");
     } else if is_desktop_resume {
         body.push_str("# Desktop Resume Failure Investigation Report\n\n");
+    } else if is_desktop_input_config {
+        body.push_str("# Desktop Input Configuration Investigation Report\n\n");
     } else if is_desktop_graphics_session {
         body.push_str("# Desktop Graphics/Session Failure Investigation Report\n\n");
     } else if is_oom_kill {
@@ -3343,6 +3575,10 @@ fn render_process_investigation_report(
                 body.push_str("Fixer diagnosed a shared desktop graphics/session failure, but it could not automatically acquire a patchable compositor, Mesa, Qt, or desktop source workspace on this host.\n\n");
                 body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
                 body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
+            } else if blocker_kind == "workspace" && is_desktop_input_config {
+                body.push_str("Fixer diagnosed a desktop keyboard-layout configuration/runtime mismatch, but it could not automatically acquire a patchable desktop-settings or input-management source workspace on this host.\n\n");
+                body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
+                body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
             } else if blocker_kind == "workspace" && is_network_driver_hang {
                 body.push_str("Fixer diagnosed a network driver hardware hang, but it could not automatically acquire a patchable kernel source workspace on this host.\n\n");
                 body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
@@ -3372,6 +3608,8 @@ fn render_process_investigation_report(
                 }
             } else if is_desktop_graphics_session {
                 body.push_str("Fixer gathered enough evidence to describe the shared desktop failure. Review the diagnosis below, then decide whether this looks like a Wayland/compositor regression, a Mesa or driver issue, or a Qt desktop-stack mismatch.\n\n");
+            } else if is_desktop_input_config {
+                body.push_str("Fixer gathered enough evidence to describe the keyboard-layout mismatch. Review the diagnosis below, then decide whether this looks like a Plasma keyboard KCM/runtime split, stale legacy XKB options, or a distro migration/configuration regression.\n\n");
             } else if is_oom_kill {
                 body.push_str("Fixer gathered enough evidence to describe the OOM kill. Review the diagnosis below, then decide whether this points at application memory growth, an unusually heavy workload, or broader system memory pressure.\n\n");
             } else if is_network_driver_hang {
@@ -3460,6 +3698,10 @@ fn render_process_investigation_report(
     } else {
         if is_desktop_resume {
             body.push_str("\n## Why Fixer Believes Resume Broke The Desktop\n\n");
+        } else if is_desktop_input_config {
+            body.push_str(
+                "\n## Why Fixer Believes The Keyboard Layout Configuration Is Mismatched\n\n",
+            );
         } else if is_desktop_graphics_session {
             body.push_str("\n## Why Fixer Believes The Desktop Graphics Session Is Breaking\n\n");
         } else if is_network_driver_hang {
@@ -3484,7 +3726,7 @@ fn render_process_investigation_report(
                 confidence,
                 explanation
             ));
-        } else if is_desktop_resume || is_desktop_graphics_session {
+        } else if is_desktop_resume || is_desktop_graphics_session || is_desktop_input_config {
             body.push_str(&format!(
                 "- Affected desktop target: `{}`\n- Failure classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
                 target_name, classification, confidence, explanation
@@ -3515,7 +3757,7 @@ fn render_process_investigation_report(
                 "- Strace capture duration: `{strace_duration}` seconds\n"
             ));
         }
-        if is_desktop_resume || is_desktop_graphics_session {
+        if is_desktop_resume || is_desktop_graphics_session || is_desktop_input_config {
             if let Some(driver) = details.get("driver").and_then(Value::as_str) {
                 body.push_str(&format!("- Graphics driver: `{driver}`\n"));
             }
@@ -3554,6 +3796,42 @@ fn render_process_investigation_report(
             }
             if let Some(resume_line) = details.get("resume_line").and_then(Value::as_str) {
                 body.push_str(&format!("- Resume marker: `{resume_line}`\n"));
+            }
+            if let Some(layout_count) = details.get("layout_count").and_then(Value::as_u64) {
+                body.push_str(&format!("- Configured layout count: `{layout_count}`\n"));
+            }
+            if let Some(loop_count) = details.get("layout_loop_count").and_then(Value::as_u64) {
+                body.push_str(&format!("- Spare-layout loop count: `{loop_count}`\n"));
+            }
+            if let Some(layouts) = details.get("layout_list").and_then(Value::as_array) {
+                let layouts = layouts.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+                if !layouts.is_empty() {
+                    body.push_str(&format!("- Layout list: `{}`\n", layouts.join(", ")));
+                }
+            }
+            if details.get("caps_switch_enabled").and_then(Value::as_bool) == Some(true) {
+                body.push_str("- Caps-based XKB switching: `enabled`\n");
+            }
+            if let Some(shortcut) = details
+                .get("switch_to_next_shortcut")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                body.push_str(&format!("- Switch-to-next shortcut: `{shortcut}`\n"));
+            }
+            if let Some(shortcut) = details
+                .get("switch_to_last_used_shortcut")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                body.push_str(&format!("- Switch-to-last-used shortcut: `{shortcut}`\n"));
+            }
+            if details
+                .get("system_layout_mismatch")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                body.push_str("- System keyboard defaults differ from the KDE layout list.\n");
             }
         }
     }
@@ -3904,6 +4182,10 @@ fn render_process_investigation_report(
         body.push_str("1. Reproduce the launch failure and confirm the journal still shows the same `libEGL`, `MESA-LOADER`, `qt.qpa.wayland`, or compositor-hang markers.\n");
         body.push_str("2. Check whether the same set of apps fail under Wayland but recover under `QT_QPA_PLATFORM=xcb` or a software-rendered fallback, which helps separate session/compositor breakage from one broken app.\n");
         body.push_str("3. Compare `kwin_wayland`, Mesa, Qt, portal, and GPU-driver package versions, then verify whether a coherent desktop-stack upgrade or downgrade removes the shared warnings and crashes.\n");
+    } else if is_desktop_input_config {
+        body.push_str("1. Inspect `~/.config/kxkbrc`, `~/.config/kglobalshortcutsrc`, and `/etc/default/keyboard` together and confirm the layout list, `LayoutLoopCount`, and XKB options still match the diagnosis above.\n");
+        body.push_str("2. Re-test the main shortcut path and the legacy XKB options path separately, and confirm whether only one of them preserves normal Caps Lock behavior under Wayland.\n");
+        body.push_str("3. If you disable stale legacy options or `Configure Layouts`, verify whether the runtime behavior now matches the visible KCM state and whether the spare layout stops entering the normal cycle unexpectedly.\n");
     } else if is_oom_kill {
         body.push_str("1. Confirm the kernel is still logging OOM activity with `journalctl -k -g 'Out of memory|Killed process|oom-kill'`.\n");
         body.push_str("2. Check whether the same package or cgroup repeatedly gets selected as the OOM victim under the same workload.\n");
@@ -3934,6 +4216,8 @@ fn render_process_investigation_report(
             }
         } else if is_desktop_graphics_session {
             body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points at the shared Wayland/compositor/graphics stack, so the next action is usually a KWin, Mesa, Qt, portal, or GPU-driver investigation rather than a narrow application patch.\n");
+        } else if is_desktop_input_config {
+            body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points at Plasma keyboard layout configuration and legacy XKB behavior on Wayland, so the next action is usually a `plasma-desktop` KCM/runtime investigation or an upstream/distro bug report rather than a generic graphics-stack patch.\n");
         } else if is_oom_kill {
             body.push_str("Treat this as the diagnosis half of the pipeline. The next action is to decide whether the application is growing unreasonably, the workload needs limits, or the host is simply under-provisioned for the current memory demand.\n");
         } else {
@@ -4183,6 +4467,8 @@ fn render_complaint_plan(
     related: &[SharedOpportunity],
     system: &Value,
     desktop_diagnosis: &Value,
+    candidate_packages: &Value,
+    runtime_constraints: &Value,
     related_desktop_summary: &Value,
     evidence_path: &std::path::Path,
 ) -> String {
@@ -4214,6 +4500,61 @@ fn render_complaint_plan(
     }
     if let Some(desktop) = system.get("current_desktop").and_then(Value::as_str) {
         body.push_str(&format!("- Desktop session: `{desktop}`\n"));
+    }
+
+    if let Some(candidates) = candidate_packages
+        .as_array()
+        .filter(|items| !items.is_empty())
+    {
+        body.push_str("\n## Candidate Fix Targets\n\n");
+        for candidate in candidates.iter().take(4) {
+            let package_name = candidate
+                .get("package_name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            body.push_str(&format!("- Package: `{package_name}`"));
+            if let Some(source_package) = candidate.get("source_package").and_then(Value::as_str) {
+                body.push_str(&format!(" (source `{source_package}`)"));
+            }
+            if let Some(score) = candidate.get("match_score").and_then(Value::as_u64) {
+                body.push_str(&format!(", match score `{score}`"));
+            }
+            if let Some(corroboration) =
+                candidate.get("corroboration_count").and_then(Value::as_u64)
+            {
+                body.push_str(&format!(", corroborated by `{corroboration}` finding(s)"));
+            }
+            body.push('\n');
+            if let Some(installed_version) =
+                candidate.get("installed_version").and_then(Value::as_str)
+            {
+                body.push_str(&format!("  Installed: `{installed_version}`\n"));
+            }
+            if let Some(candidate_version) =
+                candidate.get("candidate_version").and_then(Value::as_str)
+            {
+                body.push_str(&format!("  Candidate: `{candidate_version}`\n"));
+            }
+            if let Some(reasons) = candidate.get("reasons").and_then(Value::as_array) {
+                let reasons = reasons.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+                if !reasons.is_empty() {
+                    body.push_str(&format!("  Why: `{}`\n", reasons.join(", ")));
+                }
+            }
+            if let Some(ids) = candidate
+                .get("related_opportunity_ids")
+                .and_then(Value::as_array)
+            {
+                let ids = ids
+                    .iter()
+                    .filter_map(Value::as_i64)
+                    .map(|id| format!("#{id}"))
+                    .collect::<Vec<_>>();
+                if !ids.is_empty() {
+                    body.push_str(&format!("  Related opportunities: `{}`\n", ids.join(", ")));
+                }
+            }
+        }
     }
 
     if let Some(summary) = desktop_diagnosis.get("summary").and_then(Value::as_str) {
@@ -4275,6 +4616,73 @@ fn render_complaint_plan(
             if let Some(report_url) = package_metadata.get("report_url").and_then(Value::as_str) {
                 body.push_str(&format!("- Suggested report URL: `{report_url}`\n"));
             }
+        }
+    }
+    if let Some(summary) = runtime_constraints.get("summary").and_then(Value::as_str) {
+        body.push_str("\n## Runtime Constraints\n\n");
+        body.push_str(summary);
+        body.push_str("\n\n");
+        if let Some(package_name) = runtime_constraints
+            .get("package_name")
+            .and_then(Value::as_str)
+        {
+            body.push_str(&format!(
+                "- Package in collected config evidence: `{package_name}`\n"
+            ));
+        }
+        if let Some(session_type) = runtime_constraints
+            .get("session_type")
+            .and_then(Value::as_str)
+        {
+            body.push_str(&format!(
+                "- Session type in collected evidence: `{session_type}`\n"
+            ));
+        }
+        if let Some(loop_count) = runtime_constraints
+            .get("layout_loop_count")
+            .and_then(Value::as_u64)
+        {
+            body.push_str(&format!("- Spare-layout loop count: `{loop_count}`\n"));
+        }
+        if let Some(layout_count) = runtime_constraints
+            .get("layout_count")
+            .and_then(Value::as_u64)
+        {
+            body.push_str(&format!("- Configured layout count: `{layout_count}`\n"));
+        }
+        if runtime_constraints
+            .get("caps_switch_enabled")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            body.push_str("- Caps-based XKB switching is enabled in the collected config.\n");
+        }
+        if runtime_constraints
+            .get("system_layout_mismatch")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            body.push_str(
+                "- The collected KDE layout list differs from `/etc/default/keyboard`.\n",
+            );
+        }
+        if let Some(shortcut) = runtime_constraints
+            .get("switch_to_next_shortcut")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            body.push_str(&format!(
+                "- Global `Switch to Next Keyboard Layout` shortcut: `{shortcut}`\n"
+            ));
+        }
+        if let Some(shortcut) = runtime_constraints
+            .get("switch_to_last_used_shortcut")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            body.push_str(&format!(
+                "- Global `Switch to Last-Used Keyboard Layout` shortcut: `{shortcut}`\n"
+            ));
         }
     }
     if let Some(summary) = related_desktop_summary
@@ -4355,9 +4763,29 @@ fn render_complaint_plan(
             .iter()
             .filter(|item| item.opportunity.kind == "hotspot")
             .count();
+        let candidate_count = candidate_packages
+            .as_array()
+            .map(|items| items.len())
+            .unwrap_or(0);
 
         body.push_str("\n## Suggested Next Steps\n\n");
         let mut step = 1;
+        if candidate_count > 0 {
+            body.push_str(&format!(
+                "{step}. Start with the top candidate fix target above and inspect its strongest corroborating opportunity with `fixer inspect <id>`.\n"
+            ));
+            step += 1;
+        }
+        if runtime_constraints.get("summary").is_some() {
+            body.push_str(&format!(
+                "{step}. Treat this as a config/runtime mismatch first: compare the KCM’s global shortcut path with the legacy XKB options path, and prefer disabling stale layout-management or legacy XKB settings before chasing a generic compositor or Mesa regression.\n"
+            ));
+            step += 1;
+            body.push_str(&format!(
+                "{step}. If the collected evidence points at `plasma-desktop` on Wayland, run `fixer propose-fix <id> --engine deterministic` or `--engine codex` against that package before investigating unrelated desktop-stack warnings.\n"
+            ));
+            step += 1;
+        }
         if crash_count > 0 {
             body.push_str(&format!(
                 "{step}. Inspect the matched crash opportunities first with `fixer inspect <id>` because they are the strongest evidence for this complaint.\n"
@@ -4413,7 +4841,6 @@ fn diagnose_desktop_app_failure(complaint_text: &str, system: &Value) -> Value {
         ("mesa-loader", "MESA-LOADER"),
         ("qthreadstorage", "QThreadStorage"),
         ("qt.qpa", "qt.qpa"),
-        ("wayland", "Wayland"),
         ("wayland_display", "WAYLAND_DISPLAY"),
         ("drm", "DRM"),
         ("gbm", "GBM"),
@@ -4454,16 +4881,12 @@ fn diagnose_desktop_app_failure(complaint_text: &str, system: &Value) -> Value {
     {
         suspected_subsystems.insert("graphics stack".to_string());
     }
-    if lower.contains("wayland")
-        || system
-            .get("session_type")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
-        || system
-            .get("wayland_display")
-            .and_then(Value::as_str)
-            .is_some()
-    {
+    let has_explicit_wayland_marker = lower.contains("qt.qpa.wayland")
+        || lower.contains("wayland_display")
+        || lower.contains("wayland compositor doesn't seem to be processing events fast enough")
+        || lower.contains("kwin_wayland")
+        || lower.contains("kwin_wayland_drm");
+    if has_explicit_wayland_marker {
         suspected_subsystems.insert("wayland session".to_string());
     }
     if lower.contains("qthreadstorage")
@@ -4531,6 +4954,187 @@ fn diagnose_desktop_app_failure(complaint_text: &str, system: &Value) -> Value {
         "suspected_subsystems": suspected_subsystems.into_iter().collect::<Vec<_>>(),
         "package_metadata": package_metadata,
     })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ComplaintPackageCandidate {
+    package_name: String,
+    source_package: String,
+    installed_version: Option<String>,
+    candidate_version: Option<String>,
+    upgrade_available: bool,
+    match_score: usize,
+    corroboration_count: usize,
+    reasons: Vec<String>,
+    related_opportunity_ids: Vec<i64>,
+}
+
+#[derive(Debug, Default)]
+struct ComplaintPackageAccumulator {
+    match_score: usize,
+    corroboration_count: usize,
+    reasons: BTreeSet<String>,
+    related_opportunity_ids: BTreeSet<i64>,
+}
+
+fn complaint_keyword_weight(keyword: &str) -> usize {
+    match keyword {
+        "wayland" | "x11" | "kde" | "desktop" | "session" | "dialog" => 0,
+        "settings" => 2,
+        "lock" => 0,
+        "keyboard" | "layout" | "switch" | "caps" | "spare" | "language" | "migration"
+        | "input" => 2,
+        _ => 1,
+    }
+}
+
+fn complaint_keywords(input: &str) -> BTreeSet<String> {
+    const STOP_WORDS: &[&str] = &[
+        "the", "and", "that", "this", "with", "have", "from", "into", "when", "then", "after",
+        "before", "just", "like", "does", "dont", "doesnt", "cant", "wont", "issue", "problem",
+        "broken", "wrong", "please", "need", "make", "sure", "all", "also", "not", "for", "one",
+        "two", "three", "via", "menu", "main", "extended", "properly", "weird", "keeps", "keep",
+        "work", "disable",
+    ];
+    input
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| token.len() >= 3)
+        .filter(|token| !STOP_WORDS.contains(&token.as_str()))
+        .collect()
+}
+
+fn complaint_candidate_score(keywords: &BTreeSet<String>, candidate: &SharedOpportunity) -> usize {
+    let mut haystacks = vec![
+        candidate.opportunity.title.to_ascii_lowercase(),
+        candidate.opportunity.summary.to_ascii_lowercase(),
+        candidate.finding.title.to_ascii_lowercase(),
+        candidate.finding.summary.to_ascii_lowercase(),
+    ];
+    if let Some(artifact_name) = candidate.finding.artifact_name.as_deref() {
+        haystacks.push(artifact_name.to_ascii_lowercase());
+    }
+    if let Some(package_name) = candidate.finding.package_name.as_deref() {
+        haystacks.push(package_name.to_ascii_lowercase());
+    }
+    if let Some(package_name) = candidate
+        .opportunity
+        .evidence
+        .get("package_name")
+        .and_then(Value::as_str)
+    {
+        haystacks.push(package_name.to_ascii_lowercase());
+    }
+
+    keywords
+        .iter()
+        .map(|keyword| {
+            let weight = complaint_keyword_weight(keyword);
+            if weight > 0 && haystacks.iter().any(|haystack| haystack.contains(keyword)) {
+                weight
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
+fn complaint_candidate_reasons(
+    keywords: &BTreeSet<String>,
+    candidate: &SharedOpportunity,
+) -> Vec<String> {
+    let haystack = format!(
+        "{}\n{}\n{}\n{}",
+        candidate.opportunity.title,
+        candidate.opportunity.summary,
+        candidate.finding.summary,
+        candidate
+            .finding
+            .artifact_name
+            .as_deref()
+            .unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    let mut reasons = keywords
+        .iter()
+        .filter(|keyword| {
+            complaint_keyword_weight(keyword) > 0 && haystack.contains(keyword.as_str())
+        })
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(package_name) = candidate.finding.package_name.as_deref() {
+        reasons.push(format!("package:{package_name}"));
+    }
+    reasons.sort();
+    reasons.dedup();
+    reasons
+}
+
+fn rank_complaint_package_candidates(complaint_text: &str, related: &[SharedOpportunity]) -> Value {
+    let keywords = complaint_keywords(complaint_text);
+    let mut packages: BTreeMap<String, ComplaintPackageAccumulator> = BTreeMap::new();
+
+    for item in related {
+        let score = complaint_candidate_score(&keywords, item);
+        let package_names = [
+            item.finding.package_name.as_deref(),
+            item.opportunity
+                .evidence
+                .get("package_name")
+                .and_then(Value::as_str),
+        ]
+        .into_iter()
+        .flatten()
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+        for package_name in package_names {
+            let entry = packages.entry(package_name).or_default();
+            entry.match_score += score;
+            entry.corroboration_count += 1;
+            entry.related_opportunity_ids.insert(item.opportunity.id);
+            for reason in complaint_candidate_reasons(&keywords, item) {
+                entry.reasons.insert(reason);
+            }
+        }
+    }
+
+    let mut ranked = packages
+        .into_iter()
+        .map(|(package_name, data)| {
+            let metadata = resolve_installed_package_metadata(&package_name).ok();
+            ComplaintPackageCandidate {
+                package_name: metadata
+                    .as_ref()
+                    .map(|item| item.package_name.clone())
+                    .unwrap_or_else(|| package_name.clone()),
+                source_package: metadata
+                    .as_ref()
+                    .map(|item| item.source_package.clone())
+                    .unwrap_or(package_name),
+                installed_version: metadata
+                    .as_ref()
+                    .and_then(|item| item.installed_version.clone()),
+                candidate_version: metadata
+                    .as_ref()
+                    .and_then(|item| item.candidate_version.clone()),
+                upgrade_available: metadata.as_ref().is_some_and(|item| item.upgrade_available),
+                match_score: data.match_score,
+                corroboration_count: data.corroboration_count,
+                reasons: data.reasons.into_iter().collect(),
+                related_opportunity_ids: data.related_opportunity_ids.into_iter().collect(),
+            }
+        })
+        .filter(|candidate| candidate.match_score > 0)
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .match_score
+            .cmp(&left.match_score)
+            .then_with(|| right.corroboration_count.cmp(&left.corroboration_count))
+            .then_with(|| left.package_name.cmp(&right.package_name))
+    });
+    json!(ranked)
 }
 
 fn summarize_related_desktop_signals(related: &[SharedOpportunity]) -> Value {
@@ -4602,6 +5206,93 @@ fn summarize_related_desktop_signals(related: &[SharedOpportunity]) -> Value {
         "affected_apps": affected_apps.into_iter().collect::<Vec<_>>(),
         "marker_match_count": marker_match_count,
         "crash_count": crash_count,
+    })
+}
+
+fn summarize_related_input_config_constraints(
+    system: &Value,
+    related: &[SharedOpportunity],
+) -> Value {
+    let session_type = system
+        .get("session_type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !session_type.eq_ignore_ascii_case("wayland") {
+        return Value::Null;
+    }
+
+    let Some(candidate) = related.iter().find(|item| {
+        item.finding.kind == "investigation"
+            && item
+                .finding
+                .details
+                .get("subsystem")
+                .and_then(Value::as_str)
+                == Some("desktop-input-config")
+    }) else {
+        return Value::Null;
+    };
+
+    let details = &candidate.finding.details;
+    let package_name = details
+        .get("package_name")
+        .and_then(Value::as_str)
+        .or(candidate.finding.package_name.as_deref())
+        .unwrap_or("unknown");
+    let layout_count = details.get("layout_count").and_then(Value::as_u64);
+    let loop_count = details.get("layout_loop_count").and_then(Value::as_u64);
+    let caps_switch_enabled = details
+        .get("caps_switch_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let spare_layouts_enabled = details
+        .get("spare_layouts_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let system_layout_mismatch = details
+        .get("system_layout_mismatch")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if !caps_switch_enabled && !spare_layouts_enabled && !system_layout_mismatch {
+        return Value::Null;
+    }
+
+    let mut clauses = Vec::new();
+    if spare_layouts_enabled {
+        let loop_text = loop_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "a reduced".to_string());
+        let layout_text = layout_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "multiple".to_string());
+        clauses.push(format!(
+            "the collected KDE config keeps `{layout_text}` layouts with `LayoutLoopCount={loop_text}`"
+        ));
+    }
+    if caps_switch_enabled {
+        clauses.push("the collected config also enables Caps-based XKB switching".to_string());
+    }
+    if system_layout_mismatch {
+        clauses.push("the KDE layout list differs from `/etc/default/keyboard`".to_string());
+    }
+
+    let summary = format!(
+        "Fixer found evidence that `{package_name}` is carrying keyboard-layout state from Plasma’s X11-oriented configuration path while the active session is Wayland: {}. That usually means the running session may honor the global shortcut path and legacy XKB options differently, so the immediate fix target is the KCM/runtime mismatch rather than a generic graphics-stack regression.",
+        clauses.join(", ")
+    );
+
+    json!({
+        "summary": summary,
+        "package_name": package_name,
+        "session_type": session_type,
+        "layout_count": layout_count,
+        "layout_loop_count": loop_count,
+        "caps_switch_enabled": caps_switch_enabled,
+        "spare_layouts_enabled": spare_layouts_enabled,
+        "system_layout_mismatch": system_layout_mismatch,
+        "switch_to_next_shortcut": details.get("switch_to_next_shortcut").cloned().unwrap_or(Value::Null),
+        "switch_to_last_used_shortcut": details.get("switch_to_last_used_shortcut").cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -4778,18 +5469,20 @@ mod tests {
         initialize_workspace_git_baseline, is_generated_public_diff_path,
         load_published_codex_session, parse_review_verdict, pg_amcheck_command,
         prepare_codex_job_with_prior_patch, primary_model_rate_limit_active,
-        remember_primary_model_rate_limit, render_complaint_plan, render_external_bug_report,
-        render_local_remediation_report, render_local_remediation_sql,
-        render_process_investigation_report, render_public_session_git_diff,
-        sanitize_command_line_for_report, should_retry_after_compaction_failure,
-        should_use_spark_for_weak_weekly_budget, suggested_report_destination,
-        summarize_related_desktop_signals,
+        rank_complaint_package_candidates, remember_primary_model_rate_limit,
+        render_complaint_plan, render_external_bug_report, render_local_remediation_report,
+        render_local_remediation_sql, render_process_investigation_report,
+        render_public_session_git_diff, sanitize_command_line_for_report,
+        should_retry_after_compaction_failure, should_use_spark_for_weak_weekly_budget,
+        suggested_report_destination, summarize_related_desktop_signals,
+        summarize_related_input_config_constraints, timeout_error_summary,
     };
     use crate::config::FixerConfig;
     use crate::models::{
-        CodexJobStatus, FindingRecord, InstalledPackageMetadata, OpportunityRecord, PatchAttempt,
-        PreparedWorkspace, SharedOpportunity,
+        CodexJobStatus, FindingInput, FindingRecord, InstalledPackageMetadata, ObservedArtifact,
+        OpportunityRecord, PatchAttempt, PreparedWorkspace, SharedOpportunity,
     };
+    use crate::storage::Store;
     use serde_json::{Value, json};
     use std::path::{Path, PathBuf};
 
@@ -5380,6 +6073,59 @@ mod tests {
     }
 
     #[test]
+    fn desktop_input_config_reports_explain_wayland_kde_layout_mismatch() {
+        let opportunity = OpportunityRecord {
+            id: 13149,
+            finding_id: 13149,
+            kind: "investigation".to_string(),
+            title: "KDE keyboard layout config investigation for KDE Wayland keyboard layout stack".to_string(),
+            score: 98,
+            state: "open".to_string(),
+            summary: "KDE keyboard layout config enables 3 layouts with spare-layout loop count 2 and Caps Lock switching.".to_string(),
+            evidence: json!({
+                "package_name": "plasma-desktop",
+                "details": {
+                    "subsystem": "desktop-input-config",
+                    "profile_target": { "name": "KDE Wayland keyboard layout stack" },
+                    "loop_classification": "desktop-input-config-mismatch",
+                    "loop_confidence": 0.97,
+                    "loop_explanation": "Fixer collected live keyboard-layout config from Plasma, including loop-count, XKB options, and shortcut state, and found a mismatch between the KDE config path, legacy XKB options, and the active Wayland session.",
+                    "session_type": "wayland",
+                    "current_desktop": "KDE",
+                    "layout_count": 3,
+                    "layout_list": ["us", "ru", "by"],
+                    "layout_loop_count": 2,
+                    "caps_switch_enabled": true,
+                    "switch_to_next_shortcut": "Meta+Alt+K",
+                    "switch_to_last_used_shortcut": "Meta+Alt+L",
+                    "system_layout_mismatch": true
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        };
+        let system = json!({
+            "os_pretty_name": "Debian GNU/Linux forky/sid",
+            "kernel": "Linux 6.19.10+deb14-amd64"
+        });
+        let rendered = render_process_investigation_report(
+            &opportunity,
+            None,
+            &system,
+            Path::new("/tmp/evidence.json"),
+            None,
+        );
+        assert!(rendered.contains("Desktop Input Configuration Investigation Report"));
+        assert!(rendered.contains("Keyboard Layout Configuration Is Mismatched"));
+        assert!(rendered.contains("Spare-layout loop count: `2`"));
+        assert!(rendered.contains("Caps-based XKB switching: `enabled`"));
+        assert!(rendered.contains("plasma-desktop"));
+        assert!(rendered.contains("KCM/runtime investigation"));
+    }
+
+    #[test]
     fn process_investigation_report_mentions_codex_auth_blockers_explicitly() {
         let opportunity = OpportunityRecord {
             id: 11,
@@ -5456,6 +6202,100 @@ mod tests {
     }
 
     #[test]
+    fn complaint_package_candidates_prefer_symptom_specific_package() {
+        let related = vec![
+            SharedOpportunity {
+                local_opportunity_id: 1,
+                opportunity: OpportunityRecord {
+                    id: 126,
+                    finding_id: 126,
+                    kind: "warning".to_string(),
+                    title: "Generic Wayland warning".to_string(),
+                    score: 100,
+                    state: "open".to_string(),
+                    summary: "kde session warning in kwin".to_string(),
+                    evidence: json!({"package_name": "kwin-wayland"}),
+                    repo_root: None,
+                    ecosystem: None,
+                    created_at: "now".to_string(),
+                    updated_at: "now".to_string(),
+                },
+                finding: FindingRecord {
+                    id: 126,
+                    kind: "warning".to_string(),
+                    title: "Generic Wayland warning".to_string(),
+                    severity: "medium".to_string(),
+                    fingerprint: "kwin".to_string(),
+                    summary: "wayland compositor warning".to_string(),
+                    details: json!({}),
+                    artifact_name: Some("kwin_wayland".to_string()),
+                    artifact_path: None,
+                    package_name: Some("kwin-wayland".to_string()),
+                    repo_root: None,
+                    ecosystem: None,
+                    first_seen: "now".to_string(),
+                    last_seen: "now".to_string(),
+                },
+            },
+            SharedOpportunity {
+                local_opportunity_id: 2,
+                opportunity: OpportunityRecord {
+                    id: 127,
+                    finding_id: 127,
+                    kind: "warning".to_string(),
+                    title: "Keyboard layout setting mismatch".to_string(),
+                    score: 70,
+                    state: "open".to_string(),
+                    summary: "caps lock switches keyboard layout incorrectly".to_string(),
+                    evidence: json!({"package_name": "systemsettings"}),
+                    repo_root: None,
+                    ecosystem: None,
+                    created_at: "now".to_string(),
+                    updated_at: "now".to_string(),
+                },
+                finding: FindingRecord {
+                    id: 127,
+                    kind: "warning".to_string(),
+                    title: "Keyboard layout setting mismatch".to_string(),
+                    severity: "medium".to_string(),
+                    fingerprint: "syssettings".to_string(),
+                    summary: "keyboard layout switch uses caps lock".to_string(),
+                    details: json!({}),
+                    artifact_name: Some("systemsettings".to_string()),
+                    artifact_path: None,
+                    package_name: Some("systemsettings".to_string()),
+                    repo_root: None,
+                    ecosystem: None,
+                    first_seen: "now".to_string(),
+                    last_seen: "now".to_string(),
+                },
+            },
+        ];
+        let candidates = rank_complaint_package_candidates(
+            "kde keyboard switcher on wayland with caps lock layout issue",
+            &related,
+        );
+        let candidates = candidates.as_array().unwrap();
+        assert_eq!(
+            candidates[0].get("package_name").and_then(Value::as_str),
+            Some("systemsettings")
+        );
+    }
+
+    #[test]
+    fn keyboard_layout_complaint_does_not_trigger_desktop_startup_diagnosis() {
+        let system = json!({
+            "session_type": "wayland",
+            "current_desktop": "KDE",
+        });
+        let diagnosis = diagnose_desktop_app_failure(
+            "kde keyboard switcher on wayland does not properly work with Spare Layouts and Caps Lock language switch",
+            &system,
+        );
+        assert!(diagnosis.is_null());
+    }
+
+    #[test]
     fn complaint_plan_reports_visibility_and_desktop_diagnosis() {
         let opportunity = OpportunityRecord {
             id: 12553,
@@ -5479,21 +6319,159 @@ mod tests {
             "spectacle dies on wayland with libEGL warning and MESA-LOADER noise\nQThreadStorage: entry 2 destroyed before end of thread",
             &system,
         );
+        let related = vec![SharedOpportunity {
+            local_opportunity_id: 1,
+            opportunity: OpportunityRecord {
+                id: 9,
+                finding_id: 9,
+                kind: "crash".to_string(),
+                title: "Crash with stack trace in spectacle".to_string(),
+                score: 90,
+                state: "open".to_string(),
+                summary: "spectacle aborts during Qt startup".to_string(),
+                evidence: json!({"package_name": "spectacle"}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "now".to_string(),
+                updated_at: "now".to_string(),
+            },
+            finding: FindingRecord {
+                id: 9,
+                kind: "crash".to_string(),
+                title: "Crash with stack trace in spectacle".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "spectacle".to_string(),
+                summary: "QThreadStorage fatal after libEGL warnings".to_string(),
+                details: json!({"line": "QThreadStorage: entry 2 destroyed before end of thread"}),
+                artifact_name: Some("spectacle".to_string()),
+                artifact_path: None,
+                package_name: Some("spectacle".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "now".to_string(),
+                last_seen: "now".to_string(),
+            },
+        }];
+        let candidate_packages = rank_complaint_package_candidates(
+            "spectacle dies on wayland with libEGL warning and MESA-LOADER noise",
+            &related,
+        );
+        let runtime_constraints = summarize_related_input_config_constraints(&system, &related);
         let related_summary = summarize_related_desktop_signals(&[]);
         let rendered = render_complaint_plan(
             &opportunity,
             "spectacle dies on wayland with libEGL warning and MESA-LOADER noise",
             None,
-            &[],
+            &related,
             &system,
             &diagnosis,
+            &candidate_packages,
+            &runtime_constraints,
             &related_summary,
             Path::new("/tmp/evidence.json"),
         );
         assert!(rendered.contains("Visibility: local triage first"));
         assert!(rendered.contains("Sharing: eligible for sync on next upload"));
+        assert!(rendered.contains("Candidate Fix Targets"));
         assert!(rendered.contains("Likely affected app: `spectacle`"));
         assert!(rendered.contains("Wayland"));
+    }
+
+    #[test]
+    fn keyboard_layout_complaint_plan_surfaces_wayland_runtime_constraints() {
+        let opportunity = OpportunityRecord {
+            id: 13150,
+            finding_id: 13150,
+            kind: "complaint".to_string(),
+            title: "User complaint: KDE keyboard switcher mishandles spare layouts".to_string(),
+            score: 61,
+            state: "open".to_string(),
+            summary: "Caps Lock cycles all layouts instead of keeping one spare".to_string(),
+            evidence: json!({}),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        };
+        let system = json!({
+            "session_type": "wayland",
+            "current_desktop": "KDE",
+        });
+        let related = vec![SharedOpportunity {
+            local_opportunity_id: 1,
+            opportunity: OpportunityRecord {
+                id: 13149,
+                finding_id: 13149,
+                kind: "investigation".to_string(),
+                title:
+                    "KDE keyboard layout config investigation for KDE Wayland keyboard layout stack"
+                        .to_string(),
+                score: 91,
+                state: "open".to_string(),
+                summary:
+                    "Collected KDE layout config shows spare layouts plus Caps Lock switching."
+                        .to_string(),
+                evidence: json!({"package_name": "plasma-desktop"}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "now".to_string(),
+                updated_at: "now".to_string(),
+            },
+            finding: FindingRecord {
+                id: 13149,
+                kind: "investigation".to_string(),
+                title: "KDE keyboard layout config investigation".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "kbd".to_string(),
+                summary:
+                    "Collected KDE layout config shows spare layouts plus Caps Lock switching."
+                        .to_string(),
+                details: json!({
+                    "subsystem": "desktop-input-config",
+                    "package_name": "plasma-desktop",
+                    "layout_count": 3,
+                    "layout_loop_count": 2,
+                    "caps_switch_enabled": true,
+                    "spare_layouts_enabled": true,
+                    "system_layout_mismatch": true,
+                    "switch_to_next_shortcut": "Meta+Alt+K",
+                    "switch_to_last_used_shortcut": "Meta+Alt+L",
+                }),
+                artifact_name: Some("kxkbrc".to_string()),
+                artifact_path: None,
+                package_name: Some("plasma-desktop".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "now".to_string(),
+                last_seen: "now".to_string(),
+            },
+        }];
+        let runtime_constraints = summarize_related_input_config_constraints(&system, &related);
+        assert_eq!(
+            runtime_constraints
+                .get("package_name")
+                .and_then(Value::as_str),
+            Some("plasma-desktop")
+        );
+        let rendered = render_complaint_plan(
+            &opportunity,
+            "kde keyboard switcher on wayland does not properly work with Spare Layouts and Caps Lock language switch",
+            None,
+            &related,
+            &system,
+            &Value::Null,
+            &rank_complaint_package_candidates(
+                "kde keyboard switcher on wayland does not properly work with Spare Layouts and Caps Lock language switch",
+                &related,
+            ),
+            &runtime_constraints,
+            &Value::Null,
+            Path::new("/tmp/evidence.json"),
+        );
+        assert!(rendered.contains("## Runtime Constraints"));
+        assert!(rendered.contains("X11-oriented configuration path"));
+        assert!(rendered.contains("Spare-layout loop count: `2`"));
+        assert!(rendered.contains("Caps-based XKB switching is enabled"));
     }
 
     #[test]
@@ -5649,6 +6627,254 @@ mod tests {
             Some(super::CodexReviewVerdict::FixNeeded)
         ));
         assert!(parse_review_verdict("No explicit verdict here").is_none());
+    }
+
+    #[test]
+    fn classify_codex_failure_detects_timeout_marker() {
+        assert_eq!(
+            classify_codex_failure("Codex stage timed out after 30 second(s)."),
+            "timeout"
+        );
+    }
+
+    #[test]
+    fn timeout_error_summary_prefers_explicit_timeout_line() {
+        let log =
+            "## Proposed Subject\nSome prompt text\nCodex stage timed out after 30 second(s).";
+        assert_eq!(
+            timeout_error_summary(log).as_deref(),
+            Some("Codex stage timed out after 30 second(s).")
+        );
+    }
+
+    #[test]
+    fn timeout_error_summary_is_reusable_for_stderr_excerpt() {
+        let log = "ignored\nCodex stage timed out after 5 second(s).";
+        assert_eq!(
+            timeout_error_summary(log),
+            Some("Codex stage timed out after 5 second(s).".to_string())
+        );
+    }
+
+    #[test]
+    fn desktop_input_config_jobs_keep_plan_pass_by_default() {
+        let config = FixerConfig::default();
+        assert!(super::should_run_plan_before_patch(
+            &config,
+            Some("desktop-input-config")
+        ));
+        assert!(super::should_run_plan_before_patch(
+            &config,
+            Some("runaway-process")
+        ));
+    }
+
+    #[test]
+    fn desktop_input_config_jobs_do_not_force_spark_when_primary_unset() {
+        let mut config = FixerConfig::default();
+        config.patch.model = None;
+        config.patch.spark_model = Some("gpt-5.3-codex-spark".to_string());
+
+        assert_eq!(
+            super::initial_stage_model(&config, Some("desktop-input-config")).as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_primary_model_still_wins_for_desktop_input_config_jobs() {
+        let mut config = FixerConfig::default();
+        config.patch.model = Some("gpt-5.4".to_string());
+        config.patch.spark_model = Some("gpt-5.3-codex-spark".to_string());
+
+        assert_eq!(
+            super::initial_stage_model(&config, Some("desktop-input-config")).as_deref(),
+            Some("gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn desktop_input_config_jobs_default_to_xhigh_reasoning_on_primary_codex() {
+        let mut config = FixerConfig::default();
+        config.patch.spark_model = Some("gpt-5.3-codex-spark".to_string());
+
+        assert_eq!(
+            super::effective_codex_reasoning_effort(
+                &config,
+                Some("desktop-input-config"),
+                Some("gpt-5.4")
+            )
+            .as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            super::effective_codex_reasoning_effort(
+                &config,
+                Some("desktop-input-config"),
+                Some("gpt-5.3-codex-spark")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn desktop_input_config_jobs_get_two_review_fix_passes_minimum() {
+        let mut config = FixerConfig::default();
+        config.patch.review_fix_passes = 1;
+
+        assert_eq!(
+            super::effective_review_fix_passes(&config, Some("desktop-input-config")),
+            3
+        );
+        assert_eq!(
+            super::effective_review_fix_passes(&config, Some("runaway-process")),
+            1
+        );
+    }
+
+    #[test]
+    fn refinement_prompt_requires_code_changes_for_code_review_findings() {
+        let workspace = PreparedWorkspace {
+            repo_root: PathBuf::from("/tmp/plasma-desktop"),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("plasma-desktop".to_string()),
+            source_package: Some("plasma-desktop".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+        let prompt = super::build_refinement_prompt(
+            Path::new("/tmp/evidence.json"),
+            &workspace,
+            None,
+            None,
+            Path::new("/tmp/patch-output.txt"),
+            Path::new("/tmp/review-output.txt"),
+            1,
+            &["kcms/keyboard/keyboard_daemon.cpp".to_string()],
+        );
+
+        assert!(prompt.contains("must update the code itself"));
+        assert!(prompt.contains("metadata-only response is not sufficient"));
+    }
+
+    #[test]
+    fn local_codex_proposals_use_isolated_workspace_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let workspace_root = dir.path().join("source");
+        std::fs::create_dir_all(workspace_root.join("src")).unwrap();
+        std::fs::write(workspace_root.join("src/file.cpp"), "before\n").unwrap();
+
+        let fake_codex = dir.path().join("fake-codex.sh");
+        std::fs::write(
+            &fake_codex,
+            r#"#!/bin/sh
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+printf 'Subject: test patch\n\n## Commit Message\nok\n\n## Issue Connection\nok\n\n## Git Add Paths\nsrc/file.cpp\n\n## Validation\nnot run\n' > "$out"
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_codex).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_codex, perms).unwrap();
+        }
+
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+        let finding_id = store
+            .record_finding(&FindingInput {
+                kind: "investigation".to_string(),
+                title: "Keyboard config mismatch".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "kbd-mismatch".to_string(),
+                summary: "Keyboard layout config mismatch".to_string(),
+                details: json!({
+                    "subsystem": "desktop-input-config"
+                }),
+                artifact: Some(ObservedArtifact {
+                    kind: "config".to_string(),
+                    name: "kxkbrc".to_string(),
+                    path: None,
+                    package_name: Some("plasma-desktop".to_string()),
+                    repo_root: None,
+                    ecosystem: Some("debian".to_string()),
+                    metadata: json!({}),
+                }),
+                repo_root: None,
+                ecosystem: Some("debian".to_string()),
+            })
+            .unwrap();
+        let opportunity = store.get_opportunity_by_finding(finding_id).unwrap();
+
+        let mut config = FixerConfig::default();
+        config.service.state_dir = state_dir;
+        config.patch.codex_command = fake_codex.display().to_string();
+        config.patch.plan_before_patch = false;
+        config.patch.review_after_patch = false;
+        config.patch.model = None;
+        config.patch.spark_model = None;
+        config.patch.codex_timeout_seconds = 0;
+
+        let workspace = PreparedWorkspace {
+            repo_root: workspace_root.clone(),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("plasma-desktop".to_string()),
+            source_package: Some("plasma-desktop".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+
+        let proposal =
+            super::create_proposal(&store, &config, &opportunity, &workspace, "codex").unwrap();
+
+        let evidence: Value = serde_json::from_slice(
+            &std::fs::read(proposal.bundle_path.join("evidence.json")).unwrap(),
+        )
+        .unwrap();
+        let job: Value =
+            serde_json::from_slice(&std::fs::read(proposal.bundle_path.join("job.json")).unwrap())
+                .unwrap();
+
+        assert!(
+            proposal.bundle_path.join("workspace").exists(),
+            "expected isolated workspace snapshot"
+        );
+        assert_eq!(
+            evidence["source_workspace"]["repo_root"].as_str(),
+            Some(workspace_root.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            evidence["workspace"]["repo_root"].as_str(),
+            Some(
+                proposal
+                    .bundle_path
+                    .join("workspace")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            job["workspace"]["repo_root"].as_str(),
+            Some(
+                proposal
+                    .bundle_path
+                    .join("workspace")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
     }
 
     #[test]
@@ -6116,6 +7342,154 @@ RESULT: ok
                 .map(|path| path.file_name().unwrap().to_string_lossy().to_string()),
             Some("prior-best.patch".to_string())
         );
+    }
+
+    #[test]
+    fn desktop_input_config_prompt_points_codex_at_keyboard_code() {
+        let opportunity = OpportunityRecord {
+            id: 42,
+            finding_id: 42,
+            kind: "investigation".to_string(),
+            title: "Keyboard layout investigation".to_string(),
+            score: 98,
+            state: "open".to_string(),
+            summary: "Spare layouts cycle through all layouts on Wayland.".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "desktop-input-config"
+                }
+            }),
+            repo_root: None,
+            ecosystem: Some("debian".to_string()),
+            created_at: "2026-04-04T00:00:00Z".to_string(),
+            updated_at: "2026-04-04T00:00:00Z".to_string(),
+        };
+        let workspace = PreparedWorkspace {
+            repo_root: PathBuf::from("/tmp/plasma-desktop"),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("plasma-desktop".to_string()),
+            source_package: Some("plasma-desktop".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+        let prompt = super::build_prompt(
+            &opportunity,
+            Path::new("/tmp/evidence.json"),
+            &workspace,
+            None,
+            &FixerConfig::default(),
+        );
+
+        assert!(prompt.contains("kcms/keyboard"));
+        assert!(prompt.contains("keyboard-layout configuration evidence"));
+        assert!(!prompt.contains("perf, strace, and /proc evidence"));
+    }
+
+    #[test]
+    fn desktop_input_config_plan_prompt_avoids_generic_desktop_search() {
+        let opportunity = OpportunityRecord {
+            id: 42,
+            finding_id: 42,
+            kind: "investigation".to_string(),
+            title: "Keyboard layout investigation".to_string(),
+            score: 98,
+            state: "open".to_string(),
+            summary: "Spare layouts cycle through all layouts on Wayland.".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "desktop-input-config"
+                }
+            }),
+            repo_root: None,
+            ecosystem: Some("debian".to_string()),
+            created_at: "2026-04-04T00:00:00Z".to_string(),
+            updated_at: "2026-04-04T00:00:00Z".to_string(),
+        };
+        let workspace = PreparedWorkspace {
+            repo_root: PathBuf::from("/tmp/plasma-desktop"),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("plasma-desktop".to_string()),
+            source_package: Some("plasma-desktop".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+        let prompt = super::build_plan_prompt(
+            super::investigation_subsystem(&opportunity),
+            Path::new("/tmp/evidence.json"),
+            &workspace,
+            None,
+        );
+
+        assert!(prompt.contains("kcms/keyboard"));
+        assert!(prompt.contains("configuration/runtime mismatch"));
+        assert!(prompt.contains("not a generic graphics or panel issue"));
+    }
+
+    #[test]
+    fn desktop_input_config_prompt_includes_plasma_keyboard_build_validation() {
+        let opportunity = OpportunityRecord {
+            id: 42,
+            finding_id: 42,
+            kind: "investigation".to_string(),
+            title: "Keyboard layout investigation".to_string(),
+            score: 98,
+            state: "open".to_string(),
+            summary: "Spare layouts cycle through all layouts on Wayland.".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "desktop-input-config"
+                }
+            }),
+            repo_root: None,
+            ecosystem: Some("debian".to_string()),
+            created_at: "2026-04-04T00:00:00Z".to_string(),
+            updated_at: "2026-04-04T00:00:00Z".to_string(),
+        };
+        let workspace = PreparedWorkspace {
+            repo_root: PathBuf::from("/tmp/plasma-desktop"),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("plasma-desktop".to_string()),
+            source_package: Some("plasma-desktop".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+        let prompt = super::build_prompt(
+            &opportunity,
+            Path::new("/tmp/evidence.json"),
+            &workspace,
+            None,
+            &FixerConfig::default(),
+        );
+
+        assert!(prompt.contains("cmake -S . -B build-fix -G Ninja -DBUILD_DOC=OFF"));
+        assert!(prompt.contains("cmake --build build-fix --target kded_keyboard -j2"));
+        assert!(prompt.contains("cmake --build build-fix --target kcm_keyboard -j2"));
+    }
+
+    #[test]
+    fn desktop_input_config_plan_prompt_includes_plasma_keyboard_validation_commands() {
+        let workspace = PreparedWorkspace {
+            repo_root: PathBuf::from("/tmp/plasma-desktop"),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("plasma-desktop".to_string()),
+            source_package: Some("plasma-desktop".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+        let prompt = super::build_plan_prompt(
+            Some("desktop-input-config"),
+            Path::new("/tmp/evidence.json"),
+            &workspace,
+            None,
+        );
+
+        assert!(prompt.contains("cmake -S . -B build-fix -G Ninja -DBUILD_DOC=OFF"));
+        assert!(prompt.contains("cmake --build build-fix --target kded_keyboard -j2"));
+        assert!(prompt.contains("cmake --build build-fix --target kcm_keyboard -j2"));
     }
 
     #[test]
