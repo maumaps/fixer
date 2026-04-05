@@ -106,6 +106,20 @@ impl Store {
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS synced_issue_links (
+                local_opportunity_id INTEGER PRIMARY KEY REFERENCES opportunities(id),
+                remote_issue_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS proposal_publications (
+                proposal_id INTEGER PRIMARY KEY REFERENCES proposals(id),
+                remote_issue_id TEXT NOT NULL,
+                published_session_hash TEXT NOT NULL,
+                published_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS local_state (
                 key TEXT PRIMARY KEY,
                 value_json TEXT NOT NULL,
@@ -1091,6 +1105,140 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn list_latest_ready_codex_proposals_with_issue_links(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(ProposalRecord, String)>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT
+                p.id,
+                p.opportunity_id,
+                p.engine,
+                p.state,
+                p.bundle_path,
+                p.output_path,
+                p.created_at,
+                p.updated_at,
+                sil.remote_issue_id
+            FROM proposals p
+            JOIN synced_issue_links sil ON sil.local_opportunity_id = p.opportunity_id
+            WHERE p.engine = 'codex'
+              AND p.state = 'ready'
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM proposals newer
+                    WHERE newer.opportunity_id = p.opportunity_id
+                      AND newer.engine = 'codex'
+                      AND newer.state = 'ready'
+                      AND (
+                            newer.updated_at > p.updated_at
+                            OR (newer.updated_at = p.updated_at AND newer.id > p.id)
+                      )
+                )
+            ORDER BY p.updated_at DESC, p.id DESC
+            LIMIT ?1
+            ",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok((
+                ProposalRecord {
+                    id: row.get(0)?,
+                    opportunity_id: row.get(1)?,
+                    engine: row.get(2)?,
+                    state: row.get(3)?,
+                    bundle_path: PathBuf::from(row.get::<_, String>(4)?),
+                    output_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                },
+                row.get(8)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn save_synced_issue_link(
+        &self,
+        local_opportunity_id: i64,
+        remote_issue_id: &str,
+    ) -> Result<()> {
+        let now = now_rfc3339();
+        self.conn.execute(
+            "
+            INSERT INTO synced_issue_links (local_opportunity_id, remote_issue_id, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(local_opportunity_id) DO UPDATE SET
+                remote_issue_id = excluded.remote_issue_id,
+                updated_at = excluded.updated_at
+            ",
+            params![local_opportunity_id, remote_issue_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn synced_issue_link(&self, local_opportunity_id: i64) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "
+                SELECT remote_issue_id
+                FROM synced_issue_links
+                WHERE local_opportunity_id = ?1
+                ",
+                [local_opportunity_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn proposal_publication_marker(
+        &self,
+        proposal_id: i64,
+    ) -> Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "
+                SELECT remote_issue_id, published_session_hash
+                FROM proposal_publications
+                WHERE proposal_id = ?1
+                ",
+                [proposal_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn mark_proposal_published(
+        &self,
+        proposal_id: i64,
+        remote_issue_id: &str,
+        published_session_hash: &str,
+    ) -> Result<()> {
+        let now = now_rfc3339();
+        self.conn.execute(
+            "
+            INSERT INTO proposal_publications
+                (proposal_id, remote_issue_id, published_session_hash, published_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(proposal_id) DO UPDATE SET
+                remote_issue_id = excluded.remote_issue_id,
+                published_session_hash = excluded.published_session_hash,
+                updated_at = excluded.updated_at
+            ",
+            params![
+                proposal_id,
+                remote_issue_id,
+                published_session_hash,
+                now,
+                now
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn set_local_state<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {

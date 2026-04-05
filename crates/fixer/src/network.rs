@@ -886,8 +886,10 @@ pub fn sync_once(store: &Store, config: &FixerConfig) -> Result<SyncOutcome> {
     let hello = post_json::<_, ServerHello>(config, "v1/install/hello", &hello_request)?;
     ensure_server_hello_compatible(&hello)?;
     let bundle = build_submission_bundle(store, config, &participation)?;
-    if bundle.items.is_empty() {
-        return Err(anyhow!("no opportunities available for submission"));
+    if bundle.items.is_empty() && bundle.proposals.is_empty() {
+        return Err(anyhow!(
+            "no opportunities or ready proposals available for submission"
+        ));
     }
     let content_hash = hash_text(serde_json::to_vec(&bundle)?);
     let proof = mine_pow(
@@ -904,6 +906,8 @@ pub fn sync_once(store: &Store, config: &FixerConfig) -> Result<SyncOutcome> {
         bundle,
     };
     let receipt = post_json::<_, SubmissionReceipt>(config, "v1/submissions", &envelope)?;
+    remember_synced_issue_links(store, &envelope.bundle, &receipt)?;
+    remember_published_proposals(store, &envelope.bundle)?;
     store.set_local_state("last_sync_at", &now_rfc3339())?;
     store.set_local_state("last_sync_receipt", &receipt)?;
     Ok(SyncOutcome {
@@ -1611,6 +1615,10 @@ fn build_submission_proposals(
 ) -> Result<Vec<SubmittedProposal>> {
     let mut proposals = Vec::new();
     let mut used_bytes = 0_usize;
+    let item_ids = items
+        .iter()
+        .map(|item| item.local_opportunity_id)
+        .collect::<std::collections::HashSet<_>>();
 
     for item in items {
         if proposals.len() >= config.network.max_submission_proposals {
@@ -1621,36 +1629,93 @@ fn build_submission_proposals(
         else {
             continue;
         };
+        let remote_issue_id = store.synced_issue_link(item.local_opportunity_id)?;
         let Some(result) = submission_result_for_local_proposal(
             participation,
             &item.opportunity,
             &local_proposal,
+            remote_issue_id.as_deref(),
         )?
         else {
             continue;
         };
         let candidate = SubmittedProposal {
             local_opportunity_id: item.local_opportunity_id,
+            local_proposal_id: local_proposal.id,
+            remote_issue_id,
             result,
         };
-        let candidate_bytes = serde_json::to_vec(&candidate)?.len();
-        if !proposals.is_empty()
-            && used_bytes.saturating_add(candidate_bytes)
-                > config.network.max_submission_proposal_bytes
-        {
+        if !proposal_needs_publication(store, &candidate)? {
+            continue;
+        }
+        if !push_submission_proposal(&mut proposals, &mut used_bytes, config, candidate)? {
             break;
         }
-        used_bytes = used_bytes.saturating_add(candidate_bytes);
-        proposals.push(candidate);
+    }
+
+    for (local_proposal, remote_issue_id) in store
+        .list_latest_ready_codex_proposals_with_issue_links(
+            config.network.max_submission_proposals,
+        )?
+    {
+        if proposals.len() >= config.network.max_submission_proposals {
+            break;
+        }
+        if item_ids.contains(&local_proposal.opportunity_id) {
+            continue;
+        }
+        let opportunity = match store.get_opportunity(local_proposal.opportunity_id) {
+            Ok(opportunity) => opportunity,
+            Err(_) => continue,
+        };
+        let Some(result) = submission_result_for_local_proposal(
+            participation,
+            &opportunity,
+            &local_proposal,
+            Some(&remote_issue_id),
+        )?
+        else {
+            continue;
+        };
+        let candidate = SubmittedProposal {
+            local_opportunity_id: local_proposal.opportunity_id,
+            local_proposal_id: local_proposal.id,
+            remote_issue_id: Some(remote_issue_id),
+            result,
+        };
+        if !proposal_needs_publication(store, &candidate)? {
+            continue;
+        }
+        if !push_submission_proposal(&mut proposals, &mut used_bytes, config, candidate)? {
+            break;
+        }
     }
 
     Ok(proposals)
+}
+
+fn push_submission_proposal(
+    proposals: &mut Vec<SubmittedProposal>,
+    used_bytes: &mut usize,
+    config: &FixerConfig,
+    candidate: SubmittedProposal,
+) -> Result<bool> {
+    let candidate_bytes = serde_json::to_vec(&candidate)?.len();
+    if !proposals.is_empty()
+        && used_bytes.saturating_add(candidate_bytes) > config.network.max_submission_proposal_bytes
+    {
+        return Ok(false);
+    }
+    *used_bytes = used_bytes.saturating_add(candidate_bytes);
+    proposals.push(candidate);
+    Ok(true)
 }
 
 fn submission_result_for_local_proposal(
     participation: &ParticipationSnapshot,
     opportunity: &OpportunityRecord,
     local_proposal: &ProposalRecord,
+    remote_issue_id: Option<&str>,
 ) -> Result<Option<WorkerResultEnvelope>> {
     let status = match proposal::load_codex_job_status(&local_proposal.bundle_path) {
         Ok(status) => status,
@@ -1681,6 +1746,16 @@ fn submission_result_for_local_proposal(
         details.insert("published_session".to_string(), public_session);
     }
     let published_session = details.get("published_session").cloned();
+    if let Some(remote_issue_id) = remote_issue_id {
+        details.insert("remote_issue_id".to_string(), json!(remote_issue_id));
+    }
+    append_public_patch_quality_details(
+        &mut details,
+        &status,
+        published_session.as_ref(),
+        &local_proposal.bundle_path,
+        remote_issue_id,
+    );
     if published_session.is_none() {
         return Ok(None);
     }
@@ -1740,6 +1815,147 @@ fn submission_result_for_local_proposal(
         impossible_reason: None,
         evidence_request: None,
     }))
+}
+
+fn remember_synced_issue_links(
+    store: &Store,
+    bundle: &FindingBundle,
+    receipt: &SubmissionReceipt,
+) -> Result<()> {
+    for (item, issue_id) in bundle.items.iter().zip(receipt.issue_ids.iter()) {
+        store.save_synced_issue_link(item.local_opportunity_id, issue_id)?;
+    }
+    Ok(())
+}
+
+fn remember_published_proposals(store: &Store, bundle: &FindingBundle) -> Result<()> {
+    for proposal in &bundle.proposals {
+        let Some(remote_issue_id) = proposal.remote_issue_id.as_deref() else {
+            continue;
+        };
+        let Some(session) = proposal.result.attempt.details.get("published_session") else {
+            continue;
+        };
+        store.mark_proposal_published(
+            proposal.local_proposal_id,
+            remote_issue_id,
+            &hash_text(serde_json::to_vec(session)?),
+        )?;
+    }
+    Ok(())
+}
+
+fn proposal_needs_publication(store: &Store, candidate: &SubmittedProposal) -> Result<bool> {
+    let Some(remote_issue_id) = candidate.remote_issue_id.as_deref() else {
+        return Ok(true);
+    };
+    let Some(session) = candidate.result.attempt.details.get("published_session") else {
+        return Ok(true);
+    };
+    let session_hash = hash_text(serde_json::to_vec(session)?);
+    let prior = store.proposal_publication_marker(candidate.local_proposal_id)?;
+    Ok(!matches!(
+        prior,
+        Some((ref published_issue_id, ref published_hash))
+            if published_issue_id == remote_issue_id && published_hash == &session_hash
+    ))
+}
+
+fn append_public_patch_quality_details(
+    details: &mut serde_json::Map<String, Value>,
+    status: &CodexJobStatus,
+    published_session: Option<&Value>,
+    bundle_dir: &Path,
+    remote_issue_id: Option<&str>,
+) {
+    let published_diff_present = published_session_has_diff(published_session);
+    let response = published_session_response(published_session).unwrap_or_default();
+    let validation_quality = if !published_diff_present {
+        "not-run"
+    } else if response.contains("Ran `cmake --build")
+        && response.contains("successfully")
+        && !response.contains("could not")
+        && !response.contains("failed")
+    {
+        "passed"
+    } else if response.contains("Could not complete")
+        || response.contains("failed during configure")
+        || response.contains("I could not")
+    {
+        "blocked"
+    } else if status.state == "ready" {
+        "partial"
+    } else {
+        "blocked"
+    };
+    details.insert(
+        "published_diff_present".to_string(),
+        json!(published_diff_present),
+    );
+    details.insert("validation_quality".to_string(), json!(validation_quality));
+    details.insert(
+        "review_rounds_completed".to_string(),
+        json!(count_review_rounds(bundle_dir)),
+    );
+    details.insert(
+        "review_findings_resolved".to_string(),
+        json!(count_resolved_review_findings(bundle_dir)),
+    );
+    if published_diff_present && remote_issue_id.is_some() {
+        details.insert("supersedes_best_patch".to_string(), json!(true));
+        details.insert(
+            "supersedence_reason".to_string(),
+            json!("newer-ready-proposal-for-existing-public-issue"),
+        );
+        if let Some(created_at) = prior_best_patch_created_at_from_bundle(bundle_dir) {
+            details.insert("supersedes_patch_created_at".to_string(), json!(created_at));
+        }
+    }
+}
+
+fn count_review_rounds(bundle_dir: &Path) -> usize {
+    fs::read_dir(bundle_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("review-") && name.ends_with("-output.txt"))
+        })
+        .count()
+}
+
+fn count_resolved_review_findings(bundle_dir: &Path) -> usize {
+    let has_fix_needed = fs::read_dir(bundle_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .any(|entry| {
+            let is_review_output = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("review-") && name.ends_with("-output.txt"));
+            is_review_output
+                && read_text(&entry.path())
+                    .map(|text| text.contains("RESULT: fix-needed"))
+                    .unwrap_or(false)
+        });
+    let final_review_ok = read_text(&bundle_dir.join("codex-output.txt"))
+        .map(|text| text.contains("RESULT: ok"))
+        .unwrap_or(false);
+    usize::from(has_fix_needed && final_review_ok)
+}
+
+fn prior_best_patch_created_at_from_bundle(bundle_dir: &Path) -> Option<String> {
+    let evidence = read_text(&bundle_dir.join("evidence.json"))?;
+    let value = serde_json::from_str::<Value>(&evidence).ok()?;
+    value
+        .get("prior_best_patch")
+        .and_then(|value| value.get("created_at"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn redact_shared_opportunity(
@@ -3001,6 +3217,7 @@ mod tests {
         assert_eq!(bundle.items.len(), 1);
         assert_eq!(bundle.proposals.len(), 1);
         assert_eq!(bundle.proposals[0].local_opportunity_id, opportunity.id);
+        assert_eq!(bundle.proposals[0].local_proposal_id, 1);
         let diff = bundle.proposals[0]
             .result
             .attempt
@@ -3011,5 +3228,128 @@ mod tests {
             .unwrap();
         assert!(diff.contains("keyboard_daemon.cpp"));
         assert!(diff.contains("+after"));
+    }
+
+    #[test]
+    fn build_submission_bundle_includes_ready_proposals_for_known_issue_without_items() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+        let finding_id = store
+            .record_finding(&FindingInput {
+                kind: "investigation".to_string(),
+                title: "Keyboard layout config investigation".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "desktop-input-config-2".to_string(),
+                summary: "Wayland keyboard layout switching is inconsistent".to_string(),
+                details: json!({
+                    "subsystem": "desktop-input-config",
+                    "profile_target": { "name": "plasma-desktop" },
+                }),
+                artifact: None,
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let opportunity = store.get_opportunity_by_finding(finding_id).unwrap();
+        store
+            .save_synced_issue_link(opportunity.id, "issue-public-1")
+            .unwrap();
+
+        let source_root = dir.path().join("source");
+        let workspace_root = dir.path().join("workspace");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::write(source_root.join("keyboard_daemon.cpp"), "before\n").unwrap();
+        fs::write(workspace_root.join("keyboard_daemon.cpp"), "after\n").unwrap();
+
+        let bundle_dir = dir.path().join("proposal-bundle");
+        fs::create_dir_all(&bundle_dir).unwrap();
+        let output_path = bundle_dir.join("codex-output.txt");
+        fs::write(
+            bundle_dir.join("evidence.json"),
+            serde_json::to_vec_pretty(&json!({
+                "opportunity": opportunity,
+                "workspace": { "repo_root": workspace_root.display().to_string() },
+                "source_workspace": { "repo_root": source_root.display().to_string() },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(bundle_dir.join("prompt.md"), "Patch the keyboard daemon.\n").unwrap();
+        fs::write(
+            &output_path,
+            "Ran `cmake --build build-fix --target kded_keyboard -j2` successfully.\n",
+        )
+        .unwrap();
+        let proposal = store
+            .create_proposal(
+                opportunity.id,
+                "codex",
+                "ready",
+                &bundle_dir,
+                Some(&output_path),
+            )
+            .unwrap();
+        fs::write(
+            bundle_dir.join("status.json"),
+            serde_json::to_vec_pretty(&CodexJobStatus {
+                job_id: "job-2".to_string(),
+                state: "ready".to_string(),
+                started_at: "2026-04-04T12:00:00Z".to_string(),
+                finished_at: "2026-04-04T12:05:00Z".to_string(),
+                output_path: Some(output_path.clone()),
+                selected_model: Some("codex-default".to_string()),
+                models_used: vec!["codex-default".to_string()],
+                rate_limit_fallback_used: false,
+                failure_stage: None,
+                error: None,
+                failure_kind: None,
+                exit_status: Some(0),
+                last_stderr_excerpt: None,
+                review_failure_category: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut config = FixerConfig::default();
+        config.network.max_submission_items = 0;
+        let identity = store.ensure_install_identity().unwrap();
+        let participation = ParticipationSnapshot {
+            identity,
+            state: ParticipationState {
+                mode: ParticipationMode::SubmitterWorker,
+                ..ParticipationState::default()
+            },
+            server_url: config.network.server_url.clone(),
+            policy_text: "test policy".to_string(),
+        };
+
+        let bundle = build_submission_bundle(&store, &config, &participation).unwrap();
+        assert!(bundle.items.is_empty());
+        assert_eq!(bundle.proposals.len(), 1);
+        assert_eq!(bundle.proposals[0].local_proposal_id, proposal.id);
+        assert_eq!(
+            bundle.proposals[0].remote_issue_id.as_deref(),
+            Some("issue-public-1")
+        );
+        assert_eq!(
+            bundle.proposals[0]
+                .result
+                .attempt
+                .details
+                .get("validation_quality")
+                .and_then(Value::as_str),
+            Some("passed")
+        );
+        assert_eq!(
+            bundle.proposals[0]
+                .result
+                .attempt
+                .details
+                .get("supersedes_best_patch")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 }

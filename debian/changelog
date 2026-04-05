@@ -1,3 +1,14 @@
+fixer (0.71.0-1) unstable; urgency=medium
+
+  * Publish newer ready proposals to already-synced public issues even when
+    the underlying opportunity is no longer in the current submission batch.
+  * Track per-proposal publication state locally so sync can refresh public
+    patches without resending unchanged bundles forever.
+  * Prefer superseding or better-validated ready patches over older best.patch
+    attempts on the public server, while keeping older attempts in history.
+
+ -- Fixer Automation <fixer@maumap.com>  Sun, 05 Apr 2026 00:30:00 +0400
+
 fixer (0.70.0-1) unstable; urgency=medium
 
   * Publish ready local Codex proposals with synced issues by default, so

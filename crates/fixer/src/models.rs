@@ -387,6 +387,9 @@ pub struct SharedOpportunity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmittedProposal {
     pub local_opportunity_id: i64,
+    pub local_proposal_id: i64,
+    #[serde(default)]
+    pub remote_issue_id: Option<String>,
     pub result: WorkerResultEnvelope,
 }
 

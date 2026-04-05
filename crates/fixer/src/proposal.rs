@@ -853,6 +853,20 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         }
     }
 
+    if workflow_failure.is_none()
+        && matches!(job.subsystem.as_deref(), Some("desktop-input-config"))
+    {
+        let current_changed_paths = workspace_changed_paths(&job.workspace.repo_root);
+        let current_author_output = read_text(&current_author_output_path).unwrap_or_default();
+        if let Some(error) =
+            desktop_input_config_semantic_failure(&current_author_output, &current_changed_paths)
+        {
+            workflow_failure = Some(("semantic-non-fix".to_string(), error));
+            workflow_failure_stage = Some("review".to_string());
+            workflow_review_failure_category = Some("semantic-non-fix".to_string());
+        }
+    }
+
     let finished_at = now_rfc3339();
     fs::write(
         job.bundle_dir.join("published-prompt.md"),
@@ -2893,10 +2907,98 @@ fn investigation_subsystem(opportunity: &OpportunityRecord) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn investigation_subsystem_from_bundle(evidence_path: &Path) -> Option<String> {
+    let raw = fs::read(evidence_path).ok()?;
+    let evidence = serde_json::from_slice::<Value>(&raw).ok()?;
+    evidence
+        .get("opportunity")
+        .and_then(|value| value.get("evidence"))
+        .and_then(|value| value.get("details"))
+        .and_then(|value| value.get("subsystem"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn desktop_input_config_semantic_failure(
+    authoring_response: &str,
+    current_changed_paths: &[String],
+) -> Option<String> {
+    let response = latest_patch_authoring_response(authoring_response)
+        .unwrap_or_else(|| authoring_response.trim().to_string());
+    if response.is_empty() {
+        return None;
+    }
+    let normalized = response.to_ascii_lowercase();
+    let changed_paths = sanitize_git_add_paths(
+        &current_changed_paths
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+    );
+
+    let feature_removal_markers = [
+        "avoid exporting a dead layout switcher",
+        "stop advertising",
+        "no longer registering the d-bus layout service",
+        "no longer register",
+        "does not advertise an interactive",
+        "keep the keyboard daemon's x11 availability check",
+        "removing the wayland-only static-layout fallback",
+        "the daemon now caches x11/xkb availability",
+    ];
+    let runtime_stub_markers = [
+        "current layout was always synthetic",
+        "mutating methods were no-ops",
+        "could not actually change anything",
+        "static config state",
+        "synthetic",
+        "no-op",
+        "inert methods",
+    ];
+    let switching_fix_markers = [
+        "setlayout",
+        "getlayoutslist",
+        "layoutloopcount",
+        "spare layout",
+        "spare-layout",
+        "caps lock",
+        "legacy xkb",
+        "shortcuthelper",
+        "switching.qml",
+        "keyboard_config.cpp",
+        "layout loop",
+    ];
+    let daemon_only_paths = !changed_paths.is_empty()
+        && changed_paths.iter().all(|path| {
+            matches!(
+                path.as_str(),
+                "kcms/keyboard/keyboard_daemon.cpp" | "kcms/keyboard/keyboard_daemon.h"
+            )
+        });
+    let removes_surface = feature_removal_markers
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let admits_stubbed_runtime = runtime_stub_markers
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let addresses_switching_logic = switching_fix_markers
+        .iter()
+        .any(|marker| normalized.contains(marker));
+
+    if (removes_surface || admits_stubbed_runtime)
+        && daemon_only_paths
+        && !addresses_switching_logic
+    {
+        return Some("Desktop-input-config patch regressed into a narrower non-fix: it changes only the keyboard daemon surface and explains the result in terms of hiding, unregistering, or deadening the interactive switcher instead of fixing the reported switching behavior. For this subsystem, that must not be marked ready; either land a real behavioral fix in the switching path or return triage/report output.".to_string());
+    }
+
+    None
+}
+
 fn investigation_prompt_hint(opportunity: &OpportunityRecord) -> &'static str {
     match investigation_subsystem(opportunity) {
         Some("desktop-input-config") => {
-            "\n\nStart by explaining the likely root cause from the collected keyboard-layout configuration evidence, including Plasma `kxkbrc`, shortcut state, loop-count settings, and `/etc/default/keyboard`. Focus on `kcms/keyboard` and closely related keyboard-layout code paths first. Ignore unrelated panel, wallpaper, graphics, and generic desktop-session code unless the evidence explicitly pulls you there. If you cannot land a safe patch, leave a diagnosis that is strong enough for an upstream bug report."
+            "\n\nStart by explaining the likely root cause from the collected keyboard-layout configuration evidence, including Plasma `kxkbrc`, shortcut state, loop-count settings, and `/etc/default/keyboard`. Focus on `kcms/keyboard` and closely related keyboard-layout code paths first. Treat the actual user-facing switching behavior as the acceptance criteria: if the complaint mentions spare layouts, Caps Lock switching, or a mismatch between the main shortcut path and legacy XKB options, your patch must preserve an interactive layout switcher and fix that behavior rather than hiding, disabling, or deadening the runtime surface. For Plasma keyboard complaints like this one, inspect `setLayout`, `getLayoutsList`, spare-layout loop handling, and the split between the KGlobalAccel shortcut path and legacy XKB option handling before considering daemon/service-registration changes. Ignore unrelated panel, wallpaper, graphics, and generic desktop-session code unless the evidence explicitly pulls you there. If you cannot land a safe behavioral fix, leave a diagnosis that is strong enough for an upstream bug report instead of shipping a narrower non-fix."
         }
         _ if supports_process_investigation_report(opportunity) => {
             "\n\nStart by explaining the likely root cause from the collected perf, strace, and /proc evidence. If you cannot land a safe patch, leave a diagnosis that is strong enough for an upstream bug report."
@@ -2908,7 +3010,7 @@ fn investigation_prompt_hint(opportunity: &OpportunityRecord) -> &'static str {
 fn investigation_plan_focus_hint(subsystem: Option<&str>) -> &'static str {
     match subsystem {
         Some("desktop-input-config") => {
-            " Focus first on keyboard-layout code under `kcms/keyboard` and any directly related keyboard layout UI or daemon helpers. Treat the evidence as a Plasma keyboard configuration/runtime mismatch, not a generic graphics or panel issue."
+            " Focus first on keyboard-layout code under `kcms/keyboard` and any directly related keyboard layout UI or daemon helpers. Treat the evidence as a Plasma keyboard configuration/runtime mismatch, not a generic graphics or panel issue. The plan must preserve the affected user-visible feature surface and fix the reported switching semantics; hiding the switcher, disabling the service, or converting runtime APIs into static-config mirrors is a regression, not an acceptable patch."
         }
         _ => "",
     }
@@ -2970,14 +3072,21 @@ fn build_review_prompt(
             current_changed_paths.join(", ")
         )
     };
+    let subsystem_hint = match investigation_subsystem_from_bundle(evidence_path).as_deref() {
+        Some("desktop-input-config") => {
+            "\n\nFor `desktop-input-config` patches, also verify semantic correctness: reject any patch that only hides, disables, unregisters, or de-interactivates the keyboard-layout runtime surface instead of fixing the reported behavior. A patch is `fix-needed` if it preserves only static config state, makes current-layout reporting synthetic, turns switching methods into no-ops, or otherwise removes the user-visible switcher path to avoid the original bug."
+        }
+        _ => "",
+    };
     format!(
-        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{}{} The latest author response is at `{}`. Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, weak or non-gittable commit message text, and explanations that fail to connect the observed issue evidence to the code change.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
+        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{}{}{} The latest author response is at `{}`. Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, weak or non-gittable commit message text, and explanations that fail to connect the observed issue evidence to the code change.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
         round_hint,
         source_hint,
         changed_paths_hint,
+        subsystem_hint,
         latest_patch_output_path.display(),
     )
 }
@@ -7425,6 +7534,7 @@ RESULT: ok
         assert!(prompt.contains("kcms/keyboard"));
         assert!(prompt.contains("configuration/runtime mismatch"));
         assert!(prompt.contains("not a generic graphics or panel issue"));
+        assert!(prompt.contains("hiding the switcher"));
     }
 
     #[test]
@@ -7467,6 +7577,8 @@ RESULT: ok
         assert!(prompt.contains("cmake -S . -B build-fix -G Ninja -DBUILD_DOC=OFF"));
         assert!(prompt.contains("cmake --build build-fix --target kded_keyboard -j2"));
         assert!(prompt.contains("cmake --build build-fix --target kcm_keyboard -j2"));
+        assert!(prompt.contains("preserve an interactive layout switcher"));
+        assert!(prompt.contains("If you cannot land a safe behavioral fix"));
     }
 
     #[test]
@@ -7490,6 +7602,109 @@ RESULT: ok
         assert!(prompt.contains("cmake -S . -B build-fix -G Ninja -DBUILD_DOC=OFF"));
         assert!(prompt.contains("cmake --build build-fix --target kded_keyboard -j2"));
         assert!(prompt.contains("cmake --build build-fix --target kcm_keyboard -j2"));
+    }
+
+    #[test]
+    fn desktop_input_config_review_prompt_rejects_feature_removal_non_fixes() {
+        let workspace = PreparedWorkspace {
+            repo_root: PathBuf::from("/tmp/plasma-desktop"),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("plasma-desktop".to_string()),
+            source_package: Some("plasma-desktop".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let evidence_path = dir.path().join("evidence.json");
+        std::fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&json!({
+                "opportunity": {
+                    "evidence": {
+                        "details": {
+                            "subsystem": "desktop-input-config"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let prompt = super::build_review_prompt(
+            &evidence_path,
+            &workspace,
+            None,
+            Path::new("/tmp/patch-output.txt"),
+            0,
+            &["kcms/keyboard/keyboard_daemon.cpp".to_string()],
+        );
+
+        assert!(prompt.contains("semantic correctness"));
+        assert!(prompt.contains("hides, disables, unregisters, or de-interactivates"));
+        assert!(prompt.contains("turns switching methods into no-ops"));
+    }
+
+    #[test]
+    fn desktop_input_config_semantic_guard_rejects_dead_switcher_patch() {
+        let response = r#"Subject: kcms/keyboard: avoid exporting a dead layout switcher
+
+## Commit Message
+Keep the keyboard daemon's X11 availability check, but stop advertising org.kde.keyboard as an interactive layout service when there is no working X11/XKB backend behind it.
+
+## Issue Connection
+This change addresses that by no longer registering the D-Bus layout service when the X11/XKB backend is unavailable, so Plasma does not advertise an interactive keyboard-layout runtime that cannot report or change the real active layout.
+
+## Git Add Paths
+kcms/keyboard/keyboard_daemon.cpp
+kcms/keyboard/keyboard_daemon.h
+
+## Validation
+Ran kded_keyboard build.
+"#;
+
+        let error = super::desktop_input_config_semantic_failure(
+            response,
+            &[
+                "kcms/keyboard/keyboard_daemon.cpp".to_string(),
+                "kcms/keyboard/keyboard_daemon.h".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert!(error.contains("narrower non-fix"));
+        assert!(error.contains("must not be marked ready"));
+    }
+
+    #[test]
+    fn desktop_input_config_semantic_guard_allows_behavioral_switching_fix() {
+        let response = r#"Subject: kcms/keyboard: fix spare-layout switching order
+
+## Commit Message
+Correct the spare-layout switching path so the main loop remains stable and Caps-based switching keeps the spare layout out of the normal cycle.
+
+## Issue Connection
+This patch updates setLayout and the spare-layout loop handling, and it keeps the interactive switcher behavior intact while fixing the reported switching semantics.
+
+## Git Add Paths
+kcms/keyboard/keyboard_daemon.cpp
+kcms/keyboard/keyboard_config.cpp
+
+## Validation
+Ran kded_keyboard and kcm_keyboard builds.
+"#;
+
+        assert!(
+            super::desktop_input_config_semantic_failure(
+                response,
+                &[
+                    "kcms/keyboard/keyboard_daemon.cpp".to_string(),
+                    "kcms/keyboard/keyboard_config.cpp".to_string(),
+                ],
+            )
+            .is_none()
+        );
     }
 
     #[test]

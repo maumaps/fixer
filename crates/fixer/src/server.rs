@@ -1385,11 +1385,14 @@ async fn submit_bundle(
         issue_ids.push(issue_id);
     }
     for proposal in &envelope.bundle.proposals {
-        let Some(issue_id) = issue_by_local_opportunity_id.get(&proposal.local_opportunity_id)
-        else {
+        let issue_id = issue_by_local_opportunity_id
+            .get(&proposal.local_opportunity_id)
+            .cloned()
+            .or_else(|| proposal.remote_issue_id.clone());
+        let Some(issue_id) = issue_id else {
             continue;
         };
-        store_submitted_proposal_result(&state.db, issue_id, &proposal.result)
+        store_submitted_proposal_result(&state.db, &issue_id, &proposal.result)
             .await
             .map_err(ApiError::internal)?;
     }
@@ -5299,6 +5302,64 @@ fn select_best_attempt(candidates: &[PatchAttempt], outcome: &str) -> Option<Pat
         .max_by(compare_attempt_created_at)
 }
 
+fn validation_quality_rank(attempt: &PatchAttempt) -> i32 {
+    match attempt
+        .details
+        .get("validation_quality")
+        .and_then(Value::as_str)
+    {
+        Some("passed") => 4,
+        Some("partial") => 3,
+        Some("blocked") => 2,
+        Some("not-run") => 1,
+        _ if attempt.validation_status.as_deref() == Some("ready") => 2,
+        _ => 0,
+    }
+}
+
+fn review_rounds_completed(attempt: &PatchAttempt) -> i64 {
+    attempt
+        .details
+        .get("review_rounds_completed")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+}
+
+fn review_findings_resolved(attempt: &PatchAttempt) -> i64 {
+    attempt
+        .details
+        .get("review_findings_resolved")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+}
+
+fn attempt_supersedes_patch(attempt: &PatchAttempt, patch: &PatchAttempt) -> bool {
+    if !attempt
+        .details
+        .get("supersedes_best_patch")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if let Some(created_at) = attempt
+        .details
+        .get("supersedes_patch_created_at")
+        .and_then(Value::as_str)
+    {
+        return created_at == patch.created_at;
+    }
+    compare_attempt_created_at(attempt, patch) != Ordering::Less
+}
+
+fn compare_patch_attempt_quality(left: &PatchAttempt, right: &PatchAttempt) -> Ordering {
+    validation_quality_rank(left)
+        .cmp(&validation_quality_rank(right))
+        .then_with(|| review_findings_resolved(left).cmp(&review_findings_resolved(right)))
+        .then_with(|| review_rounds_completed(left).cmp(&review_rounds_completed(right)))
+        .then_with(|| compare_attempt_created_at(left, right))
+}
+
 fn attempt_invalidates_patch(attempt: &PatchAttempt, patch: &PatchAttempt) -> bool {
     if !attempt
         .details
@@ -5319,15 +5380,34 @@ fn attempt_invalidates_patch(attempt: &PatchAttempt, patch: &PatchAttempt) -> bo
 }
 
 fn select_best_patch_attempt(candidates: &[PatchAttempt]) -> Option<PatchAttempt> {
-    let best_patch = select_best_attempt(candidates, "patch")?;
-    if candidates
+    let mut visible = candidates
         .iter()
-        .any(|attempt| attempt_invalidates_patch(attempt, &best_patch))
-    {
-        None
-    } else {
-        Some(best_patch)
+        .filter(|attempt| attempt.state == "ready" && attempt.outcome == "patch")
+        .filter(|patch| {
+            !candidates
+                .iter()
+                .any(|attempt| attempt_invalidates_patch(attempt, patch))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if visible.is_empty() {
+        return None;
     }
+    let superseded_created_at = visible
+        .iter()
+        .filter_map(|patch| {
+            visible
+                .iter()
+                .any(|other| {
+                    other.created_at != patch.created_at && attempt_supersedes_patch(other, patch)
+                })
+                .then(|| patch.created_at.clone())
+        })
+        .collect::<std::collections::HashSet<_>>();
+    visible.retain(|patch| !superseded_created_at.contains(&patch.created_at));
+    visible
+        .into_iter()
+        .max_by(|left, right| compare_patch_attempt_quality(left, right))
 }
 
 fn repeated_workspace_blocked_triage_attempt(candidates: &[PatchAttempt]) -> Option<PatchAttempt> {
@@ -12806,6 +12886,8 @@ mod tests {
             items: vec![item.clone()],
             proposals: vec![SubmittedProposal {
                 local_opportunity_id: item.local_opportunity_id,
+                local_proposal_id: 42,
+                remote_issue_id: None,
                 result,
             }],
             redactions: Vec::new(),
@@ -12870,6 +12952,138 @@ mod tests {
             )
             .unwrap();
         assert_eq!(patch_attempt_count, 1);
+    }
+
+    #[test]
+    fn submit_bundle_publishes_ready_local_patch_attempts_to_remote_issue_without_items() {
+        let (_dir, db) = init_test_server_db();
+        let mut config = FixerConfig::default();
+        if let ServerDb::Sqlite(path) = &db {
+            config.server.postgres_url = format!("sqlite://{}", path.display());
+        }
+        let state = Arc::new(ServerState {
+            config: config.clone(),
+            db,
+        });
+        let item = sample_desktop_graphics_session_investigation(
+            "plasma-desktop",
+            &["systemsettings"],
+            "2026-04-04T12:00:00Z",
+        );
+        let existing_issue_id = "issue-existing-public";
+        let connection = sqlite_test_connection(&state.db);
+        insert_test_issue(
+            &connection,
+            existing_issue_id,
+            "cluster-existing-public",
+            110,
+            "2026-04-04T12:00:00Z",
+            &item,
+            &["other-install"],
+        );
+
+        let result = WorkerResultEnvelope {
+            lease_id: String::new(),
+            attempt: PatchAttempt {
+                cluster_id: String::new(),
+                install_id: "submitter-1".to_string(),
+                outcome: "patch".to_string(),
+                state: "ready".to_string(),
+                summary: "Patch proposal created locally.".to_string(),
+                bundle_path: Some("/tmp/bundle".to_string()),
+                output_path: Some("/tmp/bundle/codex-output.txt".to_string()),
+                validation_status: Some("ready".to_string()),
+                details: json!({
+                    "submitted_via_sync": true,
+                    "published_session": {
+                        "prompt": "Patch the keyboard daemon.",
+                        "response": "Ran `cmake --build build-fix --target kded_keyboard -j2` successfully.",
+                        "diff": "diff --git a/kcms/keyboard/keyboard_daemon.cpp b/kcms/keyboard/keyboard_daemon.cpp\n--- a/kcms/keyboard/keyboard_daemon.cpp\n+++ b/kcms/keyboard/keyboard_daemon.cpp\n@@\n-old\n+new\n",
+                        "model": "codex-default",
+                        "models_used": ["codex-default"],
+                        "rate_limit_fallback_used": false
+                    },
+                    "validation_quality": "passed",
+                    "supersedes_best_patch": true,
+                    "remote_issue_id": existing_issue_id
+                }),
+                created_at: "2026-04-04T12:05:00Z".to_string(),
+            },
+            impossible_reason: None,
+            evidence_request: None,
+        };
+        let bundle = FindingBundle {
+            captured_at: "2026-04-04T12:06:00Z".to_string(),
+            policy_version: "2026-03-29".to_string(),
+            richer_evidence_allowed: false,
+            status: StatusSnapshot {
+                capabilities: 1,
+                artifacts: 1,
+                findings: 1,
+                opportunities: 1,
+                proposals: 1,
+            },
+            capabilities: Vec::new(),
+            items: Vec::new(),
+            proposals: vec![SubmittedProposal {
+                local_opportunity_id: item.local_opportunity_id,
+                local_proposal_id: 42,
+                remote_issue_id: Some(existing_issue_id.to_string()),
+                result,
+            }],
+            redactions: Vec::new(),
+        };
+        let client = ClientHello {
+            install_id: "submitter-1".to_string(),
+            version: current_binary_version().to_string(),
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            mode: ParticipationMode::SubmitterWorker,
+            hostname: Some("test-host".to_string()),
+            capabilities: Vec::new(),
+            has_codex: true,
+            richer_evidence_allowed: false,
+            patch_driver: Some("codex".to_string()),
+            patch_model: Some("codex-default".to_string()),
+        };
+        let content_hash = hash_text(serde_json::to_vec(&bundle).unwrap());
+        let proof_of_work = mine_pow(
+            &client.install_id,
+            &content_hash,
+            config.server.submission_pow_difficulty,
+        );
+        let envelope = SubmissionEnvelope {
+            client,
+            content_hash,
+            proof_of_work,
+            bundle,
+        };
+
+        match test_runtime().block_on(submit_bundle(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:43210".parse().unwrap()),
+            Json(envelope),
+        )) {
+            Ok(_) => {}
+            Err(error) => panic!("submit_bundle failed: {}", error.message),
+        };
+
+        let best_patch_json: Option<String> = connection
+            .query_row(
+                "SELECT best_patch_json FROM issue_clusters WHERE id = ?1",
+                [existing_issue_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let best_patch: PatchAttempt =
+            serde_json::from_str(&best_patch_json.expect("best_patch_json should be set")).unwrap();
+        assert_eq!(best_patch.cluster_id, existing_issue_id);
+        assert_eq!(
+            best_patch
+                .details
+                .get("remote_issue_id")
+                .and_then(Value::as_str),
+            Some(existing_issue_id)
+        );
     }
 
     fn insert_test_attempt(
@@ -14130,6 +14344,61 @@ mod tests {
 
         assert!(best_patch.is_none());
         assert!(best_triage.is_none());
+    }
+
+    #[test]
+    fn superseding_ready_patch_replaces_older_public_best_patch() {
+        let legacy_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Older patch proposal created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "legacy prompt",
+                    "response": "Applied a patch.",
+                    "diff": "--- a/src/file.c\n+++ b/src/file.c\n",
+                },
+                "validation_quality": "partial",
+                "review_rounds_completed": 1,
+                "review_findings_resolved": 0
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let replacement_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "reviewer-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Newer patch proposal created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "new prompt",
+                    "response": "Ran `cmake --build build-fix --target kded_keyboard -j2` successfully.",
+                    "diff": "--- a/src/file.c\n+++ b/src/file.c\n@@\n-old\n+new\n",
+                },
+                "validation_quality": "passed",
+                "review_rounds_completed": 2,
+                "review_findings_resolved": 1,
+                "supersedes_best_patch": true,
+                "supersedes_patch_created_at": legacy_patch.created_at.clone()
+            }),
+            created_at: "2026-03-30T00:00:00Z".to_string(),
+        };
+
+        let (best_patch, _) =
+            best_attempts_from_candidates(vec![legacy_patch.clone(), replacement_patch.clone()]);
+
+        let best_patch = best_patch.expect("replacement patch should remain public best patch");
+        assert_eq!(best_patch.summary, replacement_patch.summary);
+        assert_eq!(best_patch.created_at, replacement_patch.created_at);
     }
 
     #[test]
