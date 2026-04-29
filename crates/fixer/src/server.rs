@@ -9872,6 +9872,7 @@ struct PublicIssueFields {
 fn cluster_key_for(item: &SharedOpportunity) -> String {
     match item.finding.kind.as_str() {
         "crash" => normalized_crash_cluster_key(item),
+        "hotspot" => normalized_hotspot_cluster_key(item),
         "warning" => normalized_warning_cluster_key(item),
         "investigation" => normalized_investigation_cluster_key(item),
         _ => hash_text(format!(
@@ -9882,6 +9883,26 @@ fn cluster_key_for(item: &SharedOpportunity) -> String {
             sanitize_public_text(&item.opportunity.summary),
         )),
     }
+}
+
+fn normalized_hotspot_cluster_key(item: &SharedOpportunity) -> String {
+    let details = &item.finding.details;
+    let target = normalized_hotspot_target_name(item);
+    let dso = normalized_hotspot_dso(details);
+    let symbol = details
+        .get("hot_path_symbol")
+        .and_then(Value::as_str)
+        .map(normalized_perf_hotspot_symbol)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| sanitize_public_text(&item.opportunity.summary));
+    hash_text(format!(
+        "hotspot|{}|{}|{}|{}|{}",
+        item.finding.package_name.as_deref().unwrap_or("-"),
+        item.opportunity.ecosystem.as_deref().unwrap_or("-"),
+        target,
+        dso,
+        symbol,
+    ))
 }
 
 fn normalized_crash_cluster_key(item: &SharedOpportunity) -> String {
@@ -10159,6 +10180,9 @@ fn normalized_primary_stack_signature(item: &SharedOpportunity) -> Option<String
 }
 
 fn build_public_issue_fields(item: &SharedOpportunity) -> PublicIssueFields {
+    if let Some(fields) = hotspot_public_issue_fields(item) {
+        return fields;
+    }
     if let Some(fields) = investigation_public_issue_fields(item) {
         return fields;
     }
@@ -10167,6 +10191,31 @@ fn build_public_issue_fields(item: &SharedOpportunity) -> PublicIssueFields {
         summary: sanitize_public_text(&item.opportunity.summary),
         visible: is_publicly_visible(item),
     }
+}
+
+fn hotspot_public_issue_fields(item: &SharedOpportunity) -> Option<PublicIssueFields> {
+    if item.finding.kind != "hotspot" {
+        return None;
+    }
+    let details = &item.finding.details;
+    let target = normalized_hotspot_target_name(item);
+    let symbol = details
+        .get("hot_path_symbol")
+        .and_then(Value::as_str)
+        .map(normalized_perf_hotspot_symbol)
+        .filter(|value| !value.is_empty())?;
+    let dso = normalized_hotspot_dso(details);
+    let symbol_display = symbol.replace('-', " ");
+    let title = if dso == "-" {
+        format!("CPU hotspot in {target}: {symbol_display}")
+    } else {
+        format!("CPU hotspot in {target}: {symbol_display} in {dso}")
+    };
+    Some(PublicIssueFields {
+        title,
+        summary: sanitize_public_text(&item.opportunity.summary),
+        visible: is_publicly_visible(item),
+    })
 }
 
 fn investigation_public_issue_fields(item: &SharedOpportunity) -> Option<PublicIssueFields> {
@@ -10346,6 +10395,61 @@ fn sanitize_bracketed_paths(raw: &str) -> String {
 fn normalize_proc_path(raw: &str) -> String {
     let proc_pid_re = Regex::new(r"/proc/\d+").expect("valid /proc pid regex");
     proc_pid_re.replace_all(raw, "/proc/<pid>").to_string()
+}
+
+fn normalize_deleted_file_marker(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches("(deleted) ")
+        .trim_end_matches(" (deleted)")
+        .trim()
+        .to_string()
+}
+
+fn normalized_hotspot_target_name(item: &SharedOpportunity) -> String {
+    item.finding
+        .details
+        .get("profile_target")
+        .and_then(|value| value.get("path"))
+        .and_then(Value::as_str)
+        .map(file_name_or_self)
+        .or_else(|| {
+            item.finding
+                .details
+                .get("profile_target")
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str)
+        })
+        .or(item.finding.artifact_name.as_deref())
+        .map(normalize_deleted_file_marker)
+        .filter(|value| !value.is_empty())
+        .or_else(|| item.finding.package_name.clone())
+        .unwrap_or_else(|| sanitize_public_text(&item.opportunity.title))
+}
+
+fn normalized_hotspot_dso(details: &Value) -> String {
+    details
+        .get("hot_path_dso_path")
+        .and_then(Value::as_str)
+        .map(file_name_or_self)
+        .or_else(|| details.get("hot_path_dso").and_then(Value::as_str))
+        .map(normalize_deleted_file_marker)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn normalized_perf_hotspot_symbol(raw: &str) -> String {
+    let mut normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    while let Some(stripped) = normalized.strip_suffix(" - -") {
+        normalized = stripped.trim_end().to_string();
+    }
+    if let Some(stripped) = normalized.strip_prefix("(deleted) [.] ") {
+        normalized = stripped.trim_start().to_string();
+    }
+    let bare_address_re = Regex::new(r"^0x[0-9a-fA-F]+$").expect("valid perf address regex");
+    if bare_address_re.is_match(&normalized) {
+        return "unresolved-offset".to_string();
+    }
+    normalize_stack_frame(&normalized)
 }
 
 fn normalize_stack_frame(frame: &str) -> String {
@@ -12712,6 +12816,57 @@ mod tests {
                 ecosystem: None,
                 first_seen: "2026-03-30T10:00:00Z".to_string(),
                 last_seen: "2026-03-30T10:00:00Z".to_string(),
+            },
+        }
+    }
+
+    fn sample_hotspot(
+        target: &str,
+        dso: &str,
+        symbol: &str,
+        package_name: &str,
+    ) -> SharedOpportunity {
+        SharedOpportunity {
+            local_opportunity_id: 1,
+            opportunity: OpportunityRecord {
+                id: 1,
+                finding_id: 1,
+                kind: "hotspot".to_string(),
+                title: format!("CPU hotspot in {target}: {symbol}"),
+                score: 75,
+                state: "open".to_string(),
+                summary: format!("7.10% of sampled CPU in {target} went through {symbol} ({dso})"),
+                evidence: json!({}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "2026-04-30T10:00:00Z".to_string(),
+                updated_at: "2026-04-30T10:00:00Z".to_string(),
+            },
+            finding: FindingRecord {
+                id: 1,
+                kind: "hotspot".to_string(),
+                title: format!("CPU hotspot in {target}: {symbol}"),
+                severity: "medium".to_string(),
+                fingerprint: format!("hotspot-{target}-{dso}-{symbol}"),
+                summary: format!("7.10% of sampled CPU in {target} went through {symbol} ({dso})"),
+                details: json!({
+                    "subsystem": "perf-hotspot",
+                    "profile_target": {
+                        "name": target,
+                        "path": format!("/usr/bin/{target}"),
+                        "package_name": package_name,
+                    },
+                    "hot_path_symbol": symbol,
+                    "hot_path_dso": dso,
+                    "hot_path_dso_path": format!("/usr/lib/x86_64-linux-gnu/{dso}"),
+                }),
+                artifact_name: Some(target.to_string()),
+                artifact_path: Some(PathBuf::from(format!("/usr/bin/{target}"))),
+                package_name: Some(package_name.to_string()),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "2026-04-30T10:00:00Z".to_string(),
+                last_seen: "2026-04-30T10:00:00Z".to_string(),
             },
         }
     }
@@ -15114,6 +15269,35 @@ mod tests {
         );
 
         assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
+    }
+
+    #[test]
+    fn hotspot_cluster_key_collapses_unresolved_offsets() {
+        let a = sample_hotspot(
+            "redis-check-rdb",
+            "libc.so.6",
+            "0x000000000017c318",
+            "libc6",
+        );
+        let b = sample_hotspot(
+            "redis-check-rdb",
+            "libc.so.6",
+            "0x000000000017b73b",
+            "libc6",
+        );
+        let c = sample_hotspot(
+            "redis-check-rdb",
+            "libjemalloc.so.2",
+            "(deleted) [.] 0x0000000000009150",
+            "redis-tools",
+        );
+
+        assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
+        assert_ne!(cluster_key_for(&a), cluster_key_for(&c));
+        assert_eq!(
+            build_public_issue_fields(&c).title,
+            "CPU hotspot in redis-check-rdb: unresolved offset in libjemalloc.so.2"
+        );
     }
 
     #[test]

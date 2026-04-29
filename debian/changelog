@@ -1,3 +1,10 @@
+fixer (0.80.0-1) unstable; urgency=medium
+
+  * Collapse unresolved perf hotspot offsets by target and DSO so stripped or
+    deleted binaries do not flood the public queue with address-only clusters.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 00:55:00 +0400
+
 fixer (0.79.0-1) unstable; urgency=medium
 
   * Treat empty public source-package strings as missing during recluster

@@ -5935,6 +5935,13 @@ fn normalize_perf_symbol(symbol: &str) -> String {
     while let Some(stripped) = normalized.strip_suffix(" - -") {
         normalized = stripped.trim_end().to_string();
     }
+    if let Some(stripped) = normalized.strip_prefix("(deleted) [.] ") {
+        normalized = stripped.trim_start().to_string();
+    }
+    let bare_address_re = Regex::new(r"^0x[0-9a-fA-F]+$").expect("valid perf address regex");
+    if bare_address_re.is_match(&normalized) {
+        return "unresolved offset".to_string();
+    }
     normalized
 }
 
@@ -7183,6 +7190,18 @@ Stack trace of thread 222:\n\
         assert_eq!(
             normalize_perf_symbol("std::__foo<int> - - - -"),
             "std::__foo<int>"
+        );
+    }
+
+    #[test]
+    fn normalize_perf_symbol_collapses_raw_offsets() {
+        assert_eq!(
+            normalize_perf_symbol("0x000000000017c318"),
+            "unresolved offset"
+        );
+        assert_eq!(
+            normalize_perf_symbol("(deleted) [.] 0x00000000003c23ce"),
+            "unresolved offset"
         );
     }
 
