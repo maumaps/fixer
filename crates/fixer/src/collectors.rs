@@ -942,6 +942,9 @@ fn collect_crashes(config: &FixerConfig, store: &Store) -> Result<usize> {
             "raw_info_excerpt": info.lines().take(80).collect::<Vec<_>>().join("\n"),
         });
         if let Some(pkg) = artifact.as_ref().and_then(|a| a.package_name.as_deref()) {
+            if let Some(metadata) = installed_package_metadata_value(pkg) {
+                details["package_metadata"] = metadata;
+            }
             if let Some(version) = installed_version_for_package(pkg) {
                 details["installed_package_version"] = json!(version);
             }
@@ -3542,6 +3545,21 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
                 .dso_path
                 .clone()
                 .unwrap_or_else(|| target.path.clone());
+            let artifact_package_name = hot_path
+                .package_name
+                .clone()
+                .or_else(|| target.package_name.clone());
+            let package_metadata = artifact_package_name
+                .as_deref()
+                .and_then(installed_package_metadata_value);
+            let target_package_metadata = target
+                .package_name
+                .as_deref()
+                .and_then(installed_package_metadata_value);
+            let hot_path_package_metadata = hot_path
+                .package_name
+                .as_deref()
+                .and_then(installed_package_metadata_value);
             let artifact = ObservedArtifact {
                 kind: "binary".to_string(),
                 name: artifact_path
@@ -3550,10 +3568,7 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
                     .unwrap_or(&target.name)
                     .to_string(),
                 path: Some(artifact_path.clone()),
-                package_name: hot_path
-                    .package_name
-                    .clone()
-                    .or_else(|| target.package_name.clone()),
+                package_name: artifact_package_name.clone(),
                 repo_root: None,
                 ecosystem: None,
                 metadata: json!({
@@ -3561,6 +3576,9 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
                     "profile_target_name": target.name,
                     "profile_target_path": target.path,
                     "profile_target_package_name": target.package_name,
+                    "package_metadata": package_metadata,
+                    "profile_target_package_metadata": target_package_metadata,
+                    "hot_path_package_metadata": hot_path_package_metadata,
                     "process_count": target.process_count,
                     "total_cpu_percent": target.total_cpu_percent,
                     "max_cpu_percent": target.max_cpu_percent,
@@ -3603,10 +3621,12 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
                     "profile_scope": "popular-binary",
                     "profile_duration_seconds": config.service.perf_duration_seconds,
                     "perf_data": profile.data_path,
+                    "package_metadata": package_metadata,
                     "profile_target": {
                         "name": target.name,
                         "path": target.path,
                         "package_name": target.package_name,
+                        "package_metadata": target_package_metadata,
                         "process_count": target.process_count,
                         "total_cpu_percent": target.total_cpu_percent,
                         "max_cpu_percent": target.max_cpu_percent,
@@ -3620,6 +3640,7 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
                     "hot_path_dso": hot_path.dso,
                     "hot_path_dso_path": hot_path.dso_path,
                     "hot_path_package_name": hot_path.package_name,
+                    "hot_path_package_metadata": hot_path_package_metadata,
                     "hot_paths": profile.hot_paths,
                 }),
                 artifact: Some(artifact),
@@ -5343,6 +5364,12 @@ fn resolve_installed_package_metadata_for_investigation(
         homepage: metadata.homepage,
         report_url: metadata.report_url,
     })
+}
+
+fn installed_package_metadata_value(package_name: &str) -> Option<Value> {
+    resolve_installed_package_metadata(package_name)
+        .ok()
+        .and_then(|metadata| serde_json::to_value(metadata).ok())
 }
 
 fn build_runaway_investigation_summary(

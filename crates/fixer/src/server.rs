@@ -8075,6 +8075,23 @@ fn inferred_public_source_package(item: &SharedOpportunity) -> Option<String> {
                     .and_then(|metadata| metadata.get("source_package"))
                     .and_then(Value::as_str)
                     .map(ToString::to_string)
+            })
+            .or_else(|| {
+                item.finding
+                    .details
+                    .get("package_metadata")
+                    .and_then(|metadata| metadata.get("source_package"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .or_else(|| {
+                item.finding
+                    .details
+                    .get("profile_target")
+                    .and_then(|target| target.get("package_metadata"))
+                    .and_then(|metadata| metadata.get("source_package"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
             }),
     )
     .or_else(|| {
@@ -15466,6 +15483,39 @@ mod tests {
         assert_eq!(
             build_public_issue_fields(&d).title,
             "CPU hotspot in node: unresolved offset in [JIT]"
+        );
+    }
+
+    #[test]
+    fn public_source_package_reads_finding_package_metadata() {
+        let mut hotspot = sample_hotspot(
+            "postgres",
+            "libc.so.6",
+            "__memmove_avx_unaligned_erms",
+            "libc6",
+        );
+        hotspot.finding.details["package_metadata"] = json!({
+            "package_name": "libc6",
+            "source_package": "glibc"
+        });
+        assert_eq!(
+            inferred_public_source_package(&hotspot).as_deref(),
+            Some("glibc")
+        );
+
+        let mut target_metadata = sample_hotspot(
+            "postgres",
+            "postgres",
+            "hash_search_with_hash_value",
+            "postgresql-18",
+        );
+        target_metadata.finding.details["profile_target"]["package_metadata"] = json!({
+            "package_name": "postgresql-18",
+            "source_package": "postgresql-18"
+        });
+        assert_eq!(
+            inferred_public_source_package(&target_metadata).as_deref(),
+            Some("postgresql-18")
         );
     }
 
