@@ -389,6 +389,24 @@ impl DesktopGraphicsSessionFailureEvent {
             crash_summary
         )
     }
+
+    fn has_compositor_stall_marker(&self) -> bool {
+        self.session_error_lines.iter().any(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("wayland compositor doesn't seem to be processing events fast enough")
+                || lower.contains("main thread was hanging temporarily")
+        })
+    }
+
+    fn profile_target_names(&self) -> Vec<&'static str> {
+        match self.compositor.as_deref() {
+            Some("kwin_wayland") => {
+                vec!["kwin_wayland", "kwin_wayland_wrapper", "kwin_wayland_drm"]
+            }
+            Some("kwin_x11") => vec!["kwin_x11"],
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1404,6 +1422,12 @@ fn collect_desktop_graphics_session_investigations(
     let Some(event) = parse_desktop_graphics_session_failure(&lines.join("\n")) else {
         return Ok(0);
     };
+    let profile = maybe_capture_desktop_graphics_stall_profile(
+        config,
+        store,
+        &event,
+        richer_evidence_enabled(config, store),
+    )?;
 
     let mut details = json!({
         "subsystem": DESKTOP_GRAPHICS_SESSION_INVESTIGATION_SUBSYSTEM,
@@ -1436,6 +1460,26 @@ fn collect_desktop_graphics_session_investigations(
         "package_metadata": event.package_metadata,
         "likely_external_root_cause": true,
     });
+    if let Some(profile) = profile {
+        if let Some(fields) = profile.as_object() {
+            for (key, value) in fields {
+                details[key] = value.clone();
+            }
+        }
+        if let Some(summary) = details.get("live_profile_summary").and_then(Value::as_str) {
+            let existing = details
+                .get("loop_explanation")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            details["loop_explanation"] = json!(if existing.is_empty() {
+                summary.to_string()
+            } else {
+                format!("{existing} {summary}")
+            });
+        }
+    }
     if let Some(pkg) = details.get("package_name").and_then(Value::as_str) {
         if let Some(version) = installed_version_for_package(pkg) {
             details["installed_package_version"] = json!(version);
@@ -3649,6 +3693,12 @@ struct RunawayInvestigationCheckpoint {
     finding_fingerprint: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DesktopGraphicsStallProfileCheckpoint {
+    captured_at: String,
+    profile: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct RunawaySyscallStat {
     name: String,
@@ -4114,6 +4164,19 @@ fn stuck_process_investigation_state_key(source_process_fingerprint: &str) -> St
     format!("stuck-process-investigation:{source_process_fingerprint}")
 }
 
+fn desktop_graphics_stall_profile_state_key(event: &DesktopGraphicsSessionFailureEvent) -> String {
+    format!(
+        "desktop-graphics-stall:{}",
+        hash_text(format!(
+            "{}:{}:{}:{}",
+            event.current_desktop,
+            event.session_type,
+            event.compositor.as_deref().unwrap_or("-"),
+            event.package_name.as_deref().unwrap_or("-"),
+        ))
+    )
+}
+
 fn investigation_cooldown_active(captured_at: &str, cooldown_seconds: u64) -> bool {
     let Ok(parsed) = DateTime::parse_from_rfc3339(captured_at) else {
         return false;
@@ -4139,6 +4202,223 @@ fn process_comm(pid: i32) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn maybe_capture_desktop_graphics_stall_profile(
+    config: &FixerConfig,
+    store: &Store,
+    event: &DesktopGraphicsSessionFailureEvent,
+    include_richer_evidence: bool,
+) -> Result<Option<Value>> {
+    if !event.session_type.eq_ignore_ascii_case("wayland") || !event.has_compositor_stall_marker() {
+        return Ok(None);
+    }
+
+    let state_key = desktop_graphics_stall_profile_state_key(event);
+    let existing = store.get_local_state::<DesktopGraphicsStallProfileCheckpoint>(&state_key)?;
+    if let Some(checkpoint) = existing.as_ref().filter(|checkpoint| {
+        investigation_cooldown_active(
+            &checkpoint.captured_at,
+            config.service.hotspot_investigation_cooldown_seconds,
+        )
+    }) {
+        return Ok(Some(checkpoint.profile.clone()));
+    }
+
+    let target_names = event.profile_target_names();
+    if target_names.is_empty() {
+        return Ok(existing.map(|checkpoint| checkpoint.profile));
+    }
+    let sampled_pids = running_pids_for_process_names(&target_names);
+    if sampled_pids.is_empty() {
+        return Ok(existing.map(|checkpoint| checkpoint.profile));
+    }
+
+    let investigations_dir = config.service.state_dir.join("investigations");
+    let perf_dir = config.service.state_dir.join("perf");
+    fs::create_dir_all(&investigations_dir)?;
+    fs::create_dir_all(&perf_dir)?;
+    prune_runaway_investigation_artifacts(
+        &investigations_dir,
+        config.service.hotspot_investigation_retention_days,
+    )?;
+
+    let capture_timestamp = now_rfc3339();
+    let sampled_pid = sampled_pids[0];
+    let capture_dir = investigations_dir.join(format!(
+        "{}-{}-{}",
+        capture_timestamp.replace(':', "-"),
+        safe_perf_name(event.compositor.as_deref().unwrap_or("wayland-compositor")),
+        abbreviated_hash(&state_key)
+    ));
+    fs::create_dir_all(&capture_dir)?;
+
+    let proc_snapshot = collect_proc_snapshot(sampled_pid, &capture_dir)?;
+    let cpu_percents = current_process_cpu_percents();
+    let executable = proc_snapshot
+        .executable
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/proc/{sampled_pid}/exe")));
+    let target = PopularBinaryProfile {
+        name: event
+            .compositor
+            .clone()
+            .unwrap_or_else(|| "wayland-compositor".to_string()),
+        path: executable.clone(),
+        package_name: event.package_name.clone(),
+        process_count: sampled_pids.len() as i64,
+        total_cpu_percent: sampled_pids
+            .iter()
+            .map(|pid| cpu_percents.get(pid).copied().unwrap_or_default())
+            .sum(),
+        max_cpu_percent: sampled_pids
+            .iter()
+            .map(|pid| cpu_percents.get(pid).copied().unwrap_or_default())
+            .fold(0.0, f64::max),
+    };
+    let perf_profile = if store.capability_available("perf")? {
+        profile_popular_binary(config, &perf_dir, &target, &sampled_pids)?
+    } else {
+        None
+    };
+    let fallback_profile = PerfProfileCapture {
+        data_path: PathBuf::new(),
+        sampled_pids: sampled_pids.clone(),
+        hot_paths: Vec::new(),
+    };
+    let profile = perf_profile.as_ref().unwrap_or(&fallback_profile);
+    let strace_capture = if store.capability_available("strace")? {
+        capture_strace_sample(
+            sampled_pid,
+            config.service.hotspot_investigation_strace_seconds,
+            &capture_dir.join("strace.log"),
+        )?
+    } else {
+        None
+    };
+    let (backtrace_capture, backtrace_capture_status) = capture_gdb_backtrace_sample(
+        sampled_pid,
+        &capture_dir,
+        store.capability_available("gdb")?,
+        config,
+    )?;
+    let top_hot_symbols = perf_profile
+        .as_ref()
+        .map(investigation_hot_symbol_summaries)
+        .unwrap_or_default();
+    let strace_lines = strace_capture
+        .as_ref()
+        .map(|capture| normalized_strace_lines(&capture.raw_log))
+        .unwrap_or_default();
+    let syscall_names = parse_strace_syscall_names(&strace_lines);
+    let top_syscalls = summarize_top_syscalls(&syscall_names);
+    let dominant_sequence = dominant_syscall_sequence(&syscall_names);
+    let hypothesis = classify_runaway_loop(
+        &strace_lines,
+        &top_syscalls,
+        &top_hot_symbols,
+        backtrace_capture.as_ref(),
+    );
+    let summary = build_runaway_investigation_summary(
+        sampled_pid,
+        profile,
+        &top_hot_symbols,
+        &top_syscalls,
+        &dominant_sequence,
+        &hypothesis,
+        &proc_snapshot,
+        strace_capture.as_ref(),
+        backtrace_capture.as_ref(),
+        backtrace_capture_status,
+        event
+            .package_name
+            .as_deref()
+            .and_then(resolve_installed_package_metadata_for_investigation),
+        include_richer_evidence,
+        config,
+    );
+    let root_cause = (hypothesis.classification != "unknown-userspace-loop")
+        .then(|| hypothesis.classification.clone());
+    let hot_path_percent = perf_profile
+        .as_ref()
+        .and_then(|profile| profile.hot_paths.first())
+        .map(|path| path.percent);
+    let hot_symbol = perf_profile
+        .as_ref()
+        .and_then(|profile| profile.hot_paths.first())
+        .map(|path| summarize_hot_symbol(&path.symbol));
+    let summary_line = match (
+        root_cause.as_deref(),
+        hot_symbol.as_deref(),
+        hot_path_percent,
+    ) {
+        (Some(root_cause), Some(symbol), Some(percent)) => format!(
+            "Fixer attached a bounded live profile to {} after compositor-stall markers and saw {} ({percent:.2}% of sampled CPU) while classifying the live behavior as `{root_cause}`.",
+            target.name, symbol
+        ),
+        (Some(root_cause), _, _) => format!(
+            "Fixer attached a bounded live profile to {} after compositor-stall markers and classified the live behavior as `{root_cause}`.",
+            target.name
+        ),
+        _ => format!(
+            "Fixer attached a bounded live profile to {} after compositor-stall markers and captured syscall/backtrace evidence for the next KWin or Mesa investigation step.",
+            target.name
+        ),
+    };
+
+    let mut profile_json = json!({
+        "live_profile_kind": "wayland-compositor-stall",
+        "live_profile_summary": summary_line,
+        "live_profile_captured_at": capture_timestamp,
+        "profile_duration_seconds": perf_profile
+            .as_ref()
+            .map(|_| config.service.perf_duration_seconds)
+            .unwrap_or(0),
+        "strace_duration_seconds": config.service.hotspot_investigation_strace_seconds,
+        "sampled_pids": profile.sampled_pids,
+        "sampled_pid_count": summary.sampled_pid_count,
+        "sampled_pid": sampled_pid,
+        "process_state": summary.process_state,
+        "wchan": summary.wchan,
+        "top_hot_symbols": summary.top_hot_symbols,
+        "top_syscalls": summary.top_syscalls,
+        "dominant_sequence": summary.dominant_sequence,
+        "strace_line_count": summary.strace_line_count,
+        "command_line": summary.command_line,
+        "executable": summary.executable,
+        "backtrace_capture": summary.backtrace_capture,
+        "thread_backtrace_summary": summary.thread_backtrace_summary,
+        "representative_backtraces": summary.representative_backtraces,
+        "common_frame_clusters": summary.common_frame_clusters,
+        "lock_contention_signals": summary.lock_contention_signals,
+        "raw_backtrace_excerpt": summary.raw_backtrace_excerpt,
+        "raw_artifacts": summary.raw_artifacts,
+        "profile_capture_target": {
+            "name": target.name,
+            "path": executable,
+            "package_name": target.package_name,
+            "process_count": target.process_count,
+            "total_cpu_percent": target.total_cpu_percent,
+            "max_cpu_percent": target.max_cpu_percent,
+        },
+    });
+    if let Some(root_cause) = root_cause {
+        profile_json["suspected_root_cause"] = json!(root_cause);
+        profile_json["suspected_root_cause_explanation"] = json!(hypothesis.explanation);
+    }
+    if let Some(perf_profile) = perf_profile {
+        profile_json["perf_data"] = json!(perf_profile.data_path);
+    }
+
+    store.set_local_state(
+        &state_key,
+        &DesktopGraphicsStallProfileCheckpoint {
+            captured_at: capture_timestamp,
+            profile: profile_json.clone(),
+        },
+    )?;
+    Ok(Some(profile_json))
 }
 
 #[derive(Debug, Clone)]
@@ -5477,6 +5757,32 @@ fn running_pids_for_binary(target_path: &Path) -> Vec<i32> {
         }
     }
     pids.sort_unstable();
+    pids
+}
+
+fn running_pids_for_process_names(names: &[&str]) -> Vec<i32> {
+    let wanted = names.iter().copied().collect::<BTreeSet<_>>();
+    let mut pids = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return pids;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        let Ok(comm) = fs::read_to_string(entry.path().join("comm")) else {
+            continue;
+        };
+        if wanted.contains(comm.trim()) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
     pids
 }
 

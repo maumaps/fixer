@@ -42,7 +42,9 @@ hydrate a workspace automatically. The order is:
 
 1. use an already attached repo
 2. try `apt-get source` when `deb-src` is configured
-3. fall back to cloning the package homepage if it looks like a real upstream repo
+3. fall back to downloading and unpacking the `apt-cache showsrc` source files
+4. clone Debian `Vcs-Git` or `Vcs-Browser` metadata when it points at a real git repo
+5. clone the package homepage if it looks like a real upstream repo
 
 `pip-audit` is not currently available as a native Debian package in the
 environment used for this project, so Python dependency auditing is not pulled

@@ -188,7 +188,9 @@ When Fixer wants to validate or propose a fix, it tries to find a real workspace
 
 1. use the repo already attached to the opportunity
 2. fetch Debian source with `apt-get source`
-3. clone the package homepage when it looks like a real upstream repository
+3. download and unpack source files listed by `apt-cache showsrc`
+4. clone Debian `Vcs-Git` or `Vcs-Browser` metadata when it points at a real git repo
+5. clone the package homepage when it looks like a real upstream repository
 
 If none of those work, Fixer should not bluff. It falls back to a triage or bug-report path rather than pretending a patch exists.
 

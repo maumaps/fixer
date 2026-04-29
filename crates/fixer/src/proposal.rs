@@ -867,6 +867,35 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         }
     }
 
+    if workflow_failure.is_none()
+        && matches!(job.subsystem.as_deref(), Some("desktop-graphics-session"))
+    {
+        let current_changed_paths = workspace_changed_paths(&job.workspace.repo_root);
+        let current_author_output = read_text(&current_author_output_path).unwrap_or_default();
+        if let Some(error) = desktop_graphics_session_semantic_failure(
+            &current_author_output,
+            &current_changed_paths,
+        ) {
+            workflow_failure = Some(("semantic-non-fix".to_string(), error));
+            workflow_failure_stage = Some("review".to_string());
+            workflow_review_failure_category = Some("semantic-non-fix".to_string());
+        }
+    }
+
+    if workflow_failure.is_none() {
+        let current_changed_paths = workspace_changed_paths(&job.workspace.repo_root);
+        let current_author_output = read_text(&current_author_output_path).unwrap_or_default();
+        if !current_changed_paths.is_empty() {
+            if let Some(error) =
+                patch_explanation_quality_failure(&current_author_output, job.subsystem.as_deref())
+            {
+                workflow_failure = Some(("unclear-patch-explanation".to_string(), error));
+                workflow_failure_stage = Some("review".to_string());
+                workflow_review_failure_category = Some("unclear-patch-explanation".to_string());
+            }
+        }
+    }
+
     let finished_at = now_rfc3339();
     fs::write(
         job.bundle_dir.join("published-prompt.md"),
@@ -1517,7 +1546,7 @@ fn build_local_metadata_review(
 }
 
 fn sanitize_git_add_paths(paths: &[String]) -> Vec<String> {
-    paths
+    let mut sanitized = paths
         .iter()
         .filter_map(|path| {
             let trimmed = path.trim().trim_matches('`').trim();
@@ -1538,7 +1567,10 @@ fn sanitize_git_add_paths(paths: &[String]) -> Vec<String> {
             }
             (!is_generated_workspace_metadata_path(trimmed)).then(|| trimmed.to_string())
         })
-        .collect()
+        .collect::<Vec<_>>();
+    sanitized.sort();
+    sanitized.dedup();
+    sanitized
 }
 
 fn is_generated_workspace_metadata_path(path: &str) -> bool {
@@ -1896,7 +1928,10 @@ fn should_run_plan_before_patch(config: &FixerConfig, subsystem: Option<&str>) -
 }
 
 fn effective_review_fix_passes(config: &FixerConfig, subsystem: Option<&str>) -> u32 {
-    if matches!(subsystem, Some("desktop-input-config")) {
+    if matches!(
+        subsystem,
+        Some("desktop-input-config" | "desktop-graphics-session")
+    ) {
         return config.patch.review_fix_passes.max(3);
     }
     config.patch.review_fix_passes
@@ -1910,7 +1945,11 @@ fn effective_codex_reasoning_effort(
     if let Some(reasoning_effort) = configured_reasoning_effort(config) {
         return Some(reasoning_effort);
     }
-    if matches!(subsystem, Some("desktop-input-config")) && !model_is_spark(config, model) {
+    if matches!(
+        subsystem,
+        Some("desktop-input-config" | "desktop-graphics-session")
+    ) && !model_is_spark(config, model)
+    {
         return Some("xhigh".to_string());
     }
     None
@@ -2846,7 +2885,7 @@ fn build_prompt(
         .unwrap_or_default();
     let validation_hint = investigation_validation_hint(opportunity, workspace);
     format!(
-        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, keep the change upstreamable, prefer the clearest control flow available, and do not keep avoidable `goto` when a simpler structure would read better. The final explanation must connect the observed issue evidence to the actual code change, not just paraphrase the diff.{}{}{} \n\n{}\n\n{}",
+        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, keep the change upstreamable, prefer the clearest control flow available, and do not keep avoidable `goto` when a simpler structure would read better. The final explanation must connect the observed issue evidence to the actual code change, not just paraphrase the diff. Write like a maintainer is going to read the patch mail cold: explain the bug in plain language, define subsystem-specific jargon the first time you need it, and make the causal story obvious. If you introduce non-obvious state translation, index remapping, or backend split logic, add a short source comment that explains the invariant being preserved.{}{}{} \n\n{}\n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -2875,7 +2914,7 @@ fn build_plan_prompt(
     let investigation_focus = investigation_plan_focus_hint(subsystem);
     let validation_hint = plan_validation_hint(subsystem, workspace);
     format!(
-        "You are planning a fixer patch before any edits happen.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`.{}{}{} Inspect the relevant code, but do not edit files in this pass.\n\nReturn a short markdown plan with these exact sections:\n\n## Problem\n## Proposed Subject\n## Patch Plan\n## Risks\n## Validation\n\nThe plan must explain how the proposed code change addresses the observed issue evidence, call out any prior Fixer patch that should be improved or replaced, and reject awkward control flow such as avoidable `goto` if there is a cleaner bounded alternative.",
+        "You are planning a fixer patch before any edits happen.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`.{}{}{} Inspect the relevant code, but do not edit files in this pass.\n\nReturn a short markdown plan with these exact sections:\n\n## Problem\n## Proposed Subject\n## Patch Plan\n## Risks\n## Validation\n\nThe plan must explain how the proposed code change addresses the observed issue evidence, call out any prior Fixer patch that should be improved or replaced, reject awkward control flow such as avoidable `goto` if there is a cleaner bounded alternative, and keep the intended maintainer-facing explanation clear enough that someone unfamiliar with the local complaint wording can still follow the fix.",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -2917,6 +2956,136 @@ fn investigation_subsystem_from_bundle(evidence_path: &Path) -> Option<String> {
         .and_then(|value| value.get("subsystem"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+fn extract_patch_labeled_line(text: &str, prefix: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn extract_patch_markdown_section_raw(text: &str, heading: &str) -> Option<String> {
+    let mut in_section = false;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if let Some(current_heading) = line.strip_prefix("## ") {
+            let current_heading = current_heading.trim();
+            if in_section {
+                break;
+            }
+            if current_heading == heading {
+                in_section = true;
+            }
+            continue;
+        }
+        if in_section {
+            lines.push(line);
+        }
+    }
+    let content = lines.join("\n");
+    (!content.trim().is_empty()).then(|| content.trim().to_string())
+}
+
+fn sentence_count(text: &str) -> usize {
+    text.split(['.', '!', '?'])
+        .map(str::trim)
+        .filter(|fragment| !fragment.is_empty())
+        .count()
+}
+
+fn patch_explanation_quality_failure(
+    authoring_response: &str,
+    subsystem: Option<&str>,
+) -> Option<String> {
+    let response = latest_patch_authoring_response(authoring_response)
+        .unwrap_or_else(|| authoring_response.trim().to_string());
+    if response.is_empty() {
+        return Some(
+            "Patch authoring response is empty, so Fixer cannot publish a clear maintainer-facing explanation."
+                .to_string(),
+        );
+    }
+    if extract_patch_labeled_line(&response, "Subject:").is_none() {
+        return Some(
+            "Patch explanation is missing the `Subject:` line, so it is not ready to publish as maintainer-facing patch mail."
+                .to_string(),
+        );
+    }
+    let commit_message = extract_patch_markdown_section_raw(&response, "Commit Message")?;
+    let issue_connection = extract_patch_markdown_section_raw(&response, "Issue Connection")?;
+    let commit_lower = commit_message.to_ascii_lowercase();
+    let issue_lower = issue_connection.to_ascii_lowercase();
+
+    let has_change_language = [
+        "fix", "keep", "preserve", "update", "change", "rebuild", "track", "remember", "avoid",
+        "restore",
+    ]
+    .iter()
+    .any(|needle| commit_lower.contains(needle) || issue_lower.contains(needle));
+    let has_effect_language = [
+        "so that",
+        "this keeps",
+        "this prevents",
+        "this avoids",
+        "this restores",
+        "which means",
+        "so the",
+        "so users",
+        "so it",
+    ]
+    .iter()
+    .any(|needle| issue_lower.contains(needle));
+    let has_symptom_language = [
+        "issue",
+        "problem",
+        "bug",
+        "symptom",
+        "user",
+        "reported",
+        "observed",
+        "complaint",
+        "layout",
+        "switch",
+        "hang",
+        "loop",
+        "crash",
+    ]
+    .iter()
+    .any(|needle| issue_lower.contains(needle));
+
+    if commit_message.trim().len() < 40 || sentence_count(&issue_connection) < 2 {
+        return Some("Patch explanation is too thin for maintainers: `## Commit Message` must explain the change plainly, and `## Issue Connection` must spell out the symptom, cause, change, and effect in at least two readable sentences.".to_string());
+    }
+    if !(has_change_language && has_effect_language && has_symptom_language) {
+        return Some("Patch explanation is incomplete for maintainers: it should clearly describe the user-visible symptom, the code-level cause, the change that was made, and the effect of that change, instead of assuming the reader already knows the local context.".to_string());
+    }
+    if matches!(subsystem, Some("desktop-input-config")) {
+        let uses_xkb = issue_lower.contains("xkb");
+        let explains_xkb = issue_lower.contains("keyboard backend")
+            || issue_lower.contains("live layout")
+            || issue_lower.contains("configured layout")
+            || issue_lower.contains("saved layout")
+            || issue_lower.contains("temporary");
+        let opaque_keyboard_terms = [
+            "logical layout",
+            "runtime xkb list",
+            "transient spare-layout runtime shuffle",
+            "xkb 2-layout shuffle",
+        ];
+        if (uses_xkb && !explains_xkb)
+            || opaque_keyboard_terms
+                .iter()
+                .any(|needle| issue_lower.contains(needle))
+        {
+            return Some("Desktop-input-config explanation is still too jargon-heavy: define XKB- or layout-order terms in plain language so a maintainer can understand what is saved, what is live, and how the patch keeps them aligned.".to_string());
+        }
+    }
+
+    None
 }
 
 fn desktop_input_config_semantic_failure(
@@ -2995,10 +3164,89 @@ fn desktop_input_config_semantic_failure(
     None
 }
 
+fn desktop_graphics_session_semantic_failure(
+    authoring_response: &str,
+    current_changed_paths: &[String],
+) -> Option<String> {
+    let response = latest_patch_authoring_response(authoring_response)
+        .unwrap_or_else(|| authoring_response.trim().to_string());
+    if response.is_empty() {
+        return None;
+    }
+    let normalized = response.to_ascii_lowercase();
+    let changed_paths = sanitize_git_add_paths(
+        &current_changed_paths
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+    );
+    if changed_paths.is_empty() {
+        return None;
+    }
+
+    let touches_runtime_source = changed_paths.iter().any(|path| {
+        path.starts_with("src/")
+            || path.starts_with("autotests/")
+            || path.starts_with("plugins/")
+            || path.starts_with("backends/")
+    });
+    let touches_graphics_path = changed_paths.iter().any(|path| {
+        path.starts_with("src/backends/")
+            || path.starts_with("src/compositor")
+            || path.starts_with("src/output")
+            || path.starts_with("src/workspace")
+            || path.starts_with("autotests/drm/")
+            || path.starts_with("autotests/integration/")
+    });
+    let packaging_only = changed_paths
+        .iter()
+        .all(|path| path.starts_with("debian/") || path == "debian/changelog");
+    let metadata_retarget_markers = [
+        "packaging metadata only",
+        "rename the debian patch",
+        "rename the downstream patch",
+        "changelog",
+        "debian patch",
+        "debian metadata",
+        "patch name",
+        "series points",
+    ];
+    let looks_like_packaging_cleanup = metadata_retarget_markers
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let session_fd_markers = [
+        "qdbusunixfiledescriptor",
+        "sleep inhibitor",
+        "delaysleep",
+        "openrestricted",
+        "consolekit",
+        "logind",
+        "dbus-owned",
+        "file descriptor",
+        "fd_cloexec",
+    ];
+    let looks_like_session_fd_detour = session_fd_markers
+        .iter()
+        .any(|marker| normalized.contains(marker));
+
+    if !touches_runtime_source && (packaging_only || looks_like_packaging_cleanup) {
+        return Some("Desktop-graphics-session patch regressed into packaging cleanup instead of a runtime graphics/session fix. For this subsystem, a proposal must stay anchored to the implicated source-level DRM/compositor/output path when that code is present in the workspace; Debian patch renames, series edits, or changelog-only churn are not an acceptable substitute.".to_string());
+    }
+
+    if !touches_graphics_path && looks_like_session_fd_detour {
+        return Some("Desktop-graphics-session patch drifted into an unrelated session/DBus file-descriptor cleanup without touching graphics/output code. For this subsystem, when the workspace contains DRM/compositor/output sources, proposals must stay anchored to the graphics-session runtime path implicated by the evidence instead of retargeting to a broader session helper refactor.".to_string());
+    }
+
+    None
+}
+
 fn investigation_prompt_hint(opportunity: &OpportunityRecord) -> &'static str {
     match investigation_subsystem(opportunity) {
         Some("desktop-input-config") => {
             "\n\nStart by explaining the likely root cause from the collected keyboard-layout configuration evidence, including Plasma `kxkbrc`, shortcut state, loop-count settings, and `/etc/default/keyboard`. Focus on `kcms/keyboard` and closely related keyboard-layout code paths first. Treat the actual user-facing switching behavior as the acceptance criteria: if the complaint mentions spare layouts, Caps Lock switching, or a mismatch between the main shortcut path and legacy XKB options, your patch must preserve an interactive layout switcher and fix that behavior rather than hiding, disabling, or deadening the runtime surface. For Plasma keyboard complaints like this one, inspect `setLayout`, `getLayoutsList`, spare-layout loop handling, and the split between the KGlobalAccel shortcut path and legacy XKB option handling before considering daemon/service-registration changes. Ignore unrelated panel, wallpaper, graphics, and generic desktop-session code unless the evidence explicitly pulls you there. If you cannot land a safe behavioral fix, leave a diagnosis that is strong enough for an upstream bug report instead of shipping a narrower non-fix."
+        }
+        Some("desktop-graphics-session") => {
+            "\n\nTreat this as a graphics/session code fix, not a packaging cleanup task. Start in the source paths implicated by the evidence, such as KWin DRM/backend, compositor, output, or closely related graphics-session tests. Do not pivot to renaming Debian patches, changelog wording, or other packaging-only metadata unless the evidence itself is specifically about packaging breakage. If the prepared source tree already contains the relevant code, stay anchored to that source-level fix path and keep the patch focused on the runtime bug."
         }
         _ if supports_process_investigation_report(opportunity) => {
             "\n\nStart by explaining the likely root cause from the collected perf, strace, and /proc evidence. If you cannot land a safe patch, leave a diagnosis that is strong enough for an upstream bug report."
@@ -3011,6 +3259,9 @@ fn investigation_plan_focus_hint(subsystem: Option<&str>) -> &'static str {
     match subsystem {
         Some("desktop-input-config") => {
             " Focus first on keyboard-layout code under `kcms/keyboard` and any directly related keyboard layout UI or daemon helpers. Treat the evidence as a Plasma keyboard configuration/runtime mismatch, not a generic graphics or panel issue. The plan must preserve the affected user-visible feature surface and fix the reported switching semantics; hiding the switcher, disabling the service, or converting runtime APIs into static-config mirrors is a regression, not an acceptable patch."
+        }
+        Some("desktop-graphics-session") => {
+            " Focus first on source-level graphics/session code such as DRM, compositor, outputs, or directly related graphics tests. Do not spend the plan on Debian patch renames, changelog edits, or other packaging-only cleanup unless the evidence explicitly points to packaging metadata as the user-visible failure."
         }
         _ => "",
     }
@@ -3076,10 +3327,13 @@ fn build_review_prompt(
         Some("desktop-input-config") => {
             "\n\nFor `desktop-input-config` patches, also verify semantic correctness: reject any patch that only hides, disables, unregisters, or de-interactivates the keyboard-layout runtime surface instead of fixing the reported behavior. A patch is `fix-needed` if it preserves only static config state, makes current-layout reporting synthetic, turns switching methods into no-ops, or otherwise removes the user-visible switcher path to avoid the original bug."
         }
+        Some("desktop-graphics-session") => {
+            "\n\nFor `desktop-graphics-session` patches, reject packaging-only answers when the workspace contains the implicated source code. A patch is `fix-needed` if it mainly renames Debian patches, rewrites changelog text, or otherwise changes packaging metadata instead of addressing the runtime graphics/session code path tied to the evidence."
+        }
         _ => "",
     };
     format!(
-        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{}{}{} The latest author response is at `{}`. Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, weak or non-gittable commit message text, and explanations that fail to connect the observed issue evidence to the code change.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
+        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{}{}{} The latest author response is at `{}`. Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, weak or non-gittable commit message text, and explanations that fail to connect the observed issue evidence to the code change. Also review the maintainer experience: the patch mail should be easy to accept upstream, the user-visible bug should be explained in plain language, subsystem-specific jargon should be defined when first used, and any non-obvious state translation or index remapping in code should have a short explanatory comment.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -3125,8 +3379,14 @@ fn build_refinement_prompt(
             current_changed_paths.join(", ")
         )
     };
+    let subsystem_hint = match investigation_subsystem_from_bundle(evidence_path).as_deref() {
+        Some("desktop-graphics-session") => {
+            " For `desktop-graphics-session`, stay on the runtime graphics/session fix path. If the review points out a correctness bug in the source patch, refine that source patch; do not sidestep into Debian patch renames, changelog edits, or other packaging-only metadata churn unless the review explicitly says the bug is in packaging."
+        }
+        _ => "",
+    };
     format!(
-        "You are refining a fixer patch after an explicit code review.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the latest author response at `{}`. Read the review report at `{}`. This is refinement round {}.{}{}{} Address the review findings with the smallest reasonable follow-up changes. If the review identifies a runtime or correctness bug in the changed code, you must update the code itself before answering; a metadata-only response is not sufficient. Keep the patch upstream-friendly, avoid awkward control flow when a simpler structure will do, keep the final response gittable, run relevant tests if available, and summarize which review findings you addressed.\n\n{}",
+        "You are refining a fixer patch after an explicit code review.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the latest author response at `{}`. Read the review report at `{}`. This is refinement round {}.{}{}{}{} Address the review findings with the smallest reasonable follow-up changes. If the review identifies a runtime or correctness bug in the changed code, you must update the code itself before answering; a metadata-only response is not sufficient. Keep the patch upstream-friendly, avoid awkward control flow when a simpler structure will do, keep the final response gittable, make the maintainer-facing explanation plain and direct, add short comments for any non-obvious translation or remapping logic, run relevant tests if available, and summarize which review findings you addressed.\n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -3136,12 +3396,13 @@ fn build_refinement_prompt(
         source_hint,
         plan_hint,
         changed_paths_hint,
+        subsystem_hint,
         patch_response_contract(),
     )
 }
 
 fn patch_response_contract() -> &'static str {
-    "In every authoring pass, your final response must start with `Subject: <single-line git commit subject>` and then include these markdown sections exactly:\n\n## Commit Message\nA short upstream-friendly explanation of what changed and why.\n\n## Issue Connection\nExplain how the code change addresses the observed issue evidence instead of merely paraphrasing the diff.\n\n## Git Add Paths\nList the repo-relative paths that belong in the final patch, one per line. Include intentionally new files, and do not list generated build artifacts.\n\n## Validation\nList the checks you ran, or say clearly that you could not run them."
+    "In every authoring pass, your final response must start with `Subject: <single-line git commit subject>` and then include these markdown sections exactly:\n\n## Commit Message\nA short upstream-friendly explanation of what changed and why. Write it in plain language that a maintainer can follow without local complaint context. If you use subsystem jargon, define it immediately.\n\n## Issue Connection\nExplain how the code change addresses the observed issue evidence instead of merely paraphrasing the diff. Cover four things clearly: the user-visible symptom, the underlying cause in code, the specific change you made, and the effect that change should have. If the logic is non-obvious in code, mention that you added a short explanatory comment.\n\n## Git Add Paths\nList the repo-relative paths that belong in the final patch, one per line. Include intentionally new files, and do not list generated build artifacts.\n\n## Validation\nList the checks you ran, or say clearly that you could not run them."
 }
 
 fn render_external_bug_report(
@@ -3840,6 +4101,17 @@ fn render_process_investigation_report(
                 "- Affected desktop target: `{}`\n- Failure classification: `{}`\n- Confidence: `{:.2}`\n- Explanation: {}\n",
                 target_name, classification, confidence, explanation
             ));
+            if let Some(profile_summary) =
+                details.get("live_profile_summary").and_then(Value::as_str)
+            {
+                body.push_str(&format!("- Live profile: {profile_summary}\n"));
+            }
+            if let Some(captured_at) = details
+                .get("live_profile_captured_at")
+                .and_then(Value::as_str)
+            {
+                body.push_str(&format!("- Live profile captured at: `{captured_at}`\n"));
+            }
             if let Some(root_cause) = suspected_root_cause {
                 body.push_str(&format!("- Suspected root cause: `{root_cause}`\n"));
             }
@@ -4289,8 +4561,8 @@ fn render_process_investigation_report(
         }
     } else if is_desktop_graphics_session {
         body.push_str("1. Reproduce the launch failure and confirm the journal still shows the same `libEGL`, `MESA-LOADER`, `qt.qpa.wayland`, or compositor-hang markers.\n");
-        body.push_str("2. Check whether the same set of apps fail under Wayland but recover under `QT_QPA_PLATFORM=xcb` or a software-rendered fallback, which helps separate session/compositor breakage from one broken app.\n");
-        body.push_str("3. Compare `kwin_wayland`, Mesa, Qt, portal, and GPU-driver package versions, then verify whether a coherent desktop-stack upgrade or downgrade removes the shared warnings and crashes.\n");
+        body.push_str("2. Check whether DBus/systemd-launched desktop apps and portal helpers inherit the expected session environment (`WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`) and whether screenshot requests fail with `org.kde.KWin.ScreenShot2.Error.Cancelled` or a render-node mismatch.\n");
+        body.push_str("3. Compare `kwin_wayland`, `xdg-desktop-portal`, `xdg-desktop-portal-kde`, Mesa, Qt, GPU-driver package versions, and the active GLX alternative (`update-alternatives --display glx`), then verify whether a coherent desktop stack or corrected default-GPU routing removes the shared warnings and crashes.\n");
     } else if is_desktop_input_config {
         body.push_str("1. Inspect `~/.config/kxkbrc`, `~/.config/kglobalshortcutsrc`, and `/etc/default/keyboard` together and confirm the layout list, `LayoutLoopCount`, and XKB options still match the diagnosis above.\n");
         body.push_str("2. Re-test the main shortcut path and the legacy XKB options path separately, and confirm whether only one of them preserves normal Caps Lock behavior under Wayland.\n");
@@ -4324,7 +4596,7 @@ fn render_process_investigation_report(
                 body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points at the graphics stack around suspend/resume, so the next action is usually a kernel, Mesa, Xorg-driver, or compositor investigation rather than a narrow package patch.\n");
             }
         } else if is_desktop_graphics_session {
-            body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points at the shared Wayland/compositor/graphics stack, so the next action is usually a KWin, Mesa, Qt, portal, or GPU-driver investigation rather than a narrow application patch.\n");
+            body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points at the shared Wayland/compositor/graphics stack, so the next action is usually a KWin, portal, Mesa, Qt, GLX/default-GPU routing, or GPU-driver investigation rather than a narrow application patch.\n");
         } else if is_desktop_input_config {
             body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points at Plasma keyboard layout configuration and legacy XKB behavior on Wayland, so the next action is usually a `plasma-desktop` KCM/runtime investigation or an upstream/distro bug report rather than a generic graphics-stack patch.\n");
         } else if is_oom_kill {
@@ -4909,7 +5181,7 @@ fn render_complaint_plan(
         }
         if related_desktop_summary.get("summary").is_some() {
             body.push_str(&format!(
-                "{step}. Treat repeated EGL or Qt startup warnings across multiple apps as a shared graphics-session problem first, and compare KWin, portal, and GPU-driver state before blaming a single application.\n"
+                "{step}. Treat repeated EGL or Qt startup warnings across multiple apps as a shared graphics-session problem first, and compare KWin, portal, GLX/default-GPU routing, and GPU-driver state before blaming a single application.\n"
             ));
             step += 1;
         }
@@ -4949,10 +5221,13 @@ fn diagnose_desktop_app_failure(complaint_text: &str, system: &Value) -> Value {
         ("libegl", "libEGL"),
         ("mesa-loader", "MESA-LOADER"),
         ("qthreadstorage", "QThreadStorage"),
+        ("error.cancelled", "Error.Cancelled"),
+        ("screenshot got cancelled", "Screenshot got cancelled"),
         ("qt.qpa", "qt.qpa"),
         ("wayland_display", "WAYLAND_DISPLAY"),
         ("drm", "DRM"),
         ("gbm", "GBM"),
+        ("glx", "GLX"),
         ("egl", "EGL"),
     ];
     let markers = marker_specs
@@ -5005,7 +5280,12 @@ fn diagnose_desktop_app_failure(complaint_text: &str, system: &Value) -> Value {
     {
         suspected_subsystems.insert("qt desktop app".to_string());
     }
-    if lower.contains("portal") || lower.contains("screen") || lower.contains("screenshot") {
+    if lower.contains("portal")
+        || lower.contains("screen")
+        || lower.contains("screenshot")
+        || lower.contains("error.cancelled")
+        || lower.contains("screenshot got cancelled")
+    {
         suspected_subsystems.insert("desktop portal or capture path".to_string());
     }
 
@@ -6154,6 +6434,11 @@ mod tests {
                         "Apr 03 14:00:04 nucat systemd-coredump[1600]: Process 1144 (spectacle) of user 1000 terminated abnormally with signal 6/ABRT, processing..."
                     ],
                     "marker_kinds": ["egl-mesa", "wayland-session", "kwin-compositor", "coredump"],
+                    "live_profile_summary": "Fixer attached a bounded live profile to kwin_wayland after compositor-stall markers and classified the live behavior as `busy-poll`.",
+                    "live_profile_captured_at": "2026-04-03T10:00:03Z",
+                    "suspected_root_cause": "busy-poll",
+                    "top_hot_symbols": ["QEventDispatcherGlib::processEvents (73.10% in libQt6Core.so.6)"],
+                    "dominant_sequence": ["ppoll", "recvmsg", "ppoll"],
                     "likely_external_root_cause": true
                 }
             }),
@@ -6176,9 +6461,16 @@ mod tests {
         assert!(rendered.contains("Desktop Graphics/Session Failure Investigation Report"));
         assert!(rendered.contains("Why Fixer Believes The Desktop Graphics Session Is Breaking"));
         assert!(rendered.contains("Affected apps: `spectacle, dolphin, kate`"));
+        assert!(rendered.contains("Live profile captured at: `2026-04-03T10:00:03Z`"));
+        assert!(rendered.contains("Suspected root cause: `busy-poll`"));
         assert!(rendered.contains("Diagnostic Markers"));
         assert!(rendered.contains("Desktop Graphics Warnings"));
-        assert!(rendered.contains("KWin, Mesa, Qt, portal, or GPU-driver investigation"));
+        assert!(rendered.contains("Dominant Call Path"));
+        assert!(rendered.contains("Repeated Loop Shape"));
+        assert!(rendered.contains(
+            "KWin, portal, Mesa, Qt, GLX/default-GPU routing, or GPU-driver investigation"
+        ));
+        assert!(rendered.contains("update-alternatives --display glx"));
     }
 
     #[test]
@@ -6824,6 +7116,15 @@ mod tests {
             ),
             None
         );
+        assert_eq!(
+            super::effective_codex_reasoning_effort(
+                &config,
+                Some("desktop-graphics-session"),
+                Some("gpt-5.4")
+            )
+            .as_deref(),
+            Some("xhigh")
+        );
     }
 
     #[test]
@@ -6838,6 +7139,10 @@ mod tests {
         assert_eq!(
             super::effective_review_fix_passes(&config, Some("runaway-process")),
             1
+        );
+        assert_eq!(
+            super::effective_review_fix_passes(&config, Some("desktop-graphics-session")),
+            3
         );
     }
 
@@ -7579,6 +7884,8 @@ RESULT: ok
         assert!(prompt.contains("cmake --build build-fix --target kcm_keyboard -j2"));
         assert!(prompt.contains("preserve an interactive layout switcher"));
         assert!(prompt.contains("If you cannot land a safe behavioral fix"));
+        assert!(prompt.contains("define subsystem-specific jargon"));
+        assert!(prompt.contains("add a short source comment"));
     }
 
     #[test]
@@ -7644,6 +7951,8 @@ RESULT: ok
         assert!(prompt.contains("semantic correctness"));
         assert!(prompt.contains("hides, disables, unregisters, or de-interactivates"));
         assert!(prompt.contains("turns switching methods into no-ops"));
+        assert!(prompt.contains("maintainer experience"));
+        assert!(prompt.contains("plain language"));
     }
 
     #[test]
@@ -7708,6 +8017,156 @@ Ran kded_keyboard and kcm_keyboard builds.
     }
 
     #[test]
+    fn patch_explanation_quality_guard_rejects_jargon_without_plain_language() {
+        let response = r#"Subject: kcms/keyboard: preserve logical layout state
+
+## Commit Message
+Preserve the logical layout order across the XKB loop mutation.
+
+## Issue Connection
+Users reported that layout switching picked the wrong slot after a spare-layout change. The patch updates the runtime XKB list and the logical layout path so the issue is fixed.
+
+## Git Add Paths
+kcms/keyboard/keyboard_daemon.cpp
+
+## Validation
+not run
+"#;
+
+        let error =
+            super::patch_explanation_quality_failure(response, Some("desktop-input-config"))
+                .unwrap();
+
+        assert!(error.contains("jargon-heavy") || error.contains("too thin"));
+    }
+
+    #[test]
+    fn patch_explanation_quality_guard_accepts_clear_structure() {
+        let response = r#"Subject: kcms/keyboard: keep spare-layout switching in configured order
+
+## Commit Message
+Keep Plasma's public layout order aligned with the order saved in its keyboard settings, and remember the previous layout before rebuilding the live layout list.
+
+## Issue Connection
+Users reported that a spare layout could confuse direct layout selection and the last-used-layout shortcut. The bug was that Plasma leaked a temporary live reordering back into the public layout order seen by the applet and shortcuts. This patch keeps the public order in the configured order and stores the previous layout before rebuilding the live list, so the spare-layout path still works without changing what each slot means to the rest of the UI.
+
+## Git Add Paths
+kcms/keyboard/keyboard_daemon.cpp
+
+## Validation
+Ran kded_keyboard and kcm_keyboard builds.
+"#;
+
+        assert!(
+            super::patch_explanation_quality_failure(response, Some("desktop-input-config"),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn desktop_graphics_session_semantic_guard_rejects_packaging_only_cleanup() {
+        let response = r#"Subject: debian: rename patch
+
+## Commit Message
+This is packaging metadata only.
+
+## Issue Connection
+Rename the Debian patch and rewrite the changelog.
+
+## Git Add Paths
+debian/changelog
+debian/patches/series
+debian/patches/upstream_fix_power_mode_freezing.patch
+debian/patches/upstream_30a7f528_core-sessions-duplicate-dbus-owned-fds.patch
+
+## Validation
+not run
+"#;
+
+        let error = super::desktop_graphics_session_semantic_failure(
+            response,
+            &[
+                "debian/changelog".to_string(),
+                "debian/patches/series".to_string(),
+                "debian/patches/upstream_fix_power_mode_freezing.patch".to_string(),
+                "debian/patches/upstream_30a7f528_core-sessions-duplicate-dbus-owned-fds.patch"
+                    .to_string(),
+            ],
+        )
+        .expect("expected packaging-only graphics/session drift to fail");
+
+        assert!(error.contains("packaging cleanup"));
+    }
+
+    #[test]
+    fn desktop_graphics_session_semantic_guard_allows_runtime_source_patch() {
+        let response = r#"Subject: backends/drm: keep outputs stable
+
+## Commit Message
+Adjust DRM output removal handling.
+
+## Issue Connection
+This keeps the graphics session from dropping to zero outputs during a transient disconnect.
+
+## Git Add Paths
+src/backends/drm/drm_backend.cpp
+src/backends/drm/drm_backend.h
+autotests/drm/mockDrmTest.cpp
+
+## Validation
+not run
+"#;
+
+        assert!(
+            super::desktop_graphics_session_semantic_failure(
+                response,
+                &[
+                    "src/backends/drm/drm_backend.cpp".to_string(),
+                    "src/backends/drm/drm_backend.h".to_string(),
+                    "autotests/drm/mockDrmTest.cpp".to_string(),
+                ],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn desktop_graphics_session_semantic_guard_rejects_session_fd_detour() {
+        let response = r#"Subject: core/session: centralize duplication of DBus-owned session fds
+
+## Commit Message
+Refactor session fd handling.
+
+## Issue Connection
+This moves QDBusUnixFileDescriptor duplication into a helper for logind and ConsoleKit sleep inhibitors.
+
+## Git Add Paths
+src/core/session_consolekit.cpp
+src/core/session_fd.cpp
+src/core/session_fd.h
+src/core/session_logind.cpp
+autotests/test_session_fd.cpp
+
+## Validation
+not run
+"#;
+
+        let error = super::desktop_graphics_session_semantic_failure(
+            response,
+            &[
+                "src/core/session_consolekit.cpp".to_string(),
+                "src/core/session_fd.cpp".to_string(),
+                "src/core/session_fd.h".to_string(),
+                "src/core/session_logind.cpp".to_string(),
+                "autotests/test_session_fd.cpp".to_string(),
+            ],
+        )
+        .expect("expected session-fd detour to fail");
+
+        assert!(error.contains("session/DBus file-descriptor cleanup"));
+    }
+
+    #[test]
     fn local_metadata_review_accepts_matching_git_add_paths() {
         let response = r#"Subject: Fix htop retry loop
 
@@ -7725,6 +8184,38 @@ not run
 "#;
 
         assert!(super::build_local_metadata_review(response, &["htop.c".to_string()]).is_none());
+    }
+
+    #[test]
+    fn local_metadata_review_accepts_matching_git_add_paths_in_any_order() {
+        let response = r#"Subject: Fix ordering-only metadata drift
+
+## Commit Message
+Keep the patch paths complete.
+
+## Issue Connection
+This keeps the declared patch file list aligned with the actual changed files.
+
+## Git Add Paths
+src/backends/drm/drm_backend.h
+autotests/drm/mockDrmTest.cpp
+src/backends/drm/drm_backend.cpp
+
+## Validation
+not run
+"#;
+
+        assert!(
+            super::build_local_metadata_review(
+                response,
+                &[
+                    "autotests/drm/mockDrmTest.cpp".to_string(),
+                    "src/backends/drm/drm_backend.cpp".to_string(),
+                    "src/backends/drm/drm_backend.h".to_string(),
+                ],
+            )
+            .is_none()
+        );
     }
 
     #[test]

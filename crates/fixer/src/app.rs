@@ -3,8 +3,8 @@ use crate::capabilities::detect_capabilities;
 use crate::collectors::{CollectReport, collect_complaint_context, collect_once};
 use crate::config::FixerConfig;
 use crate::models::{
-    CodexAuthLease, CodexAuthLeaseStatus, ComplaintCollectionReport, ComplaintOutcome,
-    LeaseBudgetPreset, ParticipationMode, SharedOpportunity,
+    CodexAuthLease, CodexAuthLeaseStatus, CodexAuthMode, ComplaintCollectionReport,
+    ComplaintOutcome, LeaseBudgetPreset, ParticipationMode, SharedOpportunity,
 };
 use crate::network::{self, ParticipationSnapshot, SyncOutcome, WorkerRunOutcome};
 use crate::proposal;
@@ -252,13 +252,39 @@ impl App {
             );
         }
         match ensure_workspace_for_opportunity(&self.config, &opportunity) {
-            Ok(workspace) => proposal::create_proposal(
-                &self.store,
-                &self.config,
-                &opportunity,
-                &workspace,
-                engine,
-            ),
+            Ok(workspace) => {
+                if engine == "codex"
+                    && self.config.patch.driver == crate::models::PatchDriver::Codex
+                    && self.config.patch.auth_mode == CodexAuthMode::UserLease
+                {
+                    let lease = self
+                        .store
+                        .load_codex_auth_lease()?
+                        .ok_or_else(|| anyhow!("no active Codex auth lease is configured"))?;
+                    let job = proposal::prepare_codex_job(
+                        &self.config,
+                        &opportunity,
+                        &workspace,
+                        &lease.user,
+                        lease.allow_kernel,
+                    )?;
+                    let status = network::run_codex_job_as_user(&self.store, &self.config, &job)?;
+                    return self.store.create_proposal(
+                        opportunity.id,
+                        engine,
+                        &status.state,
+                        &job.bundle_dir,
+                        status.output_path.as_deref(),
+                    );
+                }
+                proposal::create_proposal(
+                    &self.store,
+                    &self.config,
+                    &opportunity,
+                    &workspace,
+                    engine,
+                )
+            }
             Err(error) if engine == "deterministic" => {
                 if proposal::supports_process_investigation_report(&opportunity) {
                     proposal::create_process_investigation_report_proposal(

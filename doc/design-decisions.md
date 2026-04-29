@@ -191,7 +191,9 @@ Current order:
 
 1. attached repo
 2. `apt-get source`
-3. clone the package homepage if it looks like a real upstream repo
+3. download and unpack source files listed by `apt-cache showsrc`
+4. clone Debian `Vcs-Git` or `Vcs-Browser` metadata when it points at a real git repo
+5. clone the package homepage if it looks like a real upstream repo
 
 What it costs:
 

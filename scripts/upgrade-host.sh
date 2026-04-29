@@ -16,7 +16,7 @@ set -eu
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-apt-get install -y fixer
+apt-get install -y -o Dpkg::Options::=--force-confold fixer
 systemctl enable --now fixer.service
 
 /usr/bin/fixerd --config /etc/fixer/fixer.toml collect-once >/dev/null

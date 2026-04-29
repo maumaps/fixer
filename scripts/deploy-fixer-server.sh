@@ -4,6 +4,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 PARENT_DIR=$(CDPATH= cd -- "$REPO_ROOT/.." && pwd)
+. "$SCRIPT_DIR/build-env.sh"
 HOST=${FIXER_DEPLOY_HOST:-root@fixer.maumap.com}
 SITE=${FIXER_SITE_NAME:-fixer.maumap.com}
 VERSION=$(dpkg-parsechangelog -SVersion)
@@ -27,7 +28,7 @@ if [ ! -f "$FIXER_SERVER_PACKAGE" ]; then
     exit 1
 fi
 
-STAGE_DIR=$(mktemp -d)
+STAGE_DIR=$(mktemp -d "$TMPDIR/fixer-deploy.XXXXXX")
 trap 'rm -rf "$STAGE_DIR"' EXIT
 
 cp "$FIXER_PACKAGE" "$STAGE_DIR/"
@@ -45,6 +46,7 @@ set -eu
 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    -o Dpkg::Options::=--force-confold \
     caddy \
     postgresql \
     reprepro \
@@ -56,6 +58,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
 
 mkdir -p "$REMOTE_STAGE"
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    -o Dpkg::Options::=--force-confold \
     "$REMOTE_STAGE/$FIXER_PACKAGE_NAME" \
     "$REMOTE_STAGE/$FIXER_SERVER_PACKAGE_NAME"
 

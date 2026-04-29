@@ -646,7 +646,7 @@ fn render_command_failure(output: &std::process::Output) -> String {
     }
 }
 
-fn run_codex_job_as_user(
+pub(crate) fn run_codex_job_as_user(
     store: &Store,
     config: &FixerConfig,
     job: &CodexJobSpec,
@@ -2173,11 +2173,11 @@ fn process_investigation_worker_summary(opportunity: &crate::models::Opportunity
     let classification = details
         .get("loop_classification")
         .and_then(Value::as_str)
-        .unwrap_or("unknown-investigation")
-        .replace('-', " ");
+        .unwrap_or("unknown-investigation");
     match details.get("subsystem").and_then(Value::as_str) {
         Some("stuck-process") => {
-            format!("{target} likely remains stuck in a {classification} wait.")
+            let phrase = investigation_classification_phrase(classification, "wait");
+            format!("{target} likely remains stuck in {phrase}.")
         }
         Some("desktop-resume") => {
             let crashed = details
@@ -2202,7 +2202,32 @@ fn process_investigation_worker_summary(opportunity: &crate::models::Opportunity
             )
         }
         Some("oom-kill") => format!("{target} was killed by the kernel OOM killer."),
-        _ => format!("{target} likely remains stuck in a {classification} loop."),
+        _ => {
+            let phrase = investigation_classification_phrase(classification, "loop");
+            format!("{target} likely remains stuck in {phrase}.")
+        }
+    }
+}
+
+fn investigation_classification_phrase(classification: &str, fallback_kind: &str) -> String {
+    match (classification, fallback_kind) {
+        ("unknown-userspace-loop", _) => "an unclassified userspace loop".to_string(),
+        ("unknown-uninterruptible-wait", _) => "an unclassified uninterruptible wait".to_string(),
+        ("file-not-found-retry", _) => "a file-not-found retry loop".to_string(),
+        ("busy-poll", _) => "a busy-poll loop".to_string(),
+        ("dbus-spin", _) => "a DBus message-loop spin".to_string(),
+        ("fuse-wait", _) => "a FUSE wait".to_string(),
+        ("kernel-oom-kill", _) => "a kernel OOM kill".to_string(),
+        (value, "wait") if value.ends_with("-wait") => {
+            format!("a {}", value.replace('-', " "))
+        }
+        (value, "loop") if value.ends_with("-loop") => {
+            format!("a {}", value.replace('-', " "))
+        }
+        (value, "loop") if value.ends_with("-spin") => {
+            format!("a {}", value.replace('-', " "))
+        }
+        (value, kind) => format!("a {} {kind}", value.replace('-', " ")),
     }
 }
 
@@ -2862,7 +2887,7 @@ mod tests {
         assert_eq!(
             workspace_blocker_classification(
                 &opportunity,
-                "could not acquire a workspace for external package google-chrome-stable; no Debian source package or cloneable upstream repository is available"
+                "could not acquire a workspace for external package google-chrome-stable; no Debian source package, Debian VCS metadata, or cloneable upstream repository is available"
             )
             .as_deref(),
             Some("workspace-unavailable")
@@ -2902,7 +2927,7 @@ mod tests {
         assert_eq!(
             workspace_blocker_classification(
                 &opportunity,
-                "could not acquire a workspace for external package zoom; no Debian source package or cloneable upstream repository is available"
+                "could not acquire a workspace for external package zoom; no Debian source package, Debian VCS metadata, or cloneable upstream repository is available"
             )
             .as_deref(),
             Some("external-package")
@@ -2943,10 +2968,65 @@ mod tests {
         assert_eq!(
             workspace_blocker_classification(
                 &opportunity,
-                "could not acquire a workspace for htop; enable deb-src or provide a cloneable homepage"
+                "could not acquire a workspace for htop; enable deb-src, ensure apt-cache showsrc lists downloadable source files, or provide Debian VCS/cloneable upstream metadata"
             )
             .as_deref(),
             Some("workspace-unavailable")
+        );
+    }
+
+    #[test]
+    fn process_investigation_worker_summary_does_not_duplicate_loop_or_wait_words() {
+        let mut opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for htop".to_string(),
+            score: 10,
+            state: "open".to_string(),
+            repo_root: None,
+            summary: "htop loops".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "runaway-process",
+                    "profile_target": { "name": "htop" },
+                    "loop_classification": "unknown-userspace-loop"
+                }
+            }),
+            ecosystem: None,
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+            updated_at: "2026-04-01T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            process_investigation_worker_summary(&opportunity),
+            "htop likely remains stuck in an unclassified userspace loop."
+        );
+
+        opportunity.evidence = json!({
+            "details": {
+                "subsystem": "stuck-process",
+                "profile_target": { "name": "jbd2/sda3-8" },
+                "loop_classification": "unknown-uninterruptible-wait"
+            }
+        });
+
+        assert_eq!(
+            process_investigation_worker_summary(&opportunity),
+            "jbd2/sda3-8 likely remains stuck in an unclassified uninterruptible wait."
+        );
+
+        opportunity.evidence = json!({
+            "details": {
+                "subsystem": "runaway-process",
+                "profile_target": { "name": "packagekitd" },
+                "loop_classification": "dbus-spin"
+            }
+        });
+
+        assert_eq!(
+            process_investigation_worker_summary(&opportunity),
+            "packagekitd likely remains stuck in a DBus message-loop spin."
         );
     }
 

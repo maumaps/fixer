@@ -18,6 +18,7 @@ warning_logs = []
 [patch]
 codex_command = "codex"
 codex_args = []
+model = "gpt-5.4"
 spark_model = "gpt-5.3-codex-spark"
 sandbox = "workspace-write"
 approval_policy = "never"

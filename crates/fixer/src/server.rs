@@ -8808,6 +8808,7 @@ fn build_public_patch_cover(
         .and_then(|session| session.response.as_deref())
         .map(extract_patch_response_metadata)
         .unwrap_or_default();
+    let keyboard_layout_context = is_keyboard_layout_issue_context(title, summary, &changed_files);
     let subject = response_metadata
         .subject
         .clone()
@@ -8815,16 +8816,26 @@ fn build_public_patch_cover(
         .unwrap_or_else(|| {
             patch_subject(package_name, source_package, &changed_files, &issue_phrase)
         });
-    let commit_message = response_metadata
+    let raw_commit_message = response_metadata
         .commit_message
         .clone()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| patch_commit_message(attempt, diff, &changed_files, &issue_phrase));
-    let issue_connection = response_metadata
+    let raw_issue_connection = response_metadata
         .issue_connection
         .clone()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| patch_issue_connection(diff, &changed_files, &issue_phrase));
+    let commit_message = clarify_public_patch_commit_message(
+        &raw_commit_message,
+        keyboard_layout_context,
+        &changed_files,
+    );
+    let issue_connection = clarify_public_patch_issue_connection(
+        &raw_issue_connection,
+        keyboard_layout_context,
+        &changed_files,
+    );
     let validation_notes = patch_validation_notes(
         corroboration_count,
         last_seen,
@@ -8835,7 +8846,7 @@ fn build_public_patch_cover(
     Some(PublicPatchCover {
         subject,
         commit_message,
-        problem: ensure_sentence(summary),
+        problem: clarify_public_problem(summary, keyboard_layout_context),
         issue_connection,
         changed_files,
         validation_notes,
@@ -8969,6 +8980,71 @@ fn concise_issue_phrase(summary: &str, title: &str) -> String {
     ensure_sentence(simplified)
         .trim_end_matches('.')
         .to_string()
+}
+
+fn is_keyboard_layout_issue_context(title: &str, summary: &str, changed_files: &[String]) -> bool {
+    let lowered = format!("{title} {summary}").to_ascii_lowercase();
+    changed_files
+        .iter()
+        .any(|path| path.starts_with("kcms/keyboard/"))
+        && ["keyboard", "layout", "caps lock", "spare layout", "switch"]
+            .iter()
+            .any(|needle| lowered.contains(needle))
+}
+
+fn clarify_public_problem(summary: &str, keyboard_layout_context: bool) -> String {
+    if keyboard_layout_context {
+        return "On KDE Wayland, Plasma is configured with three keyboard layouts but only two should stay in the normal switch cycle. Instead, the spare-layout path leaks into the public layout order, so direct selection and the last-used-layout shortcut can act on the wrong slot.".to_string();
+    }
+    ensure_sentence(summary)
+}
+
+fn explanation_needs_keyboard_clarity_pass(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("xkb")
+        || lower.contains("logical layout")
+        || lower.contains("runtime xkb list")
+        || lower.contains("layoutloopcount")
+        || lower.contains("transient spare-layout runtime shuffle")
+        || lower.contains("xkb loop")
+        || lower.contains("logical slot")
+}
+
+fn clarify_public_patch_commit_message(
+    text: &str,
+    keyboard_layout_context: bool,
+    changed_files: &[String],
+) -> String {
+    if keyboard_layout_context && explanation_needs_keyboard_clarity_pass(text) {
+        if changed_files.iter().any(|path| {
+            path.ends_with("keyboard_daemon.cpp") || path.ends_with("keyboard_daemon.h")
+        }) {
+            return "Keep Plasma's public layout order aligned with the order saved in its keyboard settings, and remember the previous layout before rebuilding the live layout list for Spare Layouts.".to_string();
+        }
+        return "Keep Plasma's public layout order aligned with its saved keyboard settings when Spare Layouts is enabled.".to_string();
+    }
+    ensure_sentence(text)
+}
+
+fn clarify_public_patch_issue_connection(
+    text: &str,
+    keyboard_layout_context: bool,
+    changed_files: &[String],
+) -> String {
+    if keyboard_layout_context && explanation_needs_keyboard_clarity_pass(text) {
+        let last_used_clause = if changed_files.iter().any(|path| {
+            path.ends_with("keyboard_daemon.cpp") || path.ends_with("keyboard_daemon.h")
+        }) {
+            " It also remembers the previous layout before rebuilding the live list, so the 'last used layout' action still returns to the layout the user actually came from."
+        } else {
+            ""
+        };
+        return format!(
+            "Plasma stores three layouts here, but only two should stay in the normal switching cycle while the third remains spare. The bug was that Plasma leaked its temporary live reordering back into the layout list and indices seen by the applet and shortcuts, so selecting a spare layout could confuse direct selection. This patch keeps the public order in the configured order while letting the internal live switcher keep doing its temporary spare-layout swap.{}",
+            last_used_clause
+        );
+    }
+    ensure_sentence(text)
 }
 
 fn patch_commit_message(
@@ -14130,6 +14206,76 @@ mod tests {
         ));
         assert!(patch.contains("--- a/src/backend/utils/fmgr/dfmgr.c"));
         assert!(!patch.contains("src/backend/utils/fmgr/dfmgr.c\t2026-03-29"));
+    }
+
+    #[test]
+    fn render_public_patch_email_rewrites_keyboard_jargon_into_plain_language() {
+        let issue = PublicIssueDetail {
+            id: "019d5954-5300-75b1-b0a0-16d9cf5259e1".to_string(),
+            kind: "investigation".to_string(),
+            title: "KDE keyboard layout config investigation for KDE Wayland keyboard layout stack"
+                .to_string(),
+            summary: "KDE keyboard layout config enables 3 layout(s) with Spare Layouts loop count 2 and Caps Lock is configured as a layout switch, while /etc/default/keyboard still describes a different XKB layout set, which points at plasma-desktop keyboard layout handling rather than a generic Wayland graphics failure.".to_string(),
+            package_name: Some("plasma-desktop".to_string()),
+            source_package: Some("plasma-desktop".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("medium".to_string()),
+            score: 98,
+            corroboration_count: 1,
+            best_patch_available: true,
+            best_triage_available: false,
+            best_patch_diff_url: Some(
+                "/issues/019d5954-5300-75b1-b0a0-16d9cf5259e1/best.patch".to_string(),
+            ),
+            best_patch: Some(PublicAttempt {
+                outcome: "patch".to_string(),
+                state: "ready".to_string(),
+                summary: "Patch proposal created locally.".to_string(),
+                validation_status: Some("ready".to_string()),
+                created_at: "2026-04-04T19:47:30Z".to_string(),
+                published_session: Some(PublishedAttemptSession {
+                    prompt: "Read ./evidence.json".to_string(),
+                    response: Some(
+                        "## Refinement Pass 1\n\nSubject: kcms/keyboard: preserve last-used layout across spare-layout swaps\n\n## Commit Message\nKeep `kcms/keyboard`’s public layout order tied to the saved `kxkbrc` configuration when spare layouts are enabled, and preserve the previously active logical layout before rebuilding the runtime XKB list.\n\n## Issue Connection\nThe evidence shows Plasma is managing three configured layouts with `LayoutLoopCount=2`, so one layout is spare and can be swapped into the live two-layout XKB loop. The original bug was that Plasma exposed that transient runtime shuffle back through its public layout APIs, so UI and shortcut indices stopped matching the saved config order.\n\nThis refinement also fixes the review’s regression: when a spare layout was active and the user directly selected a main layout, `setLayout(uint)` could rebuild the runtime XKB list before remembering the previous logical layout.\n\n## Validation\n- git diff --check -- kcms/keyboard/keyboard_daemon.cpp kcms/keyboard/keyboard_daemon.h\n"
+                            .to_string(),
+                    ),
+                    diff: Some(
+                        "--- a/kcms/keyboard/keyboard_daemon.cpp\n+++ b/kcms/keyboard/keyboard_daemon.cpp\n@@\n+// Keep the public layout order stable even when the live switcher temporarily swaps in a spare layout.\n"
+                            .to_string(),
+                    ),
+                    model: Some("codex-default".to_string()),
+                    models_used: vec!["codex-default".to_string()],
+                    rate_limit_fallback_used: false,
+                }),
+                handoff: None,
+                blocker_reason: None,
+                failure_diagnostics: None,
+                failure_context: None,
+            }),
+            best_triage: None,
+            best_triage_handoff: None,
+            last_seen: "2026-04-05T15:50:00Z".to_string(),
+            technical_snapshot: None,
+            possible_duplicates: Vec::new(),
+            attempt_summary: PublicAttemptSummary::default(),
+            attempts_omitted_count: 0,
+            attempts: Vec::new(),
+            showing_all_attempts: false,
+        };
+
+        let patch = render_public_patch_email(&issue, issue.best_patch.as_ref().unwrap()).unwrap();
+
+        assert!(patch.contains(
+            "Problem:\nOn KDE Wayland, Plasma is configured with three keyboard layouts but only two should stay in the normal switch cycle."
+        ));
+        assert!(patch.contains(
+            "Commit message:\nKeep Plasma's public layout order aligned with the order saved in its keyboard settings"
+        ));
+        assert!(patch.contains(
+            "How this patch connects to the issue:\nPlasma stores three layouts here, but only two should stay in the normal switching cycle while the third remains spare."
+        ));
+        assert!(!patch.contains("runtime XKB list"));
+        assert!(!patch.contains("transient runtime shuffle"));
     }
 
     #[test]

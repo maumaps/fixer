@@ -3,6 +3,7 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+. "$SCRIPT_DIR/build-env.sh"
 INVENTORY_FILE=${FIXER_HOST_INVENTORY:-"$REPO_ROOT/doc/local/host-inventory.md"}
 CONTINUE_ON_ERROR=${FIXER_UPGRADE_CONTINUE_ON_ERROR:-0}
 
@@ -36,7 +37,7 @@ parse_inventory() {
     ' "$INVENTORY_FILE"
 }
 
-HOSTS_FILE=$(mktemp)
+HOSTS_FILE=$(mktemp "$TMPDIR/fixer-hosts.XXXXXX")
 trap 'rm -f "$HOSTS_FILE"' EXIT
 parse_inventory >"$HOSTS_FILE"
 

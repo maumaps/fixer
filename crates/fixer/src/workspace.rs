@@ -1,7 +1,7 @@
 use crate::adapters::inspect_repo;
 use crate::config::FixerConfig;
 use crate::models::{InstalledPackageMetadata, OpportunityRecord, PreparedWorkspace};
-use crate::util::{command_output, command_output_os, maybe_canonicalize};
+use crate::util::{command_exists, command_output, command_output_os, maybe_canonicalize};
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::ffi::OsStr;
@@ -56,13 +56,18 @@ pub fn ensure_workspace_for_opportunity(
         .is_some_and(|pkg| is_external_binary_package_without_workspace(pkg, &workspace_target))
     {
         return Err(anyhow!(
-            "could not acquire a workspace for external package {}; no Debian source package or cloneable upstream repository is available",
+            "could not acquire a workspace for external package {}; no Debian source package, Debian VCS metadata, or cloneable upstream repository is available",
             workspace_target.source_package
         ));
     }
 
     if deb_src_enabled() {
-        if let Ok(repo_root) = ensure_debian_source_tree(config, &workspace_target.source_package) {
+        let installed_version = metadata
+            .as_ref()
+            .and_then(|pkg| pkg.installed_version.as_deref());
+        if let Ok(repo_root) =
+            ensure_debian_source_tree(config, &workspace_target.source_package, installed_version)
+        {
             let repo_root = maybe_canonicalize(&repo_root);
             let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
             return Ok(PreparedWorkspace {
@@ -110,6 +115,24 @@ pub fn ensure_workspace_for_opportunity(
         });
     }
 
+    if let Some(vcs_url) = source_package_vcs_url(&workspace_target.source_package) {
+        if is_cloneable_repo_url(&vcs_url) {
+            let repo_root =
+                ensure_upstream_clone(config, &workspace_target.source_package, &vcs_url)?;
+            let repo_root = maybe_canonicalize(&repo_root);
+            let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
+            return Ok(PreparedWorkspace {
+                repo_root,
+                ecosystem,
+                source_kind: "debian-vcs-git".to_string(),
+                package_name,
+                source_package: Some(workspace_target.source_package.clone()),
+                homepage: Some(vcs_url),
+                acquisition_note: "Cloned Debian packaging VCS from source-package metadata because apt source indexes are unavailable.".to_string(),
+            });
+        }
+    }
+
     if let Some(homepage) = metadata.as_ref().and_then(|pkg| pkg.homepage.clone()) {
         if is_cloneable_repo_url(&homepage) {
             let repo_root =
@@ -129,7 +152,7 @@ pub fn ensure_workspace_for_opportunity(
     }
 
     Err(anyhow!(
-        "could not acquire a workspace for {}; enable deb-src or provide a cloneable homepage",
+        "could not acquire a workspace for {}; enable deb-src, ensure apt-cache showsrc lists downloadable source files, or provide Debian VCS/cloneable upstream metadata",
         workspace_target.source_package
     ))
 }
@@ -285,6 +308,13 @@ fn parse_maintainer_url(raw: &str) -> Option<String> {
         .then(|| candidate.to_string())
 }
 
+fn source_package_vcs_url(source_package: &str) -> Option<String> {
+    let raw = command_output("apt-cache", &["showsrc", source_package]).ok()?;
+    parse_deb_field(&raw, "Vcs-Git")
+        .or_else(|| parse_deb_field(&raw, "Vcs-Browser"))
+        .filter(|value| is_cloneable_repo_url(value))
+}
+
 fn is_external_binary_package_without_workspace(
     metadata: &InstalledPackageMetadata,
     workspace_target: &WorkspaceSourceTarget,
@@ -382,10 +412,14 @@ fn version_is_newer(candidate: &str, installed: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn ensure_debian_source_tree(config: &FixerConfig, source_package: &str) -> Result<PathBuf> {
+fn ensure_debian_source_tree(
+    config: &FixerConfig,
+    source_package: &str,
+    version_hint: Option<&str>,
+) -> Result<PathBuf> {
     let base_dir = config.service.state_dir.join("sources").join("debian");
     fs::create_dir_all(&base_dir)?;
-    if let Some(existing) = find_unpacked_source_dir(&base_dir, source_package) {
+    if let Some(existing) = find_unpacked_source_dir(&base_dir, source_package, version_hint) {
         return Ok(existing);
     }
     let output = Command::new("apt-get")
@@ -394,13 +428,16 @@ fn ensure_debian_source_tree(config: &FixerConfig, source_package: &str) -> Resu
         .output()
         .with_context(|| format!("failed to run apt-get source for {source_package}"))?;
     if !output.status.success() {
-        return Err(anyhow!(
-            "apt-get source failed for {}: {}",
-            source_package,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        download_and_unpack_debian_source_from_showsrc(&base_dir, source_package, version_hint)
+            .with_context(|| {
+                format!(
+                    "apt-get source failed for {}: {}; fallback download also failed",
+                    source_package,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+            })?;
     }
-    find_unpacked_source_dir(&base_dir, source_package)
+    find_unpacked_source_dir(&base_dir, source_package, version_hint)
         .ok_or_else(|| anyhow!("apt-get source finished but no unpacked source tree was found"))
 }
 
@@ -431,7 +468,11 @@ fn ensure_upstream_clone(config: &FixerConfig, source_package: &str, url: &str) 
     Ok(dest)
 }
 
-fn find_unpacked_source_dir(base_dir: &Path, source_package: &str) -> Option<PathBuf> {
+fn find_unpacked_source_dir(
+    base_dir: &Path,
+    source_package: &str,
+    version_hint: Option<&str>,
+) -> Option<PathBuf> {
     let mut candidates = fs::read_dir(base_dir)
         .ok()?
         .filter_map(|entry| entry.ok())
@@ -443,10 +484,156 @@ fn find_unpacked_source_dir(base_dir: &Path, source_package: &str) -> Option<Pat
                 .map(|name| name.starts_with(source_package))
                 .unwrap_or(false)
         })
+        .filter(|path| {
+            version_hint.is_none_or(|version| {
+                let dir_version_hint = source_dir_version_hint(version);
+                path.file_name()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|name| name.contains(dir_version_hint))
+            })
+        })
         .filter(|path| path.join("debian").exists() || path.join("Cargo.toml").exists())
         .collect::<Vec<_>>();
     candidates.sort();
     candidates.pop()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DebianSourceRecord {
+    version: String,
+    directory: String,
+    files: Vec<String>,
+}
+
+fn download_and_unpack_debian_source_from_showsrc(
+    base_dir: &Path,
+    source_package: &str,
+    version_hint: Option<&str>,
+) -> Result<()> {
+    if !command_exists("curl") {
+        return Err(anyhow!(
+            "curl is required for Debian source fallback downloads"
+        ));
+    }
+    let raw = command_output("apt-cache", &["showsrc", source_package])
+        .with_context(|| format!("failed to query apt-cache showsrc for {source_package}"))?;
+    let records = parse_showsrc_records(&raw);
+    let record = select_showsrc_record(&records, version_hint).ok_or_else(|| {
+        anyhow!("no matching apt-cache showsrc record found for {source_package}")
+    })?;
+    for file in &record.files {
+        let dest = base_dir.join(file);
+        if dest.exists() {
+            continue;
+        }
+        let url = format!(
+            "https://deb.debian.org/debian/{}/{}",
+            record.directory, file
+        );
+        let status = Command::new("curl")
+            .args([
+                "-fsSL",
+                "--retry",
+                "2",
+                "--output",
+                dest.to_string_lossy().as_ref(),
+                &url,
+            ])
+            .status()
+            .with_context(|| format!("failed to download Debian source file {url}"))?;
+        if !status.success() {
+            return Err(anyhow!("curl failed while downloading {}", url));
+        }
+    }
+    let dsc = record
+        .files
+        .iter()
+        .find(|name| name.ends_with(".dsc"))
+        .ok_or_else(|| anyhow!("Debian source record for {source_package} is missing a .dsc"))?;
+    let status = Command::new("dpkg-source")
+        .args(["-x", dsc])
+        .current_dir(base_dir)
+        .status()
+        .with_context(|| format!("failed to unpack Debian source for {source_package}"))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "dpkg-source -x failed for {}",
+            base_dir.join(dsc).display()
+        ));
+    }
+    Ok(())
+}
+
+fn parse_showsrc_records(raw: &str) -> Vec<DebianSourceRecord> {
+    raw.split("\n\n").filter_map(parse_showsrc_record).collect()
+}
+
+fn parse_showsrc_record(raw: &str) -> Option<DebianSourceRecord> {
+    let mut version = None;
+    let mut directory = None;
+    let mut files = Vec::new();
+    let mut in_files = false;
+    for line in raw.lines() {
+        if let Some(value) = line.strip_prefix("Version:") {
+            version = Some(value.trim().to_string());
+            in_files = false;
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("Directory:") {
+            directory = Some(value.trim().to_string());
+            in_files = false;
+            continue;
+        }
+        if line.starts_with("Files:") {
+            in_files = true;
+            continue;
+        }
+        if in_files {
+            if line.starts_with(' ') || line.starts_with('\t') {
+                if let Some(file_name) = line.split_whitespace().last() {
+                    files.push(file_name.to_string());
+                }
+                continue;
+            }
+            in_files = false;
+        }
+    }
+    Some(DebianSourceRecord {
+        version: version?,
+        directory: directory?,
+        files,
+    })
+}
+
+fn select_showsrc_record<'a>(
+    records: &'a [DebianSourceRecord],
+    version_hint: Option<&str>,
+) -> Option<&'a DebianSourceRecord> {
+    if let Some(version_hint) = version_hint {
+        let normalized_hint = trim_debian_epoch(version_hint);
+        if let Some(record) = records
+            .iter()
+            .find(|record| trim_debian_epoch(&record.version) == normalized_hint)
+        {
+            return Some(record);
+        }
+    }
+    records.first()
+}
+
+fn trim_debian_epoch(version: &str) -> &str {
+    version
+        .split_once(':')
+        .map(|(_, rest)| rest)
+        .unwrap_or(version)
+}
+
+fn source_dir_version_hint(version: &str) -> &str {
+    let version = trim_debian_epoch(version);
+    version
+        .rsplit_once('-')
+        .map(|(upstream, _)| upstream)
+        .unwrap_or(version)
 }
 
 fn package_name_from_opportunity(opportunity: &OpportunityRecord) -> Option<String> {
@@ -599,7 +786,8 @@ mod tests {
         is_external_binary_package_without_workspace, kernel_source_package_from_opportunity,
         kernel_upstream_repo_url, normalize_patchable_source_package,
         origin_is_debian_source_friendly, parse_apt_origins, parse_maintainer_url,
-        sanitize_dir_name, source_package_from_opportunity,
+        parse_showsrc_records, sanitize_dir_name, select_showsrc_record, source_dir_version_hint,
+        source_package_from_opportunity, source_package_vcs_url, trim_debian_epoch,
     };
     use crate::models::{InstalledPackageMetadata, OpportunityRecord};
     use serde_json::json;
@@ -623,6 +811,51 @@ mod tests {
             Some("https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git")
         );
         assert_eq!(kernel_upstream_repo_url("postgresql-18"), None);
+    }
+
+    #[test]
+    fn kwin_source_package_has_vcs_git_fallback() {
+        let vcs_url = source_package_vcs_url("kwin");
+        assert!(
+            vcs_url.as_deref() == Some("https://salsa.debian.org/qt-kde-team/kde/kwin.git")
+                || vcs_url.is_none()
+        );
+    }
+
+    #[test]
+    fn parses_showsrc_records_and_matches_version_without_epoch() {
+        let raw = "\
+Package: kwin
+Version: 4:6.5.4-5
+Files:
+ 1b5494 4981 kwin_6.5.4-5.dsc
+ 258443 8795408 kwin_6.5.4.orig.tar.xz
+ b40c20 36120 kwin_6.5.4-5.debian.tar.xz
+Directory: pool/main/k/kwin
+
+Package: kwin
+Version: 4:6.6.3-3
+Files:
+ 71cd3d 5092 kwin_6.6.3-3.dsc
+ 61a2e0 8880260 kwin_6.6.3.orig.tar.xz
+ c42abb 35708 kwin_6.6.3-3.debian.tar.xz
+Directory: pool/main/k/kwin
+";
+        let records = parse_showsrc_records(raw);
+        assert_eq!(records.len(), 2);
+        assert_eq!(trim_debian_epoch("4:6.5.4-5"), "6.5.4-5");
+        assert_eq!(source_dir_version_hint("4:6.5.4-5"), "6.5.4");
+        let record = select_showsrc_record(&records, Some("4:6.5.4-5")).unwrap();
+        assert_eq!(record.version, "4:6.5.4-5");
+        assert_eq!(record.directory, "pool/main/k/kwin");
+        assert_eq!(
+            record.files,
+            vec![
+                "kwin_6.5.4-5.dsc",
+                "kwin_6.5.4.orig.tar.xz",
+                "kwin_6.5.4-5.debian.tar.xz"
+            ]
+        );
     }
 
     #[test]
