@@ -1,3 +1,11 @@
+fixer (0.76.0-1) unstable; urgency=medium
+
+  * Install release binaries from the active Cargo target directory during
+    Debian package builds, avoiding stale executables when builds use the
+    shared dist target directory.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 29 Apr 2026 22:15:00 +0400
+
 fixer (0.75.0-1) unstable; urgency=medium
 
   * Open the public server socket before startup schema maintenance and run

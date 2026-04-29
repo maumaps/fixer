@@ -2,6 +2,8 @@
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 export CARGO_HOME = $(CURDIR)/.cargo-home
+CARGO_TARGET_DIR ?= target
+CARGO_BIN_DIR = $(CARGO_TARGET_DIR)/release
 
 %:
 	dh $@
@@ -15,10 +17,10 @@ override_dh_auto_test:
 	cargo test --locked -p fixer
 
 override_dh_auto_install:
-	install -D -m 0755 target/release/fixer $(CURDIR)/debian/fixer/usr/bin/fixer
-	install -D -m 0755 target/release/fixerd $(CURDIR)/debian/fixer/usr/bin/fixerd
+	install -D -m 0755 $(CARGO_BIN_DIR)/fixer $(CURDIR)/debian/fixer/usr/bin/fixer
+	install -D -m 0755 $(CARGO_BIN_DIR)/fixerd $(CURDIR)/debian/fixer/usr/bin/fixerd
 	install -D -m 0644 debian/fixer.toml $(CURDIR)/debian/fixer/etc/fixer/fixer.toml
-	install -D -m 0755 target/release/fixer-server $(CURDIR)/debian/fixer-server/usr/bin/fixer-server
+	install -D -m 0755 $(CARGO_BIN_DIR)/fixer-server $(CURDIR)/debian/fixer-server/usr/bin/fixer-server
 	install -D -m 0644 debian/fixer-server.toml $(CURDIR)/debian/fixer-server/etc/fixer/fixer-server.toml
 
 override_dh_installsystemd:
