@@ -2474,23 +2474,26 @@ fn recluster_issue_state(
             serde_json::from_value(row.representative_json.clone())?;
         let cluster_key = cluster_key_for(&representative);
         let public_fields = build_public_issue_fields(&representative);
+        let source_package = inferred_public_source_package(&representative);
         if cluster_key != row.cluster_key
             || public_fields.title != row.public_title
             || public_fields.summary != row.public_summary
             || public_fields.visible != row.public_visible
+            || (row.source_package.is_none() && source_package.is_some())
         {
             needs_recluster = true;
         }
         match grouped_clusters.entry(cluster_key.clone()) {
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 needs_recluster = true;
-                entry.get_mut().absorb(row, &public_fields);
+                entry.get_mut().absorb(row, &public_fields, source_package);
             }
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(CurrentClusterAccumulator::new(
                     row,
                     cluster_key,
                     &public_fields,
+                    source_package,
                 ));
             }
         }
@@ -3381,6 +3384,7 @@ impl CurrentClusterAccumulator {
         row: &CurrentIssueCluster,
         cluster_key: String,
         public_fields: &PublicIssueFields,
+        source_package: Option<String>,
     ) -> Self {
         Self {
             existing_ids: vec![row.id.clone()],
@@ -3397,7 +3401,7 @@ impl CurrentClusterAccumulator {
             public_summary: public_fields.summary.clone(),
             public_visible: public_fields.visible,
             package_name: row.package_name.clone(),
-            source_package: row.source_package.clone(),
+            source_package: source_package.or_else(|| row.source_package.clone()),
             ecosystem: row.ecosystem.clone(),
             severity: row.severity.clone(),
             score: row.score,
@@ -3417,7 +3421,12 @@ impl CurrentClusterAccumulator {
         }
     }
 
-    fn absorb(&mut self, row: &CurrentIssueCluster, public_fields: &PublicIssueFields) {
+    fn absorb(
+        &mut self,
+        row: &CurrentIssueCluster,
+        public_fields: &PublicIssueFields,
+        source_package: Option<String>,
+    ) {
         self.existing_ids.push(row.id.clone());
         self.public_visible |= public_fields.visible;
         let replace_representative =
@@ -3445,7 +3454,7 @@ impl CurrentClusterAccumulator {
             self.package_name = row.package_name.clone();
         }
         if self.source_package.is_none() {
-            self.source_package = row.source_package.clone();
+            self.source_package = source_package.or_else(|| row.source_package.clone());
         }
         if self.ecosystem.is_none() {
             self.ecosystem = row.ecosystem.clone();
@@ -5711,23 +5720,7 @@ async fn upsert_issue_cluster(
     let representative_json = serde_json::to_value(item)?;
     let public_fields = build_public_issue_fields(item);
     let package_name = item.finding.package_name.clone();
-    let source_package = canonical_public_source_package(
-        package_name.as_deref(),
-        item.opportunity
-            .evidence
-            .get("source_package")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-            .or_else(|| {
-                item.opportunity
-                    .evidence
-                    .get("details")
-                    .and_then(|details| details.get("package_metadata"))
-                    .and_then(|metadata| metadata.get("source_package"))
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            }),
-    );
+    let source_package = inferred_public_source_package(item);
     match db {
         ServerDb::Postgres(db) => {
             let existing_id = db
@@ -8040,6 +8033,35 @@ fn canonical_public_source_package(
     None
 }
 
+fn inferred_public_source_package(item: &SharedOpportunity) -> Option<String> {
+    canonical_public_source_package(
+        item.finding.package_name.as_deref(),
+        item.opportunity
+            .evidence
+            .get("source_package")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                item.opportunity
+                    .evidence
+                    .get("details")
+                    .and_then(|details| details.get("package_metadata"))
+                    .and_then(|metadata| metadata.get("source_package"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            }),
+    )
+    .or_else(|| {
+        item.finding
+            .details
+            .get("profile_target")
+            .and_then(|target| target.get("name"))
+            .and_then(Value::as_str)
+            .filter(|target| is_kernelish_target_name(target))
+            .map(|_| "linux".to_string())
+    })
+}
+
 fn is_kernelish_target_name(value: &str) -> bool {
     let normalized = value.trim().to_ascii_lowercase();
     normalized.starts_with("kworker")
@@ -9594,6 +9616,7 @@ fn canonical_triage_summary(summary: &str) -> String {
 }
 
 fn canonicalize_patch_attempt(mut attempt: PatchAttempt) -> PatchAttempt {
+    attempt.summary = canonical_attempt_summary_text(&attempt.summary);
     if attempt.state != "ready" {
         return attempt;
     }
@@ -9615,6 +9638,17 @@ fn canonicalize_patch_attempt(mut attempt: PatchAttempt) -> PatchAttempt {
         attempt.outcome = "report".to_string();
     }
     attempt
+}
+
+fn canonical_attempt_summary_text(summary: &str) -> String {
+    summary
+        .replace("unknown userspace loop loop", "unclassified userspace loop")
+        .replace(
+            "unknown uninterruptible wait wait",
+            "unclassified uninterruptible wait",
+        )
+        .replace("a unclassified", "an unclassified")
+        .replace("a unknown", "an unknown")
 }
 
 fn text_describes_local_codex_auth_issue(text: &str) -> bool {
@@ -15090,6 +15124,23 @@ mod tests {
         );
         assert!(public.summary.contains("kworker+i915_flip"));
         assert!(!public.summary.contains("152s"));
+        assert_eq!(inferred_public_source_package(&a).as_deref(), Some("linux"));
+    }
+
+    #[test]
+    fn canonical_patch_attempt_summary_removes_legacy_duplicate_loop_words() {
+        assert_eq!(
+            canonical_attempt_summary_text(
+                "htop likely remains stuck in a unknown userspace loop loop."
+            ),
+            "htop likely remains stuck in an unclassified userspace loop."
+        );
+        assert_eq!(
+            canonical_attempt_summary_text(
+                "jbd2/sda3-8 likely remains stuck in a unknown uninterruptible wait wait."
+            ),
+            "jbd2/sda3-8 likely remains stuck in an unclassified uninterruptible wait."
+        );
     }
 
     #[test]

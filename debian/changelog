@@ -1,3 +1,12 @@
+fixer (0.78.0-1) unstable; urgency=medium
+
+  * Backfill legacy public worker summaries so old attempts no longer show
+    duplicate "loop loop" or "wait wait" wording.
+  * Infer the linux source package for public kernel-thread D-state reports
+    whose original submissions lacked package metadata.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 29 Apr 2026 23:45:00 +0400
+
 fixer (0.77.0-1) unstable; urgency=medium
 
   * Bound DKMS status collection so a stuck dkms helper cannot hang
