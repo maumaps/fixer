@@ -1036,12 +1036,12 @@ async fn db_ping(db: &ServerDb) -> Result<()> {
 
 pub async fn serve(config: FixerConfig) -> Result<()> {
     let db = open_server_db(&config).await?;
-    init_db(&db, &config).await?;
     let state = Arc::new(ServerState {
         config: config.clone(),
         db,
     });
     let maintenance_db = state.db.clone();
+    let maintenance_config = config.clone();
     let maintenance_threshold = config.server.quarantine_corroboration_threshold;
 
     let app = Router::new()
@@ -1076,7 +1076,12 @@ pub async fn serve(config: FixerConfig) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", config.server.listen))?;
     tokio::spawn(async move {
-        if let Err(error) = run_startup_maintenance(&maintenance_db, maintenance_threshold).await {
+        let result = async {
+            init_db(&maintenance_db, &maintenance_config).await?;
+            run_startup_maintenance(&maintenance_db, maintenance_threshold).await
+        }
+        .await;
+        if let Err(error) = result {
             tracing::error!(?error, "fixer-server startup maintenance failed");
         }
     });
@@ -2138,8 +2143,12 @@ async fn recluster_current_issue_state(
     quarantine_corroboration_threshold: i64,
 ) -> Result<()> {
     let state = load_current_issue_state(db).await?;
-    let Some(reclustered) = recluster_issue_state(state, quarantine_corroboration_threshold)?
-    else {
+    let reclustered = tokio::task::spawn_blocking(move || {
+        recluster_issue_state(state, quarantine_corroboration_threshold)
+    })
+    .await
+    .context("recluster worker panicked")??;
+    let Some(reclustered) = reclustered else {
         return Ok(());
     };
     write_reclustered_issue_state(db, &reclustered).await

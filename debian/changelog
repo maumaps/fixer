@@ -1,3 +1,11 @@
+fixer (0.75.0-1) unstable; urgency=medium
+
+  * Open the public server socket before startup schema maintenance and run
+    CPU-heavy reclustering on Tokio's blocking pool, keeping deploy health
+    checks responsive on large production databases.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 29 Apr 2026 23:45:00 +0400
+
 fixer (0.74.0-1) unstable; urgency=medium
 
   * Bind the public server before startup maintenance reclusters existing
