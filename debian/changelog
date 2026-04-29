@@ -1,3 +1,10 @@
+fixer (0.74.0-1) unstable; urgency=medium
+
+  * Bind the public server before startup maintenance reclusters existing
+    issues, so large production databases do not return 502 during deploys.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 29 Apr 2026 23:20:00 +0400
+
 fixer (0.73.0-1) unstable; urgency=medium
 
   * Clean up worker summaries for unclassified loops and waits so public

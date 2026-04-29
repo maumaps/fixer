@@ -1041,6 +1041,8 @@ pub async fn serve(config: FixerConfig) -> Result<()> {
         config: config.clone(),
         db,
     });
+    let maintenance_db = state.db.clone();
+    let maintenance_threshold = config.server.quarantine_corroboration_threshold;
 
     let app = Router::new()
         .route("/", get(landing_page))
@@ -1073,6 +1075,11 @@ pub async fn serve(config: FixerConfig) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.server.listen)
         .await
         .with_context(|| format!("failed to bind {}", config.server.listen))?;
+    tokio::spawn(async move {
+        if let Err(error) = run_startup_maintenance(&maintenance_db, maintenance_threshold).await {
+            tracing::error!(?error, "fixer-server startup maintenance failed");
+        }
+    });
     tracing::info!("fixer-server listening on {}", config.server.listen);
     axum::serve(
         listener,
@@ -1654,9 +1661,15 @@ async fn init_db(db: &ServerDb, config: &FixerConfig) -> Result<()> {
     if needs_schema_migration(db).await? {
         migrate_legacy_schema(db, config).await?;
     }
-    ensure_current_schema(db).await?;
+    ensure_current_schema(db).await
+}
+
+async fn run_startup_maintenance(
+    db: &ServerDb,
+    quarantine_corroboration_threshold: i64,
+) -> Result<()> {
     backfill_result_classification(db).await?;
-    recluster_current_issue_state(db, config.server.quarantine_corroboration_threshold).await
+    recluster_current_issue_state(db, quarantine_corroboration_threshold).await
 }
 
 async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
