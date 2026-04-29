@@ -9655,6 +9655,17 @@ fn canonicalize_patch_attempt(mut attempt: PatchAttempt) -> PatchAttempt {
 }
 
 fn canonical_attempt_summary_text(summary: &str) -> String {
+    let kworker_re =
+        Regex::new(r"\bkworker/[^\s:]+:\d+(?:-[A-Za-z0-9_.:-]+)?(\+[A-Za-z0-9_.:-]+)?")
+            .expect("valid kworker regex");
+    let summary = kworker_re
+        .replace_all(summary, |captures: &regex::Captures<'_>| {
+            captures
+                .get(1)
+                .map(|suffix| format!("kworker{}", suffix.as_str()))
+                .unwrap_or_else(|| "kworker".to_string())
+        })
+        .to_string();
     summary
         .replace("unknown userspace loop loop", "unclassified userspace loop")
         .replace(
@@ -15486,6 +15497,18 @@ mod tests {
                 "jbd2/sda3-8 likely remains stuck in a unknown uninterruptible wait wait."
             ),
             "jbd2/sda3-8 likely remains stuck in an unclassified uninterruptible wait."
+        );
+        assert_eq!(
+            canonical_attempt_summary_text(
+                "kworker/u33:3+i915_flip likely remains stuck in an unclassified uninterruptible wait."
+            ),
+            "kworker+i915_flip likely remains stuck in an unclassified uninterruptible wait."
+        );
+        assert_eq!(
+            canonical_attempt_summary_text(
+                "kworker/0:1-events likely remains stuck in an unclassified uninterruptible wait."
+            ),
+            "kworker likely remains stuck in an unclassified uninterruptible wait."
         );
     }
 

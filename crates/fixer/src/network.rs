@@ -2169,7 +2169,8 @@ fn process_investigation_worker_summary(opportunity: &crate::models::Opportunity
         .get("profile_target")
         .and_then(|value| value.get("name"))
         .and_then(Value::as_str)
-        .unwrap_or("the process");
+        .map(normalize_worker_summary_target)
+        .unwrap_or_else(|| "the process".to_string());
     let classification = details
         .get("loop_classification")
         .and_then(Value::as_str)
@@ -2207,6 +2208,17 @@ fn process_investigation_worker_summary(opportunity: &crate::models::Opportunity
             format!("{target} likely remains stuck in {phrase}.")
         }
     }
+}
+
+fn normalize_worker_summary_target(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches(" (deleted)").trim();
+    if !trimmed.starts_with("kworker/") {
+        return trimmed.to_string();
+    }
+    trimmed
+        .split_once('+')
+        .map(|(_, suffix)| format!("kworker+{suffix}"))
+        .unwrap_or_else(|| "kworker".to_string())
 }
 
 fn investigation_classification_phrase(classification: &str, fallback_kind: &str) -> String {
@@ -3006,14 +3018,27 @@ mod tests {
         opportunity.evidence = json!({
             "details": {
                 "subsystem": "stuck-process",
-                "profile_target": { "name": "jbd2/sda3-8" },
+                "profile_target": { "name": "kworker/u33:3+i915_flip" },
                 "loop_classification": "unknown-uninterruptible-wait"
             }
         });
 
         assert_eq!(
             process_investigation_worker_summary(&opportunity),
-            "jbd2/sda3-8 likely remains stuck in an unclassified uninterruptible wait."
+            "kworker+i915_flip likely remains stuck in an unclassified uninterruptible wait."
+        );
+
+        opportunity.evidence = json!({
+            "details": {
+                "subsystem": "stuck-process",
+                "profile_target": { "name": "codex (deleted)" },
+                "loop_classification": "unknown-uninterruptible-wait"
+            }
+        });
+
+        assert_eq!(
+            process_investigation_worker_summary(&opportunity),
+            "codex likely remains stuck in an unclassified uninterruptible wait."
         );
 
         opportunity.evidence = json!({
