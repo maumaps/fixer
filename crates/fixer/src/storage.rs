@@ -680,11 +680,24 @@ impl Store {
 
         for opportunity_id in opportunity_ids {
             self.conn.execute(
+                "
+                DELETE FROM proposal_publications
+                WHERE proposal_id IN (
+                    SELECT id FROM proposals WHERE opportunity_id = ?1
+                )
+                ",
+                [opportunity_id],
+            )?;
+            self.conn.execute(
                 "DELETE FROM proposals WHERE opportunity_id = ?1",
                 [opportunity_id],
             )?;
             self.conn.execute(
                 "DELETE FROM validation_runs WHERE opportunity_id = ?1",
+                [opportunity_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM synced_issue_links WHERE local_opportunity_id = ?1",
                 [opportunity_id],
             )?;
         }
@@ -1556,6 +1569,69 @@ mod tests {
         let status = store.status().unwrap();
         assert_eq!(status.findings, 1);
         assert_eq!(status.opportunities, 1);
+    }
+
+    #[test]
+    fn delete_finding_cascade_removes_synced_links_and_publications() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        let finding_id = store
+            .record_finding(&FindingInput {
+                kind: "hotspot".to_string(),
+                title: "Example hotspot".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "hotspot-1".to_string(),
+                summary: "hotspot summary".to_string(),
+                details: json!({"subsystem": "perf-hotspot"}),
+                artifact: None,
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let opportunity = store.get_opportunity_by_finding(finding_id).unwrap();
+        let now = "2026-04-30T00:00:00Z";
+        store
+            .conn
+            .execute(
+                "
+                INSERT INTO proposals
+                    (opportunity_id, engine, state, bundle_path, output_path, created_at, updated_at)
+                VALUES (?1, 'codex', 'ready', '/tmp/bundle', NULL, ?2, ?2)
+                ",
+                rusqlite::params![opportunity.id, now],
+            )
+            .unwrap();
+        let proposal_id = store.conn.last_insert_rowid();
+        store
+            .conn
+            .execute(
+                "
+                INSERT INTO proposal_publications
+                    (proposal_id, remote_issue_id, published_session_hash, published_at, updated_at)
+                VALUES (?1, 'remote-issue', 'hash', ?2, ?2)
+                ",
+                rusqlite::params![proposal_id, now],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "
+                INSERT INTO synced_issue_links
+                    (local_opportunity_id, remote_issue_id, updated_at)
+                VALUES (?1, 'remote-issue', ?2)
+                ",
+                rusqlite::params![opportunity.id, now],
+            )
+            .unwrap();
+
+        store.delete_finding_cascade(finding_id).unwrap();
+
+        assert_eq!(store.count("proposal_publications").unwrap(), 0);
+        assert_eq!(store.count("proposals").unwrap(), 0);
+        assert_eq!(store.count("synced_issue_links").unwrap(), 0);
+        assert_eq!(store.count("opportunities").unwrap(), 0);
+        assert_eq!(store.count("findings").unwrap(), 0);
     }
 
     #[test]

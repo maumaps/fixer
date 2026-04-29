@@ -1,3 +1,11 @@
+fixer (0.90.0-1) unstable; urgency=medium
+
+  * Delete synced issue links and proposal publication rows before pruning
+    local findings, avoiding SQLite foreign-key failures on long-lived client
+    databases with already-published opportunities.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 04:05:00 +0400
+
 fixer (0.89.0-1) unstable; urgency=medium
 
   * Promote explained external workspace-impossible attempts into public
