@@ -6328,6 +6328,18 @@ fn normalize_attempt_text(text: &str) -> String {
 
 fn attempt_blocker_reason_from_summary(summary: &str) -> Option<String> {
     let summary = normalize_attempt_text(summary);
+    if text_describes_local_codex_auth_issue(&summary) {
+        return Some("codex-auth-unavailable".to_string());
+    }
+    if text_describes_internal_storage_issue(&summary) {
+        return Some("internal-storage".to_string());
+    }
+    if summary.contains("no patchable workspace was available")
+        || summary.contains("could not acquire a workspace")
+        || summary.contains("enable deb-src")
+    {
+        return Some("workspace-acquisition".to_string());
+    }
     if let Some(rest) = summary.strip_prefix("Worker could not make a safe patch: ") {
         return Some(rest.to_string());
     }
@@ -15150,6 +15162,50 @@ mod tests {
             .unwrap();
 
         assert_eq!(issue.id, "issue-alt");
+    }
+
+    #[test]
+    fn legacy_attempt_summaries_get_blocker_cooldowns() {
+        let auth_attempt = PatchAttempt {
+            cluster_id: "issue-auth".to_string(),
+            install_id: "reviewer-install".to_string(),
+            outcome: "report".to_string(),
+            state: "ready".to_string(),
+            summary: "postgres likely remains stuck in a file not found retry loop. A diagnosis report was created, but the patch attempt failed to run cleanly: the current Codex auth lease has expired".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({}),
+            created_at: Utc::now().to_rfc3339(),
+        };
+        assert_eq!(
+            attempt_blocker_reason(&auth_attempt).as_deref(),
+            Some("codex-auth-unavailable")
+        );
+        assert_eq!(attempt_blocker_cooldown_seconds(&auth_attempt), Some(3600));
+
+        let workspace_attempt = PatchAttempt {
+            summary: "kworker+i915_flip likely remains stuck in an unclassified uninterruptible wait. A diagnosis report was created even though no patchable workspace was available.".to_string(),
+            ..auth_attempt.clone()
+        };
+        assert_eq!(
+            attempt_blocker_reason(&workspace_attempt).as_deref(),
+            Some("workspace-acquisition")
+        );
+        assert_eq!(
+            attempt_blocker_cooldown_seconds(&workspace_attempt),
+            Some(1800)
+        );
+
+        let internal_attempt = PatchAttempt {
+            summary: "Worker could not make a safe patch: FOREIGN KEY constraint failed"
+                .to_string(),
+            ..auth_attempt
+        };
+        assert_eq!(
+            attempt_blocker_reason(&internal_attempt).as_deref(),
+            Some("internal-storage")
+        );
     }
 
     #[test]

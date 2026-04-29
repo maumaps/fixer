@@ -1,3 +1,10 @@
+fixer (0.87.0-1) unstable; urgency=medium
+
+  * Classify legacy auth, workspace, and internal-storage attempt summaries so
+    worker cooldowns still apply when older result details are sparse.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 03:20:00 +0400
+
 fixer (0.86.0-1) unstable; urgency=medium
 
   * Canonicalize kworker slot noise and deleted executable markers in worker
