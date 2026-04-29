@@ -1,3 +1,11 @@
+fixer (0.84.0-1) unstable; urgency=medium
+
+  * Canonicalize runaway-process perf sample symbols and include the loop
+    class plus hot path in public titles so repeated CPU investigations are
+    readable and raw offset samples recluster by owning DSO.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 02:20:00 +0400
+
 fixer (0.83.0-1) unstable; urgency=medium
 
   * Normalize kernel stack-frame offsets and include stuck-process wait points

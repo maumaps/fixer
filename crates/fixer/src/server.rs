@@ -10057,7 +10057,7 @@ fn normalized_investigation_cluster_key(item: &SharedOpportunity) -> String {
                 .and_then(Value::as_array)
                 .and_then(|symbols| symbols.first())
                 .and_then(Value::as_str)
-                .map(normalize_stack_frame)
+                .map(normalized_perf_sample_symbol)
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "-".to_string());
             let dominant_sequence = item
@@ -10251,6 +10251,50 @@ fn investigation_public_issue_fields(item: &SharedOpportunity) -> Option<PublicI
                     "{} shows a repeated `D`-state wait, likely blocked in {} via {}.",
                     target, classification, wait_point
                 ),
+                visible: is_publicly_visible(item),
+            })
+        }
+        "runaway-process" => {
+            let target = normalized_investigation_target_name(item);
+            let classification = item
+                .finding
+                .details
+                .get("loop_classification")
+                .and_then(Value::as_str)
+                .unwrap_or("unclassified-userspace-loop")
+                .replace('-', " ");
+            let signal = item
+                .finding
+                .details
+                .get("top_hot_symbols")
+                .and_then(Value::as_array)
+                .and_then(|symbols| symbols.first())
+                .and_then(Value::as_str)
+                .map(normalized_perf_sample_symbol)
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    item.finding
+                        .details
+                        .get("dominant_sequence")
+                        .and_then(Value::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .take(3)
+                                .map(normalize_stack_frame)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .filter(|value| !value.is_empty())
+                })
+                .unwrap_or_else(|| "unknown hot path".to_string());
+            Some(PublicIssueFields {
+                title: format!(
+                    "Runaway CPU investigation for {target}: {classification} at {}",
+                    truncate_patch_subject(&signal, 72)
+                ),
+                summary: sanitize_public_text(&item.opportunity.summary),
                 visible: is_publicly_visible(item),
             })
         }
@@ -10458,6 +10502,27 @@ fn normalized_perf_hotspot_symbol(raw: &str) -> String {
         return "unresolved-offset".to_string();
     }
     normalize_stack_frame(&normalized)
+}
+
+fn normalized_perf_sample_symbol(raw: &str) -> String {
+    let sample_suffix_re =
+        Regex::new(r"\s+\([^)]+?\bin ([^)]+)\)$").expect("valid perf sample suffix regex");
+    let (core, dso) = sample_suffix_re
+        .captures(raw.trim())
+        .and_then(|captures| {
+            let dso = captures.get(1)?.as_str().trim().to_string();
+            let whole = captures.get(0)?.as_str();
+            Some((raw.trim().trim_end_matches(whole).trim(), Some(dso)))
+        })
+        .unwrap_or_else(|| (raw.trim(), None));
+    let normalized = normalized_perf_hotspot_symbol(core);
+    if normalized == "unresolved-offset" {
+        if let Some(dso) = dso {
+            return format!("unresolved offset in {dso}");
+        }
+        return "unresolved offset".to_string();
+    }
+    normalized.replace('-', " ")
 }
 
 fn normalize_stack_frame(frame: &str) -> String {
@@ -12821,6 +12886,8 @@ mod tests {
                         "package_name": package_name,
                     },
                     "loop_classification": "dbus-spin",
+                    "top_hot_symbols": ["__poll (4.20% in libc.so.6)"],
+                    "dominant_sequence": ["recvfrom", "sendto", "epoll_wait"],
                     "repeated_syscalls": ["recvfrom", "sendto", "epoll_wait"],
                 }),
                 artifact_name: Some(target.to_string()),
@@ -15357,6 +15424,26 @@ mod tests {
         assert_eq!(
             normalize_stack_frame("[<0>] drm_atomic_helper_wait_for_flip_done+0x4d/0x90"),
             "drm_atomic_helper_wait_for_flip_done"
+        );
+    }
+
+    #[test]
+    fn runaway_cluster_key_collapses_raw_perf_sample_offsets() {
+        let mut a = sample_runaway_investigation("redis-check-rdb", Some("redis-tools"));
+        a.finding.details["loop_classification"] = json!("busy-poll");
+        a.finding.details["top_hot_symbols"] = json!(["0x000000000009a2b2 (6.21% in libc.so.6)"]);
+        let mut b = a.clone();
+        b.finding.details["top_hot_symbols"] =
+            json!(["(deleted) [.] 0x000000000017a818 (10.26% in libc.so.6)"]);
+        let mut c = a.clone();
+        c.finding.details["top_hot_symbols"] =
+            json!(["0x0000000000045e2a (4.20% in libjemalloc.so.2)"]);
+
+        assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
+        assert_ne!(cluster_key_for(&a), cluster_key_for(&c));
+        assert_eq!(
+            build_public_issue_fields(&a).title,
+            "Runaway CPU investigation for redis-check-rdb: busy poll at unresolved offset in libc.so.6"
         );
     }
 
