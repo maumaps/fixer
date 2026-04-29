@@ -10374,7 +10374,7 @@ fn sanitize_public_text(raw: &str) -> String {
     text = home_re.replace_all(&text, "/home/<user>").to_string();
     let pid_re = Regex::new(r"\bpid \d+\b").expect("valid pid regex");
     text = pid_re.replace_all(&text, "pid <pid>").to_string();
-    text
+    canonical_attempt_summary_text(&text)
 }
 
 fn strip_syslog_prefix(raw: &str) -> String {
@@ -15352,6 +15352,16 @@ mod tests {
                 "jbd2/sda3-8 likely remains stuck in a unknown uninterruptible wait wait."
             ),
             "jbd2/sda3-8 likely remains stuck in an unclassified uninterruptible wait."
+        );
+    }
+
+    #[test]
+    fn public_text_uses_canonical_loop_wording() {
+        assert_eq!(
+            sanitize_public_text(
+                "htop is stuck in a likely unknown userspace loop loop: repeated recvfrom x120."
+            ),
+            "htop is stuck in a likely unclassified userspace loop: repeated recvfrom x120."
         );
     }
 
