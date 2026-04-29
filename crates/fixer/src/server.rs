@@ -2479,7 +2479,7 @@ fn recluster_issue_state(
             || public_fields.title != row.public_title
             || public_fields.summary != row.public_summary
             || public_fields.visible != row.public_visible
-            || (row.source_package.is_none() && source_package.is_some())
+            || (optional_string_is_empty(&row.source_package) && source_package.is_some())
         {
             needs_recluster = true;
         }
@@ -3191,6 +3191,18 @@ struct CurrentIssueState {
     evidence_requests: Vec<CurrentEvidenceRequest>,
 }
 
+fn optional_string_is_empty(value: &Option<String>) -> bool {
+    value.as_deref().is_none_or(|value| value.trim().is_empty())
+}
+
+fn nonempty_optional_string(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 #[derive(Debug, Clone)]
 struct CurrentIssueCluster {
     id: String,
@@ -3401,7 +3413,8 @@ impl CurrentClusterAccumulator {
             public_summary: public_fields.summary.clone(),
             public_visible: public_fields.visible,
             package_name: row.package_name.clone(),
-            source_package: source_package.or_else(|| row.source_package.clone()),
+            source_package: source_package
+                .or_else(|| nonempty_optional_string(&row.source_package)),
             ecosystem: row.ecosystem.clone(),
             severity: row.severity.clone(),
             score: row.score,
@@ -3453,8 +3466,9 @@ impl CurrentClusterAccumulator {
         if self.package_name.is_none() {
             self.package_name = row.package_name.clone();
         }
-        if self.source_package.is_none() {
-            self.source_package = source_package.or_else(|| row.source_package.clone());
+        if optional_string_is_empty(&self.source_package) {
+            self.source_package =
+                source_package.or_else(|| nonempty_optional_string(&row.source_package));
         }
         if self.ecosystem.is_none() {
             self.ecosystem = row.ecosystem.clone();
@@ -15250,7 +15264,7 @@ mod tests {
                     public_summary: sanitize_public_text(&a.opportunity.summary),
                     public_visible: true,
                     package_name: None,
-                    source_package: None,
+                    source_package: Some("".to_string()),
                     ecosystem: None,
                     severity: Some("high".to_string()),
                     score: a.opportunity.score,
@@ -15314,6 +15328,10 @@ mod tests {
         assert_eq!(
             reclustered.issue_clusters[0].public_title,
             "Stuck D-state investigation for kworker+i915_flip"
+        );
+        assert_eq!(
+            reclustered.issue_clusters[0].source_package.as_deref(),
+            Some("linux")
         );
     }
 

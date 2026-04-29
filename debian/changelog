@@ -1,3 +1,10 @@
+fixer (0.79.0-1) unstable; urgency=medium
+
+  * Treat empty public source-package strings as missing during recluster
+    backfill, so legacy kernel-thread reports can be repaired to linux.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 29 Apr 2026 23:59:00 +0400
+
 fixer (0.78.0-1) unstable; urgency=medium
 
   * Backfill legacy public worker summaries so old attempts no longer show
