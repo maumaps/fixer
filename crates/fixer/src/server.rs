@@ -10413,6 +10413,7 @@ fn sanitize_public_text(raw: &str) -> String {
     if text.is_empty() {
         text = raw.trim().to_string();
     }
+    text = sanitize_deleted_executable_markers(&text);
     text = sanitize_bracketed_paths(&text);
     text = normalize_proc_path(&text);
     let home_re = Regex::new(r"/home/[^/\s]+").expect("valid home path regex");
@@ -10448,6 +10449,12 @@ fn normalize_deleted_file_marker(raw: &str) -> String {
         .trim_end_matches(" (deleted)")
         .trim()
         .to_string()
+}
+
+fn sanitize_deleted_executable_markers(raw: &str) -> String {
+    let deleted_exec_re =
+        Regex::new(r"\b([A-Za-z0-9._+:-]+)\s+\(deleted\)").expect("valid deleted marker regex");
+    deleted_exec_re.replace_all(raw, "$1").to_string()
 }
 
 fn normalized_hotspot_target_name(item: &SharedOpportunity) -> String {
@@ -10495,9 +10502,12 @@ fn normalized_perf_hotspot_symbol(raw: &str) -> String {
         Regex::new(r"^tid\s+\d+\s+\[.\]\s+0x[0-9a-fA-F]+$").expect("valid perf JIT address regex");
     let deleted_address_re =
         Regex::new(r"\(deleted\)\s+\[.\]\s+0x[0-9a-fA-F]+$").expect("valid deleted address regex");
+    let named_address_re =
+        Regex::new(r"^.+\s+\[.\]\s+0x[0-9a-fA-F]+$").expect("valid perf named address regex");
     if bare_address_re.is_match(&normalized)
         || thread_address_re.is_match(&normalized)
         || deleted_address_re.is_match(&normalized)
+        || named_address_re.is_match(&normalized)
     {
         return "unresolved-offset".to_string();
     }
@@ -10544,6 +10554,7 @@ fn normalized_investigation_target_name(item: &SharedOpportunity) -> String {
         .and_then(|value| value.get("path"))
         .and_then(Value::as_str)
         .map(file_name_or_self)
+        .map(normalize_deleted_file_marker)
         .filter(|value| !value.trim().is_empty());
     let named_target = item
         .finding
@@ -10553,9 +10564,10 @@ fn normalized_investigation_target_name(item: &SharedOpportunity) -> String {
         .and_then(Value::as_str)
         .or_else(|| item.finding.artifact_name.as_deref())
         .filter(|value| !value.trim().is_empty())
-        .map(normalize_kernel_worker_target_name);
+        .map(normalize_deleted_file_marker)
+        .map(|value| normalize_kernel_worker_target_name(&value));
     path_target
-        .map(ToString::to_string)
+        .filter(|value| !value.is_empty())
         .or(named_target)
         .or_else(|| item.finding.package_name.clone())
         .unwrap_or_else(|| sanitize_public_text(&item.opportunity.title))
@@ -10569,6 +10581,7 @@ fn normalized_investigation_target_name_from_value(item: &Value) -> Option<Strin
         .and_then(|target| target.get("path"))
         .and_then(Value::as_str)
         .map(file_name_or_self)
+        .map(normalize_deleted_file_marker)
         .filter(|value| !value.trim().is_empty());
     let named_target = details
         .and_then(|details| details.get("profile_target"))
@@ -10576,9 +10589,10 @@ fn normalized_investigation_target_name_from_value(item: &Value) -> Option<Strin
         .and_then(Value::as_str)
         .or_else(|| finding.get("artifact_name").and_then(Value::as_str))
         .filter(|value| !value.trim().is_empty())
-        .map(normalize_kernel_worker_target_name);
+        .map(normalize_deleted_file_marker)
+        .map(|value| normalize_kernel_worker_target_name(&value));
     path_target
-        .map(ToString::to_string)
+        .filter(|value| !value.is_empty())
         .or(named_target)
         .or_else(|| {
             finding
@@ -15445,6 +15459,18 @@ mod tests {
             build_public_issue_fields(&a).title,
             "Runaway CPU investigation for redis-check-rdb: busy poll at unresolved offset in libc.so.6"
         );
+
+        let mut deleted_target =
+            sample_runaway_investigation("codex (deleted)", Option::<&str>::None);
+        deleted_target.finding.details["loop_classification"] = json!("unknown-userspace-loop");
+        deleted_target.finding.details["top_hot_symbols"] =
+            json!(["codex [.] 0x0000000007d32287 (6.39% in codex)"]);
+        let public = build_public_issue_fields(&deleted_target);
+        assert_eq!(
+            public.title,
+            "Runaway CPU investigation for codex: unknown userspace loop at unresolved offset in codex"
+        );
+        assert!(!public.summary.contains("(deleted)"));
     }
 
     #[test]

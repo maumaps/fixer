@@ -1,3 +1,10 @@
+fixer (0.85.0-1) unstable; urgency=medium
+
+  * Strip deleted-executable markers from public investigation targets and
+    collapse named perf marker addresses into unresolved offsets.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 02:45:00 +0400
+
 fixer (0.84.0-1) unstable; urgency=medium
 
   * Canonicalize runaway-process perf sample symbols and include the loop
