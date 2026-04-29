@@ -5939,7 +5939,14 @@ fn normalize_perf_symbol(symbol: &str) -> String {
         normalized = stripped.trim_start().to_string();
     }
     let bare_address_re = Regex::new(r"^0x[0-9a-fA-F]+$").expect("valid perf address regex");
-    if bare_address_re.is_match(&normalized) {
+    let thread_address_re =
+        Regex::new(r"^tid\s+\d+\s+\[.\]\s+0x[0-9a-fA-F]+$").expect("valid perf JIT address regex");
+    let deleted_address_re =
+        Regex::new(r"\(deleted\)\s+\[.\]\s+0x[0-9a-fA-F]+$").expect("valid deleted address regex");
+    if bare_address_re.is_match(&normalized)
+        || thread_address_re.is_match(&normalized)
+        || deleted_address_re.is_match(&normalized)
+    {
         return "unresolved offset".to_string();
     }
     normalized
@@ -7201,6 +7208,14 @@ Stack trace of thread 222:\n\
         );
         assert_eq!(
             normalize_perf_symbol("(deleted) [.] 0x00000000003c23ce"),
+            "unresolved offset"
+        );
+        assert_eq!(
+            normalize_perf_symbol("tid 1310 [.] 0x000071d33b3f2f00"),
+            "unresolved offset"
+        );
+        assert_eq!(
+            normalize_perf_symbol("codex (deleted) [.] 0x00000000014a11a1"),
             "unresolved offset"
         );
     }

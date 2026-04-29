@@ -10446,7 +10446,14 @@ fn normalized_perf_hotspot_symbol(raw: &str) -> String {
         normalized = stripped.trim_start().to_string();
     }
     let bare_address_re = Regex::new(r"^0x[0-9a-fA-F]+$").expect("valid perf address regex");
-    if bare_address_re.is_match(&normalized) {
+    let thread_address_re =
+        Regex::new(r"^tid\s+\d+\s+\[.\]\s+0x[0-9a-fA-F]+$").expect("valid perf JIT address regex");
+    let deleted_address_re =
+        Regex::new(r"\(deleted\)\s+\[.\]\s+0x[0-9a-fA-F]+$").expect("valid deleted address regex");
+    if bare_address_re.is_match(&normalized)
+        || thread_address_re.is_match(&normalized)
+        || deleted_address_re.is_match(&normalized)
+    {
         return "unresolved-offset".to_string();
     }
     normalize_stack_frame(&normalized)
@@ -15291,12 +15298,19 @@ mod tests {
             "(deleted) [.] 0x0000000000009150",
             "redis-tools",
         );
+        let d = sample_hotspot("node", "[JIT]", "tid 1310 [.] 0x000071d33b3f2f00", "nodejs");
+        let e = sample_hotspot("node", "[JIT]", "tid 1310 [.] 0x000071d33b3f30ab", "nodejs");
 
         assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
         assert_ne!(cluster_key_for(&a), cluster_key_for(&c));
+        assert_eq!(cluster_key_for(&d), cluster_key_for(&e));
         assert_eq!(
             build_public_issue_fields(&c).title,
             "CPU hotspot in redis-check-rdb: unresolved offset in libjemalloc.so.2"
+        );
+        assert_eq!(
+            build_public_issue_fields(&d).title,
+            "CPU hotspot in node: unresolved offset in [JIT]"
         );
     }
 
