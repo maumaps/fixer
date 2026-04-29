@@ -9658,8 +9658,94 @@ fn canonical_triage_summary(summary: &str) -> String {
         )
 }
 
+fn workspace_impossible_handoff_target(attempt: &PatchAttempt) -> Option<String> {
+    let from_details = attempt
+        .details
+        .get("handoff")
+        .and_then(|value| value.get("target"))
+        .and_then(Value::as_str)
+        .or_else(|| attempt.details.get("package_name").and_then(Value::as_str))
+        .or_else(|| {
+            attempt
+                .details
+                .get("source_package")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            attempt
+                .details
+                .get("workspace")
+                .and_then(|value| value.get("source_package"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            attempt
+                .details
+                .get("workspace")
+                .and_then(|value| value.get("package_name"))
+                .and_then(Value::as_str)
+        });
+    let target = from_details
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let re = Regex::new(r"\bcould not acquire a workspace for package ([^;,.]+)")
+                .expect("valid workspace target regex");
+            re.captures(&attempt.summary)
+                .and_then(|captures| captures.get(1))
+                .map(|value| sanitize_public_text(value.as_str()))
+                .filter(|value| !value.is_empty())
+        })?;
+    (!is_kernelish_package_name(&target)).then_some(target)
+}
+
+fn canonicalize_explained_workspace_impossible_attempt(attempt: &mut PatchAttempt) -> bool {
+    if attempt.outcome != "impossible" || attempt.state != "explained" {
+        return false;
+    }
+    if text_describes_local_codex_auth_issue(&attempt.summary)
+        || text_describes_internal_storage_issue(&attempt.summary)
+    {
+        return false;
+    }
+    if attempt_blocker_reason_from_summary(&attempt.summary).as_deref()
+        != Some("workspace-acquisition")
+    {
+        return false;
+    }
+    let Some(target) = workspace_impossible_handoff_target(attempt) else {
+        return false;
+    };
+    attempt.outcome = "triage".to_string();
+    attempt.state = "ready".to_string();
+    attempt
+        .validation_status
+        .get_or_insert_with(|| "ready".to_string());
+    attempt.summary = format!(
+        "A diagnosis and external handoff were created locally because Fixer could not acquire a patchable workspace for {target}."
+    );
+    if let Some(object) = attempt.details.as_object_mut() {
+        object
+            .entry("report_only_reason".to_string())
+            .or_insert_with(|| json!("workspace-acquisition"));
+        object
+            .entry("workspace_classification".to_string())
+            .or_insert_with(|| json!("external-package"));
+        object.entry("handoff".to_string()).or_insert_with(|| {
+            json!({
+                "target": target,
+                "reason": "workspace-acquisition",
+            })
+        });
+    }
+    true
+}
+
 fn canonicalize_patch_attempt(mut attempt: PatchAttempt) -> PatchAttempt {
     attempt.summary = canonical_attempt_summary_text(&attempt.summary);
+    if canonicalize_explained_workspace_impossible_attempt(&mut attempt) {
+        return attempt;
+    }
     if attempt.state != "ready" {
         return attempt;
     }
@@ -14761,6 +14847,77 @@ mod tests {
             Some("workspace-acquisition")
         );
         assert!(best_triage.summary.contains("external handoff"));
+    }
+
+    #[test]
+    fn explained_external_workspace_impossible_promotes_to_triage_handoff() {
+        let attempt = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "impossible".to_string(),
+            state: "explained".to_string(),
+            summary: "Worker could not make a safe patch: could not acquire a workspace for package google-chrome-stable; enable deb-src or provide a cloneable homepage".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: None,
+            details: json!({
+                "package_name": "google-chrome-stable",
+                "local_opportunity_id": 73
+            }),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+        };
+
+        let (best_patch, best_triage) =
+            best_attempts_from_candidates(vec![canonicalize_patch_attempt(attempt)]);
+
+        assert!(best_patch.is_none());
+        let best_triage = best_triage.expect("external workspace impossible should be a handoff");
+        assert_eq!(best_triage.outcome, "triage");
+        assert_eq!(best_triage.state, "ready");
+        assert_eq!(
+            best_triage
+                .details
+                .get("report_only_reason")
+                .and_then(Value::as_str),
+            Some("workspace-acquisition")
+        );
+        assert_eq!(
+            best_triage
+                .details
+                .get("handoff")
+                .and_then(|value| value.get("target"))
+                .and_then(Value::as_str),
+            Some("google-chrome-stable")
+        );
+        assert!(
+            best_triage
+                .summary
+                .contains("could not acquire a patchable workspace")
+        );
+    }
+
+    #[test]
+    fn internal_workspace_impossible_is_not_promoted_to_public_triage() {
+        let attempt = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "impossible".to_string(),
+            state: "explained".to_string(),
+            summary: "Worker could not make a safe patch: could not acquire a workspace for package htop; enable deb-src or provide a cloneable homepage; failed to create diagnostic report: Permission denied (os error 13)".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: None,
+            details: json!({
+                "package_name": "htop",
+                "local_opportunity_id": 74
+            }),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+        };
+        let canonical = canonicalize_patch_attempt(attempt);
+
+        assert_eq!(canonical.outcome, "impossible");
+        assert_eq!(canonical.state, "explained");
+        assert!(!publicly_visible_attempt(&canonical));
     }
 
     #[test]
