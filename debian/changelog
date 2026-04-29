@@ -1,3 +1,10 @@
+fixer (0.77.0-1) unstable; urgency=medium
+
+  * Bound DKMS status collection so a stuck dkms helper cannot hang
+    collect-once or the background evidence service.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 29 Apr 2026 23:55:00 +0400
+
 fixer (0.76.0-1) unstable; urgency=medium
 
   * Install release binaries from the active Cargo target directory during

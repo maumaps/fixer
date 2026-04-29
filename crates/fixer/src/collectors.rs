@@ -4,8 +4,8 @@ use crate::config::FixerConfig;
 use crate::models::{FindingInput, ObservedArtifact, PopularBinaryProfile};
 use crate::storage::Store;
 use crate::util::{
-    command_exists, command_output, command_output_os, find_postgres_binary, hash_text,
-    maybe_canonicalize, now_rfc3339,
+    command_exists, command_output, command_output_os, command_output_with_timeout,
+    find_postgres_binary, hash_text, maybe_canonicalize, now_rfc3339,
 };
 use crate::workspace::resolve_installed_package_metadata;
 use anyhow::Result;
@@ -2411,7 +2411,8 @@ fn dkms_status_version(module_names: &[String], release: &str) -> Option<(String
     if !command_exists("dkms") {
         return None;
     }
-    let output = command_output("dkms", &["status"]).ok()?;
+    let output =
+        command_output_with_timeout("dkms", &["status"], StdDuration::from_secs(5)).ok()?;
     output
         .lines()
         .filter_map(parse_dkms_status_line)

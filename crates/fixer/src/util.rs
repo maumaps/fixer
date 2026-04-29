@@ -5,7 +5,9 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
@@ -37,6 +39,41 @@ pub fn command_output(program: &str, args: &[&str]) -> Result<String> {
         .args(args)
         .output()
         .with_context(|| format!("failed to run `{program}`"))?;
+    command_output_from_status(program, output)
+}
+
+pub fn command_output_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to run `{program}`"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            let output = child
+                .wait_with_output()
+                .with_context(|| format!("failed to collect `{program}` output"))?;
+            return command_output_from_status(program, output);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!(
+                "`{program}` timed out after {}s",
+                timeout.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn command_output_from_status(program: &str, output: std::process::Output) -> Result<String> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
