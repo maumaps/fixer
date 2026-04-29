@@ -10242,10 +10242,11 @@ fn investigation_public_issue_fields(item: &SharedOpportunity) -> Option<PublicI
                 .details
                 .get("wchan")
                 .and_then(Value::as_str)
+                .map(normalize_stack_frame)
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or("an unknown wait point");
+                .unwrap_or_else(|| "an unknown wait point".to_string());
             Some(PublicIssueFields {
-                title: format!("Stuck D-state investigation for {target}"),
+                title: format!("Stuck D-state investigation for {target} at {wait_point}"),
                 summary: format!(
                     "{} shows a repeated `D`-state wait, likely blocked in {} via {}.",
                     target, classification, wait_point
@@ -10460,8 +10461,14 @@ fn normalized_perf_hotspot_symbol(raw: &str) -> String {
 }
 
 fn normalize_stack_frame(frame: &str) -> String {
-    let offset_re = Regex::new(r"\+0x[0-9a-fA-F]+").expect("valid frame offset regex");
-    sanitize_public_text(&offset_re.replace_all(frame, "").to_string())
+    let address_prefix_re = Regex::new(r"^\[<[^>]+>\]\s*").expect("valid frame address regex");
+    let module_suffix_re = Regex::new(r"\s+\[[^\]]+\]\+?$").expect("valid module suffix regex");
+    let offset_re =
+        Regex::new(r"\+0x[0-9a-fA-F]+(?:/0x[0-9a-fA-F]+)?").expect("valid frame offset regex");
+    let mut normalized = address_prefix_re.replace(frame.trim(), "").to_string();
+    normalized = module_suffix_re.replace(&normalized, "").to_string();
+    normalized = offset_re.replace_all(&normalized, "").to_string();
+    sanitize_public_text(normalized.trim_end_matches('+').trim())
 }
 
 fn normalized_investigation_target_name(item: &SharedOpportunity) -> String {
@@ -15332,11 +15339,25 @@ mod tests {
         let public = build_public_issue_fields(&a);
         assert_eq!(
             public.title,
-            "Stuck D-state investigation for kworker+i915_flip"
+            "Stuck D-state investigation for kworker+i915_flip at drm_atomic_helper_wait_for_flip_done"
         );
         assert!(public.summary.contains("kworker+i915_flip"));
         assert!(!public.summary.contains("152s"));
         assert_eq!(inferred_public_source_package(&a).as_deref(), Some("linux"));
+    }
+
+    #[test]
+    fn stack_frame_normalization_drops_kernel_offsets_and_modules() {
+        assert_eq!(
+            normalize_stack_frame(
+                "[<0>] drm_atomic_helper_wait_for_flip_done+0x4b/0x90 [drm_kms_helper]+"
+            ),
+            "drm_atomic_helper_wait_for_flip_done"
+        );
+        assert_eq!(
+            normalize_stack_frame("[<0>] drm_atomic_helper_wait_for_flip_done+0x4d/0x90"),
+            "drm_atomic_helper_wait_for_flip_done"
+        );
     }
 
     #[test]
@@ -15535,7 +15556,7 @@ mod tests {
         assert!(reclustered.issue_clusters[0].promoted);
         assert_eq!(
             reclustered.issue_clusters[0].public_title,
-            "Stuck D-state investigation for kworker+i915_flip"
+            "Stuck D-state investigation for kworker+i915_flip at drm_atomic_helper_wait_for_flip_done"
         );
         assert_eq!(
             reclustered.issue_clusters[0].source_package.as_deref(),
