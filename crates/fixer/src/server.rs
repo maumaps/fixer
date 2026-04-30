@@ -8092,6 +8092,7 @@ fn inferred_public_source_package(item: &SharedOpportunity) -> Option<String> {
 fn is_kernelish_target_name(value: &str) -> bool {
     let normalized = value.trim().to_ascii_lowercase();
     normalized.starts_with("kworker")
+        || normalized.starts_with("irq/")
         || normalized.starts_with("jbd2/")
         || normalized.starts_with("kswapd")
         || normalized.starts_with("kcompactd")
@@ -16100,6 +16101,15 @@ mod tests {
         assert!(public.summary.contains("kworker+i915_flip"));
         assert!(!public.summary.contains("152s"));
         assert_eq!(inferred_public_source_package(&a).as_deref(), Some("linux"));
+        let irq_thread = sample_stuck_process_investigation(
+            "irq/138-rmi4_smbus",
+            1_000_110,
+            "2026-03-31T10:04:53Z",
+        );
+        assert_eq!(
+            inferred_public_source_package(&irq_thread).as_deref(),
+            Some("linux")
+        );
         assert_eq!(
             build_public_issue_fields(&zero_wchan).title,
             "Stuck D-state investigation for chrome at folio_wait_bit_common"

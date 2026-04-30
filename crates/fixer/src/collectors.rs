@@ -749,6 +749,7 @@ fn status_reports_kernel_thread(status_raw: &str) -> bool {
 fn looks_like_kernel_thread_name(comm: &str) -> bool {
     let comm = comm.trim();
     comm.starts_with("kworker")
+        || comm.starts_with("irq/")
         || comm.starts_with("kswapd")
         || comm.starts_with("kcompactd")
         || comm.starts_with("ksoftirqd/")
@@ -6786,6 +6787,10 @@ State:\tD (disk sleep)\n\
 Kthread:\t1\n";
         assert_eq!(
             kernel_thread_package_name(status, None, "kswapd0"),
+            Some(current_kernel_image_package_name())
+        );
+        assert_eq!(
+            kernel_thread_package_name("", None, "irq/138-rmi4_smbus"),
             Some(current_kernel_image_package_name())
         );
     }
