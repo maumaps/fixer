@@ -8088,6 +8088,7 @@ fn inferred_public_source_package(item: &SharedOpportunity) -> Option<String> {
             .map(|_| "linux".to_string())
     })
     .or_else(|| inferred_crash_source_package(item))
+    .or_else(|| inferred_hotspot_source_package(item))
     .or_else(|| inferred_oom_source_package(&item.finding.details))
     .or_else(|| inferred_runaway_mapped_executable_source_package(&item.finding.details))
     .or_else(|| inferred_kernel_hot_path_source_package(&item.finding.details))
@@ -8100,31 +8101,140 @@ fn inferred_crash_source_package(item: &SharedOpportunity) -> Option<String> {
     item.finding
         .package_name
         .as_deref()
-        .and_then(known_crash_source_package_alias)
+        .and_then(known_legacy_source_package_alias)
         .map(ToString::to_string)
 }
 
-fn known_crash_source_package_alias(package_name: &str) -> Option<&'static str> {
+fn inferred_hotspot_source_package(item: &SharedOpportunity) -> Option<String> {
+    if item.finding.kind != "hotspot" {
+        return None;
+    }
+    item.finding
+        .package_name
+        .as_deref()
+        .and_then(known_legacy_source_package_alias)
+        .map(ToString::to_string)
+        .or_else(|| inferred_hotspot_mapped_executable_source_package(&item.finding.details))
+}
+
+fn inferred_hotspot_mapped_executable_source_package(details: &Value) -> Option<String> {
+    let subsystem = details.get("subsystem").and_then(Value::as_str)?;
+    if subsystem != "perf-hotspot" {
+        return None;
+    }
+    let target_path = details
+        .get("profile_target")
+        .and_then(|target| target.get("path"))
+        .and_then(Value::as_str)
+        .map(normalize_deleted_file_marker)?;
+    if !(target_path.starts_with("/usr/bin/") || target_path.starts_with("/usr/sbin/")) {
+        return None;
+    }
+    let target_name = file_name_or_self(&target_path);
+    let hot_path_dso = details
+        .get("hot_path_dso")
+        .and_then(Value::as_str)
+        .map(normalize_deleted_file_marker)
+        .unwrap_or_default();
+    if !hot_path_dso.is_empty() && hot_path_dso != target_name {
+        return None;
+    }
+    known_runaway_executable_source_package_alias(target_name)
+}
+
+fn known_legacy_source_package_alias(package_name: &str) -> Option<&'static str> {
     match package_name.trim() {
+        "apt" => Some("apt"),
+        "bash" => Some("bash"),
+        "dbus-daemon" => Some("dbus"),
+        "element-desktop" => Some("element-desktop"),
         "firefox" => Some("firefox"),
         "google-chrome-stable" => Some("google-chrome-stable"),
+        "itcl3" => Some("itcl3"),
         "kdeconnect" => Some("kdeconnect"),
         "konqueror" => Some("konqueror"),
         "kscreen" => Some("kscreen"),
         "kwin-x11" => Some("kwin"),
+        "libapt-pkg7.0" => Some("apt"),
+        "libaudit1" => Some("audit"),
+        "libavahi-core7" => Some("avahi"),
+        "libblas3" => Some("lapack"),
+        "libc6" => Some("glibc"),
+        "libcap-ng0" => Some("libcap-ng"),
+        "libcuda1" => Some("nvidia-graphics-drivers"),
+        "libdbus-1-3" => Some("dbus"),
+        "libdrm2" => Some("libdrm"),
+        "libfontconfig1" => Some("fontconfig"),
+        "libgdal38" => Some("gdal"),
+        "libglib2.0-0t64" => Some("glib2.0"),
+        "libgl1" => Some("libglvnd"),
+        "libglvnd0" => Some("libglvnd"),
+        "libglx-mesa0" => Some("mesa"),
+        "libgtk-3-0t64" => Some("gtk+3.0"),
+        "libicu76" | "libicu78" => Some("icu"),
+        "libjemalloc2" => Some("jemalloc"),
+        "libkeyutils1" => Some("keyutils"),
+        "libkf6i18n6" => Some("kf6-ki18n"),
+        "libkf6windowsystem6" => Some("kf6-kwindowsystem"),
+        "libkirigamiprimitives6" => Some("kf6-kirigami"),
+        "libkrb5-3" => Some("krb5"),
+        "libldap2" => Some("openldap"),
+        "liblz4-1" => Some("lz4"),
+        "libncursesw6" => Some("ncurses"),
+        "libnginx-mod-http-subs-filter" => Some("libnginx-mod-http-subs-filter"),
+        "libnode127" => Some("nodejs"),
+        "libpam0g" => Some("pam"),
+        "libpixman-1-0" => Some("pixman"),
+        "libplasma5support6" => Some("plasma5support"),
+        "libplasma6" => Some("libplasma"),
+        "libproj25" => Some("proj"),
+        "libqt6core6t64" | "libqt6gui6" => Some("qt6-base"),
+        "libqt6qml6" | "libqt6quick6" | "libqt6quicktemplates2-6" => Some("qt6-declarative"),
+        "libsasl2-2" => Some("cyrus-sasl2"),
+        "libseccomp2" => Some("libseccomp"),
+        "libssl3t64" => Some("openssl"),
+        "libstd-rust-1.93" => Some("rustc"),
+        "libsystemd-shared" | "libsystemd0" => Some("systemd"),
+        "libtcl8.6" => Some("tcl8.6"),
+        "libtorrent-rasterbar2.0t64" => Some("libtorrent-rasterbar"),
+        "libuv1t64" => Some("libuv1"),
+        "libx11-6" => Some("libx11"),
+        "libxcb1" => Some("libxcb"),
+        "libxml2-16" => Some("libxml2"),
+        "libxshmfence1" => Some("libxshmfence"),
+        "libzstd1" => Some("libzstd"),
+        "mesa-libgallium" => Some("mesa"),
+        "nginx" => Some("nginx"),
+        "nodejs" => Some("nodejs"),
+        "openssh-client" | "openssh-server" => Some("openssh"),
         "packagekit" => Some("packagekit"),
+        "perl-base" => Some("perl"),
         "plasma-discover" => Some("plasma-discover"),
         "plasma-workspace" => Some("plasma-workspace"),
+        "postgresql-14" => Some("postgresql-14"),
+        "postgresql-18" | "postgresql-client-18" => Some("postgresql-18"),
+        "postgresql-18-pgrouting" => Some("pgrouting"),
+        "postgresql-18-postgis-3" => Some("postgis"),
+        "python3-scipy" => Some("scipy"),
+        "python3.12-minimal" => Some("python3.12"),
+        "python3.13-minimal" => Some("python3.13"),
+        "qbittorrent" => Some("qbittorrent"),
+        "redis-tools" => Some("redis"),
         "rust-coreutils" => Some("rust-coreutils"),
         "sddm" => Some("sddm"),
+        "slack-desktop" => Some("slack-desktop"),
         "systemd" => Some("systemd"),
         "systemd-timesyncd" => Some("systemd"),
+        "systemd-userdbd" => Some("systemd"),
         "systemsettings" => Some("systemsettings"),
         "udev" => Some("systemd"),
         "wireplumber" => Some("wireplumber"),
+        "wpasupplicant" => Some("wpa"),
         "xfce4-terminal" => Some("xfce4-terminal"),
+        "xfwm4" => Some("xfwm4"),
         "xserver-xorg-core" => Some("xorg-server"),
         "zoom" => Some("zoom"),
+        "zlib1g" => Some("zlib"),
         _ => None,
     }
 }
@@ -16236,6 +16346,28 @@ mod tests {
             Some("postgresql-18")
         );
 
+        let legacy_libc_hotspot = sample_hotspot(
+            "systemd",
+            "libc.so.6",
+            "__memmove_avx_unaligned_erms",
+            "libc6",
+        );
+        assert_eq!(
+            inferred_public_source_package(&legacy_libc_hotspot).as_deref(),
+            Some("glibc")
+        );
+
+        let legacy_qt_hotspot = sample_hotspot(
+            "sddm-greeter-qt6",
+            "libQt6Quick.so.6.10.2",
+            "QV4::ExecutionEngine::newString",
+            "libqt6quick6",
+        );
+        assert_eq!(
+            inferred_public_source_package(&legacy_qt_hotspot).as_deref(),
+            Some("qt6-declarative")
+        );
+
         let mut kernel_runaway = sample_runaway_investigation("ollama", Option::<&str>::None);
         kernel_runaway.finding.details["hot_path_dso"] = json!("[kernel.kallsyms]");
         kernel_runaway.finding.details["implicated_package_names"] =
@@ -16309,6 +16441,22 @@ mod tests {
             Some("containerd")
         );
 
+        let mut deleted_containerd_hotspot = sample_hotspot(
+            "containerd-shim-runc-v2",
+            "containerd-shim-runc-v2",
+            "runtime.runqgrab",
+            "containerd-shim-runc-v2",
+        );
+        deleted_containerd_hotspot.finding.package_name = None;
+        deleted_containerd_hotspot.finding.details["profile_target"] = json!({
+            "name": "containerd-shim-runc-v2 (deleted)",
+            "path": "/usr/bin/containerd-shim-runc-v2 (deleted)",
+        });
+        assert_eq!(
+            inferred_public_source_package(&deleted_containerd_hotspot).as_deref(),
+            Some("containerd")
+        );
+
         let mut local_ollama = sample_runaway_investigation("ollama", Option::<&str>::None);
         local_ollama.finding.details["profile_target"] = json!({
             "name": "ollama",
@@ -16316,6 +16464,15 @@ mod tests {
         });
         local_ollama.finding.details["hot_path_dso"] = json!("ollama");
         assert_eq!(inferred_public_source_package(&local_ollama), None);
+
+        let mut local_ollama_hotspot =
+            sample_hotspot("ollama", "ollama", "llama_decode_internal", "ollama");
+        local_ollama_hotspot.finding.package_name = None;
+        local_ollama_hotspot.finding.details["profile_target"] = json!({
+            "name": "ollama",
+            "path": "/usr/local/bin/ollama",
+        });
+        assert_eq!(inferred_public_source_package(&local_ollama_hotspot), None);
     }
 
     #[test]

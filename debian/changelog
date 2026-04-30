@@ -1,3 +1,10 @@
+fixer (0.110.0-1) unstable; urgency=medium
+
+  * Infer public source attribution for legacy hotspot reports whose binary
+    package metadata was collected before source-package fields were stored.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 11:58:00 +0400
+
 fixer (0.109.0-1) unstable; urgency=medium
 
   * Distinguish public stuck-process titles by wait classification when the
