@@ -8088,7 +8088,63 @@ fn inferred_public_source_package(item: &SharedOpportunity) -> Option<String> {
             .map(|_| "linux".to_string())
     })
     .or_else(|| inferred_oom_source_package(&item.finding.details))
+    .or_else(|| inferred_runaway_mapped_executable_source_package(&item.finding.details))
     .or_else(|| inferred_kernel_hot_path_source_package(&item.finding.details))
+}
+
+fn inferred_runaway_mapped_executable_source_package(details: &Value) -> Option<String> {
+    let subsystem = details.get("subsystem").and_then(Value::as_str)?;
+    if subsystem != "runaway-process" {
+        return None;
+    }
+    let target_path = details
+        .get("profile_target")
+        .and_then(|target| target.get("path"))
+        .and_then(Value::as_str)
+        .map(normalize_deleted_file_marker);
+    let target_name = target_path
+        .as_deref()
+        .map(file_name_or_self)
+        .or_else(|| {
+            details
+                .get("profile_target")
+                .and_then(|target| target.get("name"))
+                .and_then(Value::as_str)
+        })
+        .map(normalize_deleted_file_marker)
+        .filter(|value| !value.is_empty())?;
+    let hot_path_dso = details
+        .get("hot_path_dso")
+        .and_then(Value::as_str)
+        .map(normalize_deleted_file_marker)
+        .unwrap_or_default();
+    if !hot_path_dso.is_empty() && hot_path_dso != target_name {
+        return None;
+    }
+    let path_is_system_binary = target_path
+        .as_deref()
+        .is_some_and(|path| path.starts_with("/usr/bin/") || path.starts_with("/usr/sbin/"));
+    let maps_contain_system_binary = details
+        .get("maps_excerpt")
+        .and_then(Value::as_str)
+        .is_some_and(|maps| {
+            maps.lines().any(|line| {
+                let normalized = normalize_deleted_file_marker(line);
+                normalized.contains(&format!("/usr/bin/{target_name}"))
+                    || normalized.contains(&format!("/usr/sbin/{target_name}"))
+            })
+        });
+    if !path_is_system_binary && !maps_contain_system_binary {
+        return None;
+    }
+    known_runaway_executable_source_package_alias(&target_name)
+}
+
+fn known_runaway_executable_source_package_alias(value: &str) -> Option<String> {
+    match value.trim() {
+        "containerd-shim-runc-v2" => Some("containerd".to_string()),
+        _ => None,
+    }
 }
 
 fn inferred_oom_source_package(details: &Value) -> Option<String> {
@@ -16176,6 +16232,29 @@ mod tests {
             inferred_public_source_package(&yakuake_oom).as_deref(),
             Some("yakuake")
         );
+
+        let mut deleted_containerd =
+            sample_runaway_investigation("containerd-shim-runc-v2 (deleted)", Option::<&str>::None);
+        deleted_containerd.finding.details["profile_target"] = json!({
+            "name": "containerd-shim-runc-v2 (deleted)",
+            "path": "/usr/bin/containerd-shim-runc-v2 (deleted)",
+        });
+        deleted_containerd.finding.details["hot_path_dso"] = json!("containerd-shim-runc-v2");
+        deleted_containerd.finding.details["maps_excerpt"] = json!(
+            "00400000-00799000 r--p 00000000 fe:00 69883374 /usr/bin/containerd-shim-runc-v2 (deleted)"
+        );
+        assert_eq!(
+            inferred_public_source_package(&deleted_containerd).as_deref(),
+            Some("containerd")
+        );
+
+        let mut local_ollama = sample_runaway_investigation("ollama", Option::<&str>::None);
+        local_ollama.finding.details["profile_target"] = json!({
+            "name": "ollama",
+            "path": "/usr/local/bin/ollama",
+        });
+        local_ollama.finding.details["hot_path_dso"] = json!("ollama");
+        assert_eq!(inferred_public_source_package(&local_ollama), None);
     }
 
     #[test]
