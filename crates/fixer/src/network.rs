@@ -2104,13 +2104,33 @@ fn materialize_shared_opportunity(
         None
     };
 
+    let mut finding_details = item.finding.details.clone();
+    match &mut finding_details {
+        Value::Object(details) => {
+            details.insert("shared_opportunity".to_string(), json!(true));
+            details.insert(
+                "remote_opportunity_id".to_string(),
+                json!(item.opportunity.id),
+            );
+            details.insert("remote_finding_id".to_string(), json!(item.finding.id));
+        }
+        other => {
+            finding_details = json!({
+                "shared_opportunity": true,
+                "remote_opportunity_id": item.opportunity.id,
+                "remote_finding_id": item.finding.id,
+                "original_details": other,
+            });
+        }
+    }
+
     let finding_id = store.record_finding(&FindingInput {
         kind: item.finding.kind.clone(),
         title: item.finding.title.clone(),
         severity: item.finding.severity.clone(),
         fingerprint: item.finding.fingerprint.clone(),
         summary: item.finding.summary.clone(),
-        details: item.finding.details.clone(),
+        details: finding_details,
         artifact,
         repo_root: item
             .finding

@@ -1450,6 +1450,7 @@ impl Store {
             FROM findings
             WHERE kind = 'investigation'
               AND json_extract(details_json, '$.subsystem') = 'runaway-process'
+              AND COALESCE(json_extract(details_json, '$.shared_opportunity'), 0) != 1
               AND COALESCE(
                     json_extract(details_json, '$.source_profile_fingerprint'),
                     json_extract(details_json, '$.source_hotspot_fingerprint'),
