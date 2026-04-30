@@ -10145,7 +10145,7 @@ fn normalized_investigation_cluster_key(item: &SharedOpportunity) -> String {
                 .and_then(|excerpt| excerpt.lines().next())
                 .map(normalize_stack_frame)
                 .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "-".to_string());
+                .unwrap_or_else(|| wchan.to_string());
             hash_text(format!(
                 "investigation|stuck-process|{}|{}|{}|{}",
                 target, classification, wchan, stack_signature,
@@ -15961,8 +15961,16 @@ mod tests {
             2141,
             "2026-03-29T17:52:00Z",
         );
+        let mut missing_stack = sample_stuck_process_investigation(
+            "kworker/u33:7+i915_flip",
+            512,
+            "2026-03-29T17:52:00Z",
+        );
+        missing_stack.finding.details["stack_excerpt"] = json!("");
+        missing_stack.finding.package_name = Some("linux-image-6.17.0-14-generic".to_string());
 
         assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
+        assert_eq!(cluster_key_for(&a), cluster_key_for(&missing_stack));
 
         let public = build_public_issue_fields(&a);
         assert_eq!(
