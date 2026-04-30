@@ -3027,6 +3027,12 @@ fn patch_explanation_quality_failure(
     .iter()
     .any(|needle| commit_lower.contains(needle) || issue_lower.contains(needle));
     let has_effect_language = [
+        "expected effect",
+        "this should",
+        "should reduce",
+        "should prevent",
+        "should avoid",
+        "should keep",
         "so that",
         "this keeps",
         "this prevents",
@@ -3402,7 +3408,7 @@ fn build_refinement_prompt(
 }
 
 fn patch_response_contract() -> &'static str {
-    "In every authoring pass, your final response must start with `Subject: <single-line git commit subject>` and then include these markdown sections exactly:\n\n## Commit Message\nA short upstream-friendly explanation of what changed and why. Write it in plain language that a maintainer can follow without local complaint context. If you use subsystem jargon, define it immediately.\n\n## Issue Connection\nExplain how the code change addresses the observed issue evidence instead of merely paraphrasing the diff. Cover four things clearly: the user-visible symptom, the underlying cause in code, the specific change you made, and the effect that change should have. If the logic is non-obvious in code, mention that you added a short explanatory comment.\n\n## Git Add Paths\nList the repo-relative paths that belong in the final patch, one per line. Include intentionally new files, and do not list generated build artifacts.\n\n## Validation\nList the checks you ran, or say clearly that you could not run them."
+    "In every authoring pass, your final response must start with `Subject: <single-line git commit subject>` and then include these markdown sections exactly:\n\n## Commit Message\nA short upstream-friendly explanation of what changed and why. Write it in plain language that a maintainer can follow without local complaint context. If you use subsystem jargon, define it immediately.\n\n## Issue Connection\nWrite this as maintainer-facing patch mail, not as local Fixer notes. Cover four things explicitly in readable sentences: the user-visible symptom, the code-level cause or the cautious inference from evidence, the specific change you made, and the expected effect. If the evidence is indirect, say it is a plausible targeted mitigation rather than a proven root cause. Include an explicit effect sentence such as `The expected effect is ...`, `This should reduce ...`, or `This prevents ...`. If the logic is non-obvious in code, mention that you added a short explanatory comment.\n\n## Git Add Paths\nList the repo-relative paths that belong in the final patch, one per line. Include intentionally new files, and do not list generated build artifacts.\n\n## Validation\nList the checks you ran, or say clearly that you could not run them."
 }
 
 fn render_external_bug_report(
@@ -8065,6 +8071,27 @@ Ran kded_keyboard and kcm_keyboard builds.
             super::patch_explanation_quality_failure(response, Some("desktop-input-config"),)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn patch_explanation_quality_guard_accepts_expected_effect_wording() {
+        let response = r#"Subject: subprocess: use pidfds for timed POSIX waits when available
+
+## Commit Message
+Add a Linux pidfd timed-wait path for Popen.wait(timeout=...) when os.pidfd_open() is available, while preserving the existing waitpid fallback for systems where pidfds are missing or blocked.
+
+## Issue Connection
+The observed symptom was /usr/bin/python3.13 cycling through poll -> wait4 -> poll, with CPU attributed to Python frame evaluation. The bundle does not include a Python stack, so this treats subprocess.Popen._wait(timeout) as a plausible targeted mitigation for that wakeup pattern rather than a proven root cause. The patch changes the timed wait path to try a pidfd-backed selector wait first, then reap normally under _waitpid_lock, so exit status handling stays in one place. This should reduce repeated poll/wait wakeups on Linux systems with pidfd support while preserving compatibility through the old fallback.
+
+## Git Add Paths
+Lib/subprocess.py
+Lib/test/test_subprocess.py
+
+## Validation
+Ran focused subprocess timeout tests.
+"#;
+
+        assert!(super::patch_explanation_quality_failure(response, None).is_none());
     }
 
     #[test]

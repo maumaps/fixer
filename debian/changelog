@@ -1,3 +1,10 @@
+fixer (0.119.0-1) unstable; urgency=medium
+
+  * Align Codex patch prompts and explanation quality checks for expected
+    effect wording in maintainer-facing patch mail.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 22:58:00 +0400
+
 fixer (0.118.0-1) unstable; urgency=medium
 
   * Use gpt-5.5 as the default Codex model and disable Spark fallback by
