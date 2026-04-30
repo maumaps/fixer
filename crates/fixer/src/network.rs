@@ -15,9 +15,11 @@ use crate::util::{command_exists, hash_text, now_rfc3339, read_text};
 use crate::workspace::{ensure_workspace_for_opportunity, origin_is_debian_source_friendly};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,6 +60,7 @@ pub struct WorkerRunOutcome {
 const LOCAL_WORKER_BLOCKER_HISTORY_KEY: &str = "worker_local_blocker_history";
 const MAX_LOCAL_WORKER_BLOCKERS: usize = 64;
 const SUBMITTED_WORKER_RESULT_MARKER: &str = "submitted-worker-result.json";
+const UNRECOVERABLE_WORKER_RESULT_MARKER: &str = "unrecoverable-worker-result.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalWorkerBlocker {
@@ -953,20 +956,28 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
     }
     if let Some(recovered) = recover_unpublished_worker_result(config, &participation)? {
         let endpoint = format!("v1/work/{}/result", recovered.lease_id);
-        let submitted = post_json::<_, WorkerResultEnvelope>(config, &endpoint, &recovered.result)?;
-        mark_worker_result_submitted(&recovered.bundle_dir, &submitted)?;
-        store.set_local_state("last_worker_result", &submitted)?;
-        return Ok(WorkerRunOutcome {
-            hello,
-            offer: WorkOffer {
-                message: format!(
-                    "published completed local worker bundle {} before requesting fresh work",
-                    recovered.bundle_dir.display()
-                ),
-                lease: None,
-            },
-            result: Some(submitted),
-        });
+        match post_json::<_, WorkerResultEnvelope>(config, &endpoint, &recovered.result) {
+            Ok(submitted) => {
+                mark_worker_result_submitted(&recovered.bundle_dir, &submitted)?;
+                store.set_local_state("last_worker_result", &submitted)?;
+                return Ok(WorkerRunOutcome {
+                    hello,
+                    offer: WorkOffer {
+                        message: format!(
+                            "published completed local worker bundle {} before requesting fresh work",
+                            recovered.bundle_dir.display()
+                        ),
+                        lease: None,
+                    },
+                    result: Some(submitted),
+                });
+            }
+            Err(error) if is_expired_worker_result_error(&error) => {
+                mark_worker_result_unrecoverable(&recovered.bundle_dir, &recovered.result, &error)?;
+                store.clear_local_state("last_worker_result")?;
+            }
+            Err(error) => return Err(error),
+        }
     }
 
     let work_payload_hash = hash_text(serde_json::to_vec(&hello_request)?);
@@ -1390,7 +1401,20 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
     };
 
     let endpoint = format!("v1/work/{}/result", lease.lease_id);
-    let submitted = post_json::<_, WorkerResultEnvelope>(config, &endpoint, &result)?;
+    let submitted = match post_json::<_, WorkerResultEnvelope>(config, &endpoint, &result) {
+        Ok(submitted) => submitted,
+        Err(error) if is_expired_worker_result_error(&error) => {
+            if let Some(bundle_path) = result.attempt.bundle_path.as_deref() {
+                let _ = mark_worker_result_unrecoverable(Path::new(bundle_path), &result, &error);
+            }
+            store.clear_local_state("last_worker_result")?;
+            return Err(error.context(
+                "worker lease expired after the local patch attempt completed; \
+                 the result was marked unrecoverable so the next worker run can request fresh work",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     if let Some(bundle_path) = result.attempt.bundle_path.as_deref() {
         let _ = mark_worker_result_submitted(Path::new(bundle_path), &submitted);
     }
@@ -1424,7 +1448,9 @@ fn recover_unpublished_worker_result(
     bundle_dirs.sort();
     bundle_dirs.reverse();
     for bundle_dir in bundle_dirs.into_iter().take(32) {
-        if bundle_dir.join(SUBMITTED_WORKER_RESULT_MARKER).exists() {
+        if bundle_dir.join(SUBMITTED_WORKER_RESULT_MARKER).exists()
+            || bundle_dir.join(UNRECOVERABLE_WORKER_RESULT_MARKER).exists()
+        {
             continue;
         }
         let job = match proposal::load_codex_job(&bundle_dir) {
@@ -1574,6 +1600,22 @@ fn mark_worker_result_submitted(bundle_dir: &Path, submitted: &WorkerResultEnvel
     Ok(())
 }
 
+fn mark_worker_result_unrecoverable(
+    bundle_dir: &Path,
+    result: &WorkerResultEnvelope,
+    error: &anyhow::Error,
+) -> Result<()> {
+    fs::write(
+        bundle_dir.join(UNRECOVERABLE_WORKER_RESULT_MARKER),
+        serde_json::to_vec_pretty(&json!({
+            "marked_at": now_rfc3339(),
+            "reason": error.to_string(),
+            "result": result,
+        }))?,
+    )?;
+    Ok(())
+}
+
 fn build_submission_bundle(
     store: &Store,
     config: &FixerConfig,
@@ -1701,6 +1743,9 @@ fn push_submission_proposal(
     candidate: SubmittedProposal,
 ) -> Result<bool> {
     let candidate_bytes = serde_json::to_vec(&candidate)?.len();
+    if candidate_bytes > config.network.max_submission_proposal_bytes {
+        return Ok(false);
+    }
     if !proposals.is_empty()
         && used_bytes.saturating_add(candidate_bytes) > config.network.max_submission_proposal_bytes
     {
@@ -2139,11 +2184,42 @@ fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().unwrap_or_default();
-        return Err(anyhow!("server returned {status}: {body}"));
+        return Err(HttpStatusError {
+            path: path.to_string(),
+            status,
+            body,
+        }
+        .into());
     }
     response
         .json()
         .with_context(|| format!("failed to parse {path} response"))
+}
+
+#[derive(Debug)]
+struct HttpStatusError {
+    path: String,
+    status: StatusCode,
+    body: String,
+}
+
+impl fmt::Display for HttpStatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "server returned {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
+
+fn is_expired_worker_result_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<HttpStatusError>()
+        .map(|status_error| {
+            status_error.status == StatusCode::GONE
+                && status_error.path.starts_with("v1/work/")
+                && status_error.path.ends_with("/result")
+        })
+        .unwrap_or(false)
 }
 
 fn ensure_server_hello_compatible(hello: &ServerHello) -> Result<()> {
