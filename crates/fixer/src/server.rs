@@ -8097,9 +8097,30 @@ fn inferred_public_source_package(item: &SharedOpportunity) -> Option<String> {
     })
     .or_else(|| inferred_crash_source_package(item))
     .or_else(|| inferred_hotspot_source_package(item))
+    .or_else(|| inferred_apparmor_source_package(item))
     .or_else(|| inferred_oom_source_package(&item.finding.details))
     .or_else(|| inferred_runaway_mapped_executable_source_package(&item.finding.details))
     .or_else(|| inferred_kernel_hot_path_source_package(&item.finding.details))
+}
+
+fn inferred_apparmor_source_package(item: &SharedOpportunity) -> Option<String> {
+    if !matches!(
+        item.finding
+            .details
+            .get("subsystem")
+            .and_then(Value::as_str),
+        Some("apparmor")
+    ) {
+        return None;
+    }
+    let package_name = item.finding.package_name.as_deref()?.trim();
+    match package_name {
+        "cups-daemon" => Some("cups"),
+        "hostname" => Some("hostname"),
+        "rsyslog" => Some("rsyslog"),
+        _ => None,
+    }
+    .map(ToString::to_string)
 }
 
 fn inferred_crash_source_package(item: &SharedOpportunity) -> Option<String> {
@@ -10644,26 +10665,82 @@ fn is_informative_public_crash_frame(frame: &str) -> bool {
 }
 
 fn warning_public_issue_fields(item: &SharedOpportunity) -> Option<PublicIssueFields> {
-    if item.finding.kind != "warning" || item.finding.title != "Kernel warning" {
+    if item.finding.kind != "warning" {
         return None;
     }
-    let raw_line = item
-        .finding
-        .details
-        .get("line")
-        .and_then(Value::as_str)
-        .unwrap_or(item.finding.summary.as_str());
-    let warning = normalize_kernel_warning_message(raw_line);
-    let title = if warning.is_empty() {
-        "Kernel warning".to_string()
+    let title = if item.finding.title == "Kernel warning" {
+        let raw_line = item
+            .finding
+            .details
+            .get("line")
+            .and_then(Value::as_str)
+            .unwrap_or(item.finding.summary.as_str());
+        let warning = normalize_kernel_warning_message(raw_line);
+        if warning.is_empty() {
+            "Kernel warning".to_string()
+        } else {
+            format!("Kernel warning: {warning}")
+        }
+    } else if matches!(
+        item.finding
+            .details
+            .get("subsystem")
+            .and_then(Value::as_str),
+        Some("apparmor")
+    ) {
+        apparmor_public_issue_title(item)
     } else {
-        format!("Kernel warning: {warning}")
+        return None;
     };
     Some(PublicIssueFields {
         title: truncate_patch_subject(&title, 120),
         summary: sanitize_public_text(&item.opportunity.summary),
         visible: is_publicly_visible(item),
     })
+}
+
+fn apparmor_public_issue_title(item: &SharedOpportunity) -> String {
+    let details = &item.finding.details;
+    let actor = item
+        .finding
+        .title
+        .strip_prefix("AppArmor denial in ")
+        .or_else(|| details.get("profile").and_then(Value::as_str))
+        .unwrap_or("unknown");
+    let operation = details
+        .get("operation")
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "access".to_string());
+    let resource = apparmor_public_resource_label(details);
+    format!(
+        "AppArmor denial in {}: {} {}",
+        sanitize_public_text(actor),
+        operation,
+        resource
+    )
+}
+
+fn apparmor_public_resource_label(details: &Value) -> String {
+    if let Some(name) = details.get("name").and_then(Value::as_str) {
+        let normalized = normalize_proc_path(name);
+        if normalized.starts_with("/proc/")
+            || normalized.starts_with("/etc/")
+            || normalized.starts_with("apparmor/")
+        {
+            return sanitize_public_text(&normalized);
+        }
+        if !normalized.trim().is_empty() {
+            return format!("[{}]", sanitize_public_text(file_name_or_self(&normalized)));
+        }
+    }
+    if let Some(class) = details.get("class").and_then(Value::as_str) {
+        if !class.trim().is_empty() {
+            return sanitize_public_text(class);
+        }
+    }
+    "resource".to_string()
 }
 
 fn hotspot_public_issue_fields(item: &SharedOpportunity) -> Option<PublicIssueFields> {
@@ -16288,6 +16365,77 @@ mod tests {
         assert!(!first.contains("01:00:5e"));
         assert!(!first.contains("ID=25811"));
         assert!(!first.contains(" DF "));
+    }
+
+    #[test]
+    fn apparmor_public_title_includes_sanitized_denial_target() {
+        let apparmor = SharedOpportunity {
+            local_opportunity_id: 2,
+            opportunity: OpportunityRecord {
+                id: 2,
+                finding_id: 2,
+                kind: "warning".to_string(),
+                title: "AppArmor denial in hostname".to_string(),
+                score: 64,
+                state: "open".to_string(),
+                summary: "AppArmor denied hostname: file_inherit /var/lib/fixer/proposals/120/workspace/build/config.log".to_string(),
+                evidence: json!({}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "2026-03-29T11:00:00Z".to_string(),
+                updated_at: "2026-03-29T11:00:00Z".to_string(),
+            },
+            finding: FindingRecord {
+                id: 2,
+                kind: "warning".to_string(),
+                title: "AppArmor denial in hostname".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "y".to_string(),
+                summary: "AppArmor denied hostname: file_inherit /var/lib/fixer/proposals/120/workspace/build/config.log".to_string(),
+                details: json!({
+                    "subsystem": "apparmor",
+                    "profile": "hostname",
+                    "operation": "file_inherit",
+                    "class": "file",
+                    "name": "/var/lib/fixer/proposals/120/workspace/build/config.log"
+                }),
+                artifact_name: None,
+                artifact_path: None,
+                package_name: Some("hostname".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "2026-03-29T11:00:00Z".to_string(),
+                last_seen: "2026-03-29T11:00:00Z".to_string(),
+            },
+        };
+        let proc_mounts = {
+            let mut item = apparmor.clone();
+            item.finding.title =
+                "AppArmor denial in snap.telegram-desktop.telegram-desktop".to_string();
+            item.finding.details = json!({
+                "subsystem": "apparmor",
+                "profile": "snap.telegram-desktop.telegram-desktop",
+                "operation": "open",
+                "class": "file",
+                "name": "/proc/9019/mounts"
+            });
+            item
+        };
+
+        let public = build_public_issue_fields(&apparmor);
+        assert_eq!(
+            public.title,
+            "AppArmor denial in hostname: file_inherit [config.log]"
+        );
+        assert!(!public.visible);
+        assert!(!public.title.contains("/var/lib/fixer"));
+
+        let proc_public = build_public_issue_fields(&proc_mounts);
+        assert_eq!(
+            proc_public.title,
+            "AppArmor denial in snap.telegram-desktop.telegram-desktop: open /proc/<pid>/mounts"
+        );
+        assert!(!proc_public.title.contains("9019"));
     }
 
     #[test]
