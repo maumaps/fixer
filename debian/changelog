@@ -1,3 +1,10 @@
+fixer (0.113.0-1) unstable; urgency=medium
+
+  * Derive kernel warning public titles from the sanitized warning line instead
+    of storing every kernel warning as the same generic title.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 16:58:00 +0400
+
 fixer (0.112.0-1) unstable; urgency=medium
 
   * Clean legacy deleted path-only crash frames before deriving public crash

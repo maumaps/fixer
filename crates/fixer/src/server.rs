@@ -10565,6 +10565,9 @@ fn build_public_issue_fields(item: &SharedOpportunity) -> PublicIssueFields {
     if let Some(fields) = crash_public_issue_fields(item) {
         return fields;
     }
+    if let Some(fields) = warning_public_issue_fields(item) {
+        return fields;
+    }
     PublicIssueFields {
         title: sanitize_public_text(&item.opportunity.title),
         summary: sanitize_public_text(&item.opportunity.summary),
@@ -10638,6 +10641,29 @@ fn is_informative_public_crash_frame(frame: &str) -> bool {
             normalized,
             "raise" | "abort" | "__libc_start_main" | "_start" | "start_thread"
         )
+}
+
+fn warning_public_issue_fields(item: &SharedOpportunity) -> Option<PublicIssueFields> {
+    if item.finding.kind != "warning" || item.finding.title != "Kernel warning" {
+        return None;
+    }
+    let raw_line = item
+        .finding
+        .details
+        .get("line")
+        .and_then(Value::as_str)
+        .unwrap_or(item.finding.summary.as_str());
+    let warning = normalize_kernel_warning_message(raw_line);
+    let title = if warning.is_empty() {
+        "Kernel warning".to_string()
+    } else {
+        format!("Kernel warning: {warning}")
+    };
+    Some(PublicIssueFields {
+        title: truncate_patch_subject(&title, 120),
+        summary: sanitize_public_text(&item.opportunity.summary),
+        visible: is_publicly_visible(item),
+    })
 }
 
 fn hotspot_public_issue_fields(item: &SharedOpportunity) -> Option<PublicIssueFields> {
@@ -16182,6 +16208,52 @@ mod tests {
 
         assert!(!build_public_issue_fields(&kernel).visible);
         assert!(!build_public_issue_fields(&apparmor).visible);
+    }
+
+    #[test]
+    fn kernel_warning_public_title_uses_sanitized_warning_line() {
+        let kernel = SharedOpportunity {
+            local_opportunity_id: 1,
+            opportunity: OpportunityRecord {
+                id: 1,
+                finding_id: 1,
+                kind: "warning".to_string(),
+                title: "Kernel warning".to_string(),
+                score: 64,
+                state: "open".to_string(),
+                summary: "Mar 29 08:40:22 host kernel: GPT:Primary header thinks Alt. header is not at the end of the disk.".to_string(),
+                evidence: json!({}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "2026-03-29T11:00:00Z".to_string(),
+                updated_at: "2026-03-29T11:00:00Z".to_string(),
+            },
+            finding: FindingRecord {
+                id: 1,
+                kind: "warning".to_string(),
+                title: "Kernel warning".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "x".to_string(),
+                summary: "Mar 29 08:40:22 host kernel: GPT:Primary header thinks Alt. header is not at the end of the disk.".to_string(),
+                details: json!({"line": "Mar 29 08:40:22 host kernel: GPT:Primary header thinks Alt. header is not at the end of the disk."}),
+                artifact_name: None,
+                artifact_path: None,
+                package_name: None,
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "2026-03-29T11:00:00Z".to_string(),
+                last_seen: "2026-03-29T11:00:00Z".to_string(),
+            },
+        };
+
+        let public = build_public_issue_fields(&kernel);
+        assert_eq!(
+            public.title,
+            "Kernel warning: GPT:Primary header thinks Alt. header is not at the end of the disk."
+        );
+        assert!(!public.visible);
+        assert!(!public.title.contains("host"));
+        assert!(!public.title.contains("Mar 29"));
     }
 
     #[test]
