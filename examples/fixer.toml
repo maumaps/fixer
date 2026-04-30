@@ -18,19 +18,19 @@ warning_logs = []
 [patch]
 codex_command = "codex"
 codex_args = []
-model = "gpt-5.4"
+model = "gpt-5.5"
 reasoning_effort = "high"
-spark_model = "gpt-5.3-codex-spark"
+spark_model = ""
 sandbox = "workspace-write"
 approval_policy = "never"
 extra_instructions = "Keep the change narrowly scoped and leave a concise summary in the final message."
 plan_before_patch = true
 review_after_patch = true
 review_fix_passes = 1
-spark_fallback_on_rate_limit = true
+spark_fallback_on_rate_limit = false
 rate_limit_cooldown_seconds = 21600
 # For full multi-step repairs, prefer normal Codex with planning.
-# Keep spark_model available as a fallback or for narrow one-liner fixes.
+# Set spark_model only when the configured Codex token is allowed to use it.
 
 [network]
 server_url = "http://127.0.0.1:8080/"

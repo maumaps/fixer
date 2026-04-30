@@ -1,3 +1,10 @@
+fixer (0.118.0-1) unstable; urgency=medium
+
+  * Use gpt-5.5 as the default Codex model and disable Spark fallback by
+    default for restricted codex-lb tokens.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 19:03:00 +0400
+
 fixer (0.117.0-1) unstable; urgency=medium
 
   * Refresh legacy warning source packages from existing cluster package names

@@ -7541,7 +7541,9 @@ RESULT: ok
 
     #[test]
     fn detects_weekly_rate_limit_headroom_threshold() {
-        let config = FixerConfig::default();
+        let mut config = FixerConfig::default();
+        config.patch.spark_model = Some("gpt-5.3-codex-spark".to_string());
+        config.patch.spark_fallback_on_rate_limit = true;
         assert!(should_use_spark_for_weak_weekly_budget(
             &config,
             "weekly remaining 15%",
@@ -7566,7 +7568,9 @@ RESULT: ok
 
     #[test]
     fn detects_weekly_rate_limit_headroom_from_status_json_payload() {
-        let config = FixerConfig::default();
+        let mut config = FixerConfig::default();
+        config.patch.spark_model = Some("gpt-5.3-codex-spark".to_string());
+        config.patch.spark_fallback_on_rate_limit = true;
         let low_weekly_status = r#"{
             "status": {
                 "requests": {

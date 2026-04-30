@@ -95,7 +95,7 @@ pub struct PatchConfig {
     pub codex_timeout_seconds: u64,
     #[serde(default)]
     pub codex_args: Vec<String>,
-    #[serde(default)]
+    #[serde(default = "default_patch_model")]
     pub model: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
@@ -280,7 +280,7 @@ impl Default for PatchConfig {
             codex_command: default_codex_command(),
             codex_timeout_seconds: default_codex_timeout(),
             codex_args: Vec::new(),
-            model: None,
+            model: default_patch_model(),
             reasoning_effort: None,
             spark_model: default_spark_model(),
             sandbox: Some("workspace-write".to_string()),
@@ -289,7 +289,7 @@ impl Default for PatchConfig {
             plan_before_patch: true,
             review_after_patch: true,
             review_fix_passes: default_review_fix_passes(),
-            spark_fallback_on_rate_limit: true,
+            spark_fallback_on_rate_limit: false,
             spark_weekly_headroom_threshold: default_spark_weekly_headroom_threshold(),
             rate_limit_cooldown_seconds: default_rate_limit_cooldown(),
             auth_mode: CodexAuthMode::UserLease,
@@ -526,8 +526,12 @@ fn default_review_fix_passes() -> u32 {
     1
 }
 
+fn default_patch_model() -> Option<String> {
+    Some("gpt-5.5".to_string())
+}
+
 fn default_spark_model() -> Option<String> {
-    Some("gpt-5.3-codex-spark".to_string())
+    None
 }
 
 fn default_rate_limit_cooldown() -> u64 {
