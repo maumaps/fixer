@@ -1,3 +1,10 @@
+fixer (0.121.0-1) unstable; urgency=medium
+
+  * Trim outgoing submission bundles by serialized byte size so rich evidence
+    syncs stay under the server request body limit.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 23:40:00 +0400
+
 fixer (0.120.0-1) unstable; urgency=medium
 
   * Let workers abandon expired recovered result leases and continue to fresh

@@ -59,6 +59,7 @@ pub struct WorkerRunOutcome {
 
 const LOCAL_WORKER_BLOCKER_HISTORY_KEY: &str = "worker_local_blocker_history";
 const MAX_LOCAL_WORKER_BLOCKERS: usize = 64;
+const MAX_CLIENT_SUBMISSION_BUNDLE_BYTES: usize = 384 * 1024;
 const SUBMITTED_WORKER_RESULT_MARKER: &str = "submitted-worker-result.json";
 const UNRECOVERABLE_WORKER_RESULT_MARKER: &str = "unrecoverable-worker-result.json";
 
@@ -888,7 +889,11 @@ pub fn sync_once(store: &Store, config: &FixerConfig) -> Result<SyncOutcome> {
 
     let hello = post_json::<_, ServerHello>(config, "v1/install/hello", &hello_request)?;
     ensure_server_hello_compatible(&hello)?;
-    let bundle = build_submission_bundle(store, config, &participation)?;
+    let bundle = fit_submission_bundle_to_payload_budget(build_submission_bundle(
+        store,
+        config,
+        &participation,
+    )?)?;
     if bundle.items.is_empty() && bundle.proposals.is_empty() {
         return Err(anyhow!(
             "no opportunities or ready proposals available for submission"
@@ -1647,6 +1652,19 @@ fn build_submission_bundle(
         proposals,
         redactions,
     })
+}
+
+fn fit_submission_bundle_to_payload_budget(mut bundle: FindingBundle) -> Result<FindingBundle> {
+    while serde_json::to_vec(&bundle)?.len() > MAX_CLIENT_SUBMISSION_BUNDLE_BYTES {
+        if bundle.proposals.pop().is_some() {
+            continue;
+        }
+        if bundle.items.pop().is_some() {
+            continue;
+        }
+        break;
+    }
+    Ok(bundle)
 }
 
 fn build_submission_proposals(
