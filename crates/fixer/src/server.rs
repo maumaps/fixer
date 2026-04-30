@@ -7317,6 +7317,17 @@ fn attempt_matches_filter(filter: AttemptBoardFilter, attempt: &PatchAttempt) ->
     }
 }
 
+fn public_attempt_dedupe_key(issue_id: &str, attempt: &PatchAttempt) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        issue_id,
+        attempt.outcome,
+        attempt.state,
+        attempt.validation_status.as_deref().unwrap_or(""),
+        normalize_attempt_text(&attempt.summary)
+    )
+}
+
 async fn load_public_attempt_entries(
     db: &ServerDb,
     filter: AttemptBoardFilter,
@@ -7343,6 +7354,7 @@ async fn load_public_attempt_entries(
                 .await
                 .map_err(ApiError::internal)?;
             let mut entries = Vec::new();
+            let mut seen_attempts = HashSet::new();
             for row in rows {
                 let attempt_json: Value = row.get(12);
                 let envelope = serde_json::from_value::<WorkerResultEnvelope>(attempt_json)
@@ -7354,8 +7366,14 @@ async fn load_public_attempt_entries(
                 if !attempt_matches_filter(filter, &envelope.attempt) {
                     continue;
                 }
+                let issue_id: String = row.get(0);
+                let dedupe_key = public_attempt_dedupe_key(&issue_id, &envelope.attempt);
+                if !seen_attempts.insert(dedupe_key) {
+                    continue;
+                }
+                let attempt = public_attempt_from_patch_attempt(envelope.attempt);
                 entries.push(PublicAttemptEntry {
-                    issue_id: row.get(0),
+                    issue_id,
                     kind: row.get(1),
                     issue_title: row.get(2),
                     issue_summary: row.get(3),
@@ -7371,7 +7389,7 @@ async fn load_public_attempt_entries(
                         let best_triage_available: bool = row.get(11);
                         best_triage_available && !best_patch_available
                     },
-                    attempt: public_attempt_from_patch_attempt(envelope.attempt),
+                    attempt,
                 });
                 if entries.len() >= limit as usize {
                     break;
@@ -7417,6 +7435,7 @@ async fn load_public_attempt_entries(
                 })
                 .map_err(ApiError::internal)?;
             let mut entries = Vec::new();
+            let mut seen_attempts = HashSet::new();
             for row in rows {
                 let (
                     issue_id,
@@ -7442,6 +7461,11 @@ async fn load_public_attempt_entries(
                 if !attempt_matches_filter(filter, &envelope.attempt) {
                     continue;
                 }
+                let dedupe_key = public_attempt_dedupe_key(&issue_id, &envelope.attempt);
+                if !seen_attempts.insert(dedupe_key) {
+                    continue;
+                }
+                let attempt = public_attempt_from_patch_attempt(envelope.attempt);
                 entries.push(PublicAttemptEntry {
                     issue_id,
                     kind,
@@ -7456,7 +7480,7 @@ async fn load_public_attempt_entries(
                     best_patch_available: best_patch_available != 0,
                     best_triage_available: (best_triage_available != 0)
                         && (best_patch_available == 0),
-                    attempt: public_attempt_from_patch_attempt(envelope.attempt),
+                    attempt,
                 });
                 if entries.len() >= limit as usize {
                     break;
@@ -13642,6 +13666,72 @@ mod tests {
                 ],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn public_attempt_entries_collapse_duplicate_canonical_attempts() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "chrome",
+            "Top frame: crash_handler [chrome]",
+            &["crash_handler [chrome]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-1",
+            "cluster-1",
+            120,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-reporter"],
+        );
+        let attempt = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "report".to_string(),
+            state: "ready".to_string(),
+            summary:
+                "A diagnosis report was created even though no patchable workspace was available."
+                    .to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "report_only_reason": "workspace-acquisition"
+            }),
+            created_at: "2026-03-30T00:00:00Z".to_string(),
+        };
+        let newer_attempt = PatchAttempt {
+            created_at: "2026-03-30T00:05:00Z".to_string(),
+            install_id: "worker-install-2".to_string(),
+            ..attempt.clone()
+        };
+        insert_test_attempt(
+            &connection,
+            "attempt-older",
+            "lease-older",
+            &attempt,
+            "2026-03-30T00:00:00Z",
+        );
+        insert_test_attempt(
+            &connection,
+            "attempt-newer",
+            "lease-newer",
+            &newer_attempt,
+            "2026-03-30T00:05:00Z",
+        );
+
+        let entries = test_runtime()
+            .block_on(load_public_attempt_entries(
+                &db,
+                AttemptBoardFilter::All,
+                250,
+            ))
+            .unwrap_or_else(|error| panic!("load attempts failed: {}", error.message));
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].attempt.created_at, "2026-03-30T00:05:00Z");
     }
 
     #[test]
