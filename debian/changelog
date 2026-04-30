@@ -1,3 +1,12 @@
+fixer (0.127.0-1) unstable; urgency=medium
+
+  * Keep weak unknown runaway-process investigations report-only instead of
+    spending Codex review passes on speculative source patches.
+  * Label evidence-only blockers separately from workspace acquisition
+    failures in process investigation reports.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 03:09:05 +0400
+
 fixer (0.126.0-1) unstable; urgency=medium
 
   * Try Debian source and VCS metadata before classifying external-origin

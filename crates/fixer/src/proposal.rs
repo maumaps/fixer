@@ -1030,6 +1030,11 @@ pub fn process_investigation_blocker_kind(message: &str) -> &'static str {
         || lower.contains("source tree")
     {
         "workspace"
+    } else if lower.contains("evidence is too weak")
+        || lower.contains("not specific enough")
+        || lower.contains("specific source code path")
+    {
+        "evidence"
     } else {
         "automatic-patch"
     }
@@ -3967,6 +3972,10 @@ fn render_process_investigation_report(
                 body.push_str("Fixer diagnosed a likely runaway CPU loop, but it could not automatically acquire a patchable source workspace on this host.\n\n");
                 body.push_str(&format!("Workspace acquisition blocker: `{error}`\n\n"));
                 body.push_str("Use the diagnosis below to file an upstream or distro bug, or to fetch a source tree manually before retrying `fixer propose-fix <id> --engine codex`.\n\n");
+            } else if blocker_kind == "evidence" {
+                body.push_str("Fixer diagnosed a likely runaway CPU loop, but the collected evidence is not specific enough for a safe automatic source patch.\n\n");
+                body.push_str(&format!("Automatic patch evidence blocker: `{error}`\n\n"));
+                body.push_str("Treat this report as the diagnosis half: collect fresh multi-thread backtraces, a longer perf sample, and strace/journal context before retrying an automated patch attempt.\n\n");
             } else {
                 body.push_str("Fixer gathered enough evidence to describe the issue, but the automatic patch attempt did not get far enough to produce a real patch on this host.\n\n");
                 body.push_str(&format!("Automatic patch attempt blocker: `{error}`\n\n"));
@@ -5864,13 +5873,14 @@ mod tests {
         initialize_workspace_git_baseline, is_generated_public_diff_path,
         load_published_codex_session, parse_review_verdict, pg_amcheck_command,
         prepare_codex_job_with_prior_patch, primary_model_rate_limit_active,
-        rank_complaint_package_candidates, remember_primary_model_rate_limit,
-        render_complaint_plan, render_external_bug_report, render_local_remediation_report,
-        render_local_remediation_sql, render_process_investigation_report,
-        render_public_session_git_diff, sanitize_command_line_for_report,
-        should_retry_after_compaction_failure, should_use_spark_for_weak_weekly_budget,
-        suggested_report_destination, summarize_related_desktop_signals,
-        summarize_related_input_config_constraints, timeout_error_summary,
+        process_investigation_blocker_kind, rank_complaint_package_candidates,
+        remember_primary_model_rate_limit, render_complaint_plan, render_external_bug_report,
+        render_local_remediation_report, render_local_remediation_sql,
+        render_process_investigation_report, render_public_session_git_diff,
+        sanitize_command_line_for_report, should_retry_after_compaction_failure,
+        should_use_spark_for_weak_weekly_budget, suggested_report_destination,
+        summarize_related_desktop_signals, summarize_related_input_config_constraints,
+        timeout_error_summary,
     };
     use crate::config::FixerConfig;
     use crate::models::{
@@ -6180,6 +6190,53 @@ mod tests {
         assert!(rendered.contains("recvmsg x122"));
         assert!(rendered.contains("Validation Steps"));
         assert!(rendered.contains("workspace"));
+    }
+
+    #[test]
+    fn runaway_process_report_explains_weak_evidence_blocker() {
+        let opportunity = OpportunityRecord {
+            id: 77,
+            finding_id: 77,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for postgres".to_string(),
+            score: 88,
+            state: "open".to_string(),
+            summary: "postgres likely remains stuck in an unclassified userspace loop.".to_string(),
+            evidence: json!({
+                "package_name": "postgresql-18",
+                "details": {
+                    "subsystem": "runaway-process",
+                    "profile_target": { "name": "postgres" },
+                    "sampled_pid": 86846,
+                    "loop_classification": "unknown-userspace-loop",
+                    "loop_confidence": 0.42,
+                    "loop_explanation": "Fixer collected a CPU-hot process sample but could not derive a stronger hypothesis yet.",
+                    "process_state": "S (sleeping)",
+                    "wchan": "do_epoll_wait"
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-04-30T00:00:00Z".to_string(),
+            updated_at: "2026-04-30T00:00:00Z".to_string(),
+        };
+        let system = json!({
+            "os_pretty_name": "Debian GNU/Linux forky/sid",
+            "kernel": "Linux 6.19.8+deb14-amd64"
+        });
+        let blocker = "the collected evidence is too weak to tie the loop to a specific source code path, so Fixer skipped an automatic package patch attempt";
+        let rendered = render_process_investigation_report(
+            &opportunity,
+            None,
+            &system,
+            Path::new("/tmp/evidence.json"),
+            Some(blocker),
+        );
+
+        assert_eq!(process_investigation_blocker_kind(blocker), "evidence");
+        assert!(rendered.contains("not specific enough for a safe automatic source patch"));
+        assert!(rendered.contains("Automatic patch evidence blocker"));
+        assert!(!rendered.contains("Workspace acquisition blocker"));
     }
 
     #[test]

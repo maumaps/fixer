@@ -1008,15 +1008,25 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
     let opportunity = materialize_shared_opportunity(store, &lease.issue.representative)?;
     let supports_process_report = proposal::supports_process_investigation_report(&opportunity);
     if supports_process_report && process_investigation_prefers_report_only(&opportunity) {
+        let blocker = process_investigation_report_only_blocker_for_opportunity(&opportunity);
         let report = proposal::create_process_investigation_report_proposal(
             store,
             config,
             &opportunity,
-            Some(
-                "the collected evidence points below user space, so Fixer skipped an automatic package patch attempt",
-            ),
+            Some(blocker.human_message),
         )?;
         let submission_bundle = proposal::prepare_submission(store, report.id).ok();
+        let summary = if blocker.machine_reason == "weak-unknown-runaway-evidence" {
+            format!(
+                "{} Fixer produced a diagnosis report and intentionally skipped an automatic package patch attempt because the evidence is not specific enough to choose a safe source change.",
+                process_investigation_worker_summary(&opportunity)
+            )
+        } else {
+            format!(
+                "{} Fixer produced a diagnosis report and intentionally skipped a package patch attempt because the wait appears to be below user space.",
+                process_investigation_worker_summary(&opportunity)
+            )
+        };
         let result = WorkerResultEnvelope {
             lease_id: lease.lease_id.clone(),
             attempt: PatchAttempt {
@@ -1024,10 +1034,7 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                 install_id: participation.identity.install_id.clone(),
                 outcome: "report".to_string(),
                 state: report.state.clone(),
-                summary: format!(
-                    "{} Fixer produced a diagnosis report and intentionally skipped a package patch attempt because the wait appears to be below user space.",
-                    process_investigation_worker_summary(&opportunity)
-                ),
+                summary,
                 bundle_path: Some(report.bundle_path.display().to_string()),
                 output_path: report
                     .output_path
@@ -1039,7 +1046,7 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                     "local_submission_bundle": submission_bundle.map(|path| path.display().to_string()),
                     "local_opportunity_id": opportunity.id,
                     "diagnosis": process_investigation_worker_diagnosis(&opportunity),
-                    "report_only_reason": "likely-external-root-cause",
+                    "report_only_reason": blocker.machine_reason,
                 }),
                 created_at: now_rfc3339(),
             },
@@ -2377,6 +2384,62 @@ fn process_investigation_prefers_report_only(
         .get("likely_external_root_cause")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+        || weak_unknown_runaway_process_evidence(&details)
+}
+
+struct ProcessInvestigationReportOnlyBlocker {
+    machine_reason: &'static str,
+    human_message: &'static str,
+}
+
+fn process_investigation_report_only_blocker_for_opportunity(
+    opportunity: &crate::models::OpportunityRecord,
+) -> ProcessInvestigationReportOnlyBlocker {
+    let details = process_investigation_worker_diagnosis(opportunity);
+    if weak_unknown_runaway_process_evidence(&details) {
+        return ProcessInvestigationReportOnlyBlocker {
+            machine_reason: "weak-unknown-runaway-evidence",
+            human_message: "the collected evidence is too weak to tie the loop to a specific source code path, so Fixer skipped an automatic package patch attempt",
+        };
+    }
+    ProcessInvestigationReportOnlyBlocker {
+        machine_reason: "likely-external-root-cause",
+        human_message: "the collected evidence points below user space, so Fixer skipped an automatic package patch attempt",
+    }
+}
+
+fn weak_unknown_runaway_process_evidence(details: &Value) -> bool {
+    let is_unknown_runaway = details
+        .get("subsystem")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "runaway-process")
+        && details
+            .get("loop_classification")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == "unknown-userspace-loop")
+        && details
+            .get("loop_confidence")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            < 0.6;
+    if !is_unknown_runaway {
+        return false;
+    }
+
+    evidence_array_is_empty(details, "common_frame_clusters")
+        && evidence_array_is_empty(details, "representative_backtraces")
+        && evidence_array_is_empty(details, "lock_contention_signals")
+        && details
+            .get("thread_backtrace_summary")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+}
+
+fn evidence_array_is_empty(details: &Value, key: &str) -> bool {
+    details
+        .get(key)
+        .and_then(Value::as_array)
+        .is_none_or(|items| items.is_empty())
 }
 
 fn process_investigation_report_only_reason_for_error(error: &str) -> &'static str {
@@ -3204,6 +3267,54 @@ mod tests {
             ),
             "workspace-acquisition"
         );
+    }
+
+    #[test]
+    fn weak_unknown_runaway_process_investigation_prefers_report_only() {
+        let mut opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for postgres".to_string(),
+            score: 10,
+            state: "open".to_string(),
+            repo_root: None,
+            summary: "postgres loops".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "runaway-process",
+                    "profile_target": { "name": "postgres" },
+                    "loop_classification": "unknown-userspace-loop",
+                    "loop_confidence": 0.42,
+                    "hot_path_dso": "[kernel.kallsyms]",
+                    "top_syscalls": [
+                        { "name": "read", "count": 55 }
+                    ],
+                    "common_frame_clusters": [],
+                    "representative_backtraces": [],
+                    "lock_contention_signals": []
+                }
+            }),
+            ecosystem: None,
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+            updated_at: "2026-04-01T00:00:00Z".to_string(),
+        };
+
+        assert!(process_investigation_prefers_report_only(&opportunity));
+        let blocker = process_investigation_report_only_blocker_for_opportunity(&opportunity);
+        assert_eq!(blocker.machine_reason, "weak-unknown-runaway-evidence");
+
+        opportunity.evidence = json!({
+            "details": {
+                "subsystem": "runaway-process",
+                "profile_target": { "name": "packagekitd" },
+                "loop_classification": "dbus-spin",
+                "loop_confidence": 0.84,
+                "thread_backtrace_summary": "Thread 1 is repeatedly in QDBusConnection::send."
+            }
+        });
+
+        assert!(!process_investigation_prefers_report_only(&opportunity));
     }
 
     #[test]
