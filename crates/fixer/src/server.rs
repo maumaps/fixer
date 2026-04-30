@@ -2475,7 +2475,8 @@ fn recluster_issue_state(
         let cluster_key = cluster_key_for(&representative);
         let public_fields = build_public_issue_fields(&representative);
         let package_name = representative.finding.package_name.clone();
-        let source_package = inferred_public_source_package(&representative);
+        let source_package = inferred_public_source_package(&representative)
+            .or_else(|| inferred_warning_source_package_from_name(&row.kind, &row.package_name));
         if cluster_key != row.cluster_key
             || public_fields.title != row.public_title
             || public_fields.summary != row.public_summary
@@ -8125,11 +8126,17 @@ fn inferred_apparmor_source_package(item: &SharedOpportunity) -> Option<String> 
 }
 
 fn inferred_warning_source_package(item: &SharedOpportunity) -> Option<String> {
-    if item.finding.kind != "warning" {
+    inferred_warning_source_package_from_name(&item.finding.kind, &item.finding.package_name)
+}
+
+fn inferred_warning_source_package_from_name(
+    kind: &str,
+    package_name: &Option<String>,
+) -> Option<String> {
+    if kind != "warning" {
         return None;
     }
-    item.finding
-        .package_name
+    package_name
         .as_deref()
         .and_then(known_legacy_source_package_alias)
         .map(ToString::to_string)
@@ -17233,6 +17240,47 @@ mod tests {
         assert_eq!(
             reclustered.issue_clusters[0].source_package.as_deref(),
             Some("postgresql-18")
+        );
+    }
+
+    #[test]
+    fn recluster_issue_state_refreshes_warning_source_package_from_existing_package_name() {
+        let warning = sample_kernel_warning(None);
+        let public = build_public_issue_fields(&warning);
+        let state = CurrentIssueState {
+            issue_clusters: vec![CurrentIssueCluster {
+                id: "issue-a".to_string(),
+                cluster_key: cluster_key_for(&warning),
+                kind: warning.opportunity.kind.clone(),
+                title: warning.opportunity.title.clone(),
+                summary: warning.opportunity.summary.clone(),
+                public_title: public.title,
+                public_summary: public.summary,
+                public_visible: public.visible,
+                package_name: Some("nvidia-kernel-dkms".to_string()),
+                source_package: None,
+                ecosystem: None,
+                severity: Some("medium".to_string()),
+                score: warning.opportunity.score,
+                corroboration_count: 1,
+                quarantined: false,
+                promoted: true,
+                representative_json: serde_json::to_value(&warning).unwrap(),
+                best_patch_json: None,
+                best_triage_json: None,
+                last_seen: "2026-04-30T10:00:00Z".to_string(),
+            }],
+            cluster_reports: Vec::new(),
+            worker_leases: Vec::new(),
+            patch_attempts: Vec::new(),
+            evidence_requests: Vec::new(),
+        };
+
+        let reclustered = recluster_issue_state(state, 2).unwrap().unwrap();
+
+        assert_eq!(
+            reclustered.issue_clusters[0].source_package.as_deref(),
+            Some("nvidia-graphics-drivers")
         );
     }
 
