@@ -2474,11 +2474,13 @@ fn recluster_issue_state(
             serde_json::from_value(row.representative_json.clone())?;
         let cluster_key = cluster_key_for(&representative);
         let public_fields = build_public_issue_fields(&representative);
+        let package_name = representative.finding.package_name.clone();
         let source_package = inferred_public_source_package(&representative);
         if cluster_key != row.cluster_key
             || public_fields.title != row.public_title
             || public_fields.summary != row.public_summary
             || public_fields.visible != row.public_visible
+            || (package_name.is_some() && package_name != row.package_name)
             || (optional_string_is_empty(&row.source_package) && source_package.is_some())
         {
             needs_recluster = true;
@@ -2486,13 +2488,16 @@ fn recluster_issue_state(
         match grouped_clusters.entry(cluster_key.clone()) {
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 needs_recluster = true;
-                entry.get_mut().absorb(row, &public_fields, source_package);
+                entry
+                    .get_mut()
+                    .absorb(row, &public_fields, package_name, source_package);
             }
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(CurrentClusterAccumulator::new(
                     row,
                     cluster_key,
                     &public_fields,
+                    package_name,
                     source_package,
                 ));
             }
@@ -3396,6 +3401,7 @@ impl CurrentClusterAccumulator {
         row: &CurrentIssueCluster,
         cluster_key: String,
         public_fields: &PublicIssueFields,
+        package_name: Option<String>,
         source_package: Option<String>,
     ) -> Self {
         Self {
@@ -3412,7 +3418,7 @@ impl CurrentClusterAccumulator {
             public_title: public_fields.title.clone(),
             public_summary: public_fields.summary.clone(),
             public_visible: public_fields.visible,
-            package_name: row.package_name.clone(),
+            package_name: package_name.or_else(|| row.package_name.clone()),
             source_package: source_package
                 .or_else(|| nonempty_optional_string(&row.source_package)),
             ecosystem: row.ecosystem.clone(),
@@ -3438,6 +3444,7 @@ impl CurrentClusterAccumulator {
         &mut self,
         row: &CurrentIssueCluster,
         public_fields: &PublicIssueFields,
+        package_name: Option<String>,
         source_package: Option<String>,
     ) {
         self.existing_ids.push(row.id.clone());
@@ -3464,7 +3471,7 @@ impl CurrentClusterAccumulator {
         }
         self.score = self.score.max(row.score);
         if self.package_name.is_none() {
-            self.package_name = row.package_name.clone();
+            self.package_name = package_name.clone().or_else(|| row.package_name.clone());
         }
         if optional_string_is_empty(&self.source_package) {
             self.source_package =
@@ -3503,6 +3510,7 @@ impl CurrentClusterAccumulator {
             self.summary = row.summary.clone();
             self.public_title = public_fields.title.clone();
             self.public_summary = public_fields.summary.clone();
+            self.package_name = package_name.or_else(|| row.package_name.clone());
             self.representative_json = row.representative_json.clone();
             self.last_seen = row.last_seen.clone();
         } else {
@@ -16829,6 +16837,52 @@ mod tests {
         assert_eq!(
             reclustered.issue_clusters[0].source_package.as_deref(),
             Some("linux")
+        );
+    }
+
+    #[test]
+    fn recluster_issue_state_refreshes_stale_package_name_from_representative() {
+        let hotspot = sample_hotspot("postgres", "postgres", "AllocSetAlloc", "postgresql-18");
+        let public = build_public_issue_fields(&hotspot);
+        let state = CurrentIssueState {
+            issue_clusters: vec![CurrentIssueCluster {
+                id: "issue-a".to_string(),
+                cluster_key: cluster_key_for(&hotspot),
+                kind: hotspot.opportunity.kind.clone(),
+                title: hotspot.opportunity.title.clone(),
+                summary: hotspot.opportunity.summary.clone(),
+                public_title: public.title,
+                public_summary: public.summary,
+                public_visible: public.visible,
+                package_name: Some("postgresql-14".to_string()),
+                source_package: Some("postgresql-18".to_string()),
+                ecosystem: None,
+                severity: Some("medium".to_string()),
+                score: hotspot.opportunity.score,
+                corroboration_count: 1,
+                quarantined: false,
+                promoted: true,
+                representative_json: serde_json::to_value(&hotspot).unwrap(),
+                best_patch_json: None,
+                best_triage_json: None,
+                last_seen: "2026-04-30T10:00:00Z".to_string(),
+            }],
+            cluster_reports: Vec::new(),
+            worker_leases: Vec::new(),
+            patch_attempts: Vec::new(),
+            evidence_requests: Vec::new(),
+        };
+
+        let reclustered = recluster_issue_state(state, 2).unwrap().unwrap();
+
+        assert_eq!(reclustered.issue_clusters.len(), 1);
+        assert_eq!(
+            reclustered.issue_clusters[0].package_name.as_deref(),
+            Some("postgresql-18")
+        );
+        assert_eq!(
+            reclustered.issue_clusters[0].source_package.as_deref(),
+            Some("postgresql-18")
         );
     }
 
