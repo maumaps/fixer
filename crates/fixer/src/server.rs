@@ -11072,9 +11072,26 @@ fn normalize_stack_frame(frame: &str) -> String {
     let module_suffix_re = Regex::new(r"\s+\[[^\]]+\]\+?$").expect("valid module suffix regex");
     let offset_re =
         Regex::new(r"\+0x[0-9a-fA-F]+(?:/0x[0-9a-fA-F]+)?").expect("valid frame offset regex");
+    let deleted_path_marker_re =
+        Regex::new(r"\s+\[deleted\)\]").expect("valid deleted path marker regex");
+    let deleted_module_marker_re =
+        Regex::new(r"\s+\[deleted\]").expect("valid deleted module marker regex");
+    let path_only_frame_re =
+        Regex::new(r"^n/a\s+\((?:.*/)?([^/()]+)\)$").expect("valid path-only frame regex");
     let mut normalized = address_prefix_re.replace(frame.trim(), "").to_string();
+    normalized = deleted_path_marker_re
+        .replace_all(&normalized, ")")
+        .to_string();
+    normalized = deleted_module_marker_re
+        .replace_all(&normalized, "")
+        .to_string();
     normalized = module_suffix_re.replace(&normalized, "").to_string();
     normalized = offset_re.replace_all(&normalized, "").to_string();
+    if let Some(captures) = path_only_frame_re.captures(normalized.trim()) {
+        if let Some(file_name) = captures.get(1) {
+            return sanitize_public_text(file_name.as_str());
+        }
+    }
     sanitize_public_text(normalized.trim_end_matches('+').trim())
 }
 
@@ -16264,6 +16281,23 @@ mod tests {
     }
 
     #[test]
+    fn crash_public_title_cleans_deleted_path_only_frames() {
+        let crash = sample_crash(
+            "chrome",
+            "Top frame: n/a in deleted libc path",
+            &[
+                "n/a [libEGL_nvidia.so.0]",
+                "n/a (/usr/lib/x86_64-linux-gnu/libc.so.6 [deleted)]",
+            ],
+        );
+
+        let public = build_public_issue_fields(&crash);
+        assert_eq!(public.title, "Crash in chrome: SIGSEGV at libc.so.6");
+        assert!(!public.title.contains("[deleted"));
+        assert!(!public.title.contains("/usr/lib"));
+    }
+
+    #[test]
     fn hotspot_cluster_key_collapses_unresolved_offsets() {
         let a = sample_hotspot(
             "redis-check-rdb",
@@ -16556,6 +16590,10 @@ mod tests {
         assert_eq!(
             normalize_stack_frame("[<0>] drm_atomic_helper_wait_for_flip_done+0x4d/0x90"),
             "drm_atomic_helper_wait_for_flip_done"
+        );
+        assert_eq!(
+            normalize_stack_frame("n/a (/usr/lib/x86_64-linux-gnu/libc.so.6 [deleted)]"),
+            "libc.so.6"
         );
     }
 

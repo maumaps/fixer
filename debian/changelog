@@ -1,3 +1,10 @@
+fixer (0.112.0-1) unstable; urgency=medium
+
+  * Clean legacy deleted path-only crash frames before deriving public crash
+    titles.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 16:32:00 +0400
+
 fixer (0.111.0-1) unstable; urgency=medium
 
   * Refresh stale public issue package names from the canonical representative
