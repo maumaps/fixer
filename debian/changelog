@@ -1,3 +1,10 @@
+fixer (0.100.0-1) unstable; urgency=medium
+
+  * Include crash signal and a short normalized stack signature in public
+    crash titles so distinct crash clusters no longer look duplicated.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 07:12:00 +0400
+
 fixer (0.99.0-1) unstable; urgency=medium
 
   * Merge stuck D-state investigations with missing stack excerpts into the

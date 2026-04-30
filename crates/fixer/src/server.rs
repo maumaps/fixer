@@ -10286,11 +10286,76 @@ fn build_public_issue_fields(item: &SharedOpportunity) -> PublicIssueFields {
     if let Some(fields) = investigation_public_issue_fields(item) {
         return fields;
     }
+    if let Some(fields) = crash_public_issue_fields(item) {
+        return fields;
+    }
     PublicIssueFields {
         title: sanitize_public_text(&item.opportunity.title),
         summary: sanitize_public_text(&item.opportunity.summary),
         visible: is_publicly_visible(item),
     }
+}
+
+fn crash_public_issue_fields(item: &SharedOpportunity) -> Option<PublicIssueFields> {
+    if item.finding.kind != "crash" {
+        return None;
+    }
+    let details = &item.finding.details;
+    let process = details
+        .get("executable")
+        .and_then(Value::as_str)
+        .map(file_name_or_self)
+        .or(item.finding.artifact_name.as_deref())
+        .or(item.finding.package_name.as_deref())
+        .map(sanitize_public_text)
+        .unwrap_or_else(|| "unknown process".to_string());
+    let signal = details
+        .get("signal_name")
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .or_else(|| {
+            details
+                .get("signal_number")
+                .and_then(Value::as_i64)
+                .map(|value| format!("signal {value}"))
+        });
+    let stack_signature = public_crash_stack_signature(details);
+    let title = match (signal, stack_signature) {
+        (Some(signal), Some(stack_signature)) => {
+            format!("Crash in {process}: {signal} at {stack_signature}")
+        }
+        (Some(signal), None) => format!("Crash in {process}: {signal}"),
+        (None, Some(stack_signature)) => format!("Crash in {process}: {stack_signature}"),
+        (None, None) => format!("Crash in {process}"),
+    };
+    Some(PublicIssueFields {
+        title: truncate_patch_subject(&title, 120),
+        summary: sanitize_public_text(&item.opportunity.summary),
+        visible: is_publicly_visible(item),
+    })
+}
+
+fn public_crash_stack_signature(details: &Value) -> Option<String> {
+    let frames = details.get("primary_stack").and_then(Value::as_array)?;
+    let signature = frames
+        .iter()
+        .filter_map(Value::as_str)
+        .map(normalize_stack_frame)
+        .filter(|frame| is_informative_public_crash_frame(frame))
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    (!signature.is_empty()).then(|| truncate_patch_subject(&signature, 80))
+}
+
+fn is_informative_public_crash_frame(frame: &str) -> bool {
+    let normalized = frame.trim();
+    !normalized.is_empty()
+        && normalized != "n/a"
+        && !matches!(
+            normalized,
+            "raise" | "abort" | "__libc_start_main" | "_start" | "start_thread"
+        )
 }
 
 fn hotspot_public_issue_fields(item: &SharedOpportunity) -> Option<PublicIssueFields> {
@@ -15855,6 +15920,27 @@ mod tests {
         );
 
         assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
+    }
+
+    #[test]
+    fn crash_public_title_includes_signal_and_stack_signature() {
+        let crash = sample_crash(
+            "kwin_x11",
+            "Top frame: n/a [libc.so.6]",
+            &[
+                "n/a [libc.so.6]",
+                "raise [libc.so.6]",
+                "abort [libc.so.6]",
+                "_ZN4KWin18ItemRendererOpenGL10renderItemEv+0x9 [libkwin-x11.so.6]",
+                "_ZN4KWin14WorkspaceScene11paintWindowEv [libkwin-x11.so.6]",
+            ],
+        );
+
+        let public = build_public_issue_fields(&crash);
+        assert!(public.title.starts_with(
+            "Crash in kwin_x11: SIGSEGV at _ZN4KWin18ItemRendererOpenGL10renderItemEv"
+        ));
+        assert!(public.title.contains("->"));
     }
 
     #[test]
