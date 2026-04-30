@@ -1,3 +1,12 @@
+fixer (0.96.0-1) unstable; urgency=medium
+
+  * Use strace dominant syscall sequences only as a fallback clustering signal
+    when runaway-process investigations do not have a perf hot symbol, avoiding
+    duplicate clusters for the same hot path with missing or different strace
+    samples.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 05:51:00 +0400
+
 fixer (0.95.0-1) unstable; urgency=medium
 
   * Normalize timestamped strace dominant syscall sequences before clustering

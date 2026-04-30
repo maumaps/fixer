@@ -10168,27 +10168,17 @@ fn normalized_investigation_cluster_key(item: &SharedOpportunity) -> String {
                 .and_then(|symbols| symbols.first())
                 .and_then(Value::as_str)
                 .map(normalized_perf_sample_symbol)
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "-".to_string());
-            let dominant_sequence = item
-                .finding
-                .details
-                .get("dominant_sequence")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .take(3)
-                        .filter_map(normalized_dominant_sequence_entry)
-                        .collect::<Vec<_>>()
-                        .join("|")
-                })
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "-".to_string());
+                .filter(|value| !value.is_empty());
+            let dominant_sequence = hot_symbol
+                .is_none()
+                .then(|| normalized_dominant_sequence_signature(item))
+                .flatten();
             hash_text(format!(
                 "investigation|runaway-process|{}|{}|{}|{}",
-                target, classification, hot_symbol, dominant_sequence,
+                target,
+                classification,
+                hot_symbol.as_deref().unwrap_or("-"),
+                dominant_sequence.as_deref().unwrap_or("-"),
             ))
         }
         "oom-kill" => {
@@ -10712,6 +10702,23 @@ fn normalized_dominant_sequence_entry(raw: &str) -> Option<String> {
         .trim();
     let normalized = normalize_stack_frame(name);
     (!normalized.is_empty()).then_some(normalized)
+}
+
+fn normalized_dominant_sequence_signature(item: &SharedOpportunity) -> Option<String> {
+    item.finding
+        .details
+        .get("dominant_sequence")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .take(3)
+                .filter_map(normalized_dominant_sequence_entry)
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .filter(|value| !value.is_empty())
 }
 
 fn normalize_stack_frame(frame: &str) -> String {
@@ -16010,6 +16017,12 @@ mod tests {
         assert_eq!(
             cluster_key_for(&timestamped_sequence),
             cluster_key_for(&later_sequence)
+        );
+        let mut missing_sequence = timestamped_sequence.clone();
+        missing_sequence.finding.details["dominant_sequence"] = json!([]);
+        assert_eq!(
+            cluster_key_for(&timestamped_sequence),
+            cluster_key_for(&missing_sequence)
         );
         assert_eq!(
             build_public_issue_fields(&timestamped_sequence).title,
