@@ -11222,6 +11222,21 @@ fn normalize_kernel_worker_target_name(raw: &str) -> String {
 
 fn normalize_kernel_warning_message(raw: &str) -> String {
     let mut text = strip_syslog_prefix(raw);
+    if text.contains("[UFW ") {
+        let mac_re = Regex::new(r"\bMAC=[0-9a-fA-F:]+\b").expect("valid firewall mac field regex");
+        text = mac_re.replace_all(&text, "MAC=<mac>").to_string();
+        let addr_re = Regex::new(r"\b(SRC|DST)=[^\s]+\b").expect("valid firewall addr field regex");
+        text = addr_re.replace_all(&text, "$1=<addr>").to_string();
+        let numeric_re = Regex::new(r"\b(LEN|TTL|ID|PROTO|SPT|DPT|WINDOW|URGP)=\d+\b")
+            .expect("valid firewall numeric field regex");
+        text = numeric_re.replace_all(&text, "$1=<n>").to_string();
+        let hex_re = Regex::new(r"\b(TOS|PREC|RES)=0x[0-9a-fA-F]+\b")
+            .expect("valid firewall hex field regex");
+        text = hex_re.replace_all(&text, "$1=<hex>").to_string();
+        let packet_flag_re = Regex::new(r"\s+\b(?:DF|SYN|ACK|PSH|RST|FIN|URG)\b")
+            .expect("valid firewall packet flag regex");
+        text = packet_flag_re.replace_all(&text, "").to_string();
+    }
     let pci_re =
         Regex::new(r"\b[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]\b").expect("valid pci regex");
     text = pci_re.replace_all(&text, "<pci>").to_string();
@@ -16254,6 +16269,25 @@ mod tests {
         assert!(!public.visible);
         assert!(!public.title.contains("host"));
         assert!(!public.title.contains("Mar 29"));
+    }
+
+    #[test]
+    fn kernel_warning_normalization_scrubs_ufw_packet_noise() {
+        let first = normalize_kernel_warning_message(
+            "მარ 31 22:11:23 host kernel: [UFW BLOCK] IN=wlp1s0 OUT= MAC=01:00:5e:00:00:01:30:68:93:20:cf:cf:08:00 SRC=192.168.1.1 DST=224.0.0.1 LEN=36 TOS=0x00 PREC=0x00 TTL=1 ID=25811 DF PROTO=2",
+        );
+        let second = normalize_kernel_warning_message(
+            "მარ 31 23:01:23 host kernel: [UFW BLOCK] IN=wlp1s0 OUT= MAC=01:00:5e:00:00:01:30:68:93:20:cf:cf:08:00 SRC=0.0.0.0 DST=224.0.0.1 LEN=36 TOS=0x00 PREC=0x00 TTL=1 ID=1 PROTO=2",
+        );
+
+        assert_eq!(first, second);
+        assert!(first.contains("[UFW BLOCK]"));
+        assert!(first.contains("SRC=<addr>"));
+        assert!(first.contains("MAC=<mac>"));
+        assert!(!first.contains("192.168.1.1"));
+        assert!(!first.contains("01:00:5e"));
+        assert!(!first.contains("ID=25811"));
+        assert!(!first.contains(" DF "));
     }
 
     #[test]

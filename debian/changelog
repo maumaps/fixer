@@ -1,3 +1,10 @@
+fixer (0.114.0-1) unstable; urgency=medium
+
+  * Normalize volatile UFW kernel warning packet fields before clustering and
+    public title generation.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 17:10:00 +0400
+
 fixer (0.113.0-1) unstable; urgency=medium
 
   * Derive kernel warning public titles from the sanitized warning line instead
