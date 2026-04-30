@@ -1930,7 +1930,7 @@ fn should_run_plan_before_patch(config: &FixerConfig, subsystem: Option<&str>) -
 fn effective_review_fix_passes(config: &FixerConfig, subsystem: Option<&str>) -> u32 {
     if matches!(
         subsystem,
-        Some("desktop-input-config" | "desktop-graphics-session")
+        Some("desktop-input-config" | "desktop-graphics-session" | "runaway-process")
     ) {
         return config.patch.review_fix_passes.max(3);
     }
@@ -7134,7 +7134,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_input_config_jobs_get_two_review_fix_passes_minimum() {
+    fn high_risk_subsystems_get_extra_review_fix_passes() {
         let mut config = FixerConfig::default();
         config.patch.review_fix_passes = 1;
 
@@ -7144,7 +7144,7 @@ mod tests {
         );
         assert_eq!(
             super::effective_review_fix_passes(&config, Some("runaway-process")),
-            1
+            3
         );
         assert_eq!(
             super::effective_review_fix_passes(&config, Some("desktop-graphics-session")),

@@ -523,7 +523,7 @@ fn default_lease_default_ttl() -> u64 {
 }
 
 fn default_review_fix_passes() -> u32 {
-    1
+    2
 }
 
 fn default_patch_model() -> Option<String> {
