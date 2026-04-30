@@ -1,3 +1,11 @@
+fixer (0.95.0-1) unstable; urgency=medium
+
+  * Normalize timestamped strace dominant syscall sequences before clustering
+    runaway-process investigations, merging duplicate public issues that only
+    differed by sample time.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 05:43:00 +0400
+
 fixer (0.94.0-1) unstable; urgency=medium
 
   * Hide Codex/Fixer self-profile hotspots and runaway investigations from the

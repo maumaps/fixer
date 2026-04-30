@@ -10180,6 +10180,7 @@ fn normalized_investigation_cluster_key(item: &SharedOpportunity) -> String {
                         .iter()
                         .filter_map(Value::as_str)
                         .take(3)
+                        .filter_map(normalized_dominant_sequence_entry)
                         .collect::<Vec<_>>()
                         .join("|")
                 })
@@ -10392,7 +10393,7 @@ fn investigation_public_issue_fields(item: &SharedOpportunity) -> Option<PublicI
                                 .iter()
                                 .filter_map(Value::as_str)
                                 .take(3)
-                                .map(normalize_stack_frame)
+                                .filter_map(normalized_dominant_sequence_entry)
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         })
@@ -10683,6 +10684,34 @@ fn normalized_perf_sample_symbol(raw: &str) -> String {
         return "unresolved offset".to_string();
     }
     normalized.replace('-', " ")
+}
+
+fn normalized_dominant_sequence_entry(raw: &str) -> Option<String> {
+    let mut text = raw.trim();
+    loop {
+        if let Some(rest) = text.strip_prefix("[pid ") {
+            text = rest.split_once(']')?.1.trim_start();
+            continue;
+        }
+        if let Some((prefix, rest)) = text.split_once(' ') {
+            if prefix
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || ch == ':' || ch == '.')
+            {
+                text = rest.trim_start();
+                continue;
+            }
+        }
+        break;
+    }
+    let name = text
+        .split_once('(')
+        .map(|(name, _)| name)
+        .or_else(|| text.split_whitespace().next())
+        .unwrap_or(text)
+        .trim();
+    let normalized = normalize_stack_frame(name);
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn normalize_stack_frame(frame: &str) -> String {
@@ -11000,8 +11029,7 @@ fn build_public_investigation_snapshot(
                         .iter()
                         .filter_map(Value::as_str)
                         .take(4)
-                        .map(normalize_stack_frame)
-                        .filter(|value| !value.is_empty())
+                        .filter_map(normalized_dominant_sequence_entry)
                         .collect::<Vec<_>>()
                         .join(" -> ")
                 })
@@ -15960,6 +15988,32 @@ mod tests {
         assert_eq!(
             build_public_issue_fields(&a).title,
             "Runaway CPU investigation for redis-check-rdb: busy poll at unresolved offset in libc.so.6"
+        );
+
+        let mut timestamped_sequence =
+            sample_runaway_investigation("python3.13", Some("python3.13-minimal"));
+        timestamped_sequence.finding.details["loop_classification"] =
+            json!("unknown-userspace-loop");
+        timestamped_sequence.finding.details["top_hot_symbols"] =
+            json!(["_PyEval_EvalFrameDefault (14.79% in python3.13)"]);
+        timestamped_sequence.finding.details["dominant_sequence"] = json!([
+            "18:13:24.726323 clock_nanosleep",
+            "18:13:25.492791 wait4",
+            "18:13:25.492870 clock_nanosleep",
+        ]);
+        let mut later_sequence = timestamped_sequence.clone();
+        later_sequence.finding.details["dominant_sequence"] = json!([
+            "18:19:19.100524 clock_nanosleep",
+            "18:19:19.533403 wait4",
+            "18:19:19.533605 clock_nanosleep",
+        ]);
+        assert_eq!(
+            cluster_key_for(&timestamped_sequence),
+            cluster_key_for(&later_sequence)
+        );
+        assert_eq!(
+            build_public_issue_fields(&timestamped_sequence).title,
+            "Runaway CPU investigation for python3.13: unknown userspace loop at _PyEval_EvalFrameDefault"
         );
 
         let mut deleted_target =
