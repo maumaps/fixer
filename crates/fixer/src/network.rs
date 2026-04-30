@@ -2253,7 +2253,11 @@ fn is_expired_worker_result_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<HttpStatusError>()
         .map(|status_error| {
-            status_error.status == StatusCode::GONE
+            (status_error.status == StatusCode::GONE
+                || (status_error.status == StatusCode::NOT_FOUND
+                    && status_error
+                        .body
+                        .contains("lease was not found or is no longer active")))
                 && status_error.path.starts_with("v1/work/")
                 && status_error.path.ends_with("/result")
         })
@@ -2978,6 +2982,23 @@ mod tests {
 
         assert!(is_lease_expired(&expired));
         assert!(!is_lease_expired(&active));
+    }
+
+    #[test]
+    fn missing_worker_result_lease_is_treated_as_unrecoverable() {
+        let missing_lease = anyhow!(HttpStatusError {
+            path: "v1/work/lease-1/result".to_string(),
+            status: StatusCode::NOT_FOUND,
+            body: "lease was not found or is no longer active".to_string(),
+        });
+        let unrelated_not_found = anyhow!(HttpStatusError {
+            path: "v1/work/lease-1/result".to_string(),
+            status: StatusCode::NOT_FOUND,
+            body: "different missing object".to_string(),
+        });
+
+        assert!(is_expired_worker_result_error(&missing_lease));
+        assert!(!is_expired_worker_result_error(&unrelated_not_found));
     }
 
     #[test]

@@ -1,3 +1,10 @@
+fixer (0.125.0-1) unstable; urgency=medium
+
+  * Treat missing server worker leases as unrecoverable stale results so local
+    workers can move on to fresh work.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 01:45:00 +0400
+
 fixer (0.124.0-1) unstable; urgency=medium
 
   * Give Codex review/refinement workflows a second default fix pass and at
