@@ -8098,6 +8098,7 @@ fn inferred_public_source_package(item: &SharedOpportunity) -> Option<String> {
     .or_else(|| inferred_crash_source_package(item))
     .or_else(|| inferred_hotspot_source_package(item))
     .or_else(|| inferred_apparmor_source_package(item))
+    .or_else(|| inferred_warning_source_package(item))
     .or_else(|| inferred_oom_source_package(&item.finding.details))
     .or_else(|| inferred_runaway_mapped_executable_source_package(&item.finding.details))
     .or_else(|| inferred_kernel_hot_path_source_package(&item.finding.details))
@@ -8121,6 +8122,17 @@ fn inferred_apparmor_source_package(item: &SharedOpportunity) -> Option<String> 
         _ => None,
     }
     .map(ToString::to_string)
+}
+
+fn inferred_warning_source_package(item: &SharedOpportunity) -> Option<String> {
+    if item.finding.kind != "warning" {
+        return None;
+    }
+    item.finding
+        .package_name
+        .as_deref()
+        .and_then(known_legacy_source_package_alias)
+        .map(ToString::to_string)
 }
 
 fn inferred_crash_source_package(item: &SharedOpportunity) -> Option<String> {
@@ -8234,6 +8246,7 @@ fn known_legacy_source_package_alias(package_name: &str) -> Option<&'static str>
         "libzstd1" => Some("libzstd"),
         "mesa-libgallium" => Some("mesa"),
         "nginx" => Some("nginx"),
+        "nvidia-kernel-dkms" => Some("nvidia-graphics-drivers"),
         "nodejs" => Some("nodejs"),
         "openssh-client" | "openssh-server" => Some("openssh"),
         "packagekit" => Some("packagekit"),
@@ -13661,6 +13674,45 @@ mod tests {
         }
     }
 
+    fn sample_kernel_warning(package_name: Option<&str>) -> SharedOpportunity {
+        SharedOpportunity {
+            local_opportunity_id: 1,
+            opportunity: OpportunityRecord {
+                id: 1,
+                finding_id: 1,
+                kind: "warning".to_string(),
+                title: "Kernel warning".to_string(),
+                score: 64,
+                state: "open".to_string(),
+                summary: "kernel: nvidia: loading out-of-tree module taints kernel.".to_string(),
+                evidence: json!({}),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "2026-04-30T10:00:00Z".to_string(),
+                updated_at: "2026-04-30T10:00:00Z".to_string(),
+            },
+            finding: FindingRecord {
+                id: 1,
+                kind: "warning".to_string(),
+                title: "Kernel warning".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "kernel-warning-nvidia".to_string(),
+                summary: "kernel: nvidia: loading out-of-tree module taints kernel.".to_string(),
+                details: json!({
+                    "kernel_module": "nvidia",
+                    "line": "kernel: nvidia: loading out-of-tree module taints kernel.",
+                }),
+                artifact_name: None,
+                artifact_path: None,
+                package_name: package_name.map(ToOwned::to_owned),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "2026-04-30T10:00:00Z".to_string(),
+                last_seen: "2026-04-30T10:00:00Z".to_string(),
+            },
+        }
+    }
+
     fn sample_desktop_resume_investigation(
         target: &str,
         crashed_processes: &[&str],
@@ -16662,6 +16714,12 @@ mod tests {
         assert_eq!(
             inferred_public_source_package(&legacy_qt_hotspot).as_deref(),
             Some("qt6-declarative")
+        );
+
+        let nvidia_warning = sample_kernel_warning(Some("nvidia-kernel-dkms"));
+        assert_eq!(
+            inferred_public_source_package(&nvidia_warning).as_deref(),
+            Some("nvidia-graphics-drivers")
         );
 
         let mut kernel_runaway = sample_runaway_investigation("ollama", Option::<&str>::None);
