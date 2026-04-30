@@ -10568,8 +10568,13 @@ fn investigation_public_issue_fields(item: &SharedOpportunity) -> Option<PublicI
                 .replace('-', " ");
             let wait_point = normalized_stuck_process_wait_point(&item.finding.details)
                 .unwrap_or_else(|| "an unknown wait point".to_string());
+            let title = if wait_point == "an unknown wait point" {
+                format!("Stuck D-state investigation for {target} during {classification}")
+            } else {
+                format!("Stuck D-state investigation for {target} at {wait_point}")
+            };
             Some(PublicIssueFields {
-                title: format!("Stuck D-state investigation for {target} at {wait_point}"),
+                title,
                 summary: format!(
                     "{} shows a repeated `D`-state wait, likely blocked in {} via {}.",
                     target, classification, wait_point
@@ -16362,6 +16367,16 @@ mod tests {
         assert_eq!(
             build_public_issue_fields(&zero_wchan).title,
             "Stuck D-state investigation for chrome at folio_wait_bit_common"
+        );
+
+        let mut unknown_wait =
+            sample_stuck_process_investigation("postgres", 307, "2026-04-30T06:45:00Z");
+        unknown_wait.finding.details["wchan"] = json!("");
+        unknown_wait.finding.details["stack_excerpt"] = json!("");
+        unknown_wait.finding.details["loop_classification"] = json!("mount-io-wait");
+        assert_eq!(
+            build_public_issue_fields(&unknown_wait).title,
+            "Stuck D-state investigation for postgres during mount io wait"
         );
     }
 
