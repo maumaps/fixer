@@ -4,8 +4,8 @@ use crate::config::FixerConfig;
 use crate::models::{FindingInput, ObservedArtifact, PopularBinaryProfile};
 use crate::storage::Store;
 use crate::util::{
-    command_exists, command_output, command_output_os, command_output_with_timeout,
-    find_postgres_binary, hash_text, maybe_canonicalize, now_rfc3339,
+    command_exists, command_output, command_output_os, command_output_os_with_timeout,
+    command_output_with_timeout, find_postgres_binary, hash_text, maybe_canonicalize, now_rfc3339,
 };
 use crate::workspace::resolve_installed_package_metadata;
 use anyhow::Result;
@@ -29,6 +29,8 @@ const PERF_REPORT_LIMIT: usize = 12;
 const COREDUMP_FETCH_MIN: usize = 50;
 const COREDUMP_FETCH_MAX: usize = 200;
 const COREDUMP_FETCH_MULTIPLIER: usize = 8;
+const JOURNALCTL_COMMAND_TIMEOUT_SECONDS: u64 = 15;
+const KERNEL_MODULE_COMMAND_TIMEOUT_SECONDS: u64 = 5;
 const RUNAWAY_INVESTIGATION_SUBSYSTEM: &str = "runaway-process";
 const STUCK_PROCESS_INVESTIGATION_SUBSYSTEM: &str = "stuck-process";
 const DESKTOP_RESUME_INVESTIGATION_SUBSYSTEM: &str = "desktop-resume";
@@ -1140,34 +1142,26 @@ fn collect_kernel_warnings(config: &FixerConfig, store: &Store) -> Result<usize>
     let journal_lines = config.service.journal_lines.to_string();
     let mut lines = Vec::new();
     let mut seen = BTreeSet::new();
-    let warning_output = command_output(
-        "journalctl",
-        &[
-            "-k",
-            "-b",
-            "-p",
-            "warning",
-            "-n",
-            journal_lines.as_str(),
-            "--no-pager",
-        ],
-    )
-    .unwrap_or_default();
+    let warning_output = journalctl_output(&[
+        "-k",
+        "-b",
+        "-p",
+        "warning",
+        "-n",
+        journal_lines.as_str(),
+        "--no-pager",
+    ]);
     extend_unique_log_lines(&mut lines, &mut seen, &warning_output);
 
-    let apparmor_output = command_output(
-        "journalctl",
-        &[
-            "-k",
-            "-b",
-            "-g",
-            "apparmor=\"DENIED\"",
-            "-n",
-            journal_lines.as_str(),
-            "--no-pager",
-        ],
-    )
-    .unwrap_or_default();
+    let apparmor_output = journalctl_output(&[
+        "-k",
+        "-b",
+        "-g",
+        "apparmor=\"DENIED\"",
+        "-n",
+        journal_lines.as_str(),
+        "--no-pager",
+    ]);
     extend_unique_log_lines(&mut lines, &mut seen, &apparmor_output);
 
     let mut count = 0;
@@ -1211,19 +1205,15 @@ fn collect_kernel_oom_kill_investigations(config: &FixerConfig, store: &Store) -
         return Ok(0);
     }
     let journal_lines = config.service.journal_lines.saturating_mul(4).to_string();
-    let output = command_output(
-        "journalctl",
-        &[
-            "-k",
-            "-b",
-            "-g",
-            "Out of memory: Killed process|oom-kill:|invoked oom-killer",
-            "-n",
-            journal_lines.as_str(),
-            "--no-pager",
-        ],
-    )
-    .unwrap_or_default();
+    let output = journalctl_output(&[
+        "-k",
+        "-b",
+        "-g",
+        "Out of memory: Killed process|oom-kill:|invoked oom-killer",
+        "-n",
+        journal_lines.as_str(),
+        "--no-pager",
+    ]);
     let mut count = 0;
     for event in parse_kernel_oom_kill_events(&output) {
         let package_name = event.resolved_package_name();
@@ -1315,18 +1305,14 @@ fn collect_desktop_resume_investigations(config: &FixerConfig, store: &Store) ->
         return Ok(0);
     }
     let journal_lines = config.service.journal_lines.saturating_mul(8).to_string();
-    let output = command_output(
-        "journalctl",
-        &[
-            "-b",
-            "-g",
-            "suspend|resume|radeon|amdgpu|drm|Xorg|kwin_x11|sddm|display server|kernel rejected CS|could not connect to display",
-            "-n",
-            journal_lines.as_str(),
-            "--no-pager",
-        ],
-    )
-    .unwrap_or_default();
+    let output = journalctl_output(&[
+        "-b",
+        "-g",
+        "suspend|resume|radeon|amdgpu|drm|Xorg|kwin_x11|sddm|display server|kernel rejected CS|could not connect to display",
+        "-n",
+        journal_lines.as_str(),
+        "--no-pager",
+    ]);
     let Some(event) = parse_latest_desktop_resume_failure(&output) else {
         return Ok(0);
     };
@@ -1424,7 +1410,7 @@ fn collect_desktop_graphics_session_investigations(
             "--no-pager",
         ],
     ] {
-        let output = command_output("journalctl", &args).unwrap_or_default();
+        let output = journalctl_output(&args);
         extend_unique_log_lines(&mut lines, &mut seen, &output);
     }
     if lines.is_empty() {
@@ -1571,11 +1557,7 @@ fn collect_network_driver_hang_investigations(
     // Use a broad kernel log (no grep filter) so parse_network_driver_hang_events
     // can also capture the multi-line register dumps that follow hang detection lines.
     let journal_lines = config.service.journal_lines.saturating_mul(4).to_string();
-    let output = command_output(
-        "journalctl",
-        &["-k", "-b", "-n", journal_lines.as_str(), "--no-pager"],
-    )
-    .unwrap_or_default();
+    let output = journalctl_output(&["-k", "-b", "-n", journal_lines.as_str(), "--no-pager"]);
     if output.trim().is_empty() {
         return Ok(0);
     }
@@ -2333,6 +2315,15 @@ fn trimmed_nonempty(raw: String) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn journalctl_output(args: &[&str]) -> String {
+    command_output_with_timeout(
+        "journalctl",
+        args,
+        StdDuration::from_secs(JOURNALCTL_COMMAND_TIMEOUT_SECONDS),
+    )
+    .unwrap_or_default()
+}
+
 fn sql_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -2355,7 +2346,11 @@ fn kernel_warning_artifact_from_line(line: &str) -> Option<ObservedArtifact> {
     }
     for module in kernel_warning_module_candidates(line) {
         for lookup_name in kernel_module_lookup_names(&module) {
-            let Ok(output) = command_output("modinfo", &["-n", &lookup_name]) else {
+            let Ok(output) = command_output_with_timeout(
+                "modinfo",
+                &["-n", &lookup_name],
+                StdDuration::from_secs(KERNEL_MODULE_COMMAND_TIMEOUT_SECONDS),
+            ) else {
                 continue;
             };
             let Some(path_line) = output.lines().next().map(str::trim) else {
@@ -2401,13 +2396,14 @@ fn dkms_module_package(module_path: &Path, module: &str) -> Option<String> {
             return Some(package_name);
         }
     }
-    let version = command_output_os(
+    let version = command_output_os_with_timeout(
         "modinfo",
         &[
             OsStr::new("-F"),
             OsStr::new("version"),
             module_path.as_os_str(),
         ],
+        StdDuration::from_secs(KERNEL_MODULE_COMMAND_TIMEOUT_SECONDS),
     )
     .ok()?;
     for module_name in module_names {

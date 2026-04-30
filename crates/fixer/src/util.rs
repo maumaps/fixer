@@ -47,6 +47,33 @@ pub fn command_output_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Result<String> {
+    let os_args = args.iter().map(OsStr::new).collect::<Vec<_>>();
+    command_output_os_with_timeout(program, &os_args, timeout)
+}
+
+pub fn command_output_os_with_timeout(
+    program: &str,
+    args: &[&OsStr],
+    timeout: Duration,
+) -> Result<String> {
+    let timeout = timeout.max(Duration::from_secs(1));
+    if program != "timeout" && command_exists("timeout") {
+        let output = Command::new("timeout")
+            .arg("--kill-after=2s")
+            .arg(format!("{}s", timeout.as_secs()))
+            .arg(program)
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to run `{program}` with timeout"))?;
+        if output.status.code() == Some(124) || output.status.code() == Some(137) {
+            return Err(anyhow!(
+                "`{program}` timed out after {}s",
+                timeout.as_secs()
+            ));
+        }
+        return command_output_from_status(program, output);
+    }
+
     let mut child = Command::new(program)
         .args(args)
         .stdout(Stdio::piped())
@@ -137,4 +164,33 @@ pub fn find_postgres_binary(binary: &str) -> Option<PathBuf> {
         .into_iter()
         .map(|(_, path)| path.join("bin").join(binary))
         .find(|candidate| candidate.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{command_output_os_with_timeout, command_output_with_timeout};
+    use std::ffi::OsStr;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn command_output_with_timeout_bounds_slow_commands() {
+        let started = Instant::now();
+        let error = command_output_with_timeout("sh", &["-c", "sleep 10"], Duration::from_secs(1))
+            .expect_err("slow command should time out");
+
+        assert!(error.to_string().contains("timed out after 1s"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn command_output_os_with_timeout_collects_stdout() {
+        let output = command_output_os_with_timeout(
+            "sh",
+            &[OsStr::new("-c"), OsStr::new("printf ok")],
+            Duration::from_secs(5),
+        )
+        .expect("command should complete");
+
+        assert_eq!(output, "ok");
+    }
 }

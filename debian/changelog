@@ -1,3 +1,10 @@
+fixer (0.128.0-1) unstable; urgency=medium
+
+  * Run journalctl, dkms, and modinfo collectors through bounded command
+    timeouts so a slow host diagnostic cannot stall collect-once indefinitely.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 03:41:47 +0400
+
 fixer (0.127.0-1) unstable; urgency=medium
 
   * Keep weak unknown runaway-process investigations report-only instead of
