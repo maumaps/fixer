@@ -5347,6 +5347,12 @@ fn select_best_attempt(candidates: &[PatchAttempt], outcome: &str) -> Option<Pat
         .max_by(compare_attempt_created_at)
 }
 
+fn patch_attempt_is_best_candidate(attempt: &PatchAttempt) -> bool {
+    attempt.state == "ready"
+        && attempt.outcome == "patch"
+        && attempt.validation_status.as_deref() != Some("review-rejected")
+}
+
 fn validation_quality_rank(attempt: &PatchAttempt) -> i32 {
     match attempt
         .details
@@ -5427,7 +5433,7 @@ fn attempt_invalidates_patch(attempt: &PatchAttempt, patch: &PatchAttempt) -> bo
 fn select_best_patch_attempt(candidates: &[PatchAttempt]) -> Option<PatchAttempt> {
     let mut visible = candidates
         .iter()
-        .filter(|attempt| attempt.state == "ready" && attempt.outcome == "patch")
+        .filter(|attempt| patch_attempt_is_best_candidate(attempt))
         .filter(|patch| {
             !candidates
                 .iter()
@@ -5453,6 +5459,14 @@ fn select_best_patch_attempt(candidates: &[PatchAttempt]) -> Option<PatchAttempt
     visible
         .into_iter()
         .max_by(|left, right| compare_patch_attempt_quality(left, right))
+}
+
+fn select_latest_patch_context_attempt(candidates: &[PatchAttempt]) -> Option<PatchAttempt> {
+    candidates
+        .iter()
+        .filter(|attempt| patch_attempt_is_best_candidate(attempt))
+        .cloned()
+        .max_by(compare_attempt_created_at)
 }
 
 fn repeated_workspace_blocked_triage_attempt(candidates: &[PatchAttempt]) -> Option<PatchAttempt> {
@@ -5534,7 +5548,7 @@ async fn load_latest_patch_context_for_worker(
                         .filter(publicly_visible_attempt)
                 })
                 .collect::<Vec<_>>();
-            Ok(select_best_attempt(&candidates, "patch"))
+            Ok(select_latest_patch_context_attempt(&candidates))
         }
         ServerDb::Sqlite(path) => {
             let connection = sqlite_connection(path)?;
@@ -5557,7 +5571,7 @@ async fn load_latest_patch_context_for_worker(
                         .filter(publicly_visible_attempt)
                 })
                 .collect::<Vec<_>>();
-            Ok(select_best_attempt(&candidates, "patch"))
+            Ok(select_latest_patch_context_attempt(&candidates))
         }
     }
 }
@@ -12052,6 +12066,12 @@ fn render_page(
 }
 
 fn public_attempt_heading(attempt: &PublicAttempt) -> &'static str {
+    if attempt.outcome == "patch"
+        && attempt.state == "ready"
+        && attempt.validation_status.as_deref() == Some("review-rejected")
+    {
+        return "rejected patch review";
+    }
     match (attempt.outcome.as_str(), attempt.state.as_str()) {
         ("patch", "ready") => "ready patch attempt",
         ("triage", "ready") => "ready triage handoff",
@@ -13882,6 +13902,24 @@ mod tests {
     }
 
     #[test]
+    fn rejected_patch_review_heading_is_not_ready_patch() {
+        let attempt = PublicAttempt {
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Previous patch was re-reviewed and reopened.".to_string(),
+            validation_status: Some("review-rejected".to_string()),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+            published_session: None,
+            handoff: None,
+            blocker_reason: None,
+            failure_diagnostics: None,
+            failure_context: None,
+        };
+
+        assert_eq!(public_attempt_heading(&attempt), "rejected patch review");
+    }
+
+    #[test]
     fn robots_txt_blocks_machine_endpoints_and_allows_human_boards() {
         let response = test_runtime().block_on(robots_txt());
         let rt = test_runtime();
@@ -15082,6 +15120,50 @@ mod tests {
             cluster_id: "issue-1".to_string(),
             install_id: "reviewer-install".to_string(),
             outcome: "report".to_string(),
+            state: "ready".to_string(),
+            summary: "Previous patch was re-reviewed and reopened.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("review-rejected".to_string()),
+            details: json!({
+                "invalidates_best_patch": true,
+                "invalidates_patch_created_at": legacy_patch.created_at.clone(),
+                "patch_refresh_failure_kind": "review",
+            }),
+            created_at: "2026-03-30T00:00:00Z".to_string(),
+        };
+
+        let (best_patch, best_triage) =
+            best_attempts_from_candidates(vec![legacy_patch, invalidation]);
+
+        assert!(best_patch.is_none());
+        assert!(best_triage.is_none());
+    }
+
+    #[test]
+    fn rejected_patch_review_is_not_public_best_patch() {
+        let legacy_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Legacy patch proposal created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "legacy prompt",
+                    "response": "legacy response",
+                    "diff": "--- a/src/file.c\n+++ b/src/file.c\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let invalidation = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "reviewer-install".to_string(),
+            outcome: "patch".to_string(),
             state: "ready".to_string(),
             summary: "Previous patch was re-reviewed and reopened.".to_string(),
             bundle_path: None,

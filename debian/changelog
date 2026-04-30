@@ -1,3 +1,10 @@
+fixer (0.93.0-1) unstable; urgency=medium
+
+  * Keep review-rejected patch attempts visible as history without treating
+    them as public best patches or worker-refresh patch seeds.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 04:57:00 +0400
+
 fixer (0.92.0-1) unstable; urgency=medium
 
   * Count dashboard diagnosis, failure, and impossible attempt totals from the
