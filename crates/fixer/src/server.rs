@@ -6432,68 +6432,14 @@ async fn load_public_attempt_totals(db: &ServerDb) -> Result<(i64, i64, i64), Ap
     let mut ready_report_count = 0_i64;
     let mut failed_patch_attempt_count = 0_i64;
     let mut explained_impossible_count = 0_i64;
-    match db {
-        ServerDb::Postgres(client) => {
-            let rows = client
-                .query(
-                    "
-                SELECT pa.bundle_json
-                FROM patch_attempts pa
-                JOIN issue_clusters ic ON ic.id = pa.cluster_id
-                WHERE ic.promoted = TRUE
-                  AND ic.public_visible = TRUE
-                ",
-                    &[],
-                )
-                .await
-                .map_err(ApiError::internal)?;
-            for row in rows {
-                let raw: Value = row.get(0);
-                let envelope = serde_json::from_value::<WorkerResultEnvelope>(raw)
-                    .map_err(ApiError::internal)?;
-                let attempt = canonicalize_worker_result_envelope(envelope).attempt;
-                if !publicly_visible_attempt(&attempt) {
-                    continue;
-                }
-                match (attempt.outcome.as_str(), attempt.state.as_str()) {
-                    ("report", "ready") => ready_report_count += 1,
-                    ("patch", "failed") => failed_patch_attempt_count += 1,
-                    ("impossible", "explained") => explained_impossible_count += 1,
-                    _ => {}
-                }
-            }
-        }
-        ServerDb::Sqlite(path) => {
-            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
-            let mut stmt = connection
-                .prepare(
-                    "
-                SELECT pa.bundle_json
-                FROM patch_attempts pa
-                JOIN issue_clusters ic ON ic.id = pa.cluster_id
-                WHERE ic.promoted = 1
-                  AND ic.public_visible = 1
-                ",
-                )
-                .map_err(ApiError::internal)?;
-            let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(ApiError::internal)?;
-            for row in rows {
-                let raw = row.map_err(ApiError::internal)?;
-                let envelope = serde_json::from_str::<WorkerResultEnvelope>(&raw)
-                    .map_err(ApiError::internal)?;
-                let attempt = canonicalize_worker_result_envelope(envelope).attempt;
-                if !publicly_visible_attempt(&attempt) {
-                    continue;
-                }
-                match (attempt.outcome.as_str(), attempt.state.as_str()) {
-                    ("report", "ready") => ready_report_count += 1,
-                    ("patch", "failed") => failed_patch_attempt_count += 1,
-                    ("impossible", "explained") => explained_impossible_count += 1,
-                    _ => {}
-                }
-            }
+
+    let attempts = load_public_attempt_entries(db, AttemptBoardFilter::All, i64::MAX).await?;
+    for entry in attempts {
+        match (entry.attempt.outcome.as_str(), entry.attempt.state.as_str()) {
+            ("report", "ready") => ready_report_count += 1,
+            ("patch", "failed") => failed_patch_attempt_count += 1,
+            ("impossible", "explained") => explained_impossible_count += 1,
+            _ => {}
         }
     }
     Ok((
@@ -13732,6 +13678,63 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].attempt.created_at, "2026-03-30T00:05:00Z");
+    }
+
+    #[test]
+    fn public_attempt_totals_use_canonical_deduped_entries() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_runaway_investigation("packagekitd", Some("packagekit"));
+        insert_test_issue(
+            &connection,
+            "issue-failed-patch",
+            "cluster-failed-patch",
+            95,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-reporter"],
+        );
+        let attempt = PatchAttempt {
+            cluster_id: "issue-failed-patch".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "failed".to_string(),
+            summary:
+                "packagekitd likely remains stuck in a busy poll loop. The diagnosis was captured, but the patch proposal did not complete cleanly."
+                    .to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("failed".to_string()),
+            details: json!({
+                "blocker_reason": "execution"
+            }),
+            created_at: "2026-03-30T00:00:00Z".to_string(),
+        };
+        let newer_attempt = PatchAttempt {
+            created_at: "2026-03-30T00:05:00Z".to_string(),
+            install_id: "worker-install-2".to_string(),
+            ..attempt.clone()
+        };
+        insert_test_attempt(
+            &connection,
+            "attempt-failed-older",
+            "lease-failed-older",
+            &attempt,
+            "2026-03-30T00:00:00Z",
+        );
+        insert_test_attempt(
+            &connection,
+            "attempt-failed-newer",
+            "lease-failed-newer",
+            &newer_attempt,
+            "2026-03-30T00:05:00Z",
+        );
+
+        let (_, failed_patch_attempt_count, _) = test_runtime()
+            .block_on(load_public_attempt_totals(&db))
+            .unwrap_or_else(|error| panic!("load attempt totals failed: {}", error.message));
+
+        assert_eq!(failed_patch_attempt_count, 1);
     }
 
     #[test]

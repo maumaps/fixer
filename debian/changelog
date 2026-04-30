@@ -1,3 +1,11 @@
+fixer (0.92.0-1) unstable; urgency=medium
+
+  * Count dashboard diagnosis, failure, and impossible attempt totals from the
+    same canonical deduplicated public attempt entries used by the attempts
+    board and API.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 04:36:00 +0400
+
 fixer (0.91.0-1) unstable; urgency=medium
 
   * Collapse duplicate canonical public worker attempts per issue on the
