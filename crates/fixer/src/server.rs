@@ -8087,7 +8087,45 @@ fn inferred_public_source_package(item: &SharedOpportunity) -> Option<String> {
             .filter(|target| is_kernelish_target_name(target))
             .map(|_| "linux".to_string())
     })
+    .or_else(|| inferred_oom_source_package(&item.finding.details))
     .or_else(|| inferred_kernel_hot_path_source_package(&item.finding.details))
+}
+
+fn inferred_oom_source_package(details: &Value) -> Option<String> {
+    let subsystem = details.get("subsystem").and_then(Value::as_str)?;
+    if subsystem != "oom-kill" {
+        return None;
+    }
+    details
+        .get("package_metadata")
+        .and_then(|metadata| metadata.get("source_package"))
+        .and_then(Value::as_str)
+        .and_then(|source| canonical_public_source_package(None, Some(source.to_string())))
+        .or_else(|| {
+            details
+                .get("profile_target")
+                .and_then(|target| target.get("package_metadata"))
+                .and_then(|metadata| metadata.get("source_package"))
+                .and_then(Value::as_str)
+                .and_then(|source| canonical_public_source_package(None, Some(source.to_string())))
+        })
+        .or_else(|| {
+            details
+                .get("package_name")
+                .and_then(Value::as_str)
+                .or_else(|| details.get("task_memcg_target").and_then(Value::as_str))
+                .and_then(known_oom_source_package_alias)
+        })
+}
+
+fn known_oom_source_package_alias(value: &str) -> Option<String> {
+    match value.trim() {
+        "element-desktop" => Some("element-desktop".to_string()),
+        "google-chrome" | "google-chrome-stable" => Some("google-chrome-stable".to_string()),
+        "org.kde.yakuake" | "yakuake" => Some("yakuake".to_string()),
+        "slack" | "slack-desktop" => Some("slack-desktop".to_string()),
+        _ => None,
+    }
 }
 
 fn inferred_kernel_hot_path_source_package(details: &Value) -> Option<String> {
@@ -16122,6 +16160,22 @@ mod tests {
         nvidia_runaway.finding.details["implicated_package_names"] =
             json!(["libcuda1", "linux-image-6.17.10+deb14-amd64"]);
         assert_eq!(inferred_public_source_package(&nvidia_runaway), None);
+
+        let mut oom_with_metadata = sample_oom_kill_investigation("chrome", "google-chrome");
+        oom_with_metadata.finding.details["package_metadata"] = json!({
+            "package_name": "google-chrome-stable",
+            "source_package": "google-chrome-stable"
+        });
+        assert_eq!(
+            inferred_public_source_package(&oom_with_metadata).as_deref(),
+            Some("google-chrome-stable")
+        );
+
+        let yakuake_oom = sample_oom_kill_investigation("python", "org.kde.yakuake");
+        assert_eq!(
+            inferred_public_source_package(&yakuake_oom).as_deref(),
+            Some("yakuake")
+        );
     }
 
     #[test]

@@ -1226,13 +1226,18 @@ fn collect_kernel_oom_kill_investigations(config: &FixerConfig, store: &Store) -
     .unwrap_or_default();
     let mut count = 0;
     for event in parse_kernel_oom_kill_events(&output) {
-        let package_name = event.package_name();
+        let package_name = event.resolved_package_name();
+        let package_metadata = package_name
+            .as_deref()
+            .and_then(installed_package_metadata_value);
         let cgroup_target = event.cgroup_target.clone();
         let likely_external_root_cause = package_name.is_none();
         let mut oom_details = json!({
             "subsystem": "oom-kill",
             "profile_target": {
                 "name": event.process_name.clone(),
+                "package_name": package_name.clone(),
+                "package_metadata": package_metadata.clone(),
             },
             "loop_classification": "kernel-oom-kill",
             "loop_confidence": 1.0,
@@ -1256,6 +1261,7 @@ fn collect_kernel_oom_kill_investigations(config: &FixerConfig, store: &Store) -
             "oom_kill_line": event.oom_kill_line.clone(),
             "invoker_line": event.invoker_line.clone(),
             "package_name": package_name.clone(),
+            "package_metadata": package_metadata.clone(),
             "likely_external_root_cause": likely_external_root_cause,
         });
         add_env_context(&mut oom_details);
@@ -1292,6 +1298,7 @@ fn collect_kernel_oom_kill_investigations(config: &FixerConfig, store: &Store) -
                     "cpuset": event.cpuset.clone(),
                     "task_memcg": event.task_memcg.clone(),
                     "task_memcg_target": event.cgroup_target.clone(),
+                    "package_metadata": package_metadata,
                 }),
             }),
             repo_root: None,
@@ -2691,6 +2698,13 @@ impl KernelOomKillEvent {
             .cloned()
     }
 
+    fn resolved_package_name(&self) -> Option<String> {
+        self.package_name()
+            .as_deref()
+            .or(self.cgroup_target.as_deref())
+            .and_then(resolve_oom_cgroup_package_name)
+    }
+
     fn public_summary(&self) -> String {
         let anon_mib = kib_to_mib(self.anon_rss_kb);
         let total_vm_gib = kib_to_gib(self.total_vm_kb);
@@ -2703,6 +2717,33 @@ impl KernelOomKillEvent {
             "{} was killed by the kernel OOM killer after reaching about {:.0} MiB anonymous RSS ({:.1} GiB virtual memory){}.",
             self.process_name, anon_mib, total_vm_gib, scope
         )
+    }
+}
+
+fn resolve_oom_cgroup_package_name(target: &str) -> Option<String> {
+    oom_cgroup_package_candidates(target)
+        .into_iter()
+        .find(|package| resolve_installed_package_metadata(package).is_ok())
+}
+
+fn oom_cgroup_package_candidates(target: &str) -> Vec<String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
+    push_unique_candidate(&mut candidates, target.to_string());
+    if let Some(kde_app) = target.strip_prefix("org.kde.") {
+        push_unique_candidate(&mut candidates, kde_app.to_string());
+    }
+    push_unique_candidate(&mut candidates, format!("{target}-stable"));
+    push_unique_candidate(&mut candidates, format!("{target}-desktop"));
+    candidates
+}
+
+fn push_unique_candidate(candidates: &mut Vec<String>, candidate: String) {
+    if !candidate.trim().is_empty() && !candidates.iter().any(|seen| seen == &candidate) {
+        candidates.push(candidate);
     }
 }
 
@@ -6666,11 +6707,12 @@ mod tests {
         is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
         kernel_module_package_hint, kernel_thread_package_name, kernel_warning_module_candidates,
         looks_like_warning, netdev_watchdog_driver, normalize_oom_task_memcg_target,
-        normalize_perf_symbol, normalize_stuck_process_target_name, package_lookup_path,
-        parse_apparmor_denial, parse_coredump_info, parse_desktop_graphics_session_failure,
-        parse_dkms_status_line, parse_ini_sections, parse_kernel_oom_kill_events,
-        parse_latest_desktop_resume_failure, parse_network_driver_hang_events,
-        parse_perf_hot_paths, parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
+        normalize_perf_symbol, normalize_stuck_process_target_name, oom_cgroup_package_candidates,
+        package_lookup_path, parse_apparmor_denial, parse_coredump_info,
+        parse_desktop_graphics_session_failure, parse_dkms_status_line, parse_ini_sections,
+        parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
+        parse_network_driver_hang_events, parse_perf_hot_paths,
+        parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
         prioritize_coredump_events, process_runtime_seconds, safe_perf_name,
         shell_assignment_csv_value, stuck_process_investigation_fingerprint,
         stuck_process_source_fingerprint, summarize_top_syscalls, system_uptime_seconds,
@@ -6985,6 +7027,35 @@ Apr 03 14:00:04 nucat systemd-coredump[1600]: Process 1144 (spectacle) of user 1
                 "/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.kde.yakuake-12836.scope/tab(595051).scope"
             ),
             Some("org.kde.yakuake".to_string())
+        );
+    }
+
+    #[test]
+    fn oom_cgroup_package_candidates_include_common_desktop_aliases() {
+        assert_eq!(
+            oom_cgroup_package_candidates("google-chrome"),
+            vec![
+                "google-chrome".to_string(),
+                "google-chrome-stable".to_string(),
+                "google-chrome-desktop".to_string(),
+            ]
+        );
+        assert_eq!(
+            oom_cgroup_package_candidates("org.kde.yakuake"),
+            vec![
+                "org.kde.yakuake".to_string(),
+                "yakuake".to_string(),
+                "org.kde.yakuake-stable".to_string(),
+                "org.kde.yakuake-desktop".to_string(),
+            ]
+        );
+        assert_eq!(
+            oom_cgroup_package_candidates("slack"),
+            vec![
+                "slack".to_string(),
+                "slack-stable".to_string(),
+                "slack-desktop".to_string(),
+            ]
         );
     }
 

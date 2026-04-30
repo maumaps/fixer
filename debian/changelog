@@ -1,3 +1,10 @@
+fixer (0.106.0-1) unstable; urgency=medium
+
+  * Resolve OOM-kill app-unit targets to installed desktop package names and
+    include package metadata for public source attribution.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 08:48:00 +0400
+
 fixer (0.105.0-1) unstable; urgency=medium
 
   * Strip kernel "(deleted)" executable markers before package ownership
