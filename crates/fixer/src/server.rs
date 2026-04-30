@@ -10494,6 +10494,11 @@ fn investigation_public_issue_fields(item: &SharedOpportunity) -> Option<PublicI
 }
 
 fn is_publicly_visible(item: &SharedOpportunity) -> bool {
+    if matches!(item.finding.kind.as_str(), "hotspot" | "investigation")
+        && is_internal_repair_agent_target(item)
+    {
+        return false;
+    }
     match item.finding.kind.as_str() {
         "crash" => true,
         "hotspot" => true,
@@ -10516,6 +10521,41 @@ fn is_publicly_visible(item: &SharedOpportunity) -> bool {
         }
         _ => true,
     }
+}
+
+fn is_internal_repair_agent_target(item: &SharedOpportunity) -> bool {
+    item.finding
+        .details
+        .get("profile_target")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .is_some_and(is_internal_repair_agent_name)
+        || item
+            .finding
+            .details
+            .get("profile_target")
+            .and_then(|value| value.get("path"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| is_internal_repair_agent_name(&file_name_or_self(value)))
+        || item
+            .finding
+            .artifact_name
+            .as_deref()
+            .is_some_and(is_internal_repair_agent_name)
+        || item
+            .finding
+            .artifact_path
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            .is_some_and(is_internal_repair_agent_name)
+}
+
+fn is_internal_repair_agent_name(raw: &str) -> bool {
+    matches!(
+        normalize_deleted_file_marker(raw).as_str(),
+        "codex" | "fixer" | "fixerd" | "fixer-server"
+    )
 }
 
 fn sanitize_public_text(raw: &str) -> String {
@@ -15816,6 +15856,19 @@ mod tests {
             build_public_issue_fields(&d).title,
             "CPU hotspot in node: unresolved offset in [JIT]"
         );
+
+        let codex = sample_hotspot(
+            "codex (deleted)",
+            "vmlinuz-6.17.0-14-generic",
+            "do_epoll_wait",
+            "linux-image-6.17.0-14-generic",
+        );
+        let public = build_public_issue_fields(&codex);
+        assert_eq!(
+            public.title,
+            "CPU hotspot in codex: do_epoll_wait in vmlinuz-6.17.0-14-generic"
+        );
+        assert!(!public.visible);
     }
 
     #[test]
@@ -15919,6 +15972,7 @@ mod tests {
             public.title,
             "Runaway CPU investigation for codex: unknown userspace loop at unresolved offset in codex"
         );
+        assert!(!public.visible);
         assert!(!public.summary.contains("(deleted)"));
     }
 

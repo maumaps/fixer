@@ -1,3 +1,11 @@
+fixer (0.94.0-1) unstable; urgency=medium
+
+  * Hide Codex/Fixer self-profile hotspots and runaway investigations from the
+    public repair queue, and stop collecting future perf profiles for those
+    internal repair-agent processes.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 05:19:00 +0400
+
 fixer (0.93.0-1) unstable; urgency=medium
 
   * Keep review-rejected patch attempts visible as history without treating

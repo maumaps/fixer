@@ -5755,11 +5755,27 @@ fn prune_runaway_investigation_artifacts(root: &Path, retention_days: u64) -> Re
 }
 
 fn is_profile_candidate(target: &PopularBinaryProfile) -> bool {
-    target.process_count > 0
-        && !matches!(
-            target.name.as_str(),
-            "perf" | "fixer" | "fixerd" | "fixer-server"
-        )
+    target.process_count > 0 && !is_internal_repair_profile_target(target)
+}
+
+fn is_internal_repair_profile_target(target: &PopularBinaryProfile) -> bool {
+    is_internal_repair_process_name(&target.name)
+        || target
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(is_internal_repair_process_name)
+}
+
+fn is_internal_repair_process_name(raw: &str) -> bool {
+    let normalized = raw
+        .trim()
+        .trim_start_matches("(deleted) ")
+        .trim_end_matches(" (deleted)");
+    matches!(
+        normalized,
+        "codex" | "perf" | "fixer" | "fixerd" | "fixer-server"
+    )
 }
 
 fn running_pids_for_binary(target_path: &Path) -> Vec<i32> {
@@ -7190,6 +7206,14 @@ Stack trace of thread 222:\n\
             process_count: 1,
             total_cpu_percent: 1.0,
             max_cpu_percent: 1.0,
+        }));
+        assert!(!is_profile_candidate(&PopularBinaryProfile {
+            name: "codex".to_string(),
+            path: PathBuf::from("/home/kom/.codex/bin/codex"),
+            package_name: None,
+            process_count: 1,
+            total_cpu_percent: 8.0,
+            max_cpu_percent: 8.0,
         }));
         assert!(!is_profile_candidate(&PopularBinaryProfile {
             name: "firefox".to_string(),
