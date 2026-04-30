@@ -10644,7 +10644,8 @@ fn normalized_perf_hotspot_symbol(raw: &str) -> String {
         Regex::new(r"\(deleted\)\s+\[.\]\s+0x[0-9a-fA-F]+$").expect("valid deleted address regex");
     let named_address_re =
         Regex::new(r"^.+\s+\[.\]\s+0x[0-9a-fA-F]+$").expect("valid perf named address regex");
-    if bare_address_re.is_match(&normalized)
+    if normalized.eq_ignore_ascii_case("unresolved offset")
+        || bare_address_re.is_match(&normalized)
         || thread_address_re.is_match(&normalized)
         || deleted_address_re.is_match(&normalized)
         || named_address_re.is_match(&normalized)
@@ -15884,9 +15885,12 @@ mod tests {
             "0x000000000017c318",
             "redis-tools",
         );
+        let display_normalized =
+            sample_hotspot("redis-check-rdb", "libc.so.6", "unresolved offset", "libc6");
 
         assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
         assert_eq!(cluster_key_for(&a), cluster_key_for(&package_drift));
+        assert_eq!(cluster_key_for(&a), cluster_key_for(&display_normalized));
         assert_ne!(cluster_key_for(&a), cluster_key_for(&c));
         assert_eq!(cluster_key_for(&d), cluster_key_for(&e));
         assert_eq!(
