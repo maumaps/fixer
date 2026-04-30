@@ -6165,6 +6165,7 @@ fn collect_bpftrace(config: &FixerConfig, store: &Store) -> Result<usize> {
 }
 
 fn map_path_to_package(path: &Path) -> Option<String> {
+    let lookup_path = package_lookup_path(path);
     let output = if command_exists("timeout") {
         command_output_os(
             "timeout",
@@ -6172,18 +6173,30 @@ fn map_path_to_package(path: &Path) -> Option<String> {
                 OsStr::new("5s"),
                 OsStr::new("dpkg-query"),
                 OsStr::new("-S"),
-                path.as_os_str(),
+                lookup_path.as_os_str(),
             ],
         )
         .ok()?
     } else {
-        command_output_os("dpkg-query", &[OsStr::new("-S"), path.as_os_str()]).ok()?
+        command_output_os("dpkg-query", &[OsStr::new("-S"), lookup_path.as_os_str()]).ok()?
     };
     output
         .lines()
         .next()
         .and_then(|line| line.split_once(':'))
         .map(|(pkg, _)| pkg.to_string())
+}
+
+fn package_lookup_path(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    let trimmed = raw
+        .trim_start_matches("(deleted) ")
+        .trim_end_matches(" (deleted)");
+    if trimmed == raw {
+        path.to_path_buf()
+    } else {
+        PathBuf::from(trimmed)
+    }
 }
 
 fn looks_like_warning(line: &str) -> bool {
@@ -6653,11 +6666,11 @@ mod tests {
         is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
         kernel_module_package_hint, kernel_thread_package_name, kernel_warning_module_candidates,
         looks_like_warning, netdev_watchdog_driver, normalize_oom_task_memcg_target,
-        normalize_perf_symbol, normalize_stuck_process_target_name, parse_apparmor_denial,
-        parse_coredump_info, parse_desktop_graphics_session_failure, parse_dkms_status_line,
-        parse_ini_sections, parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
-        parse_network_driver_hang_events, parse_perf_hot_paths,
-        parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
+        normalize_perf_symbol, normalize_stuck_process_target_name, package_lookup_path,
+        parse_apparmor_denial, parse_coredump_info, parse_desktop_graphics_session_failure,
+        parse_dkms_status_line, parse_ini_sections, parse_kernel_oom_kill_events,
+        parse_latest_desktop_resume_failure, parse_network_driver_hang_events,
+        parse_perf_hot_paths, parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
         prioritize_coredump_events, process_runtime_seconds, safe_perf_name,
         shell_assignment_csv_value, stuck_process_investigation_fingerprint,
         stuck_process_source_fingerprint, summarize_top_syscalls, system_uptime_seconds,
@@ -7273,6 +7286,22 @@ Stack trace of thread 222:\n\
         assert_eq!(
             normalize_perf_symbol("codex (deleted) [.] 0x00000000014a11a1"),
             "unresolved offset"
+        );
+    }
+
+    #[test]
+    fn package_lookup_path_strips_deleted_executable_marker() {
+        assert_eq!(
+            package_lookup_path(Path::new("/usr/bin/containerd-shim-runc-v2 (deleted)")),
+            PathBuf::from("/usr/bin/containerd-shim-runc-v2")
+        );
+        assert_eq!(
+            package_lookup_path(Path::new("(deleted) /usr/bin/codex")),
+            PathBuf::from("/usr/bin/codex")
+        );
+        assert_eq!(
+            package_lookup_path(Path::new("/usr/bin/bash")),
+            PathBuf::from("/usr/bin/bash")
         );
     }
 
