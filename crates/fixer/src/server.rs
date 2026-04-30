@@ -10006,8 +10006,7 @@ fn normalized_hotspot_cluster_key(item: &SharedOpportunity) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| sanitize_public_text(&item.opportunity.summary));
     hash_text(format!(
-        "hotspot|{}|{}|{}|{}|{}",
-        item.finding.package_name.as_deref().unwrap_or("-"),
+        "hotspot|{}|{}|{}|{}",
         item.opportunity.ecosystem.as_deref().unwrap_or("-"),
         target,
         dso,
@@ -15879,8 +15878,15 @@ mod tests {
         );
         let d = sample_hotspot("node", "[JIT]", "tid 1310 [.] 0x000071d33b3f2f00", "nodejs");
         let e = sample_hotspot("node", "[JIT]", "tid 1310 [.] 0x000071d33b3f30ab", "nodejs");
+        let package_drift = sample_hotspot(
+            "redis-check-rdb",
+            "libc.so.6",
+            "0x000000000017c318",
+            "redis-tools",
+        );
 
         assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
+        assert_eq!(cluster_key_for(&a), cluster_key_for(&package_drift));
         assert_ne!(cluster_key_for(&a), cluster_key_for(&c));
         assert_eq!(cluster_key_for(&d), cluster_key_for(&e));
         assert_eq!(
