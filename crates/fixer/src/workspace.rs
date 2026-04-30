@@ -51,16 +51,6 @@ pub fn ensure_workspace_for_opportunity(
             acquisition_note: None,
         });
 
-    if metadata
-        .as_ref()
-        .is_some_and(|pkg| is_external_binary_package_without_workspace(pkg, &workspace_target))
-    {
-        return Err(anyhow!(
-            "could not acquire a workspace for external package {}; no Debian source package, Debian VCS metadata, or cloneable upstream repository is available",
-            workspace_target.source_package
-        ));
-    }
-
     if deb_src_enabled() {
         let installed_version = metadata
             .as_ref()
@@ -149,6 +139,16 @@ pub fn ensure_workspace_for_opportunity(
                 acquisition_note: "Cloned upstream repository from package homepage because Debian source indexes are unavailable.".to_string(),
             });
         }
+    }
+
+    if metadata
+        .as_ref()
+        .is_some_and(|pkg| is_external_binary_package_without_workspace(pkg, &workspace_target))
+    {
+        return Err(anyhow!(
+            "could not acquire a workspace for external package {}; no Debian source package, Debian VCS metadata, or cloneable upstream repository is available",
+            workspace_target.source_package
+        ));
     }
 
     Err(anyhow!(
@@ -311,8 +311,14 @@ fn parse_maintainer_url(raw: &str) -> Option<String> {
 fn source_package_vcs_url(source_package: &str) -> Option<String> {
     let raw = command_output("apt-cache", &["showsrc", source_package]).ok()?;
     parse_deb_field(&raw, "Vcs-Git")
+        .and_then(|value| vcs_git_clone_url(&value))
         .or_else(|| parse_deb_field(&raw, "Vcs-Browser"))
         .filter(|value| is_cloneable_repo_url(value))
+}
+
+fn vcs_git_clone_url(raw: &str) -> Option<String> {
+    let url = raw.split_whitespace().next()?;
+    is_cloneable_repo_url(url).then(|| url.to_string())
 }
 
 fn is_external_binary_package_without_workspace(
@@ -788,6 +794,7 @@ mod tests {
         origin_is_debian_source_friendly, parse_apt_origins, parse_maintainer_url,
         parse_showsrc_records, sanitize_dir_name, select_showsrc_record, source_dir_version_hint,
         source_package_from_opportunity, source_package_vcs_url, trim_debian_epoch,
+        vcs_git_clone_url,
     };
     use crate::models::{InstalledPackageMetadata, OpportunityRecord};
     use serde_json::json;
@@ -819,6 +826,15 @@ mod tests {
         assert!(
             vcs_url.as_deref() == Some("https://salsa.debian.org/qt-kde-team/kde/kwin.git")
                 || vcs_url.is_none()
+        );
+    }
+
+    #[test]
+    fn parses_vcs_git_clone_url_with_branch_options() {
+        assert_eq!(
+            vcs_git_clone_url("https://salsa.debian.org/postgresql/postgresql.git -b 18")
+                .as_deref(),
+            Some("https://salsa.debian.org/postgresql/postgresql.git")
         );
     }
 
