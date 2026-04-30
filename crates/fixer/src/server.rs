@@ -8087,6 +8087,43 @@ fn inferred_public_source_package(item: &SharedOpportunity) -> Option<String> {
             .filter(|target| is_kernelish_target_name(target))
             .map(|_| "linux".to_string())
     })
+    .or_else(|| inferred_kernel_hot_path_source_package(&item.finding.details))
+}
+
+fn inferred_kernel_hot_path_source_package(details: &Value) -> Option<String> {
+    let subsystem = details.get("subsystem").and_then(Value::as_str)?;
+    if subsystem != "runaway-process" {
+        return None;
+    }
+    let hot_path_dso = details.get("hot_path_dso").and_then(Value::as_str)?;
+    if !is_linux_kernel_hot_path_dso(hot_path_dso) {
+        return None;
+    }
+    details
+        .get("implicated_package_names")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|packages| packages.iter())
+        .filter_map(Value::as_str)
+        .find_map(|package| canonical_public_source_package(Some(package), None))
+        .or_else(|| Some("linux".to_string()))
+}
+
+fn is_linux_kernel_hot_path_dso(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed == "[kernel.kallsyms]" || trimmed.starts_with("vmlinuz-") {
+        return true;
+    }
+    let Some(module) = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return false;
+    };
+    !matches!(
+        module.to_ascii_lowercase().as_str(),
+        "" | "jit" | "vdso" | "vsyscall" | "nvidia"
+    )
 }
 
 fn is_kernelish_target_name(value: &str) -> bool {
@@ -16062,6 +16099,29 @@ mod tests {
             inferred_public_source_package(&target_metadata).as_deref(),
             Some("postgresql-18")
         );
+
+        let mut kernel_runaway = sample_runaway_investigation("ollama", Option::<&str>::None);
+        kernel_runaway.finding.details["hot_path_dso"] = json!("[kernel.kallsyms]");
+        kernel_runaway.finding.details["implicated_package_names"] =
+            json!(["linux-image-6.17.10+deb14-amd64"]);
+        assert_eq!(
+            inferred_public_source_package(&kernel_runaway).as_deref(),
+            Some("linux")
+        );
+
+        let mut module_runaway = sample_runaway_investigation("osrm-routed", Option::<&str>::None);
+        module_runaway.finding.details["hot_path_dso"] = json!("[i40e]");
+        module_runaway.finding.details["implicated_package_names"] = json!([]);
+        assert_eq!(
+            inferred_public_source_package(&module_runaway).as_deref(),
+            Some("linux")
+        );
+
+        let mut nvidia_runaway = sample_runaway_investigation("ollama", Option::<&str>::None);
+        nvidia_runaway.finding.details["hot_path_dso"] = json!("[nvidia]");
+        nvidia_runaway.finding.details["implicated_package_names"] =
+            json!(["libcuda1", "linux-image-6.17.10+deb14-amd64"]);
+        assert_eq!(inferred_public_source_package(&nvidia_runaway), None);
     }
 
     #[test]
