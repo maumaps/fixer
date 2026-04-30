@@ -8087,9 +8087,46 @@ fn inferred_public_source_package(item: &SharedOpportunity) -> Option<String> {
             .filter(|target| is_kernelish_target_name(target))
             .map(|_| "linux".to_string())
     })
+    .or_else(|| inferred_crash_source_package(item))
     .or_else(|| inferred_oom_source_package(&item.finding.details))
     .or_else(|| inferred_runaway_mapped_executable_source_package(&item.finding.details))
     .or_else(|| inferred_kernel_hot_path_source_package(&item.finding.details))
+}
+
+fn inferred_crash_source_package(item: &SharedOpportunity) -> Option<String> {
+    if item.finding.kind != "crash" {
+        return None;
+    }
+    item.finding
+        .package_name
+        .as_deref()
+        .and_then(known_crash_source_package_alias)
+        .map(ToString::to_string)
+}
+
+fn known_crash_source_package_alias(package_name: &str) -> Option<&'static str> {
+    match package_name.trim() {
+        "firefox" => Some("firefox"),
+        "google-chrome-stable" => Some("google-chrome-stable"),
+        "kdeconnect" => Some("kdeconnect"),
+        "konqueror" => Some("konqueror"),
+        "kscreen" => Some("kscreen"),
+        "kwin-x11" => Some("kwin"),
+        "packagekit" => Some("packagekit"),
+        "plasma-discover" => Some("plasma-discover"),
+        "plasma-workspace" => Some("plasma-workspace"),
+        "rust-coreutils" => Some("rust-coreutils"),
+        "sddm" => Some("sddm"),
+        "systemd" => Some("systemd"),
+        "systemd-timesyncd" => Some("systemd"),
+        "systemsettings" => Some("systemsettings"),
+        "udev" => Some("systemd"),
+        "wireplumber" => Some("wireplumber"),
+        "xfce4-terminal" => Some("xfce4-terminal"),
+        "xserver-xorg-core" => Some("xorg-server"),
+        "zoom" => Some("zoom"),
+        _ => None,
+    }
 }
 
 fn inferred_runaway_mapped_executable_source_package(details: &Value) -> Option<String> {
@@ -16226,6 +16263,25 @@ mod tests {
             inferred_public_source_package(&oom_with_metadata).as_deref(),
             Some("google-chrome-stable")
         );
+
+        let mut kwin_crash = sample_crash("kwin_x11", "KWin crashed", &["KWin::Workspace::self"]);
+        kwin_crash.finding.package_name = Some("kwin-x11".to_string());
+        assert_eq!(
+            inferred_public_source_package(&kwin_crash).as_deref(),
+            Some("kwin")
+        );
+
+        let mut udev_crash = sample_crash("udevd", "udevd crashed", &["udev_event_execute_rules"]);
+        udev_crash.finding.package_name = Some("udev".to_string());
+        assert_eq!(
+            inferred_public_source_package(&udev_crash).as_deref(),
+            Some("systemd")
+        );
+
+        let mut unknown_crash =
+            sample_crash("local-tool", "local tool crashed", &["local_tool::main"]);
+        unknown_crash.finding.package_name = Some("local-tool".to_string());
+        assert_eq!(inferred_public_source_package(&unknown_crash), None);
 
         let yakuake_oom = sample_oom_kill_investigation("python", "org.kde.yakuake");
         assert_eq!(
