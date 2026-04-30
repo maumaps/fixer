@@ -1,3 +1,11 @@
+fixer (0.101.0-1) unstable; urgency=medium
+
+  * Further distinguish public crash titles by looking one stack frame deeper
+    and adding a stable low-signal fingerprint suffix when no useful frame is
+    available.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 30 Apr 2026 07:18:00 +0400
+
 fixer (0.100.0-1) unstable; urgency=medium
 
   * Include crash signal and a short normalized stack signature in public

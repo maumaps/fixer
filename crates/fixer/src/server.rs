@@ -10319,7 +10319,13 @@ fn crash_public_issue_fields(item: &SharedOpportunity) -> Option<PublicIssueFiel
                 .and_then(Value::as_i64)
                 .map(|value| format!("signal {value}"))
         });
-    let stack_signature = public_crash_stack_signature(details);
+    let stack_signature = public_crash_stack_signature(details).or_else(|| {
+        let fingerprint = item.finding.fingerprint.trim();
+        (!fingerprint.is_empty()).then(|| {
+            let suffix = fingerprint.chars().take(8).collect::<String>();
+            format!("low-signal stack {suffix}")
+        })
+    });
     let title = match (signal, stack_signature) {
         (Some(signal), Some(stack_signature)) => {
             format!("Crash in {process}: {signal} at {stack_signature}")
@@ -10342,7 +10348,7 @@ fn public_crash_stack_signature(details: &Value) -> Option<String> {
         .filter_map(Value::as_str)
         .map(normalize_stack_frame)
         .filter(|frame| is_informative_public_crash_frame(frame))
-        .take(3)
+        .take(4)
         .collect::<Vec<_>>()
         .join(" -> ");
     (!signature.is_empty()).then(|| truncate_patch_subject(&signature, 80))
@@ -15941,6 +15947,22 @@ mod tests {
             "Crash in kwin_x11: SIGSEGV at _ZN4KWin18ItemRendererOpenGL10renderItemEv"
         ));
         assert!(public.title.contains("->"));
+    }
+
+    #[test]
+    fn crash_public_title_distinguishes_low_signal_stacks() {
+        let mut crash = sample_crash(
+            "ZoomWebviewHost",
+            "Low-signal stack trace; unresolved frames: 3",
+            &["n/a [n/a]", "n/a [n/a]"],
+        );
+        crash.finding.fingerprint = "abcdef0123456789".to_string();
+
+        let public = build_public_issue_fields(&crash);
+        assert_eq!(
+            public.title,
+            "Crash in ZoomWebviewHost: SIGSEGV at low-signal stack abcdef01"
+        );
     }
 
     #[test]
