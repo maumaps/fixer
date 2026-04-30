@@ -1,3 +1,10 @@
+fixer (0.122.0-1) unstable; urgency=medium
+
+  * Extend worker leases to one hour so gpt-5.5 plan, patch, review, and
+    refinement jobs can submit before the server lease expires.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 00:06:00 +0400
+
 fixer (0.121.0-1) unstable; urgency=medium
 
   * Trim outgoing submission bundles by serialized byte size so rich evidence

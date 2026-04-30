@@ -599,7 +599,7 @@ fn default_quarantine_threshold() -> i64 {
 }
 
 fn default_lease_seconds() -> u64 {
-    900
+    3600
 }
 
 fn default_worker_attempt_cooldown() -> u64 {
