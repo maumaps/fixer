@@ -10124,31 +10124,20 @@ fn normalized_investigation_cluster_key(item: &SharedOpportunity) -> String {
     match subsystem {
         "stuck-process" => {
             let target = normalized_investigation_target_name(item);
+            let details = &item.finding.details;
             let classification = item
                 .finding
                 .details
                 .get("loop_classification")
                 .and_then(Value::as_str)
                 .unwrap_or("-");
-            let wchan = item
-                .finding
-                .details
-                .get("wchan")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("-");
-            let stack_signature = item
-                .finding
-                .details
-                .get("stack_excerpt")
-                .and_then(Value::as_str)
-                .and_then(|excerpt| excerpt.lines().next())
-                .map(normalize_stack_frame)
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| wchan.to_string());
+            let wait_point =
+                normalized_stuck_process_wait_point(details).unwrap_or_else(|| "-".to_string());
+            let stack_signature = normalized_stuck_process_stack_top(details)
+                .unwrap_or_else(|| wait_point.to_string());
             hash_text(format!(
                 "investigation|stuck-process|{}|{}|{}|{}",
-                target, classification, wchan, stack_signature,
+                target, classification, wait_point, stack_signature,
             ))
         }
         "runaway-process" => {
@@ -10408,13 +10397,7 @@ fn investigation_public_issue_fields(item: &SharedOpportunity) -> Option<PublicI
                 .and_then(Value::as_str)
                 .unwrap_or("unknown-uninterruptible-wait")
                 .replace('-', " ");
-            let wait_point = item
-                .finding
-                .details
-                .get("wchan")
-                .and_then(Value::as_str)
-                .map(normalize_stack_frame)
-                .filter(|value| !value.trim().is_empty())
+            let wait_point = normalized_stuck_process_wait_point(&item.finding.details)
                 .unwrap_or_else(|| "an unknown wait point".to_string());
             Some(PublicIssueFields {
                 title: format!("Stuck D-state investigation for {target} at {wait_point}"),
@@ -10801,6 +10784,29 @@ fn normalize_stack_frame(frame: &str) -> String {
     normalized = module_suffix_re.replace(&normalized, "").to_string();
     normalized = offset_re.replace_all(&normalized, "").to_string();
     sanitize_public_text(normalized.trim_end_matches('+').trim())
+}
+
+fn normalized_stuck_process_wait_point(details: &Value) -> Option<String> {
+    details
+        .get("wchan")
+        .and_then(Value::as_str)
+        .map(normalize_stack_frame)
+        .filter(|value| is_informative_wait_point(value))
+        .or_else(|| normalized_stuck_process_stack_top(details))
+}
+
+fn normalized_stuck_process_stack_top(details: &Value) -> Option<String> {
+    details
+        .get("stack_excerpt")
+        .and_then(Value::as_str)
+        .and_then(|excerpt| excerpt.lines().next())
+        .map(normalize_stack_frame)
+        .filter(|value| is_informative_wait_point(value))
+}
+
+fn is_informative_wait_point(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty() && !matches!(trimmed, "0" | "-" | "n/a")
 }
 
 fn normalized_investigation_target_name(item: &SharedOpportunity) -> String {
@@ -16076,6 +16082,12 @@ mod tests {
         );
         missing_stack.finding.details["stack_excerpt"] = json!("");
         missing_stack.finding.package_name = Some("linux-image-6.17.0-14-generic".to_string());
+        let mut zero_wchan =
+            sample_stuck_process_investigation("chrome", 15744, "2026-04-01T17:42:54Z");
+        zero_wchan.finding.details["wchan"] = json!("0");
+        zero_wchan.finding.details["stack_excerpt"] = json!(
+            "[<0>] folio_wait_bit_common+0x129/0x310\n[<0>] __folio_lock_or_retry+0x1b3/0x470"
+        );
 
         assert_eq!(cluster_key_for(&a), cluster_key_for(&b));
         assert_eq!(cluster_key_for(&a), cluster_key_for(&missing_stack));
@@ -16088,6 +16100,10 @@ mod tests {
         assert!(public.summary.contains("kworker+i915_flip"));
         assert!(!public.summary.contains("152s"));
         assert_eq!(inferred_public_source_package(&a).as_deref(), Some("linux"));
+        assert_eq!(
+            build_public_issue_fields(&zero_wchan).title,
+            "Stuck D-state investigation for chrome at folio_wait_bit_common"
+        );
     }
 
     #[test]
