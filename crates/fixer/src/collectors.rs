@@ -4,7 +4,7 @@ use crate::config::FixerConfig;
 use crate::models::{FindingInput, ObservedArtifact, PopularBinaryProfile};
 use crate::storage::Store;
 use crate::util::{
-    command_exists, command_output, command_output_os_with_timeout, command_output_with_timeout,
+    command_exists, command_output_os_with_timeout, command_output_with_timeout,
     find_postgres_binary, hash_text, maybe_canonicalize, now_rfc3339,
 };
 use crate::workspace::resolve_installed_package_metadata;
@@ -30,9 +30,13 @@ const PERF_REPORT_LIMIT: usize = 12;
 const COREDUMP_FETCH_MIN: usize = 50;
 const COREDUMP_FETCH_MAX: usize = 200;
 const COREDUMP_FETCH_MULTIPLIER: usize = 8;
+const BASIC_COMMAND_TIMEOUT_SECONDS: u64 = 2;
+const COREDUMP_COMMAND_TIMEOUT_SECONDS: u64 = 10;
+const ETHTOOL_COMMAND_TIMEOUT_SECONDS: u64 = 5;
 const JOURNALCTL_COMMAND_TIMEOUT_SECONDS: u64 = 15;
 const KERNEL_MODULE_COMMAND_TIMEOUT_SECONDS: u64 = 5;
 const PACKAGE_LOOKUP_COMMAND_TIMEOUT_SECONDS: u64 = 5;
+const POSTGRES_COMMAND_TIMEOUT_SECONDS: u64 = 5;
 const RUNAWAY_INVESTIGATION_SUBSYSTEM: &str = "runaway-process";
 const STUCK_PROCESS_INVESTIGATION_SUBSYSTEM: &str = "stuck-process";
 const DESKTOP_RESUME_INVESTIGATION_SUBSYSTEM: &str = "desktop-resume";
@@ -687,11 +691,15 @@ fn system_uptime_seconds() -> f64 {
 }
 
 fn clock_ticks_per_second() -> f64 {
-    command_output("getconf", &["CLK_TCK"])
-        .ok()
-        .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .filter(|value| *value > 0.0)
-        .unwrap_or(100.0)
+    command_output_with_timeout(
+        "getconf",
+        &["CLK_TCK"],
+        StdDuration::from_secs(BASIC_COMMAND_TIMEOUT_SECONDS),
+    )
+    .ok()
+    .and_then(|raw| raw.trim().parse::<f64>().ok())
+    .filter(|value| *value > 0.0)
+    .unwrap_or(100.0)
 }
 
 fn process_runtime_seconds(
@@ -843,7 +851,7 @@ fn collect_crashes(config: &FixerConfig, store: &Store) -> Result<usize> {
     }
     store.prune_stackless_crash_findings()?;
     let fetch_limit = expanded_coredump_fetch_limit(config.service.coredump_limit);
-    let output = command_output(
+    let output = command_output_with_timeout(
         "coredumpctl",
         &[
             "list",
@@ -852,6 +860,7 @@ fn collect_crashes(config: &FixerConfig, store: &Store) -> Result<usize> {
             "-n",
             &fetch_limit.to_string(),
         ],
+        StdDuration::from_secs(COREDUMP_COMMAND_TIMEOUT_SECONDS),
     )?;
     if output.trim().is_empty() {
         return Ok(0);
@@ -863,8 +872,12 @@ fn collect_crashes(config: &FixerConfig, store: &Store) -> Result<usize> {
         let Some(pid) = event.get("pid").and_then(Value::as_i64) else {
             continue;
         };
-        let info = command_output("coredumpctl", &["info", "--no-pager", &pid.to_string()])
-            .unwrap_or_default();
+        let info = command_output_with_timeout(
+            "coredumpctl",
+            &["info", "--no-pager", &pid.to_string()],
+            StdDuration::from_secs(COREDUMP_COMMAND_TIMEOUT_SECONDS),
+        )
+        .unwrap_or_default();
         let Some(mut parsed) = parse_coredump_info(&info) else {
             continue;
         };
@@ -1973,7 +1986,12 @@ fn parse_network_driver_hang_events(raw: &str) -> Vec<NetworkDriverHangEvent> {
 }
 
 fn ethtool_driver_info_for_iface(iface: &str) -> Option<String> {
-    let output = command_output("ethtool", &["-i", iface]).ok()?;
+    let output = command_output_with_timeout(
+        "ethtool",
+        &["-i", iface],
+        StdDuration::from_secs(ETHTOOL_COMMAND_TIMEOUT_SECONDS),
+    )
+    .ok()?;
     let trimmed = output.trim();
     if trimmed.is_empty() {
         return None;
@@ -1982,7 +2000,12 @@ fn ethtool_driver_info_for_iface(iface: &str) -> Option<String> {
 }
 
 fn ethtool_eee_enabled(iface: &str) -> Option<bool> {
-    let output = command_output("ethtool", &["--show-eee", iface]).ok()?;
+    let output = command_output_with_timeout(
+        "ethtool",
+        &["--show-eee", iface],
+        StdDuration::from_secs(ETHTOOL_COMMAND_TIMEOUT_SECONDS),
+    )
+    .ok()?;
     for line in output.lines() {
         let line = line.trim();
         if line.starts_with("EEE status:") {
@@ -1993,7 +2016,12 @@ fn ethtool_eee_enabled(iface: &str) -> Option<bool> {
 }
 
 fn ethtool_interface_stats(iface: &str) -> Option<String> {
-    let output = command_output("ethtool", &["-S", iface]).ok()?;
+    let output = command_output_with_timeout(
+        "ethtool",
+        &["-S", iface],
+        StdDuration::from_secs(ETHTOOL_COMMAND_TIMEOUT_SECONDS),
+    )
+    .ok()?;
     let trimmed = output.trim();
     if trimmed.is_empty() {
         return None;
@@ -2041,7 +2069,12 @@ fn collect_postgres_collation_mismatches(store: &Store) -> Result<usize> {
     if !store.capability_available("psql")? || !store.capability_available("pg_lsclusters")? {
         return Ok(0);
     }
-    let output = command_output("pg_lsclusters", &["--json"]).unwrap_or_default();
+    let output = command_output_with_timeout(
+        "pg_lsclusters",
+        &["--json"],
+        StdDuration::from_secs(POSTGRES_COMMAND_TIMEOUT_SECONDS),
+    )
+    .unwrap_or_default();
     if output.trim().is_empty() {
         return Ok(0);
     }
@@ -3377,11 +3410,15 @@ fn desktop_graphics_session_package_hint(
 }
 
 fn current_kernel_image_package_name() -> String {
-    let release = command_output("uname", &["-r"])
-        .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
+    let release = command_output_with_timeout(
+        "uname",
+        &["-r"],
+        StdDuration::from_secs(BASIC_COMMAND_TIMEOUT_SECONDS),
+    )
+    .ok()
+    .map(|raw| raw.trim().to_string())
+    .filter(|value| !value.is_empty())
+    .unwrap_or_else(|| "unknown".to_string());
     format!("linux-image-{release}")
 }
 
@@ -6151,10 +6188,14 @@ fn distro_info() -> (Option<String>, Option<String>) {
 }
 
 fn installed_version_for_package(package: &str) -> Option<String> {
-    command_output("dpkg-query", &["-W", "-f=${Version}", package])
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    command_output_with_timeout(
+        "dpkg-query",
+        &["-W", "-f=${Version}", package],
+        StdDuration::from_secs(PACKAGE_LOOKUP_COMMAND_TIMEOUT_SECONDS),
+    )
+    .ok()
+    .map(|v| v.trim().to_string())
+    .filter(|v| !v.is_empty())
 }
 
 fn add_env_context(details: &mut Value) {
@@ -6218,14 +6259,10 @@ fn collect_bpftrace(config: &FixerConfig, store: &Store) -> Result<usize> {
     let Some(script) = &config.service.bpftrace_script else {
         return Ok(0);
     };
-    let output = command_output(
-        "timeout",
-        &[
-            &config.service.bpftrace_timeout_seconds.to_string(),
-            "bpftrace",
-            "-e",
-            script,
-        ],
+    let output = command_output_with_timeout(
+        "bpftrace",
+        &["-e", script],
+        StdDuration::from_secs(config.service.bpftrace_timeout_seconds),
     )
     .unwrap_or_default();
     if output.trim().is_empty() {
@@ -6741,9 +6778,10 @@ fn available_debug_packages_for(object: &str) -> Vec<String> {
     candidate_debug_packages(&package_name)
         .into_iter()
         .filter(|candidate| {
-            command_output(
+            command_output_with_timeout(
                 "apt-cache",
                 &["search", "--names-only", &format!("^{candidate}$")],
+                StdDuration::from_secs(BASIC_COMMAND_TIMEOUT_SECONDS),
             )
             .map(|output| {
                 output

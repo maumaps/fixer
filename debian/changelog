@@ -1,3 +1,11 @@
+fixer (0.132.0-1) unstable; urgency=medium
+
+  * Run the remaining collector-side external probes through bounded command
+    timeouts, covering coredumpctl, ethtool, pg_lsclusters, bpftrace, getconf,
+    uname, apt-cache, and dpkg package-version lookups.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 04:43:31 +0400
+
 fixer (0.131.0-1) unstable; urgency=medium
 
   * Skip dpkg owner probes for clearly local or virtual paths such as
