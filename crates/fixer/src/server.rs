@@ -393,6 +393,59 @@ code, pre {
     margin: 0;
 }
 
+.upstream-proof {
+    display: grid;
+    grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+    gap: 1rem;
+    align-items: stretch;
+    border-color: rgba(36, 92, 45, 0.22);
+    background:
+        linear-gradient(135deg, rgba(238, 247, 239, 0.9), rgba(255, 251, 244, 0.86));
+}
+
+.upstream-proof-copy {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.upstream-proof h2 {
+    margin-bottom: 0.4rem;
+}
+
+.upstream-proof .section-intro {
+    margin-bottom: 0;
+}
+
+.upstream-win {
+    padding: 1rem;
+    border-radius: 18px;
+    border: 1px solid rgba(36, 92, 45, 0.18);
+    background: rgba(255, 255, 255, 0.72);
+}
+
+.upstream-win-list {
+    display: grid;
+    gap: 0.8rem;
+}
+
+.upstream-win h3 {
+    margin: 0.45rem 0 0.55rem;
+    font-size: 1.15rem;
+}
+
+.upstream-win p {
+    margin: 0.55rem 0 0;
+}
+
+.upstream-win-footer {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    margin-top: 0.9rem;
+}
+
 .journey-list {
     display: grid;
     gap: 0.8rem;
@@ -623,6 +676,10 @@ code, pre {
 
     .snapshot-grid {
         grid-template-columns: 1fr 1fr;
+    }
+
+    .upstream-proof {
+        grid-template-columns: 1fr;
     }
 }
 "#;
@@ -978,6 +1035,18 @@ struct DashboardSnapshot {
     largest_public_cluster_size: i64,
     last_submission_at: Option<String>,
     top_issues: Vec<PublicIssueCandidate>,
+    upstream_wins: Vec<UpstreamPatchWin>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UpstreamPatchWin {
+    id: String,
+    project: String,
+    title: String,
+    summary: String,
+    pr_url: String,
+    merged_at: Option<String>,
+    tags: Vec<String>,
 }
 
 fn sqlite_path_from_url(url: &str) -> Option<PathBuf> {
@@ -1767,6 +1836,18 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             created_at TIMESTAMPTZ NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS upstream_patch_wins (
+            id TEXT PRIMARY KEY,
+            project TEXT NOT NULL,
+            title TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            pr_url TEXT NOT NULL,
+            merged_at TIMESTAMPTZ,
+            tags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+            patch_issue_id TEXT REFERENCES issue_clusters(id) ON DELETE SET NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
         CREATE TABLE IF NOT EXISTS evidence_requests (
             id TEXT PRIMARY KEY,
             issue_id TEXT NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
@@ -1873,6 +1954,18 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             state TEXT NOT NULL,
             summary TEXT NOT NULL,
             bundle_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS upstream_patch_wins (
+            id TEXT PRIMARY KEY,
+            project TEXT NOT NULL,
+            title TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            pr_url TEXT NOT NULL,
+            merged_at TEXT,
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            patch_issue_id TEXT REFERENCES issue_clusters(id) ON DELETE SET NULL,
             created_at TEXT NOT NULL
         );
 
@@ -6620,6 +6713,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 largest_public_cluster_size: row.get(7),
                 last_submission_at,
                 top_issues: load_public_issue_candidates(db, 8).await?,
+                upstream_wins: load_upstream_patch_wins(db, 3).await?,
             })
         }
         ServerDb::Sqlite(path) => {
@@ -6695,7 +6789,51 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 largest_public_cluster_size,
                 last_submission_at,
                 top_issues: load_public_issue_candidates(db, 8).await?,
+                upstream_wins: load_upstream_patch_wins(db, 3).await?,
             })
+        }
+    }
+}
+
+async fn load_upstream_patch_wins(
+    db: &ServerDb,
+    limit: i64,
+) -> Result<Vec<UpstreamPatchWin>, ApiError> {
+    match db {
+        ServerDb::Postgres(client) => {
+            let rows = client
+                .query(
+                    "
+            SELECT id, project, title, summary, pr_url, merged_at, tags_json
+            FROM upstream_patch_wins
+            ORDER BY merged_at DESC NULLS LAST, created_at DESC
+            LIMIT $1
+            ",
+                    &[&limit],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            rows.into_iter()
+                .map(upstream_patch_win_from_row)
+                .collect::<Result<Vec<_>, _>>()
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            let mut stmt = connection
+                .prepare(
+                    "
+            SELECT id, project, title, summary, pr_url, merged_at, tags_json
+            FROM upstream_patch_wins
+            ORDER BY merged_at DESC, created_at DESC
+            LIMIT ?1
+            ",
+                )
+                .map_err(ApiError::internal)?;
+            let rows = stmt
+                .query_map([limit], upstream_patch_win_from_sqlite_row)
+                .map_err(ApiError::internal)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(ApiError::internal)
         }
     }
 }
@@ -7503,6 +7641,33 @@ fn public_patch_from_row(row: Row) -> Result<PublicPatchEntry, ApiError> {
         best_patch_diff_url: public_best_patch_diff_url(&id, Some(&best_patch)),
         best_patch,
     })
+}
+
+fn upstream_patch_win_from_row(row: Row) -> Result<UpstreamPatchWin, ApiError> {
+    let merged_at = row
+        .get::<_, Option<DateTime<Utc>>>(5)
+        .map(|value| value.to_rfc3339());
+    let tags_json: Value = row.get(6);
+    Ok(UpstreamPatchWin {
+        id: row.get(0),
+        project: row.get(1),
+        title: row.get(2),
+        summary: row.get(3),
+        pr_url: row.get(4),
+        merged_at,
+        tags: string_array_from_value(&tags_json),
+    })
+}
+
+fn string_array_from_value(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.trim().is_empty())
+        .collect()
 }
 
 fn public_triage_from_row(row: Row) -> Result<Option<PublicTriageEntry>, ApiError> {
@@ -8834,6 +8999,24 @@ fn public_patch_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pub
         last_seen: row.get(11)?,
         best_patch_diff_url: public_best_patch_diff_url(&id, Some(&best_patch)),
         best_patch,
+    })
+}
+
+fn upstream_patch_win_from_sqlite_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<UpstreamPatchWin> {
+    let tags_raw: String = row.get(6)?;
+    let tags_json = serde_json::from_str::<Value>(&tags_raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(UpstreamPatchWin {
+        id: row.get(0)?,
+        project: row.get(1)?,
+        title: row.get(2)?,
+        summary: row.get(3)?,
+        pr_url: row.get(4)?,
+        merged_at: row.get(5)?,
+        tags: string_array_from_value(&tags_json),
     })
 }
 
@@ -11749,6 +11932,72 @@ fn validate_uuid_param(raw: &str, label: &str) -> Result<(), ApiError> {
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid {label}")))
 }
 
+fn render_upstream_wins_section(wins: &[UpstreamPatchWin]) -> String {
+    if wins.is_empty() {
+        return String::new();
+    }
+    let cards = wins
+        .iter()
+        .map(render_upstream_win_card)
+        .collect::<Vec<_>>()
+        .join("");
+    r#"
+        <section class="panel upstream-proof section">
+            <div class="upstream-proof-copy">
+                <div>
+                    <p class="eyebrow">Merged upstream</p>
+                    <h2>Fixer patches can land in projects people already trust.</h2>
+                    <p class="section-intro">The goal is not to generate local workarounds forever. When the evidence is strong and the patch is maintainable, Fixer should help move the fix back to the project that owns the code.</p>
+                </div>
+                <div class="meta">
+                    <span class="tag patch">accepted patch</span>
+                    <span class="tag">upstream review</span>
+                    <span class="tag">real build validation</span>
+                </div>
+            </div>
+            <div class="upstream-win-list">"#
+        .to_string()
+        + &cards
+        + r#"</div>
+        </section>
+"#
+}
+
+fn render_upstream_win_card(win: &UpstreamPatchWin) -> String {
+    let tags = win
+        .tags
+        .iter()
+        .take(4)
+        .map(|tag| format!("<span class=\"tag\">{}</span>", html_escape(tag)))
+        .collect::<Vec<_>>()
+        .join("");
+    let merged = win
+        .merged_at
+        .as_deref()
+        .map(format_timestamp)
+        .map(|value| format!("<p class=\"fine-print\">Merged {}</p>", html_escape(&value)))
+        .unwrap_or_default();
+    format!(
+        r#"<article class="upstream-win">
+                <p class="tag patch">{}</p>
+                <h3>{}</h3>
+                <p>{}</p>
+                {}
+                <div class="upstream-win-footer">
+                    <a class="button primary" href="{}">Read merged PR</a>
+                    <a class="button soft" href="/patches">Browse Fixer patch attempts</a>
+                </div>
+                <div class="meta">{}</div>
+            </article>"#,
+        html_escape(&win.project),
+        html_escape(&win.title),
+        html_escape(&win.summary),
+        merged,
+        html_escape(&win.pr_url),
+        tags,
+    )
+}
+
 fn render_landing_page(config: &FixerConfig, snapshot: &DashboardSnapshot) -> String {
     let canonical_url = config.network.server_url.trim_end_matches('/');
     let github_url = "https://github.com/maumaps/fixer";
@@ -11787,6 +12036,7 @@ sudo apt install fixer"
             .collect::<Vec<_>>()
             .join("")
     };
+    let upstream_wins_markup = render_upstream_wins_section(&snapshot.upstream_wins);
 
     let body = format!(
         r#"
@@ -11873,6 +12123,8 @@ sudo apt install fixer"
                 <p>Patches are pushed toward plan-first reasoning, review, and git-friendly writeups so the result is easier to understand and submit upstream.</p>
             </article>
         </section>
+
+        {upstream_wins_markup}
 
         <section class="grid columns section">
             <article class="panel">
@@ -14592,6 +14844,19 @@ mod tests {
             largest_public_cluster_size: 6,
             last_submission_at: Some("2026-03-30T00:00:00Z".to_string()),
             top_issues: Vec::new(),
+            upstream_wins: vec![UpstreamPatchWin {
+                id: "htop-zram".to_string(),
+                project: "htop".to_string(),
+                title: "Stopped repeated zram ENOENT probes in htop.".to_string(),
+                summary: "The merged patch enumerates existing zram devices, follows htop's compat/openat style, and reads sysfs files with Compat_readfileat.".to_string(),
+                pr_url: "https://github.com/htop-dev/htop/pull/1977".to_string(),
+                merged_at: Some("2026-05-01T14:42:20Z".to_string()),
+                tags: vec![
+                    "accepted patch".to_string(),
+                    "upstream review".to_string(),
+                    "real build validation".to_string(),
+                ],
+            }],
         };
 
         let markup = render_landing_page(&config, &snapshot);
@@ -14599,6 +14864,10 @@ mod tests {
         assert!(markup.contains("Install first, opt in later"));
         assert!(markup.contains("Shared queue, not private guessing"));
         assert!(markup.contains("sanitized issue families, not raw host evidence"));
+        assert!(markup.contains("Merged upstream"));
+        assert!(markup.contains("htop"));
+        assert!(markup.contains("https://github.com/htop-dev/htop/pull/1977"));
+        assert!(markup.contains("Compat_readfileat"));
         assert!(markup.contains("How the queue is sorted"));
         assert!(markup.contains("public issue families seen on 2+ hosts"));
         assert!(markup.contains("largest public issue family right now"));

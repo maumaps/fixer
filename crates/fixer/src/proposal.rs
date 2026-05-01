@@ -905,6 +905,22 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         }
     }
 
+    if workflow_failure.is_none() {
+        let current_changed_paths = workspace_changed_paths(&job.workspace.repo_root);
+        let current_author_output = read_text(&current_author_output_path).unwrap_or_default();
+        if !current_changed_paths.is_empty() {
+            if let Some(error) = patch_validation_quality_failure(
+                &current_author_output,
+                &job.workspace,
+                &current_changed_paths,
+            ) {
+                workflow_failure = Some(("weak-patch-validation".to_string(), error));
+                workflow_failure_stage = Some("review".to_string());
+                workflow_review_failure_category = Some("weak-patch-validation".to_string());
+            }
+        }
+    }
+
     let finished_at = now_rfc3339();
     fs::write(
         job.bundle_dir.join("published-prompt.md"),
@@ -1210,6 +1226,40 @@ pub fn prepare_submission(store: &Store, proposal_id: i64) -> Result<PathBuf> {
     let proposal = store.get_proposal(proposal_id)?;
     let opportunity = store.get_opportunity(proposal.opportunity_id)?;
     let path = proposal.bundle_path.join("submission.md");
+    let output_text = proposal
+        .output_path
+        .as_ref()
+        .and_then(|path| read_text(path))
+        .unwrap_or_default();
+    let latest_response =
+        latest_patch_authoring_response(&output_text).unwrap_or_else(|| output_text.clone());
+    let subject = extract_patch_labeled_line(&latest_response, "Subject:");
+    let validation = extract_patch_markdown_section_raw(&latest_response, "Validation");
+    let changed_paths = workspace_changed_paths(&proposal.bundle_path.join("workspace"));
+    let evidence = read_text(&proposal.bundle_path.join("evidence.json"))
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let workspace_metadata = evidence
+        .as_ref()
+        .and_then(|value| value.get("workspace"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let package_metadata = evidence
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("opportunity")
+                .and_then(|opportunity| opportunity.get("evidence"))
+                .and_then(|evidence| evidence.get("package_metadata"))
+                .or_else(|| {
+                    value
+                        .get("opportunity")
+                        .and_then(|opportunity| opportunity.get("evidence"))
+                        .and_then(|evidence| evidence.get("details"))
+                        .and_then(|details| details.get("package_metadata"))
+                })
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
     let mut file = fs::File::create(&path)?;
     writeln!(file, "# Submission bundle")?;
     writeln!(file)?;
@@ -1232,8 +1282,52 @@ pub fn prepare_submission(store: &Store, proposal_id: i64) -> Result<PathBuf> {
             .map(|x| x.display().to_string())
             .unwrap_or_else(|| "(none)".to_string())
     )?;
+    if let Some(subject) = subject {
+        writeln!(file, "- Patch subject: {}", subject)?;
+    }
+    if !changed_paths.is_empty() {
+        writeln!(file, "- Changed paths: {}", changed_paths.join(", "))?;
+    }
     if let Some(output) = proposal.output_path {
         writeln!(file, "- Output artifact: {}", output.display())?;
+    }
+    writeln!(file)?;
+    writeln!(file, "## Upstream handoff notes")?;
+    writeln!(file)?;
+    writeln!(
+        file,
+        "- Before opening a PR, inspect contribution docs and local helper APIs in the target upstream checkout. Prefer project wrappers such as compat/readfile helpers over generic libc/stdio APIs when the project already has them."
+    )?;
+    writeln!(
+        file,
+        "- If the apparent GitHub repository is a mirror, do not open a GitHub PR; follow the upstream contribution route instead."
+    )?;
+    if let Some(homepage) = workspace_metadata
+        .get("homepage")
+        .and_then(Value::as_str)
+        .or_else(|| package_metadata.get("homepage").and_then(Value::as_str))
+    {
+        writeln!(file, "- Homepage: {}", homepage)?;
+    }
+    if let Some(report_url) = package_metadata
+        .get("report_url")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        writeln!(file, "- Report URL: {}", report_url)?;
+    }
+    if let Some(maintainer) = package_metadata
+        .get("maintainer")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        writeln!(file, "- Package maintainer: {}", maintainer)?;
+    }
+    if let Some(validation) = validation {
+        writeln!(file)?;
+        writeln!(file, "## Validation from proposal")?;
+        writeln!(file)?;
+        writeln!(file, "{}", validation)?;
     }
     Ok(path)
 }
@@ -2924,14 +3018,18 @@ fn build_prompt(
         })
         .unwrap_or_default();
     let validation_hint = investigation_validation_hint(opportunity, workspace);
+    let build_validation_hint = workspace_build_validation_hint(workspace);
+    let upstream_style_hint = upstream_style_prompt_hint(workspace);
     format!(
-        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, keep the change upstreamable, prefer the clearest control flow available, and do not keep avoidable `goto` when a simpler structure would read better. The final explanation must connect the observed issue evidence to the actual code change, not just paraphrase the diff. Write like a maintainer is going to read the patch mail cold: explain the bug in plain language, define subsystem-specific jargon the first time you need it, and make the causal story obvious. If you introduce non-obvious state translation, index remapping, or backend split logic, add a short source comment that explains the invariant being preserved.{}{}{} \n\n{}\n\n{}",
+        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, keep the change upstreamable, prefer the clearest control flow available, and do not keep avoidable `goto` when a simpler structure would read better. Before introducing new file, process, allocation, locking, networking, or platform APIs, inspect nearby code and project contribution docs for existing helpers or compatibility wrappers and use those local patterns unless you can explain why they do not fit. Validate from a reproducible workspace-root entrypoint before falling back to focused leaf commands; if a build or test cannot run, report the exact command, the exact blocker, and any narrower check you ran instead. The final explanation must connect the observed issue evidence to the actual code change, not just paraphrase the diff. Write like a maintainer is going to read the patch mail cold: explain the bug in plain language, define subsystem-specific jargon the first time you need it, and make the causal story obvious. If you introduce non-obvious state translation, index remapping, or backend split logic, add a short source comment that explains the invariant being preserved.{}{}{}{}{} \n\n{}\n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
         investigation_hint,
         prior_patch_hint,
         validation_hint,
+        build_validation_hint,
+        upstream_style_hint,
         extra,
         patch_response_contract(),
     )
@@ -2953,14 +3051,18 @@ fn build_plan_prompt(
         .unwrap_or_default();
     let investigation_focus = investigation_plan_focus_hint(subsystem);
     let validation_hint = plan_validation_hint(subsystem, workspace);
+    let build_validation_hint = workspace_build_validation_hint(workspace);
+    let upstream_style_hint = upstream_style_prompt_hint(workspace);
     format!(
-        "You are planning a fixer patch before any edits happen.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`.{}{}{} Inspect the relevant code, but do not edit files in this pass.\n\nReturn a short markdown plan with these exact sections:\n\n## Problem\n## Proposed Subject\n## Patch Plan\n## Risks\n## Validation\n\nThe plan must explain how the proposed code change addresses the observed issue evidence, call out any prior Fixer patch that should be improved or replaced, reject awkward control flow such as avoidable `goto` if there is a cleaner bounded alternative, and keep the intended maintainer-facing explanation clear enough that someone unfamiliar with the local complaint wording can still follow the fix.",
+        "You are planning a fixer patch before any edits happen.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`.{}{}{}{}{} Inspect the relevant code, nearby callers, project contribution docs, and local helper/compat APIs, but do not edit files in this pass.\n\nReturn a short markdown plan with these exact sections:\n\n## Problem\n## Proposed Subject\n## Patch Plan\n## Risks\n## Validation\n\nThe plan must explain how the proposed code change addresses the observed issue evidence, call out any prior Fixer patch that should be improved or replaced, reject awkward control flow such as avoidable `goto` if there is a cleaner bounded alternative, name any local helper APIs or maintainer conventions the patch should follow, and keep the intended maintainer-facing explanation clear enough that someone unfamiliar with the local complaint wording can still follow the fix. In `## Validation`, name the reproducible configure/build/test entrypoint you will try from the workspace root before any focused leaf compile or smoke check.",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
         source_hint,
         investigation_focus,
         validation_hint,
+        build_validation_hint,
+        upstream_style_hint,
     )
 }
 
@@ -2975,6 +3077,65 @@ fn build_patch_prompt_with_plan(patch_prompt: &str, plan_output_path: &Path) -> 
 fn build_compact_patch_retry_prompt(base_patch_prompt: &str) -> String {
     format!(
         "{base_patch_prompt}\n\nWorkflow note: A previous patch pass failed during Codex remote compaction under high demand. Re-run this patch pass from a fresh context, keep the explanation concise, and avoid rehashing long evidence verbatim."
+    )
+}
+
+fn upstream_style_prompt_hint(workspace: &PreparedWorkspace) -> String {
+    let mut hint = String::from(
+        "\n\nUpstream-style expectation: before planning or editing, check for contribution/style docs (`CONTRIBUTING`, `HACKING`, `README-hacking`, `README.md`, `docs/`, `dev-docs/`) and scan the touched subsystem for local helpers. If the project has wrappers for file IO, path-relative IO, process spawning, memory allocation, logging, locking, or platform compatibility, prefer those wrappers over generic libc/std APIs. In the plan and final validation, name any such helper or convention you found, or say that no relevant local helper was found.",
+    );
+    if let Some(package) = workspace
+        .source_package
+        .as_deref()
+        .or(workspace.package_name.as_deref())
+    {
+        hint.push_str(&format!(
+            " Treat this as a `{package}` upstream patch, not just a Debian-local workaround."
+        ));
+    }
+    if workspace
+        .homepage
+        .as_deref()
+        .is_some_and(|homepage| homepage.contains("invent.kde.org"))
+    {
+        hint.push_str(
+            " This appears to be a KDE project; prefer KDE Invent/GitLab contribution flow over GitHub mirrors.",
+        );
+    }
+    hint
+}
+
+fn workspace_build_validation_hint(workspace: &PreparedWorkspace) -> String {
+    let root = &workspace.repo_root;
+    let mut candidates = Vec::new();
+    if root.join("autogen.sh").is_file() && root.join("configure.ac").is_file() {
+        candidates.push("`./autogen.sh && ./configure && make`");
+    } else if root.join("configure").is_file() {
+        candidates.push("`./configure && make`");
+    } else if root.join("configure.ac").is_file() {
+        candidates.push("`autoreconf -fi && ./configure && make`");
+    }
+    if root.join("meson.build").is_file() {
+        candidates.push(
+            "`meson setup build-fix && meson compile -C build-fix && meson test -C build-fix`",
+        );
+    }
+    if root.join("CMakeLists.txt").is_file() {
+        candidates
+            .push("`cmake -S . -B build-fix -G Ninja && cmake --build build-fix && ctest --test-dir build-fix --output-on-failure`");
+    }
+    if root.join("Cargo.toml").is_file() {
+        candidates.push("`cargo test`");
+    }
+    if root.join("Makefile").is_file() || root.join("GNUmakefile").is_file() {
+        candidates.push("`make` and, if available, `make check`");
+    }
+    if candidates.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nValidation expectation: try the project-level build/test entrypoint from the workspace root before reporting only a focused leaf compile. Detected candidate(s): {}. If the project-level command fails because dependencies or generated files are missing, include the exact command and failure reason in `## Validation`, then run the narrowest relevant compile/test that is still reproducible from a clean checkout.",
+        candidates.join(", ")
     )
 }
 
@@ -3286,6 +3447,186 @@ fn desktop_graphics_session_semantic_failure(
     None
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProjectValidationCommand {
+    display: &'static str,
+    kind: ProjectValidationCommandKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProjectValidationCommandKind {
+    Autogen,
+    Configure,
+    Autoreconf,
+    Meson,
+    Cmake,
+    Cargo,
+    Make,
+}
+
+fn workspace_project_validation_commands(workspace_root: &Path) -> Vec<ProjectValidationCommand> {
+    let mut candidates = Vec::new();
+    if workspace_root.join("autogen.sh").is_file() && workspace_root.join("configure.ac").is_file()
+    {
+        candidates.push(ProjectValidationCommand {
+            display: "`./autogen.sh && ./configure && make`",
+            kind: ProjectValidationCommandKind::Autogen,
+        });
+    } else if workspace_root.join("configure").is_file() {
+        candidates.push(ProjectValidationCommand {
+            display: "`./configure && make`",
+            kind: ProjectValidationCommandKind::Configure,
+        });
+    } else if workspace_root.join("configure.ac").is_file() {
+        candidates.push(ProjectValidationCommand {
+            display: "`autoreconf -fi && ./configure && make`",
+            kind: ProjectValidationCommandKind::Autoreconf,
+        });
+    }
+    if workspace_root.join("meson.build").is_file() {
+        candidates.push(ProjectValidationCommand {
+            display:
+                "`meson setup build-fix && meson compile -C build-fix && meson test -C build-fix`",
+            kind: ProjectValidationCommandKind::Meson,
+        });
+    }
+    if workspace_root.join("CMakeLists.txt").is_file() {
+        candidates.push(ProjectValidationCommand {
+            display:
+                "`cmake -S . -B build-fix -G Ninja && cmake --build build-fix && ctest --test-dir build-fix --output-on-failure`",
+            kind: ProjectValidationCommandKind::Cmake,
+        });
+    }
+    if workspace_root.join("Cargo.toml").is_file() {
+        candidates.push(ProjectValidationCommand {
+            display: "`cargo test`",
+            kind: ProjectValidationCommandKind::Cargo,
+        });
+    }
+    if workspace_root.join("Makefile").is_file() || workspace_root.join("GNUmakefile").is_file() {
+        candidates.push(ProjectValidationCommand {
+            display: "`make` and, if available, `make check`",
+            kind: ProjectValidationCommandKind::Make,
+        });
+    }
+    candidates
+}
+
+fn validation_mentions_project_command(
+    validation_lower: &str,
+    command: ProjectValidationCommand,
+) -> bool {
+    let mentions_make = validation_lower.contains("make")
+        || validation_lower.contains("ninja")
+        || validation_lower.contains("cmake --build");
+    match command.kind {
+        ProjectValidationCommandKind::Autogen => {
+            validation_lower.contains("./autogen.sh")
+                && validation_lower.contains("./configure")
+                && mentions_make
+        }
+        ProjectValidationCommandKind::Configure => {
+            validation_lower.contains("./configure") && mentions_make
+        }
+        ProjectValidationCommandKind::Autoreconf => {
+            validation_lower.contains("autoreconf")
+                && validation_lower.contains("./configure")
+                && mentions_make
+        }
+        ProjectValidationCommandKind::Meson => {
+            validation_lower.contains("meson setup")
+                && (validation_lower.contains("meson compile")
+                    || validation_lower.contains("meson test"))
+        }
+        ProjectValidationCommandKind::Cmake => {
+            (validation_lower.contains("cmake -s")
+                || validation_lower.contains("cmake --build")
+                || validation_lower.contains("ctest"))
+                && (validation_lower.contains("cmake --build")
+                    || validation_lower.contains("ctest"))
+        }
+        ProjectValidationCommandKind::Cargo => {
+            validation_lower.contains("cargo test") || validation_lower.contains("cargo build")
+        }
+        ProjectValidationCommandKind::Make => mentions_make,
+    }
+}
+
+fn patch_validation_quality_failure(
+    authoring_response: &str,
+    workspace: &PreparedWorkspace,
+    current_changed_paths: &[String],
+) -> Option<String> {
+    let response = latest_patch_authoring_response(authoring_response)
+        .unwrap_or_else(|| authoring_response.trim().to_string());
+    if response.is_empty() || current_changed_paths.is_empty() {
+        return None;
+    }
+    let validation =
+        extract_patch_markdown_section_raw(&response, "Validation").unwrap_or_default();
+    let validation_lower = validation.to_ascii_lowercase();
+    if validation.trim().is_empty() {
+        return Some("Patch validation is missing. A source-changing proposal must either run a reproducible build/test command from the workspace root or state the exact command that failed and the exact local blocker.".to_string());
+    }
+
+    let only_diff_check = validation_lower.contains("git diff --check")
+        && ![
+            "make",
+            "ninja",
+            "cmake",
+            "meson",
+            "cargo",
+            "pytest",
+            "ctest",
+            "configure",
+            "gcc",
+            "clang",
+            "dpkg-buildpackage",
+        ]
+        .iter()
+        .any(|marker| validation_lower.contains(marker));
+    if only_diff_check {
+        return Some("Patch validation only reports `git diff --check`. Formatting is useful, but a source-changing proposal also needs a build/test attempt or a precise explanation of why the project-level build/test command could not run.".to_string());
+    }
+
+    let build_candidates = workspace_project_validation_commands(&workspace.repo_root);
+    if !build_candidates.is_empty()
+        && !build_candidates
+            .iter()
+            .any(|candidate| validation_mentions_project_command(&validation_lower, *candidate))
+    {
+        let candidate_list = build_candidates
+            .iter()
+            .map(|candidate| candidate.display)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!(
+            "Patch validation did not attempt the detected project-level build/test entrypoint from the workspace root. Try one of: {candidate_list}. Focused object builds, syntax-only checks, smoke tests, or Debian package builds can be useful follow-ups, but they are not a substitute unless the project-level command is shown failing with a concrete local blocker."
+        ));
+    }
+
+    let failure_words = [
+        "could not",
+        "failed",
+        "unable",
+        "not installed",
+        "missing",
+        "no rule to make target",
+    ];
+    let reports_failure = failure_words
+        .iter()
+        .any(|marker| validation_lower.contains(marker));
+    if reports_failure
+        && !validation.contains('`')
+        && !validation_lower.contains("command")
+        && !validation_lower.contains("because")
+    {
+        return Some("Patch validation reports that a build/test could not run, but it does not include an exact command and blocker. Make the failure reproducible for maintainers by naming the command and the missing dependency, generated file, or failing step.".to_string());
+    }
+
+    None
+}
+
 fn investigation_prompt_hint(opportunity: &OpportunityRecord) -> &'static str {
     match investigation_subsystem(opportunity) {
         Some("desktop-input-config") => {
@@ -3369,6 +3710,8 @@ fn build_review_prompt(
             current_changed_paths.join(", ")
         )
     };
+    let upstream_style_hint = upstream_style_prompt_hint(workspace);
+    let build_validation_hint = workspace_build_validation_hint(workspace);
     let subsystem_hint = match investigation_subsystem_from_bundle(evidence_path).as_deref() {
         Some("desktop-input-config") => {
             "\n\nFor `desktop-input-config` patches, also verify semantic correctness: reject any patch that only hides, disables, unregisters, or de-interactivates the keyboard-layout runtime surface instead of fixing the reported behavior. A patch is `fix-needed` if it preserves only static config state, makes current-layout reporting synthetic, turns switching methods into no-ops, or otherwise removes the user-visible switcher path to avoid the original bug."
@@ -3379,7 +3722,7 @@ fn build_review_prompt(
         _ => "",
     };
     format!(
-        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{}{}{} The latest author response is at `{}`. Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, weak or non-gittable commit message text, and explanations that fail to connect the observed issue evidence to the code change. Also review the maintainer experience: the patch mail should be easy to accept upstream, the user-visible bug should be explained in plain language, subsystem-specific jargon should be defined when first used, and any non-obvious state translation or index remapping in code should have a short explanatory comment.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
+        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{}{}{}{}{} The latest author response is at `{}`. Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, weak or non-gittable commit message text, and explanations that fail to connect the observed issue evidence to the code change. Also review the maintainer experience: the patch mail should be easy to accept upstream, the user-visible bug should be explained in plain language, subsystem-specific jargon should be defined when first used, and any non-obvious state translation or index remapping in code should have a short explanatory comment. Reject patches that introduce generic libc/std APIs when nearby code or project docs provide a local compat/helper API for the same job, unless the author explicitly justifies the exception. Reject validation that only reports a leaf object/syntax build when a project-level configure/build/test entrypoint exists and was not attempted; if a full build cannot run, the author must show the exact failed command and blocker.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -3387,6 +3730,8 @@ fn build_review_prompt(
         source_hint,
         changed_paths_hint,
         subsystem_hint,
+        upstream_style_hint,
+        build_validation_hint,
         latest_patch_output_path.display(),
     )
 }
@@ -3431,8 +3776,10 @@ fn build_refinement_prompt(
         }
         _ => "",
     };
+    let upstream_style_hint = upstream_style_prompt_hint(workspace);
+    let build_validation_hint = workspace_build_validation_hint(workspace);
     format!(
-        "You are refining a fixer patch after an explicit code review.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the latest author response at `{}`. Read the review report at `{}`. This is refinement round {}.{}{}{}{} Address the review findings with the smallest reasonable follow-up changes. If the review identifies a runtime or correctness bug in the changed code, you must update the code itself before answering; a metadata-only response is not sufficient. Keep the patch upstream-friendly, avoid awkward control flow when a simpler structure will do, keep the final response gittable, make the maintainer-facing explanation plain and direct, add short comments for any non-obvious translation or remapping logic, run relevant tests if available, and summarize which review findings you addressed.\n\n{}",
+        "You are refining a fixer patch after an explicit code review.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the latest author response at `{}`. Read the review report at `{}`. This is refinement round {}.{}{}{}{}{}{} Address the review findings with the smallest reasonable follow-up changes. If the review identifies a runtime or correctness bug in the changed code, you must update the code itself before answering; a metadata-only response is not sufficient. Keep the patch upstream-friendly, use local project helpers and compat APIs when available, avoid awkward control flow when a simpler structure will do, keep the final response gittable, make the maintainer-facing explanation plain and direct, add short comments for any non-obvious translation or remapping logic, run relevant project-level build/tests from the workspace root before narrower checks when possible, and summarize which review findings you addressed.\n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -3443,6 +3790,8 @@ fn build_refinement_prompt(
         plan_hint,
         changed_paths_hint,
         subsystem_hint,
+        upstream_style_hint,
+        build_validation_hint,
         patch_response_contract(),
     )
 }
@@ -8016,6 +8365,229 @@ RESULT: ok
         assert!(prompt.contains("cmake -S . -B build-fix -G Ninja -DBUILD_DOC=OFF"));
         assert!(prompt.contains("cmake --build build-fix --target kded_keyboard -j2"));
         assert!(prompt.contains("cmake --build build-fix --target kcm_keyboard -j2"));
+    }
+
+    #[test]
+    fn generic_patch_prompts_require_upstream_style_and_local_helpers() {
+        let opportunity = OpportunityRecord {
+            id: 42,
+            finding_id: 42,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for htop".to_string(),
+            score: 98,
+            state: "open".to_string(),
+            summary: "htop repeats optional sysfs probes.".to_string(),
+            evidence: json!({}),
+            repo_root: None,
+            ecosystem: Some("debian".to_string()),
+            created_at: "2026-04-04T00:00:00Z".to_string(),
+            updated_at: "2026-04-04T00:00:00Z".to_string(),
+        };
+        let workspace = PreparedWorkspace {
+            repo_root: PathBuf::from("/tmp/htop"),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("htop".to_string()),
+            source_package: Some("htop".to_string()),
+            homepage: Some("https://htop.dev/".to_string()),
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+
+        let patch_prompt = super::build_prompt(
+            &opportunity,
+            Path::new("/tmp/evidence.json"),
+            &workspace,
+            None,
+            &FixerConfig::default(),
+        );
+        let plan_prompt =
+            super::build_plan_prompt(None, Path::new("/tmp/evidence.json"), &workspace, None);
+
+        for prompt in [patch_prompt, plan_prompt] {
+            assert!(prompt.contains("CONTRIBUTING"));
+            assert!(prompt.contains("local helper"));
+            assert!(prompt.contains("compat"));
+            assert!(prompt.contains("generic libc"));
+            assert!(prompt.contains("`htop` upstream patch"));
+        }
+    }
+
+    #[test]
+    fn generic_patch_prompts_name_detected_project_build_entrypoint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("autogen.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("configure.ac"), "AC_INIT([demo], [1])\n").unwrap();
+        let opportunity = OpportunityRecord {
+            id: 42,
+            finding_id: 42,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for htop".to_string(),
+            score: 98,
+            state: "open".to_string(),
+            summary: "htop repeats optional sysfs probes.".to_string(),
+            evidence: json!({}),
+            repo_root: None,
+            ecosystem: Some("debian".to_string()),
+            created_at: "2026-04-04T00:00:00Z".to_string(),
+            updated_at: "2026-04-04T00:00:00Z".to_string(),
+        };
+        let workspace = PreparedWorkspace {
+            repo_root: dir.path().to_path_buf(),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("htop".to_string()),
+            source_package: Some("htop".to_string()),
+            homepage: Some("https://htop.dev/".to_string()),
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+
+        let patch_prompt = super::build_prompt(
+            &opportunity,
+            Path::new("/tmp/evidence.json"),
+            &workspace,
+            None,
+            &FixerConfig::default(),
+        );
+        let plan_prompt =
+            super::build_plan_prompt(None, Path::new("/tmp/evidence.json"), &workspace, None);
+
+        for prompt in [patch_prompt, plan_prompt] {
+            assert!(prompt.contains("./autogen.sh && ./configure && make"));
+            assert!(prompt.contains("workspace root"));
+            assert!(prompt.contains("focused leaf"));
+        }
+    }
+
+    #[test]
+    fn review_and_refinement_prompts_reject_generic_api_drift() {
+        let workspace = PreparedWorkspace {
+            repo_root: PathBuf::from("/tmp/htop"),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("htop".to_string()),
+            source_package: Some("htop".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let evidence_path = dir.path().join("evidence.json");
+        std::fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&json!({
+                "opportunity": {
+                    "evidence": {
+                        "details": {
+                            "subsystem": "runaway-process"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let review_prompt = super::build_review_prompt(
+            &evidence_path,
+            &workspace,
+            None,
+            Path::new("/tmp/patch-output.txt"),
+            0,
+            &["linux/LinuxMachine.c".to_string()],
+        );
+        let refinement_prompt = super::build_refinement_prompt(
+            &evidence_path,
+            &workspace,
+            None,
+            None,
+            Path::new("/tmp/patch-output.txt"),
+            Path::new("/tmp/review-output.txt"),
+            1,
+            &["linux/LinuxMachine.c".to_string()],
+        );
+
+        assert!(review_prompt.contains("Reject patches that introduce generic libc/std APIs"));
+        assert!(review_prompt.contains("local compat/helper API"));
+        assert!(refinement_prompt.contains("use local project helpers and compat APIs"));
+        assert!(refinement_prompt.contains("CONTRIBUTING"));
+    }
+
+    #[test]
+    fn patch_validation_guard_rejects_leaf_only_check_when_project_build_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("autogen.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("configure.ac"), "AC_INIT([demo], [1])\n").unwrap();
+        let workspace = PreparedWorkspace {
+            repo_root: dir.path().to_path_buf(),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("htop".to_string()),
+            source_package: Some("htop".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+        let response = r#"Subject: linux: avoid repeated zram ENOENT probes
+
+## Commit Message
+Skip missing zram files.
+
+## Issue Connection
+The observed symptom was repeated sysfs probes. This patch avoids them.
+
+## Git Add Paths
+linux/LinuxMachine.c
+
+## Validation
+Ran `git diff --check` and `gcc -fsyntax-only linux/LinuxMachine.c`.
+"#;
+
+        let error = super::patch_validation_quality_failure(
+            response,
+            &workspace,
+            &["linux/LinuxMachine.c".to_string()],
+        )
+        .unwrap();
+
+        assert!(error.contains("project-level build/test entrypoint"));
+        assert!(error.contains("./autogen.sh && ./configure && make"));
+    }
+
+    #[test]
+    fn patch_validation_guard_accepts_detected_project_build() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("autogen.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("configure.ac"), "AC_INIT([demo], [1])\n").unwrap();
+        let workspace = PreparedWorkspace {
+            repo_root: dir.path().to_path_buf(),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("htop".to_string()),
+            source_package: Some("htop".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+        let response = r#"Subject: linux: avoid repeated zram ENOENT probes
+
+## Commit Message
+Skip missing zram files.
+
+## Issue Connection
+The observed symptom was repeated sysfs probes. This patch avoids them.
+
+## Git Add Paths
+linux/LinuxMachine.c
+
+## Validation
+Ran `git diff --check` and `./autogen.sh && ./configure && make -j2`.
+"#;
+
+        assert!(
+            super::patch_validation_quality_failure(
+                response,
+                &workspace,
+                &["linux/LinuxMachine.c".to_string()],
+            )
+            .is_none()
+        );
     }
 
     #[test]
