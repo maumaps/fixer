@@ -2450,9 +2450,31 @@ fn kernel_warning_identity(line: &str) -> String {
 }
 
 fn stable_kernel_warning_identity_message(message: &str) -> String {
+    if let Some(message) = stable_i915_atomic_update_failure_message(message) {
+        return message;
+    }
     let message = normalize_numeric_kernel_warning_field(message, "missed_beacons:");
     let message = normalize_numeric_kernel_warning_field(&message, "missed_beacons_since_rx:");
-    normalize_numeric_kernel_warning_field(&message, "device not accepting address ")
+    let message = normalize_numeric_kernel_warning_field(&message, "device not accepting address ");
+    let message = normalize_numeric_kernel_warning_field(&message, " ch ");
+    let message = normalize_nouveau_fifo_channel(&message);
+    normalize_bracketed_numeric_values(&message)
+}
+
+fn stable_i915_atomic_update_failure_message(message: &str) -> Option<String> {
+    if !message.contains("i915 ")
+        || !message.contains("[drm] *ERROR* Atomic update failure on pipe ")
+    {
+        return None;
+    }
+    message
+        .split_once(" (start=")
+        .map(|(stable, _)| stable.to_string())
+        .or_else(|| {
+            message
+                .split_once(" (")
+                .map(|(stable, _)| stable.to_string())
+        })
 }
 
 fn normalize_numeric_kernel_warning_field(input: &str, field: &str) -> String {
@@ -2472,6 +2494,54 @@ fn normalize_numeric_kernel_warning_field(input: &str, field: &str) -> String {
         }
         output.push_str("<n>");
         cursor = value_end;
+    }
+    output.push_str(&input[cursor..]);
+    output
+}
+
+fn normalize_nouveau_fifo_channel(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(offset) = input[cursor..].find('[') {
+        let open = cursor + offset;
+        let token_start = open + 1;
+        let mut token_end = token_start;
+        while token_end < input.len() && input.as_bytes()[token_end].is_ascii_hexdigit() {
+            token_end += 1;
+        }
+        if token_end.saturating_sub(token_start) >= 8
+            && input.as_bytes().get(token_end) == Some(&b' ')
+        {
+            output.push_str(&input[cursor..=open]);
+            output.push_str("<channel>");
+            cursor = token_end;
+        } else {
+            output.push_str(&input[cursor..token_start]);
+            cursor = token_start;
+        }
+    }
+    output.push_str(&input[cursor..]);
+    output
+}
+
+fn normalize_bracketed_numeric_values(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(open_offset) = input[cursor..].find('[') {
+        let open = cursor + open_offset;
+        let inner_start = open + 1;
+        let mut digit_end = inner_start;
+        while digit_end < input.len() && input.as_bytes()[digit_end].is_ascii_digit() {
+            digit_end += 1;
+        }
+        if digit_end > inner_start && input.as_bytes().get(digit_end) == Some(&b']') {
+            output.push_str(&input[cursor..=open]);
+            output.push_str("<n>");
+            cursor = digit_end;
+            continue;
+        }
+        output.push_str(&input[cursor..=open]);
+        cursor = inner_start;
     }
     output.push_str(&input[cursor..]);
     output
@@ -7276,6 +7346,42 @@ Kthread:\t0\n";
                 "kernel: usb 1-4.2.4.1: device not accepting address 73, error -71"
             ),
             "usb 1-4.2.4.1: device not accepting address <n>, error -71"
+        );
+    }
+
+    #[test]
+    fn kernel_warning_identity_stabilizes_i915_atomic_update_counters() {
+        assert_eq!(
+            kernel_warning_identity(
+                "кра 30 16:45:43 nucat kernel: i915 0000:00:02.0: [drm] *ERROR* Atomic update failure on pipe A (start=685295 end=685296) time 139 us, min 2146, max 2159, scanline start 2141, end 2160"
+            ),
+            kernel_warning_identity(
+                "кра 30 16:35:55 nucat kernel: i915 0000:00:02.0: [drm] *ERROR* Atomic update failure on pipe A (start=649999 end=650000) time 140 us, min 2146, max 2159, scanline start 2142, end 2161"
+            )
+        );
+        assert_eq!(
+            kernel_warning_identity(
+                "kernel: i915 0000:00:02.0: [drm] *ERROR* Atomic update failure on pipe A (start=685295 end=685296) time 139 us"
+            ),
+            "i915 0000:00:02.0: [drm] *ERROR* Atomic update failure on pipe A"
+        );
+    }
+
+    #[test]
+    fn kernel_warning_identity_stabilizes_nouveau_fifo_channel_and_pid() {
+        assert_eq!(
+            kernel_warning_identity(
+                "кра 24 22:39:07 nucat kernel: nouveau 0000:02:00.0: fifo: PBDMA0: 01000000 [] ch 3 [007fe80000 chrome[1572791]] subc 0 mthd 0008 data 00000000"
+            ),
+            kernel_warning_identity(
+                "кра 24 22:30:48 nucat kernel: nouveau 0000:02:00.0: fifo: PBDMA0: 01000000 [] ch 7 [007fe81000 chrome[1564909]] subc 0 mthd 0008 data 00000000"
+            )
+        );
+        assert_eq!(
+            kernel_warning_identity(
+                "kernel: nouveau 0000:02:00.0: fifo: PBDMA0: 01000000 [] ch 3 [007fe80000 chrome[1572791]] subc 0 mthd 0008 data 00000000"
+            ),
+            "nouveau 0000:02:00.0: fifo: PBDMA0: 01000000 [] ch <n> [<channel> chrome[<n>]] subc 0 mthd 0008 data 00000000"
         );
     }
 
