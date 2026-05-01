@@ -1,3 +1,11 @@
+fixer (0.130.0-1) unstable; urgency=medium
+
+  * Cache dpkg path-to-package lookup results, including timed-out misses, so
+    repeated process and perf attribution cannot multiply dpkg-query timeouts
+    during a single collection pass.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 04:18:12 +0400
+
 fixer (0.129.0-1) unstable; urgency=medium
 
   * Cache DKMS and modinfo lookup results, including timed-out misses, so

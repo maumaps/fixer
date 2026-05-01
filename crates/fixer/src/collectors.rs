@@ -4,8 +4,8 @@ use crate::config::FixerConfig;
 use crate::models::{FindingInput, ObservedArtifact, PopularBinaryProfile};
 use crate::storage::Store;
 use crate::util::{
-    command_exists, command_output, command_output_os, command_output_os_with_timeout,
-    command_output_with_timeout, find_postgres_binary, hash_text, maybe_canonicalize, now_rfc3339,
+    command_exists, command_output, command_output_os_with_timeout, command_output_with_timeout,
+    find_postgres_binary, hash_text, maybe_canonicalize, now_rfc3339,
 };
 use crate::workspace::resolve_installed_package_metadata;
 use anyhow::Result;
@@ -32,6 +32,7 @@ const COREDUMP_FETCH_MAX: usize = 200;
 const COREDUMP_FETCH_MULTIPLIER: usize = 8;
 const JOURNALCTL_COMMAND_TIMEOUT_SECONDS: u64 = 15;
 const KERNEL_MODULE_COMMAND_TIMEOUT_SECONDS: u64 = 5;
+const PACKAGE_LOOKUP_COMMAND_TIMEOUT_SECONDS: u64 = 5;
 const RUNAWAY_INVESTIGATION_SUBSYSTEM: &str = "runaway-process";
 const STUCK_PROCESS_INVESTIGATION_SUBSYSTEM: &str = "stuck-process";
 const DESKTOP_RESUME_INVESTIGATION_SUBSYSTEM: &str = "desktop-resume";
@@ -42,6 +43,7 @@ static DKMS_STATUS_OUTPUT_CACHE: OnceLock<Mutex<Option<Option<String>>>> = OnceL
 static MODINFO_MODULE_PATH_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> =
     OnceLock::new();
 static MODINFO_VERSION_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+static PATH_PACKAGE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
 const RUNAWAY_STRACE_EXCERPT_LIMIT: usize = 24;
 const RUNAWAY_TOP_SYSCALL_LIMIT: usize = 6;
 const RUNAWAY_SEQUENCE_WINDOW: usize = 3;
@@ -6246,20 +6248,30 @@ fn collect_bpftrace(config: &FixerConfig, store: &Store) -> Result<usize> {
 
 fn map_path_to_package(path: &Path) -> Option<String> {
     let lookup_path = package_lookup_path(path);
-    let output = if command_exists("timeout") {
-        command_output_os(
-            "timeout",
-            &[
-                OsStr::new("5s"),
-                OsStr::new("dpkg-query"),
-                OsStr::new("-S"),
-                lookup_path.as_os_str(),
-            ],
-        )
-        .ok()?
-    } else {
-        command_output_os("dpkg-query", &[OsStr::new("-S"), lookup_path.as_os_str()]).ok()?
-    };
+    let cache = PATH_PACKAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(package_name) = cache
+        .lock()
+        .expect("path package cache poisoned")
+        .get(&lookup_path)
+        .cloned()
+    {
+        return package_name;
+    }
+    let package_name = map_lookup_path_to_package(&lookup_path);
+    cache
+        .lock()
+        .expect("path package cache poisoned")
+        .insert(lookup_path, package_name.clone());
+    package_name
+}
+
+fn map_lookup_path_to_package(lookup_path: &Path) -> Option<String> {
+    let output = command_output_os_with_timeout(
+        "dpkg-query",
+        &[OsStr::new("-S"), lookup_path.as_os_str()],
+        StdDuration::from_secs(PACKAGE_LOOKUP_COMMAND_TIMEOUT_SECONDS),
+    )
+    .ok()?;
     output
         .lines()
         .next()
