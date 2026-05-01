@@ -25,6 +25,28 @@ struct WarningPruneCandidate {
     has_proposals: bool,
 }
 
+fn stored_kernel_warning_is_low_signal(summary: &str, details_json: &str) -> bool {
+    (summary.contains("kauditd_printk_skb:") && summary.contains("callbacks suppressed"))
+        || (details_json.contains("kauditd_printk_skb:")
+            && details_json.contains("callbacks suppressed"))
+        || stored_kernel_warning_is_register_dump(summary)
+}
+
+fn stored_kernel_warning_is_register_dump(summary: &str) -> bool {
+    let message = summary
+        .split_once(" kernel: ")
+        .map(|(_, message)| message)
+        .or_else(|| summary.strip_prefix("kernel: "))
+        .unwrap_or(summary)
+        .trim_start();
+    [
+        "RIP:", "RSP:", "RAX:", "RBX:", "RCX:", "RDX:", "RSI:", "RDI:", "RBP:", "R08:", "R09:",
+        "R10:", "R11:", "R12:", "R13:", "R14:", "R15:",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -313,51 +335,34 @@ impl Store {
     }
 
     pub fn prune_low_signal_kernel_warning_findings(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "
-            DELETE FROM proposals
-            WHERE opportunity_id IN (
-                SELECT o.id
-                FROM opportunities o
-                JOIN findings f ON f.id = o.finding_id
-                WHERE f.kind = 'warning'
-                  AND (
-                    f.summary LIKE '%kauditd_printk_skb:%callbacks suppressed%'
-                    OR f.details_json LIKE '%kauditd_printk_skb:%callbacks suppressed%'
-                  )
-            );
-
-            DELETE FROM validation_runs
-            WHERE opportunity_id IN (
-                SELECT o.id
-                FROM opportunities o
-                JOIN findings f ON f.id = o.finding_id
-                WHERE f.kind = 'warning'
-                  AND (
-                    f.summary LIKE '%kauditd_printk_skb:%callbacks suppressed%'
-                    OR f.details_json LIKE '%kauditd_printk_skb:%callbacks suppressed%'
-                  )
-            );
-
-            DELETE FROM opportunities
-            WHERE finding_id IN (
-                SELECT f.id
-                FROM findings f
-                WHERE f.kind = 'warning'
-                  AND (
-                    f.summary LIKE '%kauditd_printk_skb:%callbacks suppressed%'
-                    OR f.details_json LIKE '%kauditd_printk_skb:%callbacks suppressed%'
-                  )
-            );
-
-            DELETE FROM findings
-            WHERE kind = 'warning'
-              AND (
-                summary LIKE '%kauditd_printk_skb:%callbacks suppressed%'
-                OR details_json LIKE '%kauditd_printk_skb:%callbacks suppressed%'
-              );
-            ",
-        )?;
+        let finding_ids = {
+            let mut stmt = self.conn.prepare(
+                "
+                SELECT id, summary, details_json
+                FROM findings
+                WHERE kind = 'warning'
+                  AND title = 'Kernel warning'
+                ",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut finding_ids = Vec::new();
+            for row in rows {
+                let (id, summary, details_json) = row?;
+                if stored_kernel_warning_is_low_signal(&summary, &details_json) {
+                    finding_ids.push(id);
+                }
+            }
+            finding_ids
+        };
+        for chunk in finding_ids.chunks(500) {
+            self.delete_findings_cascade_bulk(chunk)?;
+        }
         Ok(())
     }
 
@@ -1977,6 +1982,49 @@ mod tests {
         assert_eq!(pruned, 2);
         assert_eq!(store.count("findings").unwrap(), 1);
         assert_eq!(store.count("opportunities").unwrap(), 1);
+    }
+
+    #[test]
+    fn prunes_low_signal_kernel_register_dump_findings() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        for (fingerprint, summary) in [
+            (
+                "register-rip",
+                "сак 29 23:54:45 nucat kernel: RIP: 0033:0x7fbe387eee62",
+            ),
+            (
+                "kernel-real",
+                "May 01 03:36:28 nucat kernel: VFS: Mount too revealing",
+            ),
+        ] {
+            store
+                .record_finding(&FindingInput {
+                    kind: "warning".to_string(),
+                    title: "Kernel warning".to_string(),
+                    severity: "medium".to_string(),
+                    fingerprint: fingerprint.to_string(),
+                    summary: summary.to_string(),
+                    details: json!({"line": summary}),
+                    artifact: None,
+                    repo_root: None,
+                    ecosystem: None,
+                })
+                .unwrap();
+        }
+
+        store.prune_low_signal_kernel_warning_findings().unwrap();
+
+        assert_eq!(store.count("findings").unwrap(), 1);
+        assert_eq!(store.count("opportunities").unwrap(), 1);
+        let remaining = store
+            .list_opportunities_limited(None, Some(10))
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            remaining.summary,
+            "May 01 03:36:28 nucat kernel: VFS: Mount too revealing"
+        );
     }
 
     #[test]

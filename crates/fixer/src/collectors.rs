@@ -2445,7 +2445,36 @@ fn kernel_warning_identity(line: &str) -> String {
         .map(|(_, message)| message)
         .or_else(|| line.strip_prefix("kernel: "))
         .unwrap_or(line);
-    message.split_whitespace().collect::<Vec<_>>().join(" ")
+    let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    stable_kernel_warning_identity_message(&message)
+}
+
+fn stable_kernel_warning_identity_message(message: &str) -> String {
+    let message = normalize_numeric_kernel_warning_field(message, "missed_beacons:");
+    let message = normalize_numeric_kernel_warning_field(&message, "missed_beacons_since_rx:");
+    normalize_numeric_kernel_warning_field(&message, "device not accepting address ")
+}
+
+fn normalize_numeric_kernel_warning_field(input: &str, field: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(offset) = input[cursor..].find(field) {
+        let start = cursor + offset;
+        let value_start = start + field.len();
+        output.push_str(&input[cursor..value_start]);
+        let mut value_end = value_start;
+        while value_end < input.len() && input.as_bytes()[value_end].is_ascii_digit() {
+            value_end += 1;
+        }
+        if value_end == value_start {
+            cursor = value_start;
+            continue;
+        }
+        output.push_str("<n>");
+        cursor = value_end;
+    }
+    output.push_str(&input[cursor..]);
+    output
 }
 
 fn kernel_warning_artifact_from_line(line: &str) -> Option<ObservedArtifact> {
@@ -3593,6 +3622,22 @@ fn is_low_signal_kernel_warning(line: &str) -> bool {
     (line.contains("kauditd_printk_skb:") && line.contains("callbacks suppressed"))
         || ((line.contains("show_signal:") || line.contains("show_signal_msg:"))
             && line.contains("callbacks suppressed"))
+        || is_kernel_register_dump_warning(line)
+}
+
+fn is_kernel_register_dump_warning(line: &str) -> bool {
+    let message = line
+        .split_once(" kernel: ")
+        .map(|(_, message)| message)
+        .or_else(|| line.strip_prefix("kernel: "))
+        .unwrap_or(line)
+        .trim_start();
+    [
+        "RIP:", "RSP:", "RAX:", "RBX:", "RCX:", "RDX:", "RSI:", "RDI:", "RBP:", "R08:", "R09:",
+        "R10:", "R11:", "R12:", "R13:", "R14:", "R15:",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
 }
 
 fn profile_display_name(profile: &str) -> Option<String> {
@@ -7175,6 +7220,16 @@ Kthread:\t0\n";
     }
 
     #[test]
+    fn low_signal_kernel_warning_filters_register_dump_lines() {
+        assert!(is_low_signal_kernel_warning(
+            "сак 29 23:54:45 nucat kernel: RIP: 0033:0x7fbe387eee62"
+        ));
+        assert!(is_low_signal_kernel_warning(
+            "сак 29 23:54:45 nucat kernel: R10: 0000000000000000 R11: 0000000000000202 R12: 00005636e34924f0"
+        ));
+    }
+
+    #[test]
     fn kernel_warning_identity_ignores_journal_prefix() {
         assert_eq!(
             kernel_warning_identity("May 01 03:31:13 nucat kernel: VFS: Mount too revealing"),
@@ -7185,6 +7240,42 @@ Kthread:\t0\n";
                 "сак 31 23:59:49 nucat kernel: usb 1-4.2.2-port4: disabled by hub (EMI?), re-enabling..."
             ),
             "usb 1-4.2.2-port4: disabled by hub (EMI?), re-enabling..."
+        );
+    }
+
+    #[test]
+    fn kernel_warning_identity_stabilizes_iwlwifi_missed_beacon_counters() {
+        assert_eq!(
+            kernel_warning_identity(
+                "мая 01 00:16:23 nucat kernel: iwlwifi 0000:04:00.0: missed_beacons:43, missed_beacons_since_rx:3"
+            ),
+            kernel_warning_identity(
+                "мая 01 00:12:21 nucat kernel: iwlwifi 0000:04:00.0: missed_beacons:138, missed_beacons_since_rx:1"
+            )
+        );
+        assert_eq!(
+            kernel_warning_identity(
+                "kernel: iwlwifi 0000:04:00.0: missed_beacons:43, missed_beacons_since_rx:3"
+            ),
+            "iwlwifi 0000:04:00.0: missed_beacons:<n>, missed_beacons_since_rx:<n>"
+        );
+    }
+
+    #[test]
+    fn kernel_warning_identity_stabilizes_usb_retry_addresses() {
+        assert_eq!(
+            kernel_warning_identity(
+                "сак 30 19:44:05 nucat kernel: usb 1-4.2.4.1: device not accepting address 73, error -71"
+            ),
+            kernel_warning_identity(
+                "сак 30 21:44:04 nucat kernel: usb 1-4.2.4.1: device not accepting address 122, error -71"
+            )
+        );
+        assert_eq!(
+            kernel_warning_identity(
+                "kernel: usb 1-4.2.4.1: device not accepting address 73, error -71"
+            ),
+            "usb 1-4.2.4.1: device not accepting address <n>, error -71"
         );
     }
 

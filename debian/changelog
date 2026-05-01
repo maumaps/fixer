@@ -1,3 +1,10 @@
+fixer (0.138.0-1) unstable; urgency=medium
+
+  * Normalize iwlwifi missed beacon and USB retry kernel warning counters,
+    and prune standalone register-dump warning lines as low signal.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 05:58:20 +0400
+
 fixer (0.137.0-1) unstable; urgency=medium
 
   * Normalize volatile AppArmor denial paths such as /proc/<pid> and
