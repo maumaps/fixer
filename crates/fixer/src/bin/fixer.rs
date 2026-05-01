@@ -62,6 +62,8 @@ enum Commands {
         id: i64,
         #[arg(long, default_value = "codex")]
         engine: EngineKind,
+        #[arg(long)]
+        force: bool,
     },
     PrepareSubmit {
         id: i64,
@@ -370,12 +372,12 @@ fn main() -> Result<()> {
                 println!("[{status}] {command}");
             }
         }
-        Commands::ProposeFix { id, engine } => {
+        Commands::ProposeFix { id, engine, force } => {
             let engine = match engine {
                 EngineKind::Codex => "codex",
                 EngineKind::Deterministic => "deterministic",
             };
-            let proposal = app.propose_fix(id, engine)?;
+            let proposal = app.propose_fix(id, engine, force)?;
             println!("proposal #{}", proposal.id);
             println!("state: {}", proposal.state);
             println!("bundle: {}", proposal.bundle_path.display());

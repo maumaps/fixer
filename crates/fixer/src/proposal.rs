@@ -3082,7 +3082,7 @@ fn build_compact_patch_retry_prompt(base_patch_prompt: &str) -> String {
 
 fn upstream_style_prompt_hint(workspace: &PreparedWorkspace) -> String {
     let mut hint = String::from(
-        "\n\nUpstream-style expectation: before planning or editing, check for contribution/style docs (`CONTRIBUTING`, `HACKING`, `README-hacking`, `README.md`, `docs/`, `dev-docs/`) and scan the touched subsystem for local helpers. If the project has wrappers for file IO, path-relative IO, process spawning, memory allocation, logging, locking, or platform compatibility, prefer those wrappers over generic libc/std APIs. In the plan and final validation, name any such helper or convention you found, or say that no relevant local helper was found.",
+        "\n\nUpstream-style expectation: before planning or editing, check for contribution/style docs (`CONTRIBUTING`, `HACKING`, `README-hacking`, `README.md`, `docs/`, `dev-docs/`) and scan the touched subsystem for local helpers. If the project has wrappers for file IO, path-relative IO, process spawning, memory allocation, logging, locking, or platform compatibility, prefer those wrappers over generic libc/std APIs. Do not invent a reproducer or user-visible failure that is not in the evidence bundle; if the evidence is profiler-only or indirect, describe it as a targeted mitigation or stop with a diagnosis instead of presenting a speculative patch as a confirmed bug fix. In the plan and final validation, name any such helper, convention, or evidence limit you found, or say that no relevant local helper was found.",
     );
     if let Some(package) = workspace
         .source_package
@@ -3123,6 +3123,10 @@ fn workspace_build_validation_hint(workspace: &PreparedWorkspace) -> String {
     if root.join("CMakeLists.txt").is_file() {
         candidates
             .push("`cmake -S . -B build-fix -G Ninja && cmake --build build-fix && ctest --test-dir build-fix --output-on-failure`");
+    }
+    if root.join("Configure").is_file() && root.join("Porting").is_dir() && root.join("t").is_dir()
+    {
+        candidates.push("`./Configure -des -Dusedevel && make -j2 && make test_harness`");
     }
     if root.join("Cargo.toml").is_file() {
         candidates.push("`cargo test`");
@@ -3453,13 +3457,14 @@ struct ProjectValidationCommand {
     kind: ProjectValidationCommandKind,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectValidationCommandKind {
     Autogen,
     Configure,
     Autoreconf,
     Meson,
     Cmake,
+    Perl,
     Cargo,
     Make,
 }
@@ -3495,6 +3500,15 @@ fn workspace_project_validation_commands(workspace_root: &Path) -> Vec<ProjectVa
             display:
                 "`cmake -S . -B build-fix -G Ninja && cmake --build build-fix && ctest --test-dir build-fix --output-on-failure`",
             kind: ProjectValidationCommandKind::Cmake,
+        });
+    }
+    if workspace_root.join("Configure").is_file()
+        && workspace_root.join("Porting").is_dir()
+        && workspace_root.join("t").is_dir()
+    {
+        candidates.push(ProjectValidationCommand {
+            display: "`./Configure -des -Dusedevel && make -j2 && make test_harness`",
+            kind: ProjectValidationCommandKind::Perl,
         });
     }
     if workspace_root.join("Cargo.toml").is_file() {
@@ -3545,6 +3559,12 @@ fn validation_mentions_project_command(
                 && (validation_lower.contains("cmake --build")
                     || validation_lower.contains("ctest"))
         }
+        ProjectValidationCommandKind::Perl => {
+            (validation_lower.contains("./configure") || validation_lower.contains("configure -d"))
+                && validation_lower.contains("make")
+                && (validation_lower.contains("make test")
+                    || validation_lower.contains("test_harness"))
+        }
         ProjectValidationCommandKind::Cargo => {
             validation_lower.contains("cargo test") || validation_lower.contains("cargo build")
         }
@@ -3590,6 +3610,17 @@ fn patch_validation_quality_failure(
     }
 
     let build_candidates = workspace_project_validation_commands(&workspace.repo_root);
+    if let Some(perl_candidate) = build_candidates
+        .iter()
+        .find(|candidate| candidate.kind == ProjectValidationCommandKind::Perl)
+    {
+        if !validation_mentions_project_command(&validation_lower, *perl_candidate) {
+            return Some(format!(
+                "Patch validation did not attempt the detected Perl full test suite from the workspace root. Try {}. Focused porting tests, syntax-only checks, smoke tests, or plain `make` can be useful follow-ups, but they are not a substitute unless the full suite is shown failing with a concrete local blocker.",
+                perl_candidate.display
+            ));
+        }
+    }
     if !build_candidates.is_empty()
         && !build_candidates
             .iter()
@@ -3722,7 +3753,7 @@ fn build_review_prompt(
         _ => "",
     };
     format!(
-        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{}{}{}{}{} The latest author response is at `{}`. Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, weak or non-gittable commit message text, and explanations that fail to connect the observed issue evidence to the code change. Also review the maintainer experience: the patch mail should be easy to accept upstream, the user-visible bug should be explained in plain language, subsystem-specific jargon should be defined when first used, and any non-obvious state translation or index remapping in code should have a short explanatory comment. Reject patches that introduce generic libc/std APIs when nearby code or project docs provide a local compat/helper API for the same job, unless the author explicitly justifies the exception. Reject validation that only reports a leaf object/syntax build when a project-level configure/build/test entrypoint exists and was not attempted; if a full build cannot run, the author must show the exact failed command and blocker.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
+        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{}{}{}{}{} The latest author response is at `{}`. Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, weak or non-gittable commit message text, and explanations that fail to connect the observed issue evidence to the code change. Also review the maintainer experience: the patch mail should be easy to accept upstream, the user-visible bug should be explained in plain language, subsystem-specific jargon should be defined when first used, and any non-obvious state translation or index remapping in code should have a short explanatory comment. Reject patches that invent a reproducer, command line, crash, or user-visible failure not present in the evidence bundle; indirect profiler or strace evidence may justify a cautious mitigation, but the author must say it is indirect instead of presenting it as a confirmed upstream bug. Reject patches that introduce generic libc/std APIs when nearby code or project docs provide a local compat/helper API for the same job, unless the author explicitly justifies the exception. Reject validation that only reports a leaf object/syntax build when a project-level configure/build/test entrypoint exists and was not attempted; if a full build cannot run, the author must show the exact failed command and blocker.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -3797,7 +3828,7 @@ fn build_refinement_prompt(
 }
 
 fn patch_response_contract() -> &'static str {
-    "In every authoring pass, your final response must start with `Subject: <single-line git commit subject>` and then include these markdown sections exactly:\n\n## Commit Message\nA short upstream-friendly explanation of what changed and why. Write it in plain language that a maintainer can follow without local complaint context. If you use subsystem jargon, define it immediately.\n\n## Issue Connection\nWrite this as maintainer-facing patch mail, not as local Fixer notes. Cover four things explicitly in readable sentences: the user-visible symptom, the code-level cause or the cautious inference from evidence, the specific change you made, and the expected effect. If the evidence is indirect, say it is a plausible targeted mitigation rather than a proven root cause. Include an explicit effect sentence such as `The expected effect is ...`, `This should reduce ...`, or `This prevents ...`. If the logic is non-obvious in code, mention that you added a short explanatory comment.\n\n## Git Add Paths\nList the repo-relative paths that belong in the final patch, one per line. Include intentionally new files, and do not list generated build artifacts.\n\n## Validation\nList the checks you ran, or say clearly that you could not run them."
+    "In every authoring pass, your final response must start with `Subject: <single-line git commit subject>` and then include these markdown sections exactly:\n\n## Commit Message\nA short upstream-friendly explanation of what changed and why. Write it in plain language that a maintainer can follow without local complaint context. If you use subsystem jargon, define it immediately.\n\n## Issue Connection\nWrite this as maintainer-facing patch mail, not as local Fixer notes. Cover four things explicitly in readable sentences: the user-visible symptom or the exact collected signal, the code-level cause or the cautious inference from evidence, the specific change you made, and the expected effect. Do not invent a reproducer, command line, crash, or user-visible failure that is not present in the evidence bundle. If the evidence is indirect, say it is a plausible targeted mitigation rather than a proven root cause. Include an explicit effect sentence such as `The expected effect is ...`, `This should reduce ...`, or `This prevents ...`. If the logic is non-obvious in code, mention that you added a short explanatory comment.\n\n## Git Add Paths\nList the repo-relative paths that belong in the final patch, one per line. Include intentionally new files, and do not list generated build artifacts.\n\n## Validation\nList the checks you ran, or say clearly that you could not run them."
 }
 
 fn render_external_bug_report(
@@ -8588,6 +8619,90 @@ Ran `git diff --check` and `./autogen.sh && ./configure && make -j2`.
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn patch_validation_guard_requires_perl_full_test_suite() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Configure"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("Porting")).unwrap();
+        std::fs::create_dir_all(dir.path().join("t")).unwrap();
+        let workspace = PreparedWorkspace {
+            repo_root: dir.path().to_path_buf(),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "upstream-git".to_string(),
+            package_name: Some("perl".to_string()),
+            source_package: Some("perl".to_string()),
+            homepage: Some("https://github.com/Perl/perl5".to_string()),
+            acquisition_note: "prepared from upstream git".to_string(),
+        };
+        let response = r#"Subject: pp_select: preserve tiny positive timeouts
+
+## Commit Message
+Preserve tiny positive timeouts when converting select arguments.
+
+## Issue Connection
+The observed signal was a tight select timeout path in collected samples. This change keeps tiny positive values from becoming zero, so the expected effect is fewer accidental busy waits.
+
+## Git Add Paths
+pp_sys.c
+
+## Validation
+Ran `./Configure -des -Dusedevel && make -j2`.
+"#;
+
+        let error = super::patch_validation_quality_failure(
+            response,
+            &workspace,
+            &["pp_sys.c".to_string()],
+        )
+        .unwrap();
+
+        assert!(error.contains("make test_harness"));
+    }
+
+    #[test]
+    fn upstream_prompts_warn_against_invented_reproducers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Makefile"), "all:\n\ttrue\n").unwrap();
+        let workspace = PreparedWorkspace {
+            repo_root: dir.path().to_path_buf(),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "upstream-git".to_string(),
+            package_name: Some("melt".to_string()),
+            source_package: Some("mlt".to_string()),
+            homepage: Some("https://github.com/mltframework/mlt".to_string()),
+            acquisition_note: "prepared from upstream git".to_string(),
+        };
+        let evidence_path = dir.path().join("evidence.json");
+        std::fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&json!({
+                "opportunity": {
+                    "evidence": {
+                        "details": {
+                            "subsystem": "runaway-process"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let plan_prompt = super::build_plan_prompt(None, &evidence_path, &workspace, None);
+        let review_prompt = super::build_review_prompt(
+            &evidence_path,
+            &workspace,
+            None,
+            Path::new("/tmp/patch-output.txt"),
+            0,
+            &["src/melt.c".to_string()],
+        );
+
+        assert!(plan_prompt.contains("Do not invent a reproducer"));
+        assert!(review_prompt.contains("Reject patches that invent a reproducer"));
+        assert!(super::patch_response_contract().contains("Do not invent a reproducer"));
     }
 
     #[test]

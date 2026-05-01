@@ -3,7 +3,7 @@ use crate::util::hash_text;
 use regex::Regex;
 use serde_json::Value;
 
-pub const PRIVACY_WARNING: &str = "Fixer may unintentionally collect private or sensitive data, including local paths, package metadata, command lines, stack traces, warning lines, and other evidence gathered to diagnose issues. Uploading findings to a server is opt-in. Richer evidence such as raw coredumps or whole repositories requires a second explicit approval.";
+pub const PRIVACY_WARNING: &str = "Fixer may unintentionally collect private or sensitive data, including local paths, package metadata, command lines, stack traces, debugger backtraces with local variables, warning lines, and other evidence gathered to diagnose issues. Uploading findings to a server is opt-in. Raw coredumps and whole repositories are not uploaded automatically.";
 
 pub fn consent_policy_text(policy_version: &str) -> String {
     format!(

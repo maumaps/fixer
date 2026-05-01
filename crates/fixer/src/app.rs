@@ -232,7 +232,17 @@ impl App {
         &self,
         opportunity_id: i64,
         engine: &str,
+        force: bool,
     ) -> Result<crate::models::ProposalRecord> {
+        if !force && engine == "codex" {
+            if let Some(proposal) = self
+                .store
+                .latest_ready_codex_proposal_for_opportunity(opportunity_id)?
+            {
+                return Ok(proposal);
+            }
+        }
+
         let opportunity = self.store.get_opportunity(opportunity_id)?;
         if engine == "deterministic" && proposal::supports_local_remediation(&opportunity) {
             return proposal::create_local_remediation_proposal(
@@ -565,7 +575,7 @@ mod tests {
         should_retry_complaint_in_overlay, tokenize_complaint_text,
     };
     use crate::config::FixerConfig;
-    use crate::models::{FindingRecord, OpportunityRecord, SharedOpportunity};
+    use crate::models::{FindingInput, FindingRecord, OpportunityRecord, SharedOpportunity};
     use crate::models::{ParticipationMode, ParticipationState};
     use anyhow::anyhow;
     use serde_json::json;
@@ -751,5 +761,40 @@ mod tests {
 
         let outcome = app.complain("spectacle fails on wayland", false).unwrap();
         assert_eq!(outcome.opportunity.state, "open");
+    }
+
+    #[test]
+    fn propose_fix_reuses_ready_codex_proposal_without_force() {
+        let dir = tempdir().unwrap();
+        let mut config = FixerConfig::default();
+        config.service.database_path = dir.path().join("fixer.sqlite3");
+        config.service.state_dir = dir.path().join("state");
+        let app = super::App::from_config(config).unwrap();
+        let finding_id = app
+            .store
+            .record_finding(&FindingInput {
+                kind: "hotspot".to_string(),
+                title: "Runaway CPU investigation for htop".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "htop-zram-loop".to_string(),
+                summary: "htop repeats optional zram probes".to_string(),
+                details: json!({"package_name": "htop"}),
+                artifact: None,
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let opportunity = app.store.get_opportunity_by_finding(finding_id).unwrap();
+        let bundle_dir = dir.path().join("existing-ready");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        let existing = app
+            .store
+            .create_proposal(opportunity.id, "codex", "ready", &bundle_dir, None)
+            .unwrap();
+
+        let proposal = app.propose_fix(opportunity.id, "codex", false).unwrap();
+
+        assert_eq!(proposal.id, existing.id);
+        assert_eq!(app.store.status().unwrap().proposals, 1);
     }
 }

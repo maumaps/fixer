@@ -10863,7 +10863,15 @@ fn is_informative_public_crash_frame(frame: &str) -> bool {
         && normalized != "n/a"
         && !matches!(
             normalized,
-            "raise" | "abort" | "__libc_start_main" | "_start" | "start_thread"
+            "raise"
+                | "abort"
+                | "__GI_raise"
+                | "__GI_abort"
+                | "__pthread_kill"
+                | "__pthread_kill_implementation"
+                | "__libc_start_main"
+                | "_start"
+                | "start_thread"
         )
 }
 
@@ -11398,7 +11406,22 @@ fn normalize_stack_frame(frame: &str) -> String {
             return sanitize_public_text(file_name.as_str());
         }
     }
-    sanitize_public_text(normalized.trim_end_matches('+').trim())
+    let normalized = normalized.trim_end_matches('+').trim();
+    let normalized =
+        demangle_cpp_stack_symbol(normalized).unwrap_or_else(|| normalized.to_string());
+    sanitize_public_text(&normalized)
+}
+
+fn demangle_cpp_stack_symbol(symbol: &str) -> Option<String> {
+    let symbol = symbol.trim();
+    if !symbol.starts_with("_Z") {
+        return None;
+    }
+    let parsed = cpp_demangle::Symbol::new(symbol).ok()?;
+    parsed
+        .demangle()
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn normalized_stuck_process_wait_point(details: &Value) -> Option<String> {
@@ -16840,9 +16863,11 @@ mod tests {
         );
 
         let public = build_public_issue_fields(&crash);
-        assert!(public.title.starts_with(
-            "Crash in kwin_x11: SIGSEGV at _ZN4KWin18ItemRendererOpenGL10renderItemEv"
-        ));
+        assert!(
+            public.title.starts_with(
+                "Crash in kwin_x11: SIGSEGV at KWin::ItemRendererOpenGL::renderItem()"
+            )
+        );
         assert!(public.title.contains("->"));
     }
 
@@ -17183,6 +17208,23 @@ mod tests {
             normalize_stack_frame("n/a (/usr/lib/x86_64-linux-gnu/libc.so.6 [deleted)]"),
             "libc.so.6"
         );
+        assert_eq!(
+            normalize_stack_frame(
+                "_ZN22QGuiApplicationPrivate21createEventDispatcherEv [libQt6Gui.so.6]"
+            ),
+            "QGuiApplicationPrivate::createEventDispatcher()"
+        );
+        assert_eq!(
+            normalize_stack_frame("_Z26createQApplicationIfNeededP13mlt_service_s [libmltqt6.so]"),
+            "createQApplicationIfNeeded(mlt_service_s*)"
+        );
+        assert!(!is_informative_public_crash_frame("__GI_abort"));
+        assert!(!is_informative_public_crash_frame(
+            "__pthread_kill_implementation"
+        ));
+        assert!(is_informative_public_crash_frame(
+            "QGuiApplicationPrivate::createEventDispatcher()"
+        ));
     }
 
     #[test]

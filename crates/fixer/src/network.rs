@@ -1652,7 +1652,8 @@ fn build_submission_bundle(
             .consent_policy_version
             .clone()
             .unwrap_or_else(|| config.privacy.policy_version.clone()),
-        richer_evidence_allowed: participation.state.richer_evidence_allowed,
+        richer_evidence_allowed: participation.state.richer_evidence_allowed
+            || participation.state.mode.can_submit(),
         status,
         capabilities,
         items,
@@ -2180,7 +2181,7 @@ fn build_client_hello(
         hostname: current_hostname(),
         has_codex: codex_worker.ready,
         capabilities,
-        richer_evidence_allowed: state.richer_evidence_allowed,
+        richer_evidence_allowed: state.richer_evidence_allowed || state.mode.can_submit(),
         patch_driver: Some(driver_name.to_string()),
         patch_model: config.patch.model.clone(),
     })

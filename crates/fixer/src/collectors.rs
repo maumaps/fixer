@@ -32,6 +32,8 @@ const COREDUMP_FETCH_MAX: usize = 200;
 const COREDUMP_FETCH_MULTIPLIER: usize = 8;
 const BASIC_COMMAND_TIMEOUT_SECONDS: u64 = 2;
 const COREDUMP_COMMAND_TIMEOUT_SECONDS: u64 = 10;
+const COREDUMP_DEBUG_TIMEOUT_SECONDS: u64 = 45;
+const COREDUMP_DEBUG_CHAR_LIMIT: usize = 128 * 1024;
 const ETHTOOL_COMMAND_TIMEOUT_SECONDS: u64 = 5;
 const JOURNALCTL_COMMAND_TIMEOUT_SECONDS: u64 = 15;
 const KERNEL_MODULE_COMMAND_TIMEOUT_SECONDS: u64 = 5;
@@ -850,6 +852,7 @@ fn collect_crashes(config: &FixerConfig, store: &Store) -> Result<usize> {
         return Ok(0);
     }
     store.prune_stackless_crash_findings()?;
+    let include_richer_evidence = richer_evidence_enabled(config, store);
     let fetch_limit = expanded_coredump_fetch_limit(config.service.coredump_limit);
     let output = command_output_with_timeout(
         "coredumpctl",
@@ -964,6 +967,9 @@ fn collect_crashes(config: &FixerConfig, store: &Store) -> Result<usize> {
             "symbolization": symbolization,
             "raw_info_excerpt": info.lines().take(80).collect::<Vec<_>>().join("\n"),
         });
+        if include_richer_evidence {
+            details["debugger_diagnostics"] = coredump_debugger_diagnostics(pid);
+        }
         if let Some(pkg) = artifact.as_ref().and_then(|a| a.package_name.as_deref()) {
             if let Some(metadata) = installed_package_metadata_value(pkg) {
                 details["package_metadata"] = metadata;
@@ -996,6 +1002,64 @@ fn expanded_coredump_fetch_limit(limit: usize) -> usize {
         .saturating_mul(COREDUMP_FETCH_MULTIPLIER)
         .max(COREDUMP_FETCH_MIN)
         .min(COREDUMP_FETCH_MAX)
+}
+
+fn coredump_debugger_arguments() -> &'static str {
+    "-batch -quiet -ex 'set pagination off' -ex 'set print frame-arguments all' -ex 'set print elements 256' -ex 'set print repeats 32' -ex 'thread apply all bt full' -ex 'info sharedlibrary'"
+}
+
+fn coredump_debugger_diagnostics(pid: i64) -> Value {
+    let pid_text = pid.to_string();
+    let debugger_arguments = coredump_debugger_arguments();
+    let command = format!("coredumpctl debug --debugger=gdb -A {debugger_arguments:?} {pid_text}");
+    match command_output_with_timeout(
+        "coredumpctl",
+        &[
+            "debug",
+            "--debugger=gdb",
+            "-A",
+            debugger_arguments,
+            &pid_text,
+        ],
+        StdDuration::from_secs(COREDUMP_DEBUG_TIMEOUT_SECONDS),
+    ) {
+        Ok(output) => {
+            let (output_excerpt, truncated) =
+                truncate_for_json_field(&output, COREDUMP_DEBUG_CHAR_LIMIT);
+            json!({
+                "status": "captured",
+                "kind": "gdb-bt-full",
+                "command": command,
+                "timeout_seconds": COREDUMP_DEBUG_TIMEOUT_SECONDS,
+                "char_limit": COREDUMP_DEBUG_CHAR_LIMIT,
+                "truncated": truncated,
+                "output_excerpt": output_excerpt,
+            })
+        }
+        Err(error) => json!({
+            "status": "unavailable",
+            "kind": "gdb-bt-full",
+            "command": command,
+            "timeout_seconds": COREDUMP_DEBUG_TIMEOUT_SECONDS,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn truncate_for_json_field(input: &str, limit: usize) -> (String, bool) {
+    if input.len() <= limit {
+        return (input.to_string(), false);
+    }
+    let mut end = 0;
+    for (index, _) in input.char_indices() {
+        if index > limit {
+            break;
+        }
+        end = index;
+    }
+    let mut output = input[..end].to_string();
+    output.push_str("\n...[truncated by Fixer]...");
+    (output, true)
 }
 
 #[derive(Debug, Clone)]
@@ -4527,8 +4591,10 @@ fn richer_evidence_enabled(config: &FixerConfig, store: &Store) -> bool {
         .load_participation_state()
         .ok()
         .flatten()
-        .map(|state| state.richer_evidence_allowed)
-        .unwrap_or(config.participation.richer_evidence_allowed)
+        .map(|state| state.richer_evidence_allowed || state.mode.can_submit())
+        .unwrap_or(
+            config.participation.richer_evidence_allowed || config.participation.mode.can_submit(),
+        )
 }
 
 fn runaway_investigation_state_key(source_hotspot_fingerprint: &str) -> String {
@@ -7050,25 +7116,27 @@ mod tests {
     use super::{
         RunawayHypothesis, StuckProcessGroup, StuckProcessInvestigationSummary,
         apparmor_finding_from_kernel_line, classify_runaway_loop, classify_stuck_process,
-        complaint_mentions_keyboard_layout_issue, crash_event_executable, crash_event_label,
-        crash_event_process_name, csv_config_values, current_kernel_image_package_name,
-        dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
-        is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
-        kernel_module_package_hint, kernel_thread_package_name, kernel_warning_identity,
-        kernel_warning_module_candidates, looks_like_warning, netdev_watchdog_driver,
-        normalize_oom_task_memcg_target, normalize_perf_symbol,
+        complaint_mentions_keyboard_layout_issue, coredump_debugger_arguments,
+        crash_event_executable, crash_event_label, crash_event_process_name, csv_config_values,
+        current_kernel_image_package_name, dominant_syscall_sequence, extend_unique_log_lines,
+        investigation_cooldown_active, is_low_signal_kernel_warning, is_profile_candidate,
+        kernel_module_lookup_names, kernel_module_package_hint, kernel_thread_package_name,
+        kernel_warning_identity, kernel_warning_module_candidates, looks_like_warning,
+        netdev_watchdog_driver, normalize_oom_task_memcg_target, normalize_perf_symbol,
         normalize_stuck_process_target_name, oom_cgroup_package_candidates, package_lookup_path,
         package_lookup_path_is_dpkg_candidate, parse_apparmor_denial, parse_coredump_info,
         parse_desktop_graphics_session_failure, parse_dkms_status_line, parse_ini_sections,
         parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
         parse_network_driver_hang_events, parse_perf_hot_paths,
         parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
-        prioritize_coredump_events, process_runtime_seconds, safe_perf_name,
-        shell_assignment_csv_value, stable_apparmor_denial_name,
+        prioritize_coredump_events, process_runtime_seconds, richer_evidence_enabled,
+        safe_perf_name, shell_assignment_csv_value, stable_apparmor_denial_name,
         stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
-        summarize_top_syscalls, system_uptime_seconds,
+        summarize_top_syscalls, system_uptime_seconds, truncate_for_json_field,
     };
-    use crate::models::PopularBinaryProfile;
+    use crate::config::FixerConfig;
+    use crate::models::{ParticipationMode, ParticipationState, PopularBinaryProfile};
+    use crate::storage::Store;
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
@@ -7649,6 +7717,45 @@ ELF object binary architecture: AMD x86-64\n";
             "__pthread_kill_implementation [libc.so.6]"
         );
         assert_eq!(parsed.useful_stack_frame_count, 3);
+    }
+
+    #[test]
+    fn coredump_debugger_arguments_request_full_backtraces() {
+        let args = coredump_debugger_arguments();
+        assert!(args.contains("thread apply all bt full"));
+        assert!(args.contains("set print frame-arguments all"));
+        assert!(args.contains("info sharedlibrary"));
+    }
+
+    #[test]
+    fn coredump_debugger_output_truncates_on_char_boundary() {
+        let (short, short_truncated) = truncate_for_json_field("abc", 10);
+        assert_eq!(short, "abc");
+        assert!(!short_truncated);
+
+        let (long, long_truncated) = truncate_for_json_field("aébcdef", 3);
+        assert!(long.starts_with("aé"));
+        assert!(long.contains("truncated by Fixer"));
+        assert!(long_truncated);
+    }
+
+    #[test]
+    fn upload_opt_in_enables_richer_crash_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+        let mut config = FixerConfig::default();
+        config.privacy.require_secondary_opt_in_for_richer_evidence = true;
+        assert!(!richer_evidence_enabled(&config, &store));
+
+        store
+            .save_participation_state(&ParticipationState {
+                mode: ParticipationMode::Submitter,
+                richer_evidence_allowed: false,
+                ..ParticipationState::default()
+            })
+            .unwrap();
+
+        assert!(richer_evidence_enabled(&config, &store));
     }
 
     #[test]

@@ -1,3 +1,15 @@
+fixer (0.142.0-1) unstable; urgency=medium
+
+  * Reuse existing ready Codex proposals by default and add an explicit
+    propose-fix --force escape hatch.
+  * Tighten upstream proposal prompts and validation so generated patches do
+    not invent reproducers and Perl changes require the full test harness.
+  * Demangle public C++ crash stack frames and suppress generic abort frames.
+  * Capture GDB full backtraces for crash findings when upload participation
+    is already enabled, without requiring a separate richer-evidence escrow.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sat, 02 May 2026 01:12:00 +0400
+
 fixer (0.141.0-1) unstable; urgency=medium
 
   * Require project-level build/test validation before marking generated
