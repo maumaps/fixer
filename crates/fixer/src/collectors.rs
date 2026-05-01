@@ -34,6 +34,8 @@ const BASIC_COMMAND_TIMEOUT_SECONDS: u64 = 2;
 const COREDUMP_COMMAND_TIMEOUT_SECONDS: u64 = 10;
 const COREDUMP_DEBUG_TIMEOUT_SECONDS: u64 = 45;
 const COREDUMP_DEBUG_CHAR_LIMIT: usize = 128 * 1024;
+const COREDUMP_DEBUG_MAX_AGE_SECONDS: i64 = 60 * 60;
+const COREDUMP_DEBUG_MAX_CORE_BYTES: i64 = 64 * 1024 * 1024;
 const ETHTOOL_COMMAND_TIMEOUT_SECONDS: u64 = 5;
 const JOURNALCTL_COMMAND_TIMEOUT_SECONDS: u64 = 15;
 const KERNEL_MODULE_COMMAND_TIMEOUT_SECONDS: u64 = 5;
@@ -968,7 +970,10 @@ fn collect_crashes(config: &FixerConfig, store: &Store) -> Result<usize> {
             "raw_info_excerpt": info.lines().take(80).collect::<Vec<_>>().join("\n"),
         });
         if include_richer_evidence {
-            details["debugger_diagnostics"] = coredump_debugger_diagnostics(pid);
+            details["debugger_diagnostics"] = match coredump_debugger_skip_reason(&event) {
+                Some(reason) => coredump_debugger_skipped_diagnostics(reason),
+                None => coredump_debugger_diagnostics(pid),
+            };
         }
         if let Some(pkg) = artifact.as_ref().and_then(|a| a.package_name.as_deref()) {
             if let Some(metadata) = installed_package_metadata_value(pkg) {
@@ -1006,6 +1011,48 @@ fn expanded_coredump_fetch_limit(limit: usize) -> usize {
 
 fn coredump_debugger_arguments() -> &'static str {
     "-batch -quiet -ex 'set pagination off' -ex 'set print frame-arguments all' -ex 'set print elements 256' -ex 'set print repeats 32' -ex 'thread apply all bt full' -ex 'info sharedlibrary'"
+}
+
+fn coredump_debugger_skip_reason(event: &Value) -> Option<String> {
+    match event.get("corefile").and_then(Value::as_str) {
+        Some("present") => {}
+        Some(value) => return Some(format!("core file is not present: {value}")),
+        None => return Some("core file availability is unknown".to_string()),
+    }
+
+    if let Some(size) = event.get("size").and_then(Value::as_i64) {
+        if size > COREDUMP_DEBUG_MAX_CORE_BYTES {
+            return Some(format!(
+                "core file is too large for automatic debugger capture: {size} bytes"
+            ));
+        }
+    }
+
+    let Some(event_micros) = event.get("time").and_then(Value::as_i64) else {
+        return Some("core dump timestamp is unavailable".to_string());
+    };
+    let now_micros = Utc::now().timestamp_micros();
+    let max_age_micros = COREDUMP_DEBUG_MAX_AGE_SECONDS.saturating_mul(1_000_000);
+    if event_micros < now_micros.saturating_sub(max_age_micros) {
+        return Some(format!(
+            "core dump is older than {COREDUMP_DEBUG_MAX_AGE_SECONDS} seconds"
+        ));
+    }
+    if event_micros > now_micros.saturating_add(5 * 60 * 1_000_000) {
+        return Some("core dump timestamp is in the future".to_string());
+    }
+
+    None
+}
+
+fn coredump_debugger_skipped_diagnostics(reason: String) -> Value {
+    json!({
+        "status": "skipped",
+        "kind": "gdb-bt-full",
+        "reason": reason,
+        "max_age_seconds": COREDUMP_DEBUG_MAX_AGE_SECONDS,
+        "max_core_bytes": COREDUMP_DEBUG_MAX_CORE_BYTES,
+    })
 }
 
 fn coredump_debugger_diagnostics(pid: i64) -> Value {
@@ -7117,12 +7164,13 @@ mod tests {
         RunawayHypothesis, StuckProcessGroup, StuckProcessInvestigationSummary,
         apparmor_finding_from_kernel_line, classify_runaway_loop, classify_stuck_process,
         complaint_mentions_keyboard_layout_issue, coredump_debugger_arguments,
-        crash_event_executable, crash_event_label, crash_event_process_name, csv_config_values,
-        current_kernel_image_package_name, dominant_syscall_sequence, extend_unique_log_lines,
-        investigation_cooldown_active, is_low_signal_kernel_warning, is_profile_candidate,
-        kernel_module_lookup_names, kernel_module_package_hint, kernel_thread_package_name,
-        kernel_warning_identity, kernel_warning_module_candidates, looks_like_warning,
-        netdev_watchdog_driver, normalize_oom_task_memcg_target, normalize_perf_symbol,
+        coredump_debugger_skip_reason, crash_event_executable, crash_event_label,
+        crash_event_process_name, csv_config_values, current_kernel_image_package_name,
+        dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
+        is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
+        kernel_module_package_hint, kernel_thread_package_name, kernel_warning_identity,
+        kernel_warning_module_candidates, looks_like_warning, netdev_watchdog_driver,
+        normalize_oom_task_memcg_target, normalize_perf_symbol,
         normalize_stuck_process_target_name, oom_cgroup_package_candidates, package_lookup_path,
         package_lookup_path_is_dpkg_candidate, parse_apparmor_denial, parse_coredump_info,
         parse_desktop_graphics_session_failure, parse_dkms_status_line, parse_ini_sections,
@@ -7137,6 +7185,7 @@ mod tests {
     use crate::config::FixerConfig;
     use crate::models::{ParticipationMode, ParticipationState, PopularBinaryProfile};
     use crate::storage::Store;
+    use chrono::Utc;
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
@@ -7737,6 +7786,43 @@ ELF object binary architecture: AMD x86-64\n";
         assert!(long.starts_with("aé"));
         assert!(long.contains("truncated by Fixer"));
         assert!(long_truncated);
+    }
+
+    #[test]
+    fn coredump_debugger_capture_is_limited_to_recent_small_present_cores() {
+        let now = Utc::now().timestamp_micros();
+        assert!(
+            coredump_debugger_skip_reason(&json!({
+                "corefile": "present",
+                "size": 1024,
+                "time": now,
+            }))
+            .is_none()
+        );
+
+        let old = coredump_debugger_skip_reason(&json!({
+            "corefile": "present",
+            "size": 1024,
+            "time": now - (2 * 60 * 60 * 1_000_000),
+        }))
+        .unwrap();
+        assert!(old.contains("older"));
+
+        let large = coredump_debugger_skip_reason(&json!({
+            "corefile": "present",
+            "size": 128 * 1024 * 1024,
+            "time": now,
+        }))
+        .unwrap();
+        assert!(large.contains("too large"));
+
+        let missing = coredump_debugger_skip_reason(&json!({
+            "corefile": "missing",
+            "size": 1024,
+            "time": now,
+        }))
+        .unwrap();
+        assert!(missing.contains("not present"));
     }
 
     #[test]

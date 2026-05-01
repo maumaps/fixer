@@ -1,3 +1,10 @@
+fixer (0.143.0-1) unstable; urgency=medium
+
+  * Limit automatic GDB coredump diagnostics to recent, present, bounded-size
+    cores so richer crash uploads do not retro-debug stale or huge coredumps.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sat, 02 May 2026 01:02:00 +0400
+
 fixer (0.142.0-1) unstable; urgency=medium
 
   * Reuse existing ready Codex proposals by default and add an explicit
