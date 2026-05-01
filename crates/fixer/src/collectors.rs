@@ -3689,25 +3689,45 @@ fn parse_key_value_fields(raw: &str) -> HashMap<String, String> {
 }
 
 fn is_low_signal_kernel_warning(line: &str) -> bool {
-    (line.contains("kauditd_printk_skb:") && line.contains("callbacks suppressed"))
-        || ((line.contains("show_signal:") || line.contains("show_signal_msg:"))
-            && line.contains("callbacks suppressed"))
+    line.contains("callbacks suppressed")
         || is_kernel_register_dump_warning(line)
+        || is_kernel_trace_context_warning(line)
 }
 
 fn is_kernel_register_dump_warning(line: &str) -> bool {
-    let message = line
-        .split_once(" kernel: ")
-        .map(|(_, message)| message)
-        .or_else(|| line.strip_prefix("kernel: "))
-        .unwrap_or(line)
-        .trim_start();
+    let message = kernel_log_message(line).trim_start();
     [
         "RIP:", "RSP:", "RAX:", "RBX:", "RCX:", "RDX:", "RSI:", "RDI:", "RBP:", "R08:", "R09:",
         "R10:", "R11:", "R12:", "R13:", "R14:", "R15:",
     ]
     .iter()
     .any(|prefix| message.starts_with(prefix))
+}
+
+fn is_kernel_trace_context_warning(line: &str) -> bool {
+    let message = kernel_log_message(line);
+    if message.starts_with("Code:")
+        || message.starts_with("---[ end trace ")
+        || message.trim() == "</TASK>"
+    {
+        return true;
+    }
+    let trimmed = message.trim_start();
+    if trimmed.len() == message.len() {
+        return false;
+    }
+    let frame = trimmed.strip_prefix("? ").unwrap_or(trimmed);
+    let Some(symbol) = frame.split_whitespace().next() else {
+        return false;
+    };
+    symbol.contains("+0x") && symbol.contains('/')
+}
+
+fn kernel_log_message(line: &str) -> &str {
+    line.split_once(" kernel: ")
+        .map(|(_, message)| message)
+        .or_else(|| line.strip_prefix("kernel: "))
+        .unwrap_or(line)
 }
 
 fn profile_display_name(profile: &str) -> Option<String> {
@@ -7296,6 +7316,25 @@ Kthread:\t0\n";
         ));
         assert!(is_low_signal_kernel_warning(
             "сак 29 23:54:45 nucat kernel: R10: 0000000000000000 R11: 0000000000000202 R12: 00005636e34924f0"
+        ));
+    }
+
+    #[test]
+    fn low_signal_kernel_warning_filters_trace_context_lines() {
+        assert!(is_low_signal_kernel_warning(
+            "кра 05 22:52:25 nucat kernel: ---[ end trace 0000000000000000 ]---"
+        ));
+        assert!(is_low_signal_kernel_warning(
+            "кра 05 22:52:25 nucat kernel:  </TASK>"
+        ));
+        assert!(is_low_signal_kernel_warning(
+            "кра 05 22:52:25 nucat kernel: Code: 88 4c 8b 45 80 <0f> 85 ce fe ff ff"
+        ));
+        assert!(is_low_signal_kernel_warning(
+            "кра 05 22:35:35 nucat kernel:  ? do_syscall_64+0xbe/0x600"
+        ));
+        assert!(is_low_signal_kernel_warning(
+            "кра 05 22:35:35 nucat kernel:  drm_release+0x5c/0xe0 [drm]"
         ));
     }
 

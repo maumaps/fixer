@@ -26,25 +26,47 @@ struct WarningPruneCandidate {
 }
 
 fn stored_kernel_warning_is_low_signal(summary: &str, details_json: &str) -> bool {
-    (summary.contains("kauditd_printk_skb:") && summary.contains("callbacks suppressed"))
-        || (details_json.contains("kauditd_printk_skb:")
-            && details_json.contains("callbacks suppressed"))
+    summary.contains("callbacks suppressed")
+        || details_json.contains("callbacks suppressed")
         || stored_kernel_warning_is_register_dump(summary)
+        || stored_kernel_warning_is_trace_context(summary)
 }
 
 fn stored_kernel_warning_is_register_dump(summary: &str) -> bool {
-    let message = summary
-        .split_once(" kernel: ")
-        .map(|(_, message)| message)
-        .or_else(|| summary.strip_prefix("kernel: "))
-        .unwrap_or(summary)
-        .trim_start();
+    let message = stored_kernel_warning_message(summary).trim_start();
     [
         "RIP:", "RSP:", "RAX:", "RBX:", "RCX:", "RDX:", "RSI:", "RDI:", "RBP:", "R08:", "R09:",
         "R10:", "R11:", "R12:", "R13:", "R14:", "R15:",
     ]
     .iter()
     .any(|prefix| message.starts_with(prefix))
+}
+
+fn stored_kernel_warning_is_trace_context(summary: &str) -> bool {
+    let message = stored_kernel_warning_message(summary);
+    if message.starts_with("Code:")
+        || message.starts_with("---[ end trace ")
+        || message.trim() == "</TASK>"
+    {
+        return true;
+    }
+    let trimmed = message.trim_start();
+    if trimmed.len() == message.len() {
+        return false;
+    }
+    let frame = trimmed.strip_prefix("? ").unwrap_or(trimmed);
+    let Some(symbol) = frame.split_whitespace().next() else {
+        return false;
+    };
+    symbol.contains("+0x") && symbol.contains('/')
+}
+
+fn stored_kernel_warning_message(summary: &str) -> &str {
+    summary
+        .split_once(" kernel: ")
+        .map(|(_, message)| message)
+        .or_else(|| summary.strip_prefix("kernel: "))
+        .unwrap_or(summary)
 }
 
 impl Store {
@@ -1992,6 +2014,18 @@ mod tests {
             (
                 "register-rip",
                 "сак 29 23:54:45 nucat kernel: RIP: 0033:0x7fbe387eee62",
+            ),
+            (
+                "trace-code",
+                "кра 05 22:52:25 nucat kernel: Code: 88 4c 8b 45 80 <0f> 85 ce fe ff ff",
+            ),
+            (
+                "trace-frame",
+                "кра 05 22:35:35 nucat kernel:  ? do_syscall_64+0xbe/0x600",
+            ),
+            (
+                "callbacks-suppressed",
+                "кра 23 05:42:11 nucat kernel: set_capacity_and_notify: 33 callbacks suppressed",
             ),
             (
                 "kernel-real",

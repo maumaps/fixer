@@ -1,3 +1,10 @@
+fixer (0.140.0-1) unstable; urgency=medium
+
+  * Drop standalone kernel trace context lines and generic callback
+    suppression notices from local warning opportunities.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 06:26:48 +0400
+
 fixer (0.139.0-1) unstable; urgency=medium
 
   * Normalize volatile i915 atomic-update and nouveau FIFO kernel warning
