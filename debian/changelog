@@ -1,3 +1,11 @@
+fixer (0.131.0-1) unstable; urgency=medium
+
+  * Skip dpkg owner probes for clearly local or virtual paths such as
+    /usr/local, /home, /run, /proc, and /tmp so process collection does not
+    spend timeout budget on paths Debian packages cannot own in practice.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 04:24:55 +0400
+
 fixer (0.130.0-1) unstable; urgency=medium
 
   * Cache dpkg path-to-package lookup results, including timed-out misses, so

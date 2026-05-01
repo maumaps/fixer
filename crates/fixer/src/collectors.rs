@@ -6248,6 +6248,9 @@ fn collect_bpftrace(config: &FixerConfig, store: &Store) -> Result<usize> {
 
 fn map_path_to_package(path: &Path) -> Option<String> {
     let lookup_path = package_lookup_path(path);
+    if !package_lookup_path_is_dpkg_candidate(&lookup_path) {
+        return None;
+    }
     let cache = PATH_PACKAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(package_name) = cache
         .lock()
@@ -6263,6 +6266,30 @@ fn map_path_to_package(path: &Path) -> Option<String> {
         .expect("path package cache poisoned")
         .insert(lookup_path, package_name.clone());
     package_name
+}
+
+fn package_lookup_path_is_dpkg_candidate(path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    if path.is_empty() {
+        return false;
+    }
+    [
+        "/dev/",
+        "/home/",
+        "/proc/",
+        "/root/",
+        "/run/",
+        "/snap/",
+        "/sys/",
+        "/tmp/",
+        "/usr/local/",
+        "/var/tmp/",
+    ]
+    .iter()
+    .all(|prefix| {
+        let dir = prefix.trim_end_matches('/');
+        path != dir && !path.starts_with(prefix)
+    })
 }
 
 fn map_lookup_path_to_package(lookup_path: &Path) -> Option<String> {
@@ -6759,9 +6786,9 @@ mod tests {
         kernel_module_package_hint, kernel_thread_package_name, kernel_warning_module_candidates,
         looks_like_warning, netdev_watchdog_driver, normalize_oom_task_memcg_target,
         normalize_perf_symbol, normalize_stuck_process_target_name, oom_cgroup_package_candidates,
-        package_lookup_path, parse_apparmor_denial, parse_coredump_info,
-        parse_desktop_graphics_session_failure, parse_dkms_status_line, parse_ini_sections,
-        parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
+        package_lookup_path, package_lookup_path_is_dpkg_candidate, parse_apparmor_denial,
+        parse_coredump_info, parse_desktop_graphics_session_failure, parse_dkms_status_line,
+        parse_ini_sections, parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
         parse_network_driver_hang_events, parse_perf_hot_paths,
         parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
         prioritize_coredump_events, process_runtime_seconds, safe_perf_name,
@@ -7425,6 +7452,25 @@ Stack trace of thread 222:\n\
             package_lookup_path(Path::new("/usr/bin/bash")),
             PathBuf::from("/usr/bin/bash")
         );
+    }
+
+    #[test]
+    fn package_lookup_candidates_skip_non_dpkg_local_paths() {
+        assert!(!package_lookup_path_is_dpkg_candidate(Path::new(
+            "/usr/local/bin/ollama"
+        )));
+        assert!(!package_lookup_path_is_dpkg_candidate(Path::new(
+            "/home/kom/.local/bin/tool"
+        )));
+        assert!(!package_lookup_path_is_dpkg_candidate(Path::new(
+            "/run/user/1000/app"
+        )));
+        assert!(package_lookup_path_is_dpkg_candidate(Path::new(
+            "/usr/bin/bash"
+        )));
+        assert!(package_lookup_path_is_dpkg_candidate(Path::new(
+            "/opt/google/chrome/chrome"
+        )));
     }
 
     #[test]
