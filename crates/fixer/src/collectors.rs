@@ -1219,6 +1219,7 @@ fn collect_kernel_warnings(config: &FixerConfig, store: &Store) -> Result<usize>
         count += 1;
     }
     let _ = store.prune_duplicate_kernel_warning_findings(kernel_warning_identity)?;
+    let _ = store.prune_duplicate_apparmor_warning_findings(apparmor_warning_identity)?;
     Ok(count)
 }
 
@@ -2751,10 +2752,14 @@ impl ParsedAppArmorDenial {
         resolve_profile_or_command_path(&self.profile, self.comm.as_deref())
     }
 
+    fn stable_name(&self) -> Option<String> {
+        self.name.as_deref().map(stable_apparmor_denial_name)
+    }
+
     fn summary(&self) -> String {
         let actor = self.mediated_actor_display_name();
         let operation = self.operation.as_deref().unwrap_or("access");
-        if let Some(name) = &self.name {
+        if let Some(name) = self.stable_name() {
             return format!("AppArmor denied {actor}: {operation} {name}");
         }
         if let Some(class) = &self.class {
@@ -3464,7 +3469,7 @@ fn apparmor_finding_from_kernel_line(line: &str) -> Option<FindingInput> {
         denial.comm.as_deref().unwrap_or(""),
         denial.operation.as_deref().unwrap_or(""),
         denial.class.as_deref().unwrap_or(""),
-        denial.name.as_deref().unwrap_or(""),
+        denial.stable_name().as_deref().unwrap_or(""),
         denial.family.as_deref().unwrap_or(""),
         denial.sock_type.as_deref().unwrap_or(""),
         denial.requested.as_deref().unwrap_or(""),
@@ -3600,6 +3605,87 @@ fn profile_display_name(profile: &str) -> Option<String> {
         Some(profile.to_string())
     } else {
         None
+    }
+}
+
+fn stable_apparmor_denial_name(name: &str) -> String {
+    let Some(rest) = name.strip_prefix("/proc/") else {
+        return stable_snap_telegram_denial_name(name).unwrap_or_else(|| name.to_string());
+    };
+    let Some((pid, suffix)) = rest.split_once('/') else {
+        return name.to_string();
+    };
+    if pid.chars().all(|ch| ch.is_ascii_digit()) {
+        return match suffix {
+            "mountinfo" => "/proc/<pid>/mountinfo".to_string(),
+            "mounts" => "/proc/<pid>/mounts".to_string(),
+            "stat" => "/proc/<pid>/stat".to_string(),
+            "status" => "/proc/<pid>/status".to_string(),
+            "cmdline" => "/proc/<pid>/cmdline".to_string(),
+            _ => name.to_string(),
+        };
+    }
+    name.to_string()
+}
+
+fn stable_snap_telegram_denial_name(name: &str) -> Option<String> {
+    if !name.contains("/snap/telegram-desktop/") {
+        return None;
+    }
+    let user_data_marker = "/.local/share/TelegramDesktop/tdata/user_data/";
+    let (_, user_data_suffix) = name.split_once(user_data_marker)?;
+    for cache_dir in ["cache", "media_cache"] {
+        if user_data_suffix.starts_with(&format!("{cache_dir}/")) {
+            return Some(format!(
+                "$SNAP_USER_DATA/TelegramDesktop/tdata/user_data/{cache_dir}/<entry>"
+            ));
+        }
+    }
+    let tdata_marker = "/.local/share/TelegramDesktop/tdata/";
+    if let Some((_, tdata_suffix)) = name.split_once(tdata_marker) {
+        if tdata_suffix.starts_with('#') {
+            return Some("$SNAP_USER_DATA/TelegramDesktop/tdata/#<id>".to_string());
+        }
+        if let Some((directory, file_name)) = tdata_suffix.rsplit_once('/') {
+            if file_name.starts_with('#') {
+                return Some(format!(
+                    "$SNAP_USER_DATA/TelegramDesktop/tdata/{directory}/#<id>"
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn apparmor_warning_identity(details: &Value, summary: &str) -> String {
+    let field = |name: &str| {
+        details
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let stable_name = details
+        .get("name")
+        .and_then(Value::as_str)
+        .map(stable_apparmor_denial_name)
+        .unwrap_or_default();
+    let identity = [
+        field("profile"),
+        field("comm"),
+        field("operation"),
+        field("class"),
+        stable_name,
+        field("family"),
+        field("sock_type"),
+        field("requested"),
+        field("denied"),
+    ]
+    .join("\t");
+    if identity.trim().is_empty() {
+        summary.to_string()
+    } else {
+        identity
     }
 }
 
@@ -6843,8 +6929,9 @@ mod tests {
         parse_network_driver_hang_events, parse_perf_hot_paths,
         parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
         prioritize_coredump_events, process_runtime_seconds, safe_perf_name,
-        shell_assignment_csv_value, stuck_process_investigation_fingerprint,
-        stuck_process_source_fingerprint, summarize_top_syscalls, system_uptime_seconds,
+        shell_assignment_csv_value, stable_apparmor_denial_name,
+        stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
+        summarize_top_syscalls, system_uptime_seconds,
     };
     use crate::models::PopularBinaryProfile;
     use serde_json::{Value, json};
@@ -6947,6 +7034,30 @@ Options=grp_led:scroll,grp:caps_toggle
         assert_eq!(
             finding.summary,
             "AppArmor denied cupsd via dbus: create net unix/stream"
+        );
+    }
+
+    #[test]
+    fn apparmor_proc_pid_names_are_stable_in_summary_and_fingerprint() {
+        let a = "May 01 03:30:42 nucat kernel: audit: type=1400 audit(1777591842.603:1): apparmor=\"DENIED\" operation=\"open\" class=\"file\" profile=\"snap.telegram-desktop.telegram-desktop\" name=\"/proc/4232/mountinfo\" pid=4232 comm=\"snapctl\" requested_mask=\"r\" denied_mask=\"r\" fsuid=1000 ouid=1000";
+        let b = "May 01 03:30:43 nucat kernel: audit: type=1400 audit(1777591843.603:2): apparmor=\"DENIED\" operation=\"open\" class=\"file\" profile=\"snap.telegram-desktop.telegram-desktop\" name=\"/proc/213534/mountinfo\" pid=213534 comm=\"snapctl\" requested_mask=\"r\" denied_mask=\"r\" fsuid=1000 ouid=1000";
+        let first = apparmor_finding_from_kernel_line(a).expect("AppArmor finding should parse");
+        let second = apparmor_finding_from_kernel_line(b).expect("AppArmor finding should parse");
+
+        assert_eq!(
+            first.summary,
+            "AppArmor denied snap.telegram-desktop.telegram-desktop via snapctl: open /proc/<pid>/mountinfo"
+        );
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_eq!(
+            stable_apparmor_denial_name("/proc/213534/mountinfo"),
+            "/proc/<pid>/mountinfo"
+        );
+        assert_eq!(
+            stable_apparmor_denial_name(
+                "/home/kom/snap/telegram-desktop/6934/.local/share/TelegramDesktop/tdata/user_data/cache/0/07/6286595C8BA9"
+            ),
+            "$SNAP_USER_DATA/TelegramDesktop/tdata/user_data/cache/<entry>"
         );
     }
 

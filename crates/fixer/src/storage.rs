@@ -17,7 +17,7 @@ pub struct Store {
     conn: Connection,
 }
 
-struct KernelWarningPruneCandidate {
+struct WarningPruneCandidate {
     id: i64,
     summary: String,
     details: Value,
@@ -365,7 +365,38 @@ impl Store {
     where
         F: Fn(&str) -> String,
     {
-        let mut stmt = self.conn.prepare(
+        self.prune_duplicate_warning_findings("f.title = 'Kernel warning'", |candidate| {
+            let line = candidate
+                .details
+                .get("line")
+                .and_then(Value::as_str)
+                .unwrap_or(&candidate.summary);
+            identity_for_line(line)
+        })
+    }
+
+    pub fn prune_duplicate_apparmor_warning_findings<F>(
+        &self,
+        identity_for_finding: F,
+    ) -> Result<usize>
+    where
+        F: Fn(&Value, &str) -> String,
+    {
+        self.prune_duplicate_warning_findings(
+            "json_extract(f.details_json, '$.subsystem') = 'apparmor'",
+            |candidate| identity_for_finding(&candidate.details, &candidate.summary),
+        )
+    }
+
+    fn prune_duplicate_warning_findings<F>(
+        &self,
+        where_clause: &str,
+        identity_for_candidate: F,
+    ) -> Result<usize>
+    where
+        F: Fn(&WarningPruneCandidate) -> String,
+    {
+        let sql = format!(
             "
             SELECT
                 f.id,
@@ -380,11 +411,12 @@ impl Store {
                 )
             FROM findings f
             WHERE f.kind = 'warning'
-              AND f.title = 'Kernel warning'
-            ",
-        )?;
+              AND {where_clause}
+            "
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
-            Ok(KernelWarningPruneCandidate {
+            Ok(WarningPruneCandidate {
                 id: row.get(0)?,
                 summary: row.get(1)?,
                 details: serde_json::from_str(&row.get::<_, String>(2)?)
@@ -396,14 +428,20 @@ impl Store {
         let candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
 
-        let mut groups: HashMap<String, Vec<KernelWarningPruneCandidate>> = HashMap::new();
+        self.prune_duplicate_warning_candidates(candidates, identity_for_candidate)
+    }
+
+    fn prune_duplicate_warning_candidates<F>(
+        &self,
+        candidates: Vec<WarningPruneCandidate>,
+        identity_for_candidate: F,
+    ) -> Result<usize>
+    where
+        F: Fn(&WarningPruneCandidate) -> String,
+    {
+        let mut groups: HashMap<String, Vec<WarningPruneCandidate>> = HashMap::new();
         for candidate in candidates {
-            let line = candidate
-                .details
-                .get("line")
-                .and_then(Value::as_str)
-                .unwrap_or(&candidate.summary);
-            let key = identity_for_line(line);
+            let key = identity_for_candidate(&candidate);
             if key.is_empty() {
                 continue;
             }
@@ -1933,6 +1971,70 @@ mod tests {
                     .map(|(_, message)| message)
                     .unwrap_or(line)
                     .to_string()
+            })
+            .unwrap();
+
+        assert_eq!(pruned, 2);
+        assert_eq!(store.count("findings").unwrap(), 1);
+        assert_eq!(store.count("opportunities").unwrap(), 1);
+    }
+
+    #[test]
+    fn prunes_duplicate_apparmor_warning_findings_by_stable_identity() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        for (index, pid) in ["4232", "213534", "1485986"].iter().enumerate() {
+            store
+                .record_finding(&FindingInput {
+                    kind: "warning".to_string(),
+                    title: "AppArmor denial in snap.telegram-desktop.telegram-desktop".to_string(),
+                    severity: "medium".to_string(),
+                    fingerprint: format!("old-apparmor-warning-{index}"),
+                    summary: format!(
+                        "AppArmor denied snap.telegram-desktop.telegram-desktop via snapctl: open /proc/{pid}/mountinfo"
+                    ),
+                    details: json!({
+                        "subsystem": "apparmor",
+                        "profile": "snap.telegram-desktop.telegram-desktop",
+                        "comm": "snapctl",
+                        "operation": "open",
+                        "class": "file",
+                        "name": format!("/proc/{pid}/mountinfo"),
+                        "requested": "r",
+                        "denied": "r",
+                    }),
+                    artifact: None,
+                    repo_root: None,
+                    ecosystem: None,
+                })
+                .unwrap();
+        }
+
+        let pruned = store
+            .prune_duplicate_apparmor_warning_findings(|details, summary| {
+                let stable_name = details
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|name| {
+                        if name.starts_with("/proc/") && name.ends_with("/mountinfo") {
+                            "/proc/<pid>/mountinfo"
+                        } else {
+                            name
+                        }
+                    })
+                    .unwrap_or(summary);
+                format!(
+                    "{}:{}:{}",
+                    details
+                        .get("profile")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                    details
+                        .get("comm")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                    stable_name
+                )
             })
             .unwrap();
 

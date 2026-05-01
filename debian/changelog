@@ -1,3 +1,10 @@
+fixer (0.137.0-1) unstable; urgency=medium
+
+  * Normalize volatile AppArmor denial paths such as /proc/<pid> and
+    Telegram Desktop cache entries, then prune duplicate local warnings.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 05:40:14 +0400
+
 fixer (0.136.0-1) unstable; urgency=medium
 
   * Use stable kernel warning identities that ignore journal timestamps and
