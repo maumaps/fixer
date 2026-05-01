@@ -1,14 +1,26 @@
 use crate::adapters::inspect_repo;
 use crate::config::FixerConfig;
 use crate::models::{InstalledPackageMetadata, OpportunityRecord, PreparedWorkspace};
-use crate::util::{command_exists, command_output, command_output_os, maybe_canonicalize};
+use crate::util::{
+    command_exists, command_output_in_dir_with_timeout, command_output_os_with_timeout,
+    command_output_with_timeout, command_status_in_dir_with_timeout, command_status_with_timeout,
+    maybe_canonicalize,
+};
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration as StdDuration;
 use url::Url;
+
+const APT_QUERY_TIMEOUT_SECONDS: u64 = 10;
+const DPKG_QUERY_TIMEOUT_SECONDS: u64 = 5;
+const VERSION_COMPARE_TIMEOUT_SECONDS: u64 = 2;
+const SOURCE_DOWNLOAD_TIMEOUT_SECONDS: u64 = 120;
+const GIT_CLONE_TIMEOUT_SECONDS: u64 = 300;
+const CURL_DOWNLOAD_TIMEOUT_SECONDS: u64 = 120;
+const DPKG_SOURCE_TIMEOUT_SECONDS: u64 = 120;
 
 pub fn ensure_workspace_for_opportunity(
     config: &FixerConfig,
@@ -164,7 +176,7 @@ struct WorkspaceSourceTarget {
 }
 
 pub fn resolve_installed_package_metadata(package_name: &str) -> Result<InstalledPackageMetadata> {
-    let dpkg_output = command_output_os(
+    let dpkg_output = command_output_os_with_timeout(
         "dpkg-query",
         &[
             OsStr::new("-W"),
@@ -173,6 +185,7 @@ pub fn resolve_installed_package_metadata(package_name: &str) -> Result<Installe
             ),
             OsStr::new(package_name),
         ],
+        StdDuration::from_secs(DPKG_QUERY_TIMEOUT_SECONDS),
     )
     .with_context(|| format!("failed to resolve installed package metadata for {package_name}"))?;
     let mut lines = dpkg_output.lines();
@@ -204,7 +217,7 @@ pub fn resolve_installed_package_metadata(package_name: &str) -> Result<Installe
         .filter(|x| !x.is_empty())
         .map(ToString::to_string)
         .or_else(|| {
-            command_output("apt-cache", &["show", package_name])
+            apt_cache_output(&["show", package_name])
                 .ok()
                 .and_then(|raw| {
                     raw.lines().find_map(|line| {
@@ -228,7 +241,7 @@ pub fn resolve_installed_package_metadata(package_name: &str) -> Result<Installe
         .filter(|x| !x.is_empty())
         .map(ToString::to_string);
 
-    let apt_show = command_output("apt-cache", &["show", package_name]).unwrap_or_default();
+    let apt_show = apt_cache_output(&["show", package_name]).unwrap_or_default();
     let candidate_version = parse_deb_field(&apt_show, "Version");
     let vendor = parse_deb_field(&apt_show, "Vendor");
     let bugs_url = parse_deb_field(&apt_show, "Bugs");
@@ -240,7 +253,7 @@ pub fn resolve_installed_package_metadata(package_name: &str) -> Result<Installe
     } else {
         (None, None)
     };
-    let apt_policy_raw = command_output("apt-cache", &["policy", package_name]).ok();
+    let apt_policy_raw = apt_cache_output(&["policy", package_name]).ok();
     let apt_origins = apt_policy_raw
         .as_deref()
         .map(parse_apt_origins)
@@ -289,6 +302,14 @@ fn parse_deb_field(raw: &str, field_name: &str) -> Option<String> {
     })
 }
 
+fn apt_cache_output(args: &[&str]) -> Result<String> {
+    command_output_with_timeout(
+        "apt-cache",
+        args,
+        StdDuration::from_secs(APT_QUERY_TIMEOUT_SECONDS),
+    )
+}
+
 fn parse_apt_origins(raw: &str) -> Vec<String> {
     raw.lines()
         .filter_map(|line| {
@@ -309,7 +330,7 @@ fn parse_maintainer_url(raw: &str) -> Option<String> {
 }
 
 fn source_package_vcs_url(source_package: &str) -> Option<String> {
-    let raw = command_output("apt-cache", &["showsrc", source_package]).ok()?;
+    let raw = apt_cache_output(&["showsrc", source_package]).ok()?;
     parse_deb_field(&raw, "Vcs-Git")
         .and_then(|value| vcs_git_clone_url(&value))
         .or_else(|| parse_deb_field(&raw, "Vcs-Browser"))
@@ -411,11 +432,13 @@ fn origin_url(origin: &str) -> Option<Url> {
 }
 
 fn version_is_newer(candidate: &str, installed: &str) -> bool {
-    Command::new("dpkg")
-        .args(["--compare-versions", candidate, "gt", installed])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    command_status_with_timeout(
+        "dpkg",
+        &["--compare-versions", candidate, "gt", installed],
+        StdDuration::from_secs(VERSION_COMPARE_TIMEOUT_SECONDS),
+    )
+    .map(|status| status.success())
+    .unwrap_or(false)
 }
 
 fn ensure_debian_source_tree(
@@ -428,18 +451,18 @@ fn ensure_debian_source_tree(
     if let Some(existing) = find_unpacked_source_dir(&base_dir, source_package, version_hint) {
         return Ok(existing);
     }
-    let output = Command::new("apt-get")
-        .args(["source", source_package])
-        .current_dir(&base_dir)
-        .output()
-        .with_context(|| format!("failed to run apt-get source for {source_package}"))?;
-    if !output.status.success() {
+    let source_result = command_output_in_dir_with_timeout(
+        "apt-get",
+        &["source", source_package],
+        &base_dir,
+        StdDuration::from_secs(SOURCE_DOWNLOAD_TIMEOUT_SECONDS),
+    )
+    .with_context(|| format!("failed to run apt-get source for {source_package}"));
+    if let Err(source_error) = source_result {
         download_and_unpack_debian_source_from_showsrc(&base_dir, source_package, version_hint)
             .with_context(|| {
                 format!(
-                    "apt-get source failed for {}: {}; fallback download also failed",
-                    source_package,
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    "apt-get source failed for {source_package}: {source_error:#}; fallback download also failed"
                 )
             })?;
     }
@@ -458,16 +481,18 @@ fn ensure_upstream_clone(config: &FixerConfig, source_package: &str, url: &str) 
         fs::remove_dir_all(&dest)
             .with_context(|| format!("failed to replace stale workspace {}", dest.display()))?;
     }
-    let status = Command::new("git")
-        .args([
+    let status = command_status_with_timeout(
+        "git",
+        &[
             "clone",
             "--depth",
             "1",
             url,
             dest.to_string_lossy().as_ref(),
-        ])
-        .status()
-        .with_context(|| format!("failed to clone upstream repository {}", url))?;
+        ],
+        StdDuration::from_secs(GIT_CLONE_TIMEOUT_SECONDS),
+    )
+    .with_context(|| format!("failed to clone upstream repository {}", url))?;
     if !status.success() {
         return Err(anyhow!("git clone failed for {}", url));
     }
@@ -521,7 +546,7 @@ fn download_and_unpack_debian_source_from_showsrc(
             "curl is required for Debian source fallback downloads"
         ));
     }
-    let raw = command_output("apt-cache", &["showsrc", source_package])
+    let raw = apt_cache_output(&["showsrc", source_package])
         .with_context(|| format!("failed to query apt-cache showsrc for {source_package}"))?;
     let records = parse_showsrc_records(&raw);
     let record = select_showsrc_record(&records, version_hint).ok_or_else(|| {
@@ -536,17 +561,19 @@ fn download_and_unpack_debian_source_from_showsrc(
             "https://deb.debian.org/debian/{}/{}",
             record.directory, file
         );
-        let status = Command::new("curl")
-            .args([
+        let status = command_status_with_timeout(
+            "curl",
+            &[
                 "-fsSL",
                 "--retry",
                 "2",
                 "--output",
                 dest.to_string_lossy().as_ref(),
                 &url,
-            ])
-            .status()
-            .with_context(|| format!("failed to download Debian source file {url}"))?;
+            ],
+            StdDuration::from_secs(CURL_DOWNLOAD_TIMEOUT_SECONDS),
+        )
+        .with_context(|| format!("failed to download Debian source file {url}"))?;
         if !status.success() {
             return Err(anyhow!("curl failed while downloading {}", url));
         }
@@ -556,11 +583,13 @@ fn download_and_unpack_debian_source_from_showsrc(
         .iter()
         .find(|name| name.ends_with(".dsc"))
         .ok_or_else(|| anyhow!("Debian source record for {source_package} is missing a .dsc"))?;
-    let status = Command::new("dpkg-source")
-        .args(["-x", dsc])
-        .current_dir(base_dir)
-        .status()
-        .with_context(|| format!("failed to unpack Debian source for {source_package}"))?;
+    let status = command_status_in_dir_with_timeout(
+        "dpkg-source",
+        &["-x", dsc],
+        base_dir,
+        StdDuration::from_secs(DPKG_SOURCE_TIMEOUT_SECONDS),
+    )
+    .with_context(|| format!("failed to unpack Debian source for {source_package}"))?;
     if !status.success() {
         return Err(anyhow!(
             "dpkg-source -x failed for {}",

@@ -5,7 +5,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,13 +56,66 @@ pub fn command_output_os_with_timeout(
     args: &[&OsStr],
     timeout: Duration,
 ) -> Result<String> {
+    let output = run_command_os_with_timeout(program, args, None, timeout)?;
+    command_output_from_status(program, output)
+}
+
+pub fn command_output_in_dir_with_timeout(
+    program: &str,
+    args: &[&str],
+    current_dir: &Path,
+    timeout: Duration,
+) -> Result<String> {
+    let os_args = args.iter().map(OsStr::new).collect::<Vec<_>>();
+    let output = run_command_os_with_timeout(program, &os_args, Some(current_dir), timeout)?;
+    command_output_from_status(program, output)
+}
+
+pub fn command_status_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<ExitStatus> {
+    let os_args = args.iter().map(OsStr::new).collect::<Vec<_>>();
+    command_status_os_with_timeout(program, &os_args, timeout)
+}
+
+pub fn command_status_in_dir_with_timeout(
+    program: &str,
+    args: &[&str],
+    current_dir: &Path,
+    timeout: Duration,
+) -> Result<ExitStatus> {
+    let os_args = args.iter().map(OsStr::new).collect::<Vec<_>>();
+    Ok(run_command_os_with_timeout(program, &os_args, Some(current_dir), timeout)?.status)
+}
+
+fn command_status_os_with_timeout(
+    program: &str,
+    args: &[&OsStr],
+    timeout: Duration,
+) -> Result<ExitStatus> {
+    Ok(run_command_os_with_timeout(program, args, None, timeout)?.status)
+}
+
+fn run_command_os_with_timeout(
+    program: &str,
+    args: &[&OsStr],
+    current_dir: Option<&Path>,
+    timeout: Duration,
+) -> Result<Output> {
     let timeout = timeout.max(Duration::from_secs(1));
     if program != "timeout" && command_exists("timeout") {
-        let output = Command::new("timeout")
+        let mut command = Command::new("timeout");
+        command
             .arg("--kill-after=2s")
             .arg(format!("{}s", timeout.as_secs()))
             .arg(program)
-            .args(args)
+            .args(args);
+        if let Some(current_dir) = current_dir {
+            command.current_dir(current_dir);
+        }
+        let output = command
             .output()
             .with_context(|| format!("failed to run `{program}` with timeout"))?;
         if output.status.code() == Some(124) || output.status.code() == Some(137) {
@@ -71,13 +124,18 @@ pub fn command_output_os_with_timeout(
                 timeout.as_secs()
             ));
         }
-        return command_output_from_status(program, output);
+        return Ok(output);
     }
 
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to run `{program}`"))?;
     let deadline = Instant::now() + timeout;
@@ -86,7 +144,7 @@ pub fn command_output_os_with_timeout(
             let output = child
                 .wait_with_output()
                 .with_context(|| format!("failed to collect `{program}` output"))?;
-            return command_output_from_status(program, output);
+            return Ok(output);
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
@@ -168,7 +226,10 @@ pub fn find_postgres_binary(binary: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_output_os_with_timeout, command_output_with_timeout};
+    use super::{
+        command_output_in_dir_with_timeout, command_output_os_with_timeout,
+        command_output_with_timeout, command_status_with_timeout,
+    };
     use std::ffi::OsStr;
     use std::time::{Duration, Instant};
 
@@ -192,5 +253,27 @@ mod tests {
         .expect("command should complete");
 
         assert_eq!(output, "ok");
+    }
+
+    #[test]
+    fn command_status_with_timeout_returns_nonzero_status() {
+        let status = command_status_with_timeout("sh", &["-c", "exit 7"], Duration::from_secs(5))
+            .expect("command should run");
+
+        assert_eq!(status.code(), Some(7));
+    }
+
+    #[test]
+    fn command_output_in_dir_with_timeout_uses_current_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = command_output_in_dir_with_timeout(
+            "sh",
+            &["-c", "pwd"],
+            dir.path(),
+            Duration::from_secs(5),
+        )
+        .expect("command should run");
+
+        assert_eq!(output, dir.path().display().to_string());
     }
 }

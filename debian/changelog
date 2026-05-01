@@ -1,3 +1,11 @@
+fixer (0.133.0-1) unstable; urgency=medium
+
+  * Run workspace acquisition commands through bounded command timeouts,
+    including apt-cache metadata, dpkg metadata/version checks, apt-get source,
+    git clone, curl source fallback downloads, and dpkg-source unpacking.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 04:56:49 +0400
+
 fixer (0.132.0-1) unstable; urgency=medium
 
   * Run the remaining collector-side external probes through bounded command
