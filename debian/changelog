@@ -1,3 +1,11 @@
+fixer (0.129.0-1) unstable; urgency=medium
+
+  * Cache DKMS and modinfo lookup results, including timed-out misses, so
+    repeated kernel warning attribution cannot multiply external command
+    timeouts on hosts with slow DKMS metadata.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 04:01:26 +0400
+
 fixer (0.128.0-1) unstable; urgency=medium
 
   * Run journalctl, dkms, and modinfo collectors through bounded command

@@ -18,6 +18,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration as StdDuration;
 
@@ -37,6 +38,10 @@ const DESKTOP_RESUME_INVESTIGATION_SUBSYSTEM: &str = "desktop-resume";
 const DESKTOP_GRAPHICS_SESSION_INVESTIGATION_SUBSYSTEM: &str = "desktop-graphics-session";
 const DESKTOP_INPUT_CONFIG_INVESTIGATION_SUBSYSTEM: &str = "desktop-input-config";
 const NETWORK_DRIVER_HANG_INVESTIGATION_SUBSYSTEM: &str = "network-driver-hang";
+static DKMS_STATUS_OUTPUT_CACHE: OnceLock<Mutex<Option<Option<String>>>> = OnceLock::new();
+static MODINFO_MODULE_PATH_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> =
+    OnceLock::new();
+static MODINFO_VERSION_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
 const RUNAWAY_STRACE_EXCERPT_LIMIT: usize = 24;
 const RUNAWAY_TOP_SYSCALL_LIMIT: usize = 6;
 const RUNAWAY_SEQUENCE_WINDOW: usize = 3;
@@ -2324,6 +2329,61 @@ fn journalctl_output(args: &[&str]) -> String {
     .unwrap_or_default()
 }
 
+fn cached_dkms_status_output() -> Option<String> {
+    let cache = DKMS_STATUS_OUTPUT_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().ok()?;
+    if let Some(cached) = guard.as_ref() {
+        return cached.clone();
+    }
+    let output = command_output_with_timeout("dkms", &["status"], StdDuration::from_secs(5)).ok();
+    *guard = Some(output.clone());
+    output
+}
+
+fn cached_modinfo_module_path(lookup_name: &str) -> Option<String> {
+    let cache = MODINFO_MODULE_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().ok()?;
+    if let Some(cached) = guard.get(lookup_name) {
+        return cached.clone();
+    }
+    let output = command_output_with_timeout(
+        "modinfo",
+        &["-n", lookup_name],
+        StdDuration::from_secs(KERNEL_MODULE_COMMAND_TIMEOUT_SECONDS),
+    )
+    .ok();
+    let path = output
+        .as_deref()
+        .and_then(|value| value.lines().next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    guard.insert(lookup_name.to_string(), path.clone());
+    path
+}
+
+fn cached_modinfo_module_version(module_path: &Path) -> Option<String> {
+    let cache = MODINFO_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().ok()?;
+    if let Some(cached) = guard.get(module_path) {
+        return cached.clone();
+    }
+    let version = command_output_os_with_timeout(
+        "modinfo",
+        &[
+            OsStr::new("-F"),
+            OsStr::new("version"),
+            module_path.as_os_str(),
+        ],
+        StdDuration::from_secs(KERNEL_MODULE_COMMAND_TIMEOUT_SECONDS),
+    )
+    .ok()
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty());
+    guard.insert(module_path.to_path_buf(), version.clone());
+    version
+}
+
 fn sql_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -2346,14 +2406,7 @@ fn kernel_warning_artifact_from_line(line: &str) -> Option<ObservedArtifact> {
     }
     for module in kernel_warning_module_candidates(line) {
         for lookup_name in kernel_module_lookup_names(&module) {
-            let Ok(output) = command_output_with_timeout(
-                "modinfo",
-                &["-n", &lookup_name],
-                StdDuration::from_secs(KERNEL_MODULE_COMMAND_TIMEOUT_SECONDS),
-            ) else {
-                continue;
-            };
-            let Some(path_line) = output.lines().next().map(str::trim) else {
+            let Some(path_line) = cached_modinfo_module_path(&lookup_name) else {
                 continue;
             };
             let module_path = PathBuf::from(path_line);
@@ -2396,18 +2449,9 @@ fn dkms_module_package(module_path: &Path, module: &str) -> Option<String> {
             return Some(package_name);
         }
     }
-    let version = command_output_os_with_timeout(
-        "modinfo",
-        &[
-            OsStr::new("-F"),
-            OsStr::new("version"),
-            module_path.as_os_str(),
-        ],
-        StdDuration::from_secs(KERNEL_MODULE_COMMAND_TIMEOUT_SECONDS),
-    )
-    .ok()?;
+    let version = cached_modinfo_module_version(module_path)?;
     for module_name in module_names {
-        if let Some(package_name) = map_dkms_source_to_package(&module_name, version.trim()) {
+        if let Some(package_name) = map_dkms_source_to_package(&module_name, &version) {
             return Some(package_name);
         }
     }
@@ -2418,8 +2462,7 @@ fn dkms_status_version(module_names: &[String], release: &str) -> Option<(String
     if !command_exists("dkms") {
         return None;
     }
-    let output =
-        command_output_with_timeout("dkms", &["status"], StdDuration::from_secs(5)).ok()?;
+    let output = cached_dkms_status_output()?;
     output
         .lines()
         .filter_map(parse_dkms_status_line)
