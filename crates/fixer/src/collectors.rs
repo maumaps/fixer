@@ -1203,11 +1203,12 @@ fn collect_kernel_warnings(config: &FixerConfig, store: &Store) -> Result<usize>
         }
         let mut details = Value::Object(details);
         add_env_context(&mut details);
+        let warning_identity = kernel_warning_identity(&line);
         let finding = FindingInput {
             kind: "warning".to_string(),
             title: "Kernel warning".to_string(),
             severity: "medium".to_string(),
-            fingerprint: hash_text(format!("kernel-warning:{line}")),
+            fingerprint: hash_text(format!("kernel-warning:{warning_identity}")),
             summary: line.clone(),
             details,
             artifact,
@@ -1217,6 +1218,7 @@ fn collect_kernel_warnings(config: &FixerConfig, store: &Store) -> Result<usize>
         let _ = store.record_finding(&finding)?;
         count += 1;
     }
+    let _ = store.prune_duplicate_kernel_warning_findings(kernel_warning_identity)?;
     Ok(count)
 }
 
@@ -2433,6 +2435,16 @@ fn extend_unique_log_lines(lines: &mut Vec<String>, seen: &mut BTreeSet<String>,
             lines.push(line.to_string());
         }
     }
+}
+
+fn kernel_warning_identity(line: &str) -> String {
+    let line = line.trim();
+    let message = line
+        .split_once(" kernel: ")
+        .map(|(_, message)| message)
+        .or_else(|| line.strip_prefix("kernel: "))
+        .unwrap_or(line);
+    message.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn kernel_warning_artifact_from_line(line: &str) -> Option<ObservedArtifact> {
@@ -6821,12 +6833,13 @@ mod tests {
         crash_event_process_name, csv_config_values, current_kernel_image_package_name,
         dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
         is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
-        kernel_module_package_hint, kernel_thread_package_name, kernel_warning_module_candidates,
-        looks_like_warning, netdev_watchdog_driver, normalize_oom_task_memcg_target,
-        normalize_perf_symbol, normalize_stuck_process_target_name, oom_cgroup_package_candidates,
-        package_lookup_path, package_lookup_path_is_dpkg_candidate, parse_apparmor_denial,
-        parse_coredump_info, parse_desktop_graphics_session_failure, parse_dkms_status_line,
-        parse_ini_sections, parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
+        kernel_module_package_hint, kernel_thread_package_name, kernel_warning_identity,
+        kernel_warning_module_candidates, looks_like_warning, netdev_watchdog_driver,
+        normalize_oom_task_memcg_target, normalize_perf_symbol,
+        normalize_stuck_process_target_name, oom_cgroup_package_candidates, package_lookup_path,
+        package_lookup_path_is_dpkg_candidate, parse_apparmor_denial, parse_coredump_info,
+        parse_desktop_graphics_session_failure, parse_dkms_status_line, parse_ini_sections,
+        parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
         parse_network_driver_hang_events, parse_perf_hot_paths,
         parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
         prioritize_coredump_events, process_runtime_seconds, safe_perf_name,
@@ -7048,6 +7061,20 @@ Kthread:\t0\n";
         assert!(is_low_signal_kernel_warning(
             "Mar 29 12:41:59 nucat kernel: show_signal: 666 callbacks suppressed"
         ));
+    }
+
+    #[test]
+    fn kernel_warning_identity_ignores_journal_prefix() {
+        assert_eq!(
+            kernel_warning_identity("May 01 03:31:13 nucat kernel: VFS: Mount too revealing"),
+            "VFS: Mount too revealing"
+        );
+        assert_eq!(
+            kernel_warning_identity(
+                "сак 31 23:59:49 nucat kernel: usb 1-4.2.2-port4: disabled by hub (EMI?), re-enabling..."
+            ),
+            "usb 1-4.2.2-port4: disabled by hub (EMI?), re-enabling..."
+        );
     }
 
     #[test]

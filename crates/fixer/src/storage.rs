@@ -5,16 +5,24 @@ use crate::models::{
 };
 use crate::util::now_rfc3339;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub struct Store {
     conn: Connection,
+}
+
+struct KernelWarningPruneCandidate {
+    id: i64,
+    summary: String,
+    details: Value,
+    last_seen: String,
+    has_proposals: bool,
 }
 
 impl Store {
@@ -351,6 +359,82 @@ impl Store {
             ",
         )?;
         Ok(())
+    }
+
+    pub fn prune_duplicate_kernel_warning_findings<F>(&self, identity_for_line: F) -> Result<usize>
+    where
+        F: Fn(&str) -> String,
+    {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT
+                f.id,
+                f.summary,
+                f.details_json,
+                f.last_seen,
+                EXISTS (
+                    SELECT 1
+                    FROM proposals p
+                    JOIN opportunities o ON o.id = p.opportunity_id
+                    WHERE o.finding_id = f.id
+                )
+            FROM findings f
+            WHERE f.kind = 'warning'
+              AND f.title = 'Kernel warning'
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(KernelWarningPruneCandidate {
+                id: row.get(0)?,
+                summary: row.get(1)?,
+                details: serde_json::from_str(&row.get::<_, String>(2)?)
+                    .unwrap_or_else(|_| json!({})),
+                last_seen: row.get(3)?,
+                has_proposals: row.get::<_, bool>(4)?,
+            })
+        })?;
+        let candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let mut groups: HashMap<String, Vec<KernelWarningPruneCandidate>> = HashMap::new();
+        for candidate in candidates {
+            let line = candidate
+                .details
+                .get("line")
+                .and_then(Value::as_str)
+                .unwrap_or(&candidate.summary);
+            let key = identity_for_line(line);
+            if key.is_empty() {
+                continue;
+            }
+            groups.entry(key).or_default().push(candidate);
+        }
+
+        let mut pruned = 0;
+        let mut delete_ids = Vec::new();
+        for group in groups.values_mut() {
+            if group.len() < 2 {
+                continue;
+            }
+            group.sort_by(|a, b| {
+                b.has_proposals
+                    .cmp(&a.has_proposals)
+                    .then_with(|| b.last_seen.cmp(&a.last_seen))
+                    .then_with(|| b.id.cmp(&a.id))
+            });
+            let keep_id = group[0].id;
+            for candidate in group.iter().skip(1) {
+                if candidate.has_proposals || candidate.id == keep_id {
+                    continue;
+                }
+                delete_ids.push(candidate.id);
+            }
+        }
+        for chunk in delete_ids.chunks(500) {
+            self.delete_findings_cascade_bulk(chunk)?;
+            pruned += chunk.len();
+        }
+        Ok(pruned)
     }
 
     pub fn prune_postgres_collation_findings(
@@ -708,6 +792,73 @@ impl Store {
         )?;
         self.conn
             .execute("DELETE FROM findings WHERE id = ?1", [finding_id])?;
+        Ok(())
+    }
+
+    fn delete_findings_cascade_bulk(&self, finding_ids: &[i64]) -> Result<()> {
+        if finding_ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(finding_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        self.conn.execute(
+            &format!(
+                "
+                DELETE FROM proposal_publications
+                WHERE proposal_id IN (
+                    SELECT p.id
+                    FROM proposals p
+                    JOIN opportunities o ON o.id = p.opportunity_id
+                    WHERE o.finding_id IN ({placeholders})
+                )
+                "
+            ),
+            params_from_iter(finding_ids.iter().copied()),
+        )?;
+        self.conn.execute(
+            &format!(
+                "
+                DELETE FROM proposals
+                WHERE opportunity_id IN (
+                    SELECT id FROM opportunities WHERE finding_id IN ({placeholders})
+                )
+                "
+            ),
+            params_from_iter(finding_ids.iter().copied()),
+        )?;
+        self.conn.execute(
+            &format!(
+                "
+                DELETE FROM validation_runs
+                WHERE opportunity_id IN (
+                    SELECT id FROM opportunities WHERE finding_id IN ({placeholders})
+                )
+                "
+            ),
+            params_from_iter(finding_ids.iter().copied()),
+        )?;
+        self.conn.execute(
+            &format!(
+                "
+                DELETE FROM synced_issue_links
+                WHERE local_opportunity_id IN (
+                    SELECT id FROM opportunities WHERE finding_id IN ({placeholders})
+                )
+                "
+            ),
+            params_from_iter(finding_ids.iter().copied()),
+        )?;
+        self.conn.execute(
+            &format!("DELETE FROM opportunities WHERE finding_id IN ({placeholders})"),
+            params_from_iter(finding_ids.iter().copied()),
+        )?;
+        self.conn.execute(
+            &format!("DELETE FROM findings WHERE id IN ({placeholders})"),
+            params_from_iter(finding_ids.iter().copied()),
+        )?;
         Ok(())
     }
 
@@ -1750,6 +1901,44 @@ mod tests {
             .unwrap();
         assert_eq!(local_only.len(), 1);
         assert_eq!(local_only[0].state, "local-only");
+    }
+
+    #[test]
+    fn prunes_duplicate_kernel_warning_findings_by_stable_identity() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        for (index, timestamp) in ["03:31:13", "03:31:40", "03:31:49"].iter().enumerate() {
+            store
+                .record_finding(&FindingInput {
+                    kind: "warning".to_string(),
+                    title: "Kernel warning".to_string(),
+                    severity: "medium".to_string(),
+                    fingerprint: format!("old-kernel-warning-{index}"),
+                    summary: format!("May 01 {timestamp} nucat kernel: VFS: Mount too revealing"),
+                    details: json!({
+                        "line": format!(
+                            "May 01 {timestamp} nucat kernel: VFS: Mount too revealing"
+                        ),
+                    }),
+                    artifact: None,
+                    repo_root: None,
+                    ecosystem: None,
+                })
+                .unwrap();
+        }
+
+        let pruned = store
+            .prune_duplicate_kernel_warning_findings(|line| {
+                line.split_once(" kernel: ")
+                    .map(|(_, message)| message)
+                    .unwrap_or(line)
+                    .to_string()
+            })
+            .unwrap();
+
+        assert_eq!(pruned, 2);
+        assert_eq!(store.count("findings").unwrap(), 1);
+        assert_eq!(store.count("opportunities").unwrap(), 1);
     }
 
     #[test]

@@ -1,3 +1,10 @@
+fixer (0.136.0-1) unstable; urgency=medium
+
+  * Use stable kernel warning identities that ignore journal timestamps and
+    prune duplicate local kernel warning findings in bulk.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 05:24:01 +0400
+
 fixer (0.135.0-1) unstable; urgency=medium
 
   * Limit the default fixer opportunities CLI output, add --limit/--all
