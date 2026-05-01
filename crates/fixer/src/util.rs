@@ -56,8 +56,21 @@ pub fn command_output_os_with_timeout(
     args: &[&OsStr],
     timeout: Duration,
 ) -> Result<String> {
-    let output = run_command_os_with_timeout(program, args, None, timeout)?;
+    let output = command_run_os_with_timeout(program, args, timeout)?;
     command_output_from_status(program, output)
+}
+
+pub fn command_run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Result<Output> {
+    let os_args = args.iter().map(OsStr::new).collect::<Vec<_>>();
+    command_run_os_with_timeout(program, &os_args, timeout)
+}
+
+pub fn command_run_os_with_timeout(
+    program: &str,
+    args: &[&OsStr],
+    timeout: Duration,
+) -> Result<Output> {
+    run_command_os_with_timeout(program, args, None, timeout)
 }
 
 pub fn command_output_in_dir_with_timeout(
@@ -67,8 +80,27 @@ pub fn command_output_in_dir_with_timeout(
     timeout: Duration,
 ) -> Result<String> {
     let os_args = args.iter().map(OsStr::new).collect::<Vec<_>>();
-    let output = run_command_os_with_timeout(program, &os_args, Some(current_dir), timeout)?;
+    let output = command_run_os_in_dir_with_timeout(program, &os_args, current_dir, timeout)?;
     command_output_from_status(program, output)
+}
+
+pub fn command_run_in_dir_with_timeout(
+    program: &str,
+    args: &[&str],
+    current_dir: &Path,
+    timeout: Duration,
+) -> Result<Output> {
+    let os_args = args.iter().map(OsStr::new).collect::<Vec<_>>();
+    command_run_os_in_dir_with_timeout(program, &os_args, current_dir, timeout)
+}
+
+pub fn command_run_os_in_dir_with_timeout(
+    program: &str,
+    args: &[&OsStr],
+    current_dir: &Path,
+    timeout: Duration,
+) -> Result<Output> {
+    run_command_os_with_timeout(program, args, Some(current_dir), timeout)
 }
 
 pub fn command_status_with_timeout(
@@ -87,15 +119,24 @@ pub fn command_status_in_dir_with_timeout(
     timeout: Duration,
 ) -> Result<ExitStatus> {
     let os_args = args.iter().map(OsStr::new).collect::<Vec<_>>();
-    Ok(run_command_os_with_timeout(program, &os_args, Some(current_dir), timeout)?.status)
+    command_status_os_in_dir_with_timeout(program, &os_args, current_dir, timeout)
 }
 
-fn command_status_os_with_timeout(
+pub fn command_status_os_with_timeout(
     program: &str,
     args: &[&OsStr],
     timeout: Duration,
 ) -> Result<ExitStatus> {
-    Ok(run_command_os_with_timeout(program, args, None, timeout)?.status)
+    Ok(command_run_os_with_timeout(program, args, timeout)?.status)
+}
+
+pub fn command_status_os_in_dir_with_timeout(
+    program: &str,
+    args: &[&OsStr],
+    current_dir: &Path,
+    timeout: Duration,
+) -> Result<ExitStatus> {
+    Ok(command_run_os_in_dir_with_timeout(program, args, current_dir, timeout)?.status)
 }
 
 fn run_command_os_with_timeout(

@@ -5,7 +5,11 @@ use crate::models::{
     SharedOpportunity,
 };
 use crate::storage::Store;
-use crate::util::{command_exists, command_output, now_rfc3339, read_text};
+use crate::util::{
+    command_exists, command_output_with_timeout, command_run_in_dir_with_timeout,
+    command_run_os_with_timeout, command_run_with_timeout, command_status_in_dir_with_timeout,
+    command_status_os_with_timeout, now_rfc3339, read_text,
+};
 use crate::workspace::resolve_installed_package_metadata;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -19,6 +23,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::Duration as StdDuration;
+
+const PROPOSAL_HELPER_COMMAND_TIMEOUT_SECONDS: u64 = 10;
+const PROPOSAL_COPY_TIMEOUT_SECONDS: u64 = 120;
+const PROPOSAL_DIFF_TIMEOUT_SECONDS: u64 = 60;
 
 fn create_bundle_dir(config: &FixerConfig, opportunity_id: i64) -> Result<PathBuf> {
     let fallback_root = std::env::temp_dir().join("fixer-proposals");
@@ -1282,17 +1291,19 @@ fn initialize_workspace_git_baseline(workspace_root: &Path) -> Result<()> {
     }
 
     let run = |args: &[&str]| -> Result<()> {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(workspace_root)
-            .status()
-            .with_context(|| {
-                format!(
-                    "failed to run git {:?} in {}",
-                    args,
-                    workspace_root.display()
-                )
-            })?;
+        let status = command_status_in_dir_with_timeout(
+            "git",
+            args,
+            workspace_root,
+            StdDuration::from_secs(PROPOSAL_HELPER_COMMAND_TIMEOUT_SECONDS),
+        )
+        .with_context(|| {
+            format!(
+                "failed to run git {:?} in {}",
+                args,
+                workspace_root.display()
+            )
+        })?;
         if status.success() {
             Ok(())
         } else {
@@ -1324,17 +1335,22 @@ fn copy_directory_recursively(
             )
         })?;
     }
-    let status = Command::new("cp")
-        .args(["-a", "--reflink=auto"])
-        .arg(source)
-        .arg(destination)
-        .status()
-        .with_context(|| {
-            format!(
-                "failed to create workspace snapshot from {}",
-                source.display()
-            )
-        })?;
+    let status = command_status_os_with_timeout(
+        "cp",
+        &[
+            std::ffi::OsStr::new("-a"),
+            std::ffi::OsStr::new("--reflink=auto"),
+            source.as_os_str(),
+            destination.as_os_str(),
+        ],
+        StdDuration::from_secs(PROPOSAL_COPY_TIMEOUT_SECONDS),
+    )
+    .with_context(|| {
+        format!(
+            "failed to create workspace snapshot from {}",
+            source.display()
+        )
+    })?;
     if !status.success() {
         return Err(anyhow!(
             "failed to snapshot workspace {} into {}",
@@ -1363,26 +1379,28 @@ fn render_public_session_diff(
         return Ok(Some(truncate_public_session_text(&diff, 128 * 1024)));
     }
 
-    let output = Command::new("diff")
-        .args([
-            "-urN",
-            "--exclude=.git",
-            "--exclude=.pc",
-            "--exclude=.deps",
-            "--exclude=.libs",
-            "--exclude=build",
-            "--exclude=autom4te.cache",
-            "--exclude=Makefile",
-            "--exclude=config.status",
-            "--exclude=config.cache",
-            "--exclude=config.log",
-            "--exclude=config.h",
-            "--exclude=stamp-h1",
-        ])
-        .arg(source_workspace_root)
-        .arg(workspace_root)
-        .output()
-        .context("failed to generate a public diff for the Codex session")?;
+    let output = command_run_os_with_timeout(
+        "diff",
+        &[
+            std::ffi::OsStr::new("-urN"),
+            std::ffi::OsStr::new("--exclude=.git"),
+            std::ffi::OsStr::new("--exclude=.pc"),
+            std::ffi::OsStr::new("--exclude=.deps"),
+            std::ffi::OsStr::new("--exclude=.libs"),
+            std::ffi::OsStr::new("--exclude=build"),
+            std::ffi::OsStr::new("--exclude=autom4te.cache"),
+            std::ffi::OsStr::new("--exclude=Makefile"),
+            std::ffi::OsStr::new("--exclude=config.status"),
+            std::ffi::OsStr::new("--exclude=config.cache"),
+            std::ffi::OsStr::new("--exclude=config.log"),
+            std::ffi::OsStr::new("--exclude=config.h"),
+            std::ffi::OsStr::new("--exclude=stamp-h1"),
+            source_workspace_root.as_os_str(),
+            workspace_root.as_os_str(),
+        ],
+        StdDuration::from_secs(PROPOSAL_DIFF_TIMEOUT_SECONDS),
+    )
+    .context("failed to generate a public diff for the Codex session")?;
     match output.status.code() {
         Some(0) => Ok(None),
         Some(1) => {
@@ -1413,16 +1431,19 @@ fn render_public_session_git_diff(
     }
     let intended_paths = sanitize_git_add_paths(git_add_paths);
     if !intended_paths.is_empty() {
-        let mut add_cmd = Command::new("git");
-        add_cmd
-            .args(["add", "-N", "--"])
-            .args(intended_paths.iter())
-            .current_dir(workspace_root);
-        let _ = add_cmd.status();
+        let mut args = vec!["add", "-N", "--"];
+        args.extend(intended_paths.iter().map(String::as_str));
+        let _ = command_status_in_dir_with_timeout(
+            "git",
+            &args,
+            workspace_root,
+            StdDuration::from_secs(PROPOSAL_HELPER_COMMAND_TIMEOUT_SECONDS),
+        );
     }
 
-    let output = Command::new("git")
-        .args([
+    let output = command_run_in_dir_with_timeout(
+        "git",
+        &[
             "diff",
             "--no-ext-diff",
             "--binary",
@@ -1432,10 +1453,11 @@ fn render_public_session_git_diff(
             "HEAD",
             "--",
             ".",
-        ])
-        .current_dir(workspace_root)
-        .output()
-        .context("failed to generate a git-backed public diff for the Codex session")?;
+        ],
+        workspace_root,
+        StdDuration::from_secs(PROPOSAL_DIFF_TIMEOUT_SECONDS),
+    )
+    .context("failed to generate a git-backed public diff for the Codex session")?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -1453,14 +1475,18 @@ fn workspace_changed_paths(workspace_root: &Path) -> Vec<String> {
         return Vec::new();
     }
 
-    let tracked_output = Command::new("git")
-        .args(["diff", "--name-only", "--relative"])
-        .current_dir(workspace_root)
-        .output();
-    let untracked_output = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .current_dir(workspace_root)
-        .output();
+    let tracked_output = command_run_in_dir_with_timeout(
+        "git",
+        &["diff", "--name-only", "--relative"],
+        workspace_root,
+        StdDuration::from_secs(PROPOSAL_HELPER_COMMAND_TIMEOUT_SECONDS),
+    );
+    let untracked_output = command_run_in_dir_with_timeout(
+        "git",
+        &["ls-files", "--others", "--exclude-standard"],
+        workspace_root,
+        StdDuration::from_secs(PROPOSAL_HELPER_COMMAND_TIMEOUT_SECONDS),
+    );
 
     let mut paths = Vec::new();
     if let Ok(output) = tracked_output {
@@ -1961,10 +1987,8 @@ fn effective_codex_reasoning_effort(
 }
 
 fn codex_supports_reasoning_effort_flag(config: &FixerConfig) -> bool {
-    let Ok(output) = Command::new(&config.patch.codex_command)
-        .arg("exec")
-        .arg("--help")
-        .output()
+    let Ok(output) =
+        command_run_with_patch_command_timeout(&config.patch.codex_command, &["exec", "--help"])
     else {
         return false;
     };
@@ -1974,6 +1998,17 @@ fn codex_supports_reasoning_effort_flag(config: &FixerConfig) -> bool {
         String::from_utf8_lossy(&output.stderr)
     );
     help.contains("--reasoning-effort")
+}
+
+fn command_run_with_patch_command_timeout(
+    program: &str,
+    args: &[&str],
+) -> Result<std::process::Output> {
+    command_run_with_timeout(
+        program,
+        args,
+        StdDuration::from_secs(PROPOSAL_HELPER_COMMAND_TIMEOUT_SECONDS),
+    )
 }
 
 fn codex_model_limit_state_path(config: &FixerConfig) -> PathBuf {
@@ -5704,7 +5739,12 @@ fn collect_system_context() -> Value {
     let os_release = read_text(std::path::Path::new("/etc/os-release")).unwrap_or_default();
     let os_pretty_name = parse_os_release_field(&os_release, "PRETTY_NAME");
     let os_bug_report_url = parse_os_release_field(&os_release, "BUG_REPORT_URL");
-    let kernel = command_output("uname", &["-srmo"]).ok();
+    let kernel = command_output_with_timeout(
+        "uname",
+        &["-srmo"],
+        StdDuration::from_secs(PROPOSAL_HELPER_COMMAND_TIMEOUT_SECONDS),
+    )
+    .ok();
     json!({
         "os_pretty_name": os_pretty_name,
         "os_bug_report_url": os_bug_report_url,

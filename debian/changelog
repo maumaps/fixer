@@ -1,3 +1,11 @@
+fixer (0.134.0-1) unstable; urgency=medium
+
+  * Run proposal housekeeping commands through bounded timeouts, including
+    workspace snapshot copies, git baseline/diff helpers, fallback public diff
+    generation, Codex help probing, and system context uname collection.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 01 May 2026 05:11:22 +0400
+
 fixer (0.133.0-1) unstable; urgency=medium
 
   * Run workspace acquisition commands through bounded command timeouts,
