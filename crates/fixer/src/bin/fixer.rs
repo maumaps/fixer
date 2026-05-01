@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const DEFAULT_OPPORTUNITY_LIMIT: usize = 50;
+
 #[derive(Parser)]
 #[command(
     name = "fixer",
@@ -41,6 +43,10 @@ enum Commands {
     Opportunities {
         #[arg(long)]
         state: Option<String>,
+        #[arg(long, default_value_t = DEFAULT_OPPORTUNITY_LIMIT, conflicts_with = "all")]
+        limit: usize,
+        #[arg(long)]
+        all: bool,
     },
     Top {
         #[arg(long, default_value = "binary")]
@@ -289,20 +295,38 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Commands::Opportunities { state } => {
-            for item in app.store.list_opportunities(state.as_deref())? {
+        Commands::Opportunities { state, limit, all } => {
+            let items = if all {
+                app.store.list_opportunities(state.as_deref())?
+            } else {
+                app.store
+                    .list_opportunities_limited(state.as_deref(), Some(limit))?
+            };
+            let total = if all {
+                items.len() as i64
+            } else {
+                app.store.count_opportunities(state.as_deref())?
+            };
+            for item in &items {
                 println!(
                     "#{} [{}] score={} state={}",
                     item.id, item.kind, item.score, item.state
                 );
                 println!("  {}", item.title);
                 println!("  {}", item.summary);
-                if let Some(repo_root) = item.repo_root {
+                if let Some(repo_root) = &item.repo_root {
                     println!("  repo: {}", repo_root.display());
                 }
-                if let Some(ecosystem) = item.ecosystem {
+                if let Some(ecosystem) = &item.ecosystem {
                     println!("  ecosystem: {ecosystem}");
                 }
+            }
+            if !all && total > items.len() as i64 {
+                eprintln!(
+                    "showing first {} of {}; use --limit N or --all",
+                    items.len(),
+                    total
+                );
             }
         }
         Commands::Top { kind } => {

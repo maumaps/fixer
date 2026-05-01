@@ -768,39 +768,70 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn count_opportunities(&self, state: Option<&str>) -> Result<i64> {
+        if let Some(state) = state {
+            self.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM opportunities WHERE state = ?1",
+                    [state],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+        } else {
+            self.conn
+                .query_row("SELECT COUNT(*) FROM opportunities", [], |row| row.get(0))
+                .map_err(Into::into)
+        }
+    }
+
     pub fn list_opportunities(&self, state: Option<&str>) -> Result<Vec<OpportunityRecord>> {
-        let sql = if state.is_some() {
-            "SELECT id, finding_id, kind, title, score, state, summary, evidence_json, repo_root, ecosystem, created_at, updated_at
-             FROM opportunities WHERE state = ?1 ORDER BY score DESC, updated_at DESC"
-        } else {
-            "SELECT id, finding_id, kind, title, score, state, summary, evidence_json, repo_root, ecosystem, created_at, updated_at
-             FROM opportunities ORDER BY score DESC, updated_at DESC"
-        };
-        let mut stmt = self.conn.prepare(sql)?;
-        let mapper = |row: &rusqlite::Row<'_>| {
-            Ok(OpportunityRecord {
-                id: row.get(0)?,
-                finding_id: row.get(1)?,
-                kind: row.get(2)?,
-                title: row.get(3)?,
-                score: row.get(4)?,
-                state: row.get(5)?,
-                summary: row.get(6)?,
-                evidence: serde_json::from_str(&row.get::<_, String>(7)?)
-                    .unwrap_or_else(|_| json!({})),
-                repo_root: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
-                ecosystem: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
-            })
-        };
-        let rows = if let Some(state) = state {
-            stmt.query_map([state], mapper)?
-        } else {
-            stmt.query_map([], mapper)?
-        };
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        self.list_opportunities_limited(state, None)
+    }
+
+    pub fn list_opportunities_limited(
+        &self,
+        state: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<OpportunityRecord>> {
+        let limit = limit.map(|limit| i64::try_from(limit).unwrap_or(i64::MAX));
+        match (state, limit) {
+            (Some(state), Some(limit)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, finding_id, kind, title, score, state, summary, evidence_json, repo_root, ecosystem, created_at, updated_at
+                     FROM opportunities WHERE state = ?1 ORDER BY score DESC, updated_at DESC LIMIT ?2",
+                )?;
+                stmt.query_map(params![state, limit], map_opportunity_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            }
+            (Some(state), None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, finding_id, kind, title, score, state, summary, evidence_json, repo_root, ecosystem, created_at, updated_at
+                     FROM opportunities WHERE state = ?1 ORDER BY score DESC, updated_at DESC",
+                )?;
+                stmt.query_map([state], map_opportunity_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            }
+            (None, Some(limit)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, finding_id, kind, title, score, state, summary, evidence_json, repo_root, ecosystem, created_at, updated_at
+                     FROM opportunities ORDER BY score DESC, updated_at DESC LIMIT ?1",
+                )?;
+                stmt.query_map([limit], map_opportunity_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            }
+            (None, None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, finding_id, kind, title, score, state, summary, evidence_json, repo_root, ecosystem, created_at, updated_at
+                     FROM opportunities ORDER BY score DESC, updated_at DESC",
+                )?;
+                stmt.query_map([], map_opportunity_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            }
+        }
     }
 
     pub fn get_opportunity(&self, id: i64) -> Result<OpportunityRecord> {
@@ -1542,6 +1573,23 @@ fn score_for(
     base + severity_boost + detail_boost + i64::from(has_repo) * 5 + i64::from(has_ecosystem) * 3
 }
 
+fn map_opportunity_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpportunityRecord> {
+    Ok(OpportunityRecord {
+        id: row.get(0)?,
+        finding_id: row.get(1)?,
+        kind: row.get(2)?,
+        title: row.get(3)?,
+        score: row.get(4)?,
+        state: row.get(5)?,
+        summary: row.get(6)?,
+        evidence: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_else(|_| json!({})),
+        repo_root: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
+        ecosystem: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::Store;
@@ -1658,6 +1706,50 @@ mod tests {
             .unwrap();
         let updated = store.get_opportunity(opportunity.id).unwrap();
         assert_eq!(updated.state, "local-only");
+    }
+
+    #[test]
+    fn lists_opportunities_with_limit_and_state_count() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        let mut local_only_id = None;
+        for index in 0..3 {
+            let finding_id = store
+                .record_finding(&FindingInput {
+                    kind: "warning".to_string(),
+                    title: format!("Warning {index}"),
+                    severity: "medium".to_string(),
+                    fingerprint: format!("warning-{index}"),
+                    summary: "warning summary".to_string(),
+                    details: json!({"line": format!("warning: test {index}")}),
+                    artifact: None,
+                    repo_root: None,
+                    ecosystem: None,
+                })
+                .unwrap();
+            if index == 2 {
+                local_only_id = Some(store.get_opportunity_by_finding(finding_id).unwrap().id);
+            }
+        }
+        store
+            .set_opportunity_state(local_only_id.unwrap(), "local-only")
+            .unwrap();
+
+        assert_eq!(store.count_opportunities(None).unwrap(), 3);
+        assert_eq!(
+            store
+                .list_opportunities_limited(None, Some(2))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(store.count_opportunities(Some("local-only")).unwrap(), 1);
+
+        let local_only = store
+            .list_opportunities_limited(Some("local-only"), Some(10))
+            .unwrap();
+        assert_eq!(local_only.len(), 1);
+        assert_eq!(local_only[0].state, "local-only");
     }
 
     #[test]
