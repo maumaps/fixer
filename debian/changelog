@@ -1,3 +1,10 @@
+fixer (0.144.0-1) unstable; urgency=medium
+
+  * Explain root-owned collector database errors for `fixer collect` with a
+    direct sudo hint instead of surfacing the raw SQLite readonly message.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 04 May 2026 23:12:00 +0400
+
 fixer (0.143.0-1) unstable; urgency=medium
 
   * Limit automatic GDB coredump diagnostics to recent, present, bounded-size

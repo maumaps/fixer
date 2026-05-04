@@ -195,7 +195,13 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Collect => {
-            let report = app.collect_once()?;
+            let report = app.collect_once().map_err(|e| {
+                if is_permission_or_readonly_error(&e) {
+                    e.context("(are you superuser? try: sudo fixer collect)")
+                } else {
+                    e
+                }
+            })?;
             println!(
                 "collected {} capabilities, {} artifacts, {} findings",
                 report.capabilities_seen, report.artifacts_seen, report.findings_seen
