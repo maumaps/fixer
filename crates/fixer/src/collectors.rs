@@ -4231,6 +4231,18 @@ struct RunawayRepresentativeBacktrace {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PerlRunawayProcessEvidence {
+    detection_signals: Vec<String>,
+    suspected_script: Option<String>,
+    script_candidates: Vec<String>,
+    include_paths: Vec<String>,
+    module_options: Vec<String>,
+    interpreter_options: Vec<String>,
+    evidence_gap: String,
+    follow_up_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct RunawayFrameCluster {
     signature: String,
     thread_count: usize,
@@ -4273,6 +4285,7 @@ struct RunawayInvestigationSummary {
     lock_contention_signals: Vec<String>,
     thread_backtrace_summary: Option<String>,
     raw_backtrace_excerpt: Option<String>,
+    perl_process: Option<PerlRunawayProcessEvidence>,
     hypothesis: RunawayHypothesis,
     raw_artifacts: BTreeMap<String, String>,
     package_metadata: Option<RunawayPackageMetadata>,
@@ -4470,6 +4483,7 @@ fn maybe_record_runaway_investigation(
         "lock_contention_signals": investigation.lock_contention_signals,
         "thread_backtrace_summary": investigation.thread_backtrace_summary,
         "raw_backtrace_excerpt": investigation.raw_backtrace_excerpt,
+        "perl_process": investigation.perl_process,
         "maps_excerpt": backtrace_capture.and_then(|capture| capture.maps_excerpt.clone()),
         "raw_artifacts": investigation.raw_artifacts,
     });
@@ -4912,6 +4926,7 @@ fn maybe_capture_desktop_graphics_stall_profile(
 #[derive(Debug, Clone)]
 struct ProcSnapshot {
     command_line: Option<String>,
+    command_argv: Vec<String>,
     executable: Option<String>,
     process_state: Option<String>,
     wchan: Option<String>,
@@ -4927,7 +4942,8 @@ struct ProcSnapshot {
 
 fn collect_proc_snapshot(pid: i32, capture_dir: &Path) -> Result<ProcSnapshot> {
     let mut raw_artifacts = BTreeMap::new();
-    let command_line = read_proc_cmdline(pid);
+    let command_argv = read_proc_cmdline_argv(pid);
+    let command_line = (!command_argv.is_empty()).then(|| command_argv.join(" "));
     if let Some(value) = &command_line {
         let path = capture_dir.join("cmdline.txt");
         fs::write(&path, value)?;
@@ -5008,6 +5024,7 @@ fn collect_proc_snapshot(pid: i32, capture_dir: &Path) -> Result<ProcSnapshot> {
 
     Ok(ProcSnapshot {
         command_line,
+        command_argv,
         executable,
         process_state: status_raw
             .as_deref()
@@ -5057,15 +5074,14 @@ fn collect_fd_targets(pid: i32, limit: usize) -> Vec<String> {
     targets.into_iter().collect()
 }
 
-fn read_proc_cmdline(pid: i32) -> Option<String> {
-    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let text = raw
-        .split(|byte| *byte == 0)
+fn read_proc_cmdline_argv(pid: i32) -> Vec<String> {
+    let Some(raw) = fs::read(format!("/proc/{pid}/cmdline")).ok() else {
+        return Vec::new();
+    };
+    raw.split(|byte| *byte == 0)
         .filter(|part| !part.is_empty())
         .map(|part| String::from_utf8_lossy(part).to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    (!text.trim().is_empty()).then_some(text)
+        .collect()
 }
 
 fn capture_strace_sample(
@@ -5838,6 +5854,189 @@ fn installed_package_metadata_value(package_name: &str) -> Option<Value> {
         .and_then(|metadata| serde_json::to_value(metadata).ok())
 }
 
+fn collect_perl_runaway_process_evidence(
+    command_line: Option<&str>,
+    command_argv: &[String],
+    executable: Option<&str>,
+    profile: &PerfProfileCapture,
+    top_hot_symbols: &[String],
+    top_syscalls: &[RunawaySyscallStat],
+    backtrace_capture: Option<&GdbBacktraceCapture>,
+) -> Option<PerlRunawayProcessEvidence> {
+    let mut detection_signals = BTreeSet::new();
+    let executable_lower = executable.unwrap_or_default().to_ascii_lowercase();
+    let command_lower = command_line.unwrap_or_default().to_ascii_lowercase();
+    let symbols_lower = top_hot_symbols.join("\n").to_ascii_lowercase();
+    let backtrace_lower = backtrace_capture
+        .map(|capture| capture.raw_bt.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if executable_lower.contains("/perl") || executable_lower.ends_with("perl") {
+        detection_signals.insert("executable looks like Perl".to_string());
+    }
+    if command_lower
+        .split_whitespace()
+        .next()
+        .is_some_and(|token| {
+            token.ends_with("perl") || token.ends_with("perl5") || token.contains("/perl")
+        })
+    {
+        detection_signals.insert("command line starts with Perl".to_string());
+    }
+    if profile.hot_paths.iter().any(|path| {
+        path.package_name
+            .as_deref()
+            .is_some_and(|pkg| pkg.contains("perl"))
+    }) {
+        detection_signals.insert("hot DSO belongs to a Perl package".to_string());
+    }
+    if symbols_lower.contains("perl_runops") || symbols_lower.contains("perl_") {
+        detection_signals.insert("perf sample contains Perl interpreter frames".to_string());
+    }
+    if backtrace_lower.contains("perl_runops") || backtrace_lower.contains("perl_") {
+        detection_signals.insert("native backtrace contains Perl interpreter frames".to_string());
+    }
+    if top_syscalls.iter().any(|item| {
+        matches!(
+            item.name.as_str(),
+            "pselect6" | "select" | "poll" | "ppoll" | "epoll_wait"
+        )
+    }) && (symbols_lower.contains("perl_runops") || command_lower.contains("perl"))
+    {
+        detection_signals.insert("poll-family syscall loop under Perl".to_string());
+    }
+
+    if detection_signals.is_empty() {
+        return None;
+    }
+
+    let mut script_candidates = Vec::new();
+    let mut include_paths = Vec::new();
+    let mut module_options = Vec::new();
+    let mut interpreter_options = Vec::new();
+    if !command_argv.is_empty() {
+        parse_perl_command_argv_hints(
+            command_argv,
+            &mut script_candidates,
+            &mut include_paths,
+            &mut module_options,
+            &mut interpreter_options,
+        );
+    } else if let Some(command_line) = command_line {
+        parse_perl_command_line_hints(
+            command_line,
+            &mut script_candidates,
+            &mut include_paths,
+            &mut module_options,
+            &mut interpreter_options,
+        );
+    }
+    script_candidates.sort();
+    script_candidates.dedup();
+    include_paths.sort();
+    include_paths.dedup();
+    module_options.sort();
+    module_options.dedup();
+    interpreter_options.sort();
+    interpreter_options.dedup();
+
+    let suspected_script = script_candidates.first().cloned();
+    let evidence_gap = if suspected_script.is_some() {
+        "Fixer saw a Perl interpreter loop and script-level launch hints, but it did not retain a Perl-level stack tying the poll loop to a script line or module call."
+    } else {
+        "Fixer saw a Perl interpreter loop, but no script path was visible from the retained command-line evidence; this is not enough to justify changing Perl core semantics."
+    }
+    .to_string();
+    let follow_up_commands = vec![
+        "ps -p <pid> -o pid,stat,pcpu,etime,wchan,args".to_string(),
+        "strace -ttT -f -e trace=pselect6,select,poll,ppoll,epoll_wait,nanosleep,clock_nanosleep -p <pid>".to_string(),
+        "gdb --batch -p <pid> -ex 'thread apply all bt full' -ex detach -ex quit".to_string(),
+        "Reproduce the visible Perl script with minimal input and capture its Perl-level stack or trace before proposing a source patch.".to_string(),
+    ];
+
+    Some(PerlRunawayProcessEvidence {
+        detection_signals: detection_signals.into_iter().collect(),
+        suspected_script,
+        script_candidates,
+        include_paths,
+        module_options,
+        interpreter_options,
+        evidence_gap,
+        follow_up_commands,
+    })
+}
+
+fn parse_perl_command_line_hints(
+    command_line: &str,
+    script_candidates: &mut Vec<String>,
+    include_paths: &mut Vec<String>,
+    module_options: &mut Vec<String>,
+    interpreter_options: &mut Vec<String>,
+) {
+    let args = command_line
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    parse_perl_command_argv_hints(
+        &args,
+        script_candidates,
+        include_paths,
+        module_options,
+        interpreter_options,
+    );
+}
+
+fn parse_perl_command_argv_hints(
+    args: &[String],
+    script_candidates: &mut Vec<String>,
+    include_paths: &mut Vec<String>,
+    module_options: &mut Vec<String>,
+    interpreter_options: &mut Vec<String>,
+) {
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--" {
+            if let Some(script) = args.get(index + 1) {
+                script_candidates.push(script.to_string());
+            }
+            break;
+        }
+        if arg == "-I" {
+            if let Some(path) = args.get(index + 1) {
+                include_paths.push(path.to_string());
+                index += 2;
+                continue;
+            }
+        }
+        if let Some(path) = arg.strip_prefix("-I").filter(|value| !value.is_empty()) {
+            include_paths.push(path.to_string());
+            index += 1;
+            continue;
+        }
+        if let Some(module) = arg
+            .strip_prefix("-M")
+            .or_else(|| arg.strip_prefix("-m"))
+            .filter(|value| !value.is_empty())
+        {
+            module_options.push(module.to_string());
+            index += 1;
+            continue;
+        }
+        if matches!(arg, "-e" | "-E") {
+            interpreter_options.push(format!("{arg} <inline Perl omitted>"));
+            break;
+        }
+        if arg.starts_with('-') {
+            interpreter_options.push(arg.to_string());
+            index += 1;
+            continue;
+        }
+        script_candidates.push(arg.to_string());
+        break;
+    }
+}
+
 fn build_runaway_investigation_summary(
     sampled_pid: i32,
     profile: &PerfProfileCapture,
@@ -5883,6 +6082,17 @@ fn build_runaway_investigation_summary(
     let excerpt = strace_capture
         .map(|capture| excerpt_list(&capture.raw_log, RUNAWAY_STRACE_EXCERPT_LIMIT))
         .unwrap_or_default();
+    let perl_process = include_richer_evidence.then(|| {
+        collect_perl_runaway_process_evidence(
+            proc_snapshot.command_line.as_deref(),
+            &proc_snapshot.command_argv,
+            proc_snapshot.executable.as_deref(),
+            profile,
+            top_hot_symbols,
+            top_syscalls,
+            backtrace_capture,
+        )
+    });
     RunawayInvestigationSummary {
         sampled_pid,
         sampled_pid_count: profile.sampled_pids.len(),
@@ -5966,6 +6176,7 @@ fn build_runaway_investigation_summary(
         } else {
             None
         },
+        perl_process: perl_process.flatten(),
         hypothesis: hypothesis.clone(),
         raw_artifacts: if include_richer_evidence {
             raw_artifacts
@@ -7163,19 +7374,19 @@ mod tests {
     use super::{
         RunawayHypothesis, StuckProcessGroup, StuckProcessInvestigationSummary,
         apparmor_finding_from_kernel_line, classify_runaway_loop, classify_stuck_process,
-        complaint_mentions_keyboard_layout_issue, coredump_debugger_arguments,
-        coredump_debugger_skip_reason, crash_event_executable, crash_event_label,
-        crash_event_process_name, csv_config_values, current_kernel_image_package_name,
-        dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
-        is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
-        kernel_module_package_hint, kernel_thread_package_name, kernel_warning_identity,
-        kernel_warning_module_candidates, looks_like_warning, netdev_watchdog_driver,
-        normalize_oom_task_memcg_target, normalize_perf_symbol,
+        collect_perl_runaway_process_evidence, complaint_mentions_keyboard_layout_issue,
+        coredump_debugger_arguments, coredump_debugger_skip_reason, crash_event_executable,
+        crash_event_label, crash_event_process_name, csv_config_values,
+        current_kernel_image_package_name, dominant_syscall_sequence, extend_unique_log_lines,
+        investigation_cooldown_active, is_low_signal_kernel_warning, is_profile_candidate,
+        kernel_module_lookup_names, kernel_module_package_hint, kernel_thread_package_name,
+        kernel_warning_identity, kernel_warning_module_candidates, looks_like_warning,
+        netdev_watchdog_driver, normalize_oom_task_memcg_target, normalize_perf_symbol,
         normalize_stuck_process_target_name, oom_cgroup_package_candidates, package_lookup_path,
         package_lookup_path_is_dpkg_candidate, parse_apparmor_denial, parse_coredump_info,
         parse_desktop_graphics_session_failure, parse_dkms_status_line, parse_ini_sections,
         parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
-        parse_network_driver_hang_events, parse_perf_hot_paths,
+        parse_network_driver_hang_events, parse_perf_hot_paths, parse_perl_command_line_hints,
         parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
         prioritize_coredump_events, process_runtime_seconds, richer_evidence_enabled,
         safe_perf_name, shell_assignment_csv_value, stable_apparmor_denial_name,
@@ -8146,6 +8357,92 @@ Stack trace of thread 222:\n\
         );
         assert_eq!(hypothesis.classification, "file-not-found-retry");
         assert!(hypothesis.confidence > 0.8);
+    }
+
+    #[test]
+    fn parses_perl_command_line_hints_without_inline_code() {
+        let mut scripts = Vec::new();
+        let mut includes = Vec::new();
+        let mut modules = Vec::new();
+        let mut options = Vec::new();
+
+        parse_perl_command_line_hints(
+            "/usr/bin/perl -Ilib -MTime::HiRes=time -w ./worker.pl --queue hot",
+            &mut scripts,
+            &mut includes,
+            &mut modules,
+            &mut options,
+        );
+
+        assert_eq!(scripts, vec!["./worker.pl"]);
+        assert_eq!(includes, vec!["lib"]);
+        assert_eq!(modules, vec!["Time::HiRes=time"]);
+        assert_eq!(options, vec!["-w"]);
+
+        let mut scripts = Vec::new();
+        let mut includes = Vec::new();
+        let mut modules = Vec::new();
+        let mut options = Vec::new();
+        parse_perl_command_line_hints(
+            "/usr/bin/perl -E 'say secret'",
+            &mut scripts,
+            &mut includes,
+            &mut modules,
+            &mut options,
+        );
+
+        assert!(scripts.is_empty());
+        assert_eq!(options, vec!["-E <inline Perl omitted>"]);
+    }
+
+    #[test]
+    fn perl_runaway_evidence_records_gap_for_interpreter_busy_poll() {
+        let profile = super::PerfProfileCapture {
+            data_path: PathBuf::from("/tmp/perf.data"),
+            sampled_pids: vec![123],
+            hot_paths: vec![super::PerfHotPath {
+                percent: 100.0,
+                comm: "perl".to_string(),
+                dso: "perl".to_string(),
+                dso_path: Some(PathBuf::from("/usr/bin/perl")),
+                package_name: Some("perl-base".to_string()),
+                symbol: "Perl_runops_standard".to_string(),
+            }],
+        };
+        let top_syscalls = vec![super::RunawaySyscallStat {
+            name: "pselect6".to_string(),
+            count: 4,
+        }];
+        let evidence = collect_perl_runaway_process_evidence(
+            Some("/usr/bin/perl -Ilib -MAnyEvent ./daemon.pl"),
+            &[
+                "/usr/bin/perl".to_string(),
+                "-Ilib".to_string(),
+                "-MAnyEvent".to_string(),
+                "./daemon.pl".to_string(),
+            ],
+            Some("/usr/bin/perl"),
+            &profile,
+            &["Perl_runops_standard (100.00% in perl)".to_string()],
+            &top_syscalls,
+            None,
+        )
+        .expect("Perl evidence should be collected");
+
+        assert_eq!(evidence.suspected_script.as_deref(), Some("./daemon.pl"));
+        assert!(evidence.include_paths.contains(&"lib".to_string()));
+        assert!(evidence.module_options.contains(&"AnyEvent".to_string()));
+        assert!(
+            evidence
+                .evidence_gap
+                .contains("did not retain a Perl-level stack")
+        );
+        assert!(
+            evidence
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("pselect6"))
+        );
     }
 
     #[test]

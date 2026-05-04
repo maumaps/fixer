@@ -5038,6 +5038,68 @@ fn render_process_investigation_report(
         body.push_str("\n## Repeated Loop Shape\n\n");
         body.push_str(&format!("`{dominant_sequence}`\n"));
     }
+    if let Some(perl_process) = details.get("perl_process").and_then(Value::as_object) {
+        body.push_str("\n## Perl Process Context\n\n");
+        if let Some(signals) = perl_process
+            .get("detection_signals")
+            .and_then(Value::as_array)
+        {
+            let signals = signals
+                .iter()
+                .filter_map(Value::as_str)
+                .take(8)
+                .collect::<Vec<_>>();
+            if !signals.is_empty() {
+                body.push_str("Detection signals:\n");
+                for signal in signals {
+                    body.push_str(&format!("- `{signal}`\n"));
+                }
+            }
+        }
+        if let Some(script) = perl_process
+            .get("suspected_script")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            body.push_str(&format!("\nSuspected script: `{script}`\n"));
+        }
+        if let Some(modules) = perl_process.get("module_options").and_then(Value::as_array) {
+            let modules = modules
+                .iter()
+                .filter_map(Value::as_str)
+                .take(8)
+                .collect::<Vec<_>>();
+            if !modules.is_empty() {
+                body.push_str("\nPerl module options:\n");
+                for module in modules {
+                    body.push_str(&format!("- `{module}`\n"));
+                }
+            }
+        }
+        if let Some(gap) = perl_process
+            .get("evidence_gap")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            body.push_str(&format!("\nEvidence gap: {gap}\n"));
+        }
+        if let Some(commands) = perl_process
+            .get("follow_up_commands")
+            .and_then(Value::as_array)
+        {
+            let commands = commands
+                .iter()
+                .filter_map(Value::as_str)
+                .take(6)
+                .collect::<Vec<_>>();
+            if !commands.is_empty() {
+                body.push_str("\nPerl-specific follow-up:\n");
+                for command in commands {
+                    body.push_str(&format!("- `{command}`\n"));
+                }
+            }
+        }
+    }
     if is_stuck_process {
         if let Some(io_excerpt) = details.get("io_excerpt").and_then(Value::as_str) {
             body.push_str("\n## I/O Snapshot\n\n```text\n");
@@ -6687,6 +6749,62 @@ mod tests {
         assert!(rendered.contains("recvmsg x122"));
         assert!(rendered.contains("Validation Steps"));
         assert!(rendered.contains("workspace"));
+    }
+
+    #[test]
+    fn runaway_investigation_reports_include_perl_process_context() {
+        let opportunity = OpportunityRecord {
+            id: 78,
+            finding_id: 78,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for perl".to_string(),
+            score: 106,
+            state: "open".to_string(),
+            summary: "perl is stuck in a likely busy poll loop.".to_string(),
+            evidence: json!({
+                "package_name": "perl-base",
+                "details": {
+                    "subsystem": "runaway-process",
+                    "profile_target": { "name": "perl" },
+                    "sampled_pid": 4017,
+                    "loop_classification": "busy-poll",
+                    "loop_confidence": 0.78,
+                    "loop_explanation": "The trace repeatedly returns to pselect6 without meaningful blocking.",
+                    "top_hot_symbols": ["Perl_runops_standard (100.00% in perl)"],
+                    "top_syscalls": [{ "name": "pselect6", "count": 4 }],
+                    "dominant_sequence": ["pselect6", "pselect6", "pselect6"],
+                    "perl_process": {
+                        "detection_signals": [
+                            "hot DSO belongs to a Perl package",
+                            "perf sample contains Perl interpreter frames"
+                        ],
+                        "suspected_script": "./daemon.pl",
+                        "module_options": ["AnyEvent"],
+                        "evidence_gap": "Fixer saw a Perl interpreter loop and script-level launch hints, but it did not retain a Perl-level stack tying the poll loop to a script line or module call.",
+                        "follow_up_commands": [
+                            "strace -ttT -f -e trace=pselect6,select,poll,ppoll,epoll_wait,nanosleep,clock_nanosleep -p <pid>"
+                        ]
+                    }
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-05-01T00:00:00Z".to_string(),
+            updated_at: "2026-05-01T00:00:00Z".to_string(),
+        };
+        let rendered = render_process_investigation_report(
+            &opportunity,
+            None,
+            &json!({}),
+            Path::new("/tmp/evidence.json"),
+            None,
+        );
+
+        assert!(rendered.contains("Perl Process Context"));
+        assert!(rendered.contains("Suspected script: `./daemon.pl`"));
+        assert!(rendered.contains("Evidence gap: Fixer saw a Perl interpreter loop"));
+        assert!(rendered.contains("Perl-specific follow-up"));
+        assert!(rendered.contains("pselect6"));
     }
 
     #[test]
