@@ -3484,12 +3484,11 @@ fn evidence_confidence_quality_failure(response: &str, issue_connection: &str) -
             return Some("`## Evidence Confidence` says `observed`, but `## Issue Connection` does not name the direct evidence such as a coredump, stack trace, journal line, or captured runtime trace.".to_string());
         }
         if issue_lower.contains("reproduced")
-            && !issue_lower.contains("not reproduced")
-            && !issue_lower.contains("not independently reproduced")
+            && !observed_response_has_reproduction_caveat(&issue_lower)
         {
             return Some("Observed-only patches must not imply an independently reproduced failure. Say explicitly that the failure was observed by Fixer and not independently reproduced, or provide the reproduced command/test and use `reproduced`.".to_string());
         }
-        if has_source_changes && !issue_lower.contains("not independently reproduced") {
+        if has_source_changes && !observed_response_has_reproduction_caveat(&issue_lower) {
             return Some("Observed source patches must say explicitly that the failure was observed by Fixer and not independently reproduced, or provide the reproduced command/test and use `reproduced`.".to_string());
         }
     }
@@ -3499,6 +3498,13 @@ fn evidence_confidence_quality_failure(response: &str, issue_connection: &str) -
     }
 
     None
+}
+
+fn observed_response_has_reproduction_caveat(issue_lower: &str) -> bool {
+    issue_lower.contains("not reproduced")
+        || issue_lower.contains("not independently reproduced")
+        || issue_lower.contains("did not independently reproduce")
+        || issue_lower.contains("didn't independently reproduce")
 }
 
 fn response_lists_source_changes(response: &str) -> bool {
@@ -9511,6 +9517,29 @@ Lib/test/test_subprocess.py
 
 ## Validation
 Ran focused subprocess timeout tests.
+"#;
+
+        assert!(super::patch_explanation_quality_failure(response, None).is_none());
+    }
+
+    #[test]
+    fn patch_explanation_quality_guard_accepts_first_person_observed_caveat() {
+        let response = r#"Subject: zmalloc: cache Linux proc stat fd
+
+## Commit Message
+Cache the Linux procfs descriptor used for RSS sampling and reopen it after fork.
+
+## Evidence Confidence
+observed
+
+## Issue Connection
+Fixer observed, and I did not independently reproduce, a Redis trace repeatedly opening `/proc/self/stat` while cron memory sampling called `zmalloc_get_rss()`. This patch keeps a close-on-exec cached descriptor and reads it with `pread()`, so the expected effect is fewer repeated procfs open and close calls during the same sampling cadence.
+
+## Git Add Paths
+src/zmalloc.c
+
+## Validation
+Ran make.
 "#;
 
         assert!(super::patch_explanation_quality_failure(response, None).is_none());
