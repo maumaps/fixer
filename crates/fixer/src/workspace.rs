@@ -680,6 +680,7 @@ fn package_name_from_opportunity(opportunity: &OpportunityRecord) -> Option<Stri
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string)
+        .or_else(|| apparmor_profile_package_from_opportunity(opportunity))
         .or_else(|| {
             opportunity
                 .evidence
@@ -711,6 +712,13 @@ fn source_package_from_opportunity(opportunity: &OpportunityRecord) -> Option<St
             opportunity
                 .evidence
                 .get("details")?
+                .get("profile_package_metadata")?
+                .get("source_package")
+        })
+        .or_else(|| {
+            opportunity
+                .evidence
+                .get("details")?
                 .get("package_metadata")?
                 .get("source_package")
         })
@@ -731,6 +739,77 @@ fn source_package_from_opportunity(opportunity: &OpportunityRecord) -> Option<St
                 .unwrap_or_else(|| value.to_string())
         })
         .or_else(|| kernel_source_package_from_opportunity(opportunity))
+}
+
+fn apparmor_profile_package_from_opportunity(opportunity: &OpportunityRecord) -> Option<String> {
+    let details = opportunity.evidence.get("details")?;
+    if details.get("subsystem").and_then(Value::as_str) != Some("apparmor") {
+        return None;
+    }
+    if let Some(package_name) = details
+        .get("profile_package_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(package_name.to_string());
+    }
+    let profile = details
+        .get("profile")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    resolve_apparmor_profile_path(profile).and_then(|path| map_system_path_to_package(&path))
+}
+
+fn resolve_apparmor_profile_path(profile: &str) -> Option<PathBuf> {
+    apparmor_profile_path_candidates(profile)
+        .into_iter()
+        .find(|candidate| candidate.exists())
+}
+
+fn apparmor_profile_path_candidates(profile: &str) -> Vec<PathBuf> {
+    let profile = profile.trim();
+    if profile.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    let mut push_candidate = |path: PathBuf| {
+        if !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    };
+
+    let apparmor_dir = Path::new("/etc/apparmor.d");
+    if Path::new(profile).is_absolute() {
+        let normalized = profile.trim_start_matches('/').replace('/', ".");
+        push_candidate(apparmor_dir.join(normalized));
+        if let Some(file_name) = Path::new(profile)
+            .file_name()
+            .and_then(|value| value.to_str())
+        {
+            push_candidate(apparmor_dir.join(file_name));
+        }
+    } else {
+        push_candidate(apparmor_dir.join(profile));
+        if profile.contains('/') {
+            push_candidate(apparmor_dir.join(profile.replace('/', ".")));
+        }
+    }
+    candidates
+}
+
+fn map_system_path_to_package(path: &Path) -> Option<String> {
+    let output = command_output_os_with_timeout(
+        "dpkg-query",
+        &[OsStr::new("-S"), path.as_os_str()],
+        StdDuration::from_secs(DPKG_QUERY_TIMEOUT_SECONDS),
+    )
+    .ok()?;
+    output
+        .lines()
+        .next()
+        .and_then(|line| line.split_once(':'))
+        .map(|(pkg, _)| pkg.to_string())
 }
 
 fn normalize_patchable_source_package(package_name: &str, source_package: &str) -> String {
@@ -846,16 +925,18 @@ fn deb_src_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        WorkspaceSourceTarget, chrome_workspace_alias, is_cloneable_repo_url,
-        is_external_binary_package_without_workspace, kernel_source_package_from_opportunity,
-        kernel_upstream_repo_url, normalize_patchable_source_package,
-        origin_is_debian_source_friendly, package_name_from_opportunity, parse_apt_origins,
-        parse_maintainer_url, parse_showsrc_records, sanitize_dir_name, select_showsrc_record,
-        source_dir_version_hint, source_package_from_opportunity, source_package_vcs_url,
-        trim_debian_epoch, vcs_git_clone_url,
+        WorkspaceSourceTarget, apparmor_profile_path_candidates, chrome_workspace_alias,
+        is_cloneable_repo_url, is_external_binary_package_without_workspace,
+        kernel_source_package_from_opportunity, kernel_upstream_repo_url,
+        normalize_patchable_source_package, origin_is_debian_source_friendly,
+        package_name_from_opportunity, parse_apt_origins, parse_maintainer_url,
+        parse_showsrc_records, sanitize_dir_name, select_showsrc_record, source_dir_version_hint,
+        source_package_from_opportunity, source_package_vcs_url, trim_debian_epoch,
+        vcs_git_clone_url,
     };
     use crate::models::{InstalledPackageMetadata, OpportunityRecord};
     use serde_json::json;
+    use std::path::PathBuf;
 
     #[test]
     fn detects_cloneable_urls() {
@@ -1116,6 +1197,58 @@ zoom:\n\
         assert_eq!(
             source_package_from_opportunity(&opportunity).as_deref(),
             Some("linux")
+        );
+    }
+
+    #[test]
+    fn apparmor_profile_paths_cover_named_and_absolute_profiles() {
+        assert_eq!(
+            apparmor_profile_path_candidates("lsusb"),
+            vec![PathBuf::from("/etc/apparmor.d/lsusb")]
+        );
+        assert_eq!(
+            apparmor_profile_path_candidates("/usr/sbin/cupsd"),
+            vec![
+                PathBuf::from("/etc/apparmor.d/usr.sbin.cupsd"),
+                PathBuf::from("/etc/apparmor.d/cupsd"),
+            ]
+        );
+    }
+
+    #[test]
+    fn apparmor_profile_package_beats_mediated_binary_package() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "warning".to_string(),
+            title: "AppArmor denial in lsusb".to_string(),
+            score: 64,
+            state: "open".to_string(),
+            summary: "AppArmor denied lsusb: open /".to_string(),
+            evidence: json!({
+                "package_name": "usbutils",
+                "details": {
+                    "subsystem": "apparmor",
+                    "profile": "lsusb",
+                    "profile_package_name": "apparmor",
+                    "profile_package_metadata": {
+                        "source_package": "apparmor"
+                    }
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-05-09T00:00:00Z".to_string(),
+            updated_at: "2026-05-09T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            package_name_from_opportunity(&opportunity).as_deref(),
+            Some("apparmor")
+        );
+        assert_eq!(
+            source_package_from_opportunity(&opportunity).as_deref(),
+            Some("apparmor")
         );
     }
 

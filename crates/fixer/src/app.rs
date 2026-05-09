@@ -22,6 +22,8 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+const COMPLAINT_RELATED_CANDIDATE_LIMIT: usize = 50_000;
+
 pub struct App {
     pub config: FixerConfig,
     pub store: Store,
@@ -403,7 +405,15 @@ impl App {
         complaint_opportunity_id: i64,
     ) -> Result<Vec<SharedOpportunity>> {
         let keywords = tokenize_complaint_text(description);
-        let mut candidates = self.store.list_submission_candidates(200)?;
+        let candidate_limit = if keywords.is_empty() {
+            200
+        } else {
+            // Complaint text is often very specific. Do not let broad high-score
+            // findings crowd an exact package or command name out of the search
+            // window before keyword ranking has a chance to see it.
+            COMPLAINT_RELATED_CANDIDATE_LIMIT
+        };
+        let mut candidates = self.store.list_submission_candidates(candidate_limit)?;
         candidates.retain(|item| item.opportunity.id != complaint_opportunity_id);
         if keywords.is_empty() {
             candidates.truncate(5);
@@ -575,10 +585,13 @@ mod tests {
         should_retry_complaint_in_overlay, tokenize_complaint_text,
     };
     use crate::config::FixerConfig;
-    use crate::models::{FindingInput, FindingRecord, OpportunityRecord, SharedOpportunity};
+    use crate::models::{
+        FindingInput, FindingRecord, ObservedArtifact, OpportunityRecord, SharedOpportunity,
+    };
     use crate::models::{ParticipationMode, ParticipationState};
     use anyhow::anyhow;
     use serde_json::json;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[test]
@@ -761,6 +774,72 @@ mod tests {
 
         let outcome = app.complain("spectacle fails on wayland", false).unwrap();
         assert_eq!(outcome.opportunity.state, "open");
+    }
+
+    #[test]
+    fn complaint_related_candidates_include_exact_match_beyond_top_window() {
+        let dir = tempdir().unwrap();
+        let mut config = FixerConfig::default();
+        config.service.database_path = dir.path().join("fixer.sqlite3");
+        config.service.state_dir = dir.path().join("state");
+        let app = super::App::from_config(config).unwrap();
+
+        for index in 0..220 {
+            app.store
+                .record_finding(&FindingInput {
+                    kind: "investigation".to_string(),
+                    title: format!("High score desktop investigation {index}"),
+                    severity: "high".to_string(),
+                    fingerprint: format!("desktop-{index}"),
+                    summary: "Generic compositor issue without command names".to_string(),
+                    details: json!({"subsystem": "desktop-graphics-session"}),
+                    artifact: None,
+                    repo_root: None,
+                    ecosystem: None,
+                })
+                .unwrap();
+        }
+
+        let lsusb_finding = app
+            .store
+            .record_finding(&FindingInput {
+                kind: "warning".to_string(),
+                title: "AppArmor denial in lsusb".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "lsusb-apparmor-denial".to_string(),
+                summary: "AppArmor denied lsusb: open /".to_string(),
+                details: json!({
+                    "subsystem": "apparmor",
+                    "profile": "lsusb",
+                    "name": "/"
+                }),
+                artifact: Some(ObservedArtifact {
+                    kind: "apparmor-profile".to_string(),
+                    name: "lsusb".to_string(),
+                    path: Some(PathBuf::from("/etc/apparmor.d/lsusb")),
+                    package_name: Some("apparmor".to_string()),
+                    repo_root: None,
+                    ecosystem: None,
+                    metadata: json!({}),
+                }),
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let lsusb = app.store.get_opportunity_by_finding(lsusb_finding).unwrap();
+
+        let related = app
+            .related_candidates_for_complaint(
+                "lsusb fails because libusb hits an AppArmor denial",
+                -1,
+            )
+            .unwrap();
+
+        assert!(
+            related
+                .iter()
+                .any(|candidate| candidate.opportunity.id == lsusb.id)
+        );
     }
 
     #[test]

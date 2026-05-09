@@ -2962,6 +2962,10 @@ impl ParsedAppArmorDenial {
         resolve_profile_or_command_path(&self.profile, self.comm.as_deref())
     }
 
+    fn profile_path(&self) -> Option<PathBuf> {
+        resolve_apparmor_profile_path(&self.profile)
+    }
+
     fn stable_name(&self) -> Option<String> {
         self.name.as_deref().map(stable_apparmor_denial_name)
     }
@@ -3659,18 +3663,43 @@ fn kib_to_gib(value: u64) -> f64 {
 
 fn apparmor_finding_from_kernel_line(line: &str) -> Option<FindingInput> {
     let denial = parse_apparmor_denial(line)?;
+    let actor_name = denial.actor_display_name();
+    let profile_path = denial.profile_path();
+    let profile_package_name = profile_path
+        .as_ref()
+        .and_then(|path| map_path_to_package(path));
+    let profile_package_metadata = profile_package_name
+        .as_deref()
+        .and_then(installed_package_metadata_value);
     let executable_path = denial.executable_path();
-    let artifact = executable_path.as_ref().map(|path| ObservedArtifact {
-        kind: "binary".to_string(),
-        name: denial.actor_display_name(),
+    let executable_package_name = executable_path
+        .as_ref()
+        .and_then(|path| map_path_to_package(path));
+    let executable_package_metadata = executable_package_name
+        .as_deref()
+        .and_then(installed_package_metadata_value);
+    let artifact_path = profile_path.as_ref().or(executable_path.as_ref());
+    let artifact_package_name = profile_package_name
+        .clone()
+        .or_else(|| executable_package_name.clone());
+    let artifact = artifact_path.map(|path| ObservedArtifact {
+        kind: if profile_path.is_some() {
+            "apparmor-profile"
+        } else {
+            "binary"
+        }
+        .to_string(),
+        name: actor_name.clone(),
         path: Some(path.clone()),
-        package_name: map_path_to_package(path),
+        package_name: artifact_package_name.clone(),
         repo_root: None,
         ecosystem: None,
         metadata: json!({
             "source": "journalctl",
-            "profile": denial.profile,
-            "comm": denial.comm,
+            "profile": denial.profile.clone(),
+            "comm": denial.comm.clone(),
+            "profile_path": profile_path,
+            "executable_path": executable_path,
         }),
     });
     let fingerprint = hash_text(format!(
@@ -3687,7 +3716,7 @@ fn apparmor_finding_from_kernel_line(line: &str) -> Option<FindingInput> {
     ));
     Some(FindingInput {
         kind: "warning".to_string(),
-        title: format!("AppArmor denial in {}", denial.actor_display_name()),
+        title: format!("AppArmor denial in {}", actor_name),
         severity: "medium".to_string(),
         fingerprint,
         summary: denial.summary(),
@@ -3696,6 +3725,12 @@ fn apparmor_finding_from_kernel_line(line: &str) -> Option<FindingInput> {
             "subsystem": "apparmor",
             "profile": denial.profile,
             "comm": denial.comm,
+            "profile_path": profile_path,
+            "profile_package_name": profile_package_name,
+            "profile_package_metadata": profile_package_metadata,
+            "executable_path": executable_path,
+            "executable_package_name": executable_package_name,
+            "executable_package_metadata": executable_package_metadata,
             "operation": denial.operation,
             "class": denial.class,
             "info": denial.info,
@@ -3955,6 +3990,44 @@ fn resolve_profile_or_command_path(profile: &str, comm: Option<&str>) -> Option<
         candidates.push(Path::new("/usr/libexec").join(comm));
     }
     candidates.into_iter().find(|candidate| candidate.exists())
+}
+
+fn resolve_apparmor_profile_path(profile: &str) -> Option<PathBuf> {
+    apparmor_profile_path_candidates(profile)
+        .into_iter()
+        .find(|candidate| candidate.exists())
+}
+
+fn apparmor_profile_path_candidates(profile: &str) -> Vec<PathBuf> {
+    let profile = profile.trim();
+    if profile.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    let mut push_candidate = |path: PathBuf| {
+        if !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    };
+
+    let apparmor_dir = Path::new("/etc/apparmor.d");
+    if Path::new(profile).is_absolute() {
+        let normalized = profile.trim_start_matches('/').replace('/', ".");
+        push_candidate(apparmor_dir.join(normalized));
+        if let Some(file_name) = Path::new(profile)
+            .file_name()
+            .and_then(|value| value.to_str())
+        {
+            push_candidate(apparmor_dir.join(file_name));
+        }
+    } else {
+        push_candidate(apparmor_dir.join(profile));
+        if profile.contains('/') {
+            push_candidate(apparmor_dir.join(profile.replace('/', ".")));
+        }
+    }
+    candidates
 }
 
 fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
@@ -7780,16 +7853,16 @@ fn frame_is_useful(frame: &str) -> bool {
 mod tests {
     use super::{
         RunawayHypothesis, StuckProcessGroup, StuckProcessInvestigationSummary,
-        apparmor_finding_from_kernel_line, classify_runaway_loop, classify_stuck_process,
-        collect_interpreter_runaway_process_evidence, collect_perl_runaway_process_evidence,
-        complaint_mentions_keyboard_layout_issue, coredump_debugger_arguments,
-        coredump_debugger_skip_reason, crash_event_executable, crash_event_label,
-        crash_event_process_name, csv_config_values, current_kernel_image_package_name,
-        dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
-        is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
-        kernel_module_package_hint, kernel_thread_package_name, kernel_warning_identity,
-        kernel_warning_module_candidates, looks_like_warning, netdev_watchdog_driver,
-        normalize_oom_task_memcg_target, normalize_perf_symbol,
+        apparmor_finding_from_kernel_line, apparmor_profile_path_candidates, classify_runaway_loop,
+        classify_stuck_process, collect_interpreter_runaway_process_evidence,
+        collect_perl_runaway_process_evidence, complaint_mentions_keyboard_layout_issue,
+        coredump_debugger_arguments, coredump_debugger_skip_reason, crash_event_executable,
+        crash_event_label, crash_event_process_name, csv_config_values,
+        current_kernel_image_package_name, dominant_syscall_sequence, extend_unique_log_lines,
+        investigation_cooldown_active, is_low_signal_kernel_warning, is_profile_candidate,
+        kernel_module_lookup_names, kernel_module_package_hint, kernel_thread_package_name,
+        kernel_warning_identity, kernel_warning_module_candidates, looks_like_warning,
+        netdev_watchdog_driver, normalize_oom_task_memcg_target, normalize_perf_symbol,
         normalize_stuck_process_target_name, oom_cgroup_package_candidates, package_lookup_path,
         package_lookup_path_is_dpkg_candidate, parse_apparmor_denial, parse_coredump_info,
         parse_desktop_graphics_session_failure, parse_dkms_status_line, parse_ini_sections,
@@ -7907,6 +7980,21 @@ Options=grp_led:scroll,grp:caps_toggle
         assert_eq!(
             finding.summary,
             "AppArmor denied cupsd via dbus: create net unix/stream"
+        );
+    }
+
+    #[test]
+    fn apparmor_profile_path_candidates_cover_named_and_absolute_profiles() {
+        assert_eq!(
+            apparmor_profile_path_candidates("lsusb"),
+            vec![PathBuf::from("/etc/apparmor.d/lsusb")]
+        );
+        assert_eq!(
+            apparmor_profile_path_candidates("/usr/sbin/cupsd"),
+            vec![
+                PathBuf::from("/etc/apparmor.d/usr.sbin.cupsd"),
+                PathBuf::from("/etc/apparmor.d/cupsd"),
+            ]
         );
     }
 

@@ -8288,6 +8288,7 @@ fn inferred_apparmor_source_package(item: &SharedOpportunity) -> Option<String> 
     }
     let package_name = item.finding.package_name.as_deref()?.trim();
     match package_name {
+        "apparmor" => Some("apparmor"),
         "cups-daemon" => Some("cups"),
         "hostname" => Some("hostname"),
         "rsyslog" => Some("rsyslog"),

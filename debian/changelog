@@ -2,6 +2,8 @@ fixer (0.145.0-1) unstable; urgency=medium
 
   * Add service-key Codex worker auth for unattended machine workers with a
     dedicated CODEX_HOME.
+  * Route AppArmor-denial workspaces to the owning profile package and keep
+    exact complaint matches visible even when they have lower scores.
 
  -- Darafei Praliaskouski <me@komzpa.net>  Sat, 09 May 2026 00:00:00 +0400
 
