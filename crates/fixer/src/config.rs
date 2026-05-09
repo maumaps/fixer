@@ -95,6 +95,8 @@ pub struct PatchConfig {
     pub codex_timeout_seconds: u64,
     #[serde(default)]
     pub codex_args: Vec<String>,
+    #[serde(default)]
+    pub codex_home: Option<PathBuf>,
     #[serde(default = "default_patch_model")]
     pub model: Option<String>,
     #[serde(default)]
@@ -280,6 +282,7 @@ impl Default for PatchConfig {
             codex_command: default_codex_command(),
             codex_timeout_seconds: default_codex_timeout(),
             codex_args: Vec::new(),
+            codex_home: None,
             model: default_patch_model(),
             reasoning_effort: None,
             spark_model: default_spark_model(),

@@ -89,6 +89,7 @@ pub struct ProposalRecord {
 #[serde(rename_all = "kebab-case")]
 pub enum CodexAuthMode {
     RootDirect,
+    ServiceKey,
     #[default]
     UserLease,
 }

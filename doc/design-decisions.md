@@ -274,17 +274,20 @@ What we chose:
 
 - the collector service stays root-owned
 - Codex proposal work is leased from a real user and runs with that user's existing auth
+- unattended machine workers may instead use `patch.auth_mode = "service-key"` with a dedicated `CODEX_HOME`
 
 Why:
 
 - it is much safer than copying a Codex login into root
 - it respects the fact that patch generation is higher-risk than collection
 - it creates a natural budget and supervision point
+- service-key deployments keep machine credentials separate from a human Codex login
 
 What it costs:
 
 - worker setup is a little more involved
 - unattended workers depend on a working user systemd manager and lease state
+- service-key workers need explicit key issuance and rotation outside Fixer
 
 ## 17. Public pages should be useful, not voyeuristic
 

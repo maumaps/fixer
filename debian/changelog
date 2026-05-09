@@ -1,3 +1,10 @@
+fixer (0.145.0-1) unstable; urgency=medium
+
+  * Add service-key Codex worker auth for unattended machine workers with a
+    dedicated CODEX_HOME.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sat, 09 May 2026 00:00:00 +0400
+
 fixer (0.144.0-1) unstable; urgency=medium
 
   * Explain root-owned collector database errors for `fixer collect` with a

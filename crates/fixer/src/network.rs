@@ -225,6 +225,16 @@ fn codex_worker_availability(
             ready: true,
             reason: None,
         }),
+        CodexAuthMode::ServiceKey => match codex_service_home_status(config) {
+            Ok(()) => Ok(CodexWorkerAvailability {
+                ready: true,
+                reason: None,
+            }),
+            Err(error) => Ok(CodexWorkerAvailability {
+                ready: false,
+                reason: Some(error.to_string()),
+            }),
+        },
         CodexAuthMode::UserLease => {
             let status = codex_auth_lease_status(store, config)?;
             Ok(CodexWorkerAvailability {
@@ -238,6 +248,28 @@ fn codex_worker_availability(
             })
         }
     }
+}
+
+fn codex_service_home_status(config: &FixerConfig) -> Result<()> {
+    let Some(codex_home) = config.patch.codex_home.as_ref() else {
+        return Err(anyhow!(
+            "patch.codex_home must be set when patch.auth_mode is `service-key`"
+        ));
+    };
+    if !codex_home.is_dir() {
+        return Err(anyhow!(
+            "patch.codex_home `{}` is not a directory",
+            codex_home.display()
+        ));
+    }
+    let config_path = codex_home.join("config.toml");
+    if !config_path.is_file() {
+        return Err(anyhow!(
+            "patch.codex_home `{}` does not contain config.toml",
+            codex_home.display()
+        ));
+    }
+    Ok(())
 }
 
 fn require_local_admin_tools() -> Result<()> {
@@ -783,14 +815,16 @@ fn create_worker_codex_proposal(
             )
         }
         PatchDriver::Codex => match config.patch.auth_mode {
-            CodexAuthMode::RootDirect => proposal::create_proposal_with_prior_patch(
-                store,
-                config,
-                opportunity,
-                workspace,
-                issue.best_patch.as_ref(),
-                tool_name,
-            ),
+            CodexAuthMode::RootDirect | CodexAuthMode::ServiceKey => {
+                proposal::create_proposal_with_prior_patch(
+                    store,
+                    config,
+                    opportunity,
+                    workspace,
+                    issue.best_patch.as_ref(),
+                    tool_name,
+                )
+            }
             CodexAuthMode::UserLease => {
                 let lease = store
                     .load_codex_auth_lease()?
@@ -3378,6 +3412,54 @@ mod tests {
 
         let hello = build_client_hello(&store, &config, &identity, &state).unwrap();
         assert!(hello.has_codex);
+    }
+
+    #[test]
+    fn build_client_hello_advertises_codex_for_service_key_hosts() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        store
+            .sync_capabilities(&[sample_codex_capability()])
+            .unwrap();
+
+        let codex_home = dir.path().join("codex-home");
+        fs::create_dir(&codex_home).unwrap();
+        fs::write(codex_home.join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
+
+        let mut config = FixerConfig::default();
+        config.patch.auth_mode = CodexAuthMode::ServiceKey;
+        config.patch.codex_home = Some(codex_home);
+        config.patch.codex_command = "sh".to_string();
+        let identity = store.ensure_install_identity().unwrap();
+        let state = ParticipationState {
+            mode: ParticipationMode::SubmitterWorker,
+            ..ParticipationState::default()
+        };
+
+        let hello = build_client_hello(&store, &config, &identity, &state).unwrap();
+        assert!(hello.has_codex);
+    }
+
+    #[test]
+    fn build_client_hello_hides_service_key_codex_without_config() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        store
+            .sync_capabilities(&[sample_codex_capability()])
+            .unwrap();
+
+        let mut config = FixerConfig::default();
+        config.patch.auth_mode = CodexAuthMode::ServiceKey;
+        config.patch.codex_home = Some(dir.path().join("missing-codex-home"));
+        config.patch.codex_command = "sh".to_string();
+        let identity = store.ensure_install_identity().unwrap();
+        let state = ParticipationState {
+            mode: ParticipationMode::SubmitterWorker,
+            ..ParticipationState::default()
+        };
+
+        let hello = build_client_hello(&store, &config, &identity, &state).unwrap();
+        assert!(!hello.has_codex);
     }
 
     #[test]

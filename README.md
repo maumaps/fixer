@@ -175,6 +175,19 @@ sudo fixer auth lease grant <user> --ttl 8h --budget conservative
 sudo fixer auth lease status
 ```
 
+For unattended machine workers, use a separate service credential instead of a
+human lease:
+
+```toml
+[patch]
+auth_mode = "service-key"
+codex_home = "/etc/fixer/codex"
+```
+
+`codex_home` must contain a Codex `config.toml`; Fixer passes it to Codex as
+`CODEX_HOME`, so the service can use a machine-scoped API key without copying a
+person's `~/.codex` login into root.
+
 Worker jobs run in isolated per-job workspace snapshots under `/var/lib/fixer/proposals/...`. The goal is not perfect sandboxing yet, but a much more supervised path than “run Codex as root and hope for the best.”
 
 For `desktop-input-config` investigations such as Plasma keyboard-layout complaints, Fixer keeps the full Codex path by default:

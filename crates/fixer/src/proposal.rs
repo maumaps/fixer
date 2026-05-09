@@ -2429,6 +2429,9 @@ fn run_codex_process(
     } else {
         Command::new(&config.patch.codex_command)
     };
+    if let Some(codex_home) = &config.patch.codex_home {
+        cmd.env("CODEX_HOME", codex_home);
+    }
     if let Some(approval_policy) = &config.patch.approval_policy {
         cmd.arg("-a").arg(approval_policy);
     }
