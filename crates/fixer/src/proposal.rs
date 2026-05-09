@@ -3855,8 +3855,8 @@ fn patch_validation_quality_failure(
     None
 }
 
-fn investigation_prompt_hint(opportunity: &OpportunityRecord) -> &'static str {
-    match investigation_subsystem(opportunity) {
+fn investigation_prompt_hint(opportunity: &OpportunityRecord) -> String {
+    let base = match investigation_subsystem(opportunity) {
         Some("desktop-input-config") => {
             "\n\nStart by explaining the likely root cause from the collected keyboard-layout configuration evidence, including Plasma `kxkbrc`, shortcut state, loop-count settings, and `/etc/default/keyboard`. Focus on `kcms/keyboard` and closely related keyboard-layout code paths first. Treat the actual user-facing switching behavior as the acceptance criteria: if the complaint mentions spare layouts, Caps Lock switching, or a mismatch between the main shortcut path and legacy XKB options, your patch must preserve an interactive layout switcher and fix that behavior rather than hiding, disabling, or deadening the runtime surface. For Plasma keyboard complaints like this one, inspect `setLayout`, `getLayoutsList`, spare-layout loop handling, and the split between the KGlobalAccel shortcut path and legacy XKB option handling before considering daemon/service-registration changes. Ignore unrelated panel, wallpaper, graphics, and generic desktop-session code unless the evidence explicitly pulls you there. If you cannot land a safe behavioral fix, leave a diagnosis that is strong enough for an upstream bug report instead of shipping a narrower non-fix."
         }
@@ -3867,11 +3867,16 @@ fn investigation_prompt_hint(opportunity: &OpportunityRecord) -> &'static str {
             "\n\nStart by explaining the likely root cause from the collected perf, strace, and /proc evidence. If you cannot land a safe patch, leave a diagnosis that is strong enough for an upstream bug report."
         }
         _ => "",
+    };
+    let mut hint = base.to_string();
+    if interpreter_process_from_opportunity(opportunity).is_some() {
+        hint.push_str("\n\nInterpreter process expectation: when the hot process is Python, Perl, shell, Node, Ruby, PHP, Lua, or another interpreter, inspect both the runtime and the script/application entrypoint from `details.interpreter_process`. Prefer the script or application package when evidence points there; do not patch the interpreter runtime merely because the hot binary is `python`, `perl`, `bash`, or similar. Runtime fixes are welcome only after checking the entrypoint and explaining why the runtime mishandles the workload or why running bad code faster/safer is itself the right upstream fix.");
     }
+    hint
 }
 
-fn investigation_plan_focus_hint(subsystem: Option<&str>) -> &'static str {
-    match subsystem {
+fn investigation_plan_focus_hint(subsystem: Option<&str>) -> String {
+    let base = match subsystem {
         Some("desktop-input-config") => {
             " Focus first on keyboard-layout code under `kcms/keyboard` and any directly related keyboard layout UI or daemon helpers. Treat the evidence as a Plasma keyboard configuration/runtime mismatch, not a generic graphics or panel issue. The plan must preserve the affected user-visible feature surface and fix the reported switching semantics; hiding the switcher, disabling the service, or converting runtime APIs into static-config mirrors is a regression, not an acceptable patch."
         }
@@ -3879,7 +3884,20 @@ fn investigation_plan_focus_hint(subsystem: Option<&str>) -> &'static str {
             " Focus first on source-level graphics/session code such as DRM, compositor, outputs, or directly related graphics tests. Do not spend the plan on Debian patch renames, changelog edits, or other packaging-only cleanup unless the evidence explicitly points to packaging metadata as the user-visible failure."
         }
         _ => "",
+    };
+    let mut hint = base.to_string();
+    if matches!(subsystem, Some("runaway-process")) {
+        hint.push_str(" For interpreter processes, plan from the script/application entrypoint evidence first and include the runtime only as a second investigation target unless the evidence proves a runtime bug.");
     }
+    hint
+}
+
+fn interpreter_process_from_opportunity(opportunity: &OpportunityRecord) -> Option<&Value> {
+    opportunity
+        .evidence
+        .get("details")?
+        .get("interpreter_process")
+        .filter(|value| !value.is_null())
 }
 
 fn investigation_validation_hint(
@@ -5157,6 +5175,94 @@ fn render_process_investigation_report(
     if !dominant_sequence.is_empty() {
         body.push_str("\n## Repeated Loop Shape\n\n");
         body.push_str(&format!("`{dominant_sequence}`\n"));
+    }
+    if let Some(interpreter_process) = details
+        .get("interpreter_process")
+        .and_then(Value::as_object)
+    {
+        body.push_str("\n## Interpreter Process Context\n\n");
+        if let Some(interpreter) = interpreter_process
+            .get("interpreter")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            body.push_str(&format!("- Interpreter: `{interpreter}`\n"));
+        }
+        if let Some(executable) = interpreter_process
+            .get("interpreter_executable")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            body.push_str(&format!("- Runtime executable: `{executable}`\n"));
+        }
+        if let Some(entrypoint_kind) = interpreter_process
+            .get("entrypoint_kind")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            body.push_str(&format!("- Entrypoint kind: `{entrypoint_kind}`\n"));
+        }
+        if let Some(entrypoint) = interpreter_process
+            .get("suspected_entrypoint")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            body.push_str(&format!("- Suspected entrypoint: `{entrypoint}`\n"));
+        }
+        if let Some(package) = interpreter_process
+            .get("entrypoint_package_name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            body.push_str(&format!("- Entrypoint package: `{package}`\n"));
+        }
+        if let Some(package) = interpreter_process
+            .get("runtime_package_name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            body.push_str(&format!("- Runtime package: `{package}`\n"));
+        }
+        if let Some(signals) = interpreter_process
+            .get("detection_signals")
+            .and_then(Value::as_array)
+        {
+            let signals = signals
+                .iter()
+                .filter_map(Value::as_str)
+                .take(8)
+                .collect::<Vec<_>>();
+            if !signals.is_empty() {
+                body.push_str("\nDetection signals:\n");
+                for signal in signals {
+                    body.push_str(&format!("- `{signal}`\n"));
+                }
+            }
+        }
+        if let Some(gap) = interpreter_process
+            .get("evidence_gap")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            body.push_str(&format!("\nEvidence gap: {gap}\n"));
+        }
+        body.push_str("\nInvestigation priority: inspect the script/application entrypoint and the runtime; prefer an entrypoint/application fix unless the evidence proves the interpreter runtime itself is at fault.\n");
+        if let Some(commands) = interpreter_process
+            .get("recommended_next_steps")
+            .and_then(Value::as_array)
+        {
+            let commands = commands
+                .iter()
+                .filter_map(Value::as_str)
+                .take(6)
+                .collect::<Vec<_>>();
+            if !commands.is_empty() {
+                body.push_str("\nInterpreter-aware follow-up:\n");
+                for command in commands {
+                    body.push_str(&format!("- `{command}`\n"));
+                }
+            }
+        }
     }
     if let Some(perl_process) = details.get("perl_process").and_then(Value::as_object) {
         body.push_str("\n## Perl Process Context\n\n");
@@ -6893,6 +6999,21 @@ mod tests {
                     "top_hot_symbols": ["Perl_runops_standard (100.00% in perl)"],
                     "top_syscalls": [{ "name": "pselect6", "count": 4 }],
                     "dominant_sequence": ["pselect6", "pselect6", "pselect6"],
+                    "interpreter_process": {
+                        "detection_signals": [
+                            "process command resolves to perl interpreter"
+                        ],
+                        "interpreter": "perl",
+                        "interpreter_executable": "/usr/bin/perl",
+                        "entrypoint_kind": "script",
+                        "suspected_entrypoint": "./daemon.pl",
+                        "entrypoint_package_name": "example-daemon",
+                        "runtime_package_name": "perl-base",
+                        "evidence_gap": "Fixer saw a perl interpreter loop and a script entrypoint, but it did not prove whether the tight loop comes from script/application logic or from the runtime itself.",
+                        "recommended_next_steps": [
+                            "Inspect the perl script or module entrypoint first; only patch the interpreter/runtime after proving it mishandles the workload."
+                        ]
+                    },
                     "perl_process": {
                         "detection_signals": [
                             "hot DSO belongs to a Perl package",
@@ -6921,6 +7042,10 @@ mod tests {
         );
 
         assert!(rendered.contains("Perl Process Context"));
+        assert!(rendered.contains("Interpreter Process Context"));
+        assert!(rendered.contains("Suspected entrypoint: `./daemon.pl`"));
+        assert!(rendered.contains("Entrypoint package: `example-daemon`"));
+        assert!(rendered.contains("prefer an entrypoint/application fix"));
         assert!(rendered.contains("Suspected script: `./daemon.pl`"));
         assert!(rendered.contains("Evidence gap: Fixer saw a Perl interpreter loop"));
         assert!(rendered.contains("Perl-specific follow-up"));
@@ -8864,6 +8989,56 @@ plain stderr line
             assert!(prompt.contains("generic libc"));
             assert!(prompt.contains("`htop` upstream patch"));
         }
+    }
+
+    #[test]
+    fn interpreter_patch_prompt_prioritizes_entrypoint_before_runtime() {
+        let opportunity = OpportunityRecord {
+            id: 43,
+            finding_id: 43,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for python".to_string(),
+            score: 98,
+            state: "open".to_string(),
+            summary: "python worker burns CPU".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "runaway-process",
+                    "interpreter_process": {
+                        "interpreter": "python",
+                        "entrypoint_kind": "script",
+                        "suspected_entrypoint": "/usr/bin/fixer-worker",
+                        "entrypoint_package_name": "fixer-worker",
+                        "runtime_package_name": "python3.13-minimal"
+                    }
+                }
+            }),
+            repo_root: None,
+            ecosystem: Some("debian".to_string()),
+            created_at: "2026-05-09T00:00:00Z".to_string(),
+            updated_at: "2026-05-09T00:00:00Z".to_string(),
+        };
+        let workspace = PreparedWorkspace {
+            repo_root: PathBuf::from("/tmp/fixer"),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("fixer-worker".to_string()),
+            source_package: Some("fixer".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+
+        let patch_prompt = super::build_prompt(
+            &opportunity,
+            Path::new("/tmp/evidence.json"),
+            &workspace,
+            None,
+            &FixerConfig::default(),
+        );
+
+        assert!(patch_prompt.contains("Interpreter process expectation"));
+        assert!(patch_prompt.contains("script/application entrypoint"));
+        assert!(patch_prompt.contains("do not patch the interpreter runtime merely"));
     }
 
     #[test]

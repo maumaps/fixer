@@ -674,9 +674,19 @@ fn source_dir_version_hint(version: &str) -> &str {
 fn package_name_from_opportunity(opportunity: &OpportunityRecord) -> Option<String> {
     opportunity
         .evidence
-        .get("package_name")
+        .get("details")
+        .and_then(|details| details.get("interpreter_process"))
+        .and_then(|process| process.get("entrypoint_package_name"))
         .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string)
+        .or_else(|| {
+            opportunity
+                .evidence
+                .get("package_name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
         .or_else(|| kernel_source_package_from_opportunity(opportunity))
 }
 
@@ -684,13 +694,32 @@ fn source_package_from_opportunity(opportunity: &OpportunityRecord) -> Option<St
     let package_name = package_name_from_opportunity(opportunity);
     opportunity
         .evidence
-        .get("source_package")
+        .get("details")
+        .and_then(|details| details.get("interpreter_process"))
+        .and_then(|process| process.get("entrypoint_package_metadata"))
+        .and_then(|metadata| metadata.get("source_package"))
+        .or_else(|| {
+            opportunity
+                .evidence
+                .get("details")?
+                .get("interpreter_process")?
+                .get("entrypoint_package_name")
+        })
+        .or_else(|| opportunity.evidence.get("source_package"))
         .or_else(|| opportunity.evidence.get("details")?.get("source_package"))
         .or_else(|| {
             opportunity
                 .evidence
                 .get("details")?
                 .get("package_metadata")?
+                .get("source_package")
+        })
+        .or_else(|| {
+            opportunity
+                .evidence
+                .get("details")?
+                .get("interpreter_process")?
+                .get("runtime_package_metadata")?
                 .get("source_package")
         })
         .and_then(Value::as_str)
@@ -820,10 +849,10 @@ mod tests {
         WorkspaceSourceTarget, chrome_workspace_alias, is_cloneable_repo_url,
         is_external_binary_package_without_workspace, kernel_source_package_from_opportunity,
         kernel_upstream_repo_url, normalize_patchable_source_package,
-        origin_is_debian_source_friendly, parse_apt_origins, parse_maintainer_url,
-        parse_showsrc_records, sanitize_dir_name, select_showsrc_record, source_dir_version_hint,
-        source_package_from_opportunity, source_package_vcs_url, trim_debian_epoch,
-        vcs_git_clone_url,
+        origin_is_debian_source_friendly, package_name_from_opportunity, parse_apt_origins,
+        parse_maintainer_url, parse_showsrc_records, sanitize_dir_name, select_showsrc_record,
+        source_dir_version_hint, source_package_from_opportunity, source_package_vcs_url,
+        trim_debian_epoch, vcs_git_clone_url,
     };
     use crate::models::{InstalledPackageMetadata, OpportunityRecord};
     use serde_json::json;
@@ -1087,6 +1116,52 @@ zoom:\n\
         assert_eq!(
             source_package_from_opportunity(&opportunity).as_deref(),
             Some("linux")
+        );
+    }
+
+    #[test]
+    fn prefers_interpreter_entrypoint_package_for_workspace_target() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "python loop".to_string(),
+            score: 100,
+            state: "open".to_string(),
+            summary: "python is burning CPU".to_string(),
+            evidence: json!({
+                "package_name": "python3.13-minimal",
+                "details": {
+                    "package_metadata": {
+                        "source_package": "python3.13"
+                    },
+                    "interpreter_process": {
+                        "interpreter": "python",
+                        "suspected_entrypoint": "/usr/bin/fixer-worker",
+                        "entrypoint_package_name": "fixer-worker",
+                        "entrypoint_package_metadata": {
+                            "source_package": "fixer"
+                        },
+                        "runtime_package_name": "python3.13-minimal",
+                        "runtime_package_metadata": {
+                            "source_package": "python3.13"
+                        }
+                    }
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-05-09T00:00:00Z".to_string(),
+            updated_at: "2026-05-09T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            package_name_from_opportunity(&opportunity).as_deref(),
+            Some("fixer-worker")
+        );
+        assert_eq!(
+            source_package_from_opportunity(&opportunity).as_deref(),
+            Some("fixer")
         );
     }
 

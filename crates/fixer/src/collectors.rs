@@ -4243,6 +4243,24 @@ struct PerlRunawayProcessEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct InterpreterRunawayProcessEvidence {
+    detection_signals: Vec<String>,
+    interpreter: String,
+    interpreter_executable: Option<String>,
+    entrypoint_kind: String,
+    suspected_entrypoint: Option<String>,
+    entrypoint_package_name: Option<String>,
+    entrypoint_package_metadata: Option<RunawayPackageMetadata>,
+    runtime_package_name: Option<String>,
+    runtime_package_metadata: Option<RunawayPackageMetadata>,
+    script_candidates: Vec<String>,
+    module_options: Vec<String>,
+    interpreter_options: Vec<String>,
+    evidence_gap: String,
+    recommended_next_steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct RunawayFrameCluster {
     signature: String,
     thread_count: usize,
@@ -4285,6 +4303,7 @@ struct RunawayInvestigationSummary {
     lock_contention_signals: Vec<String>,
     thread_backtrace_summary: Option<String>,
     raw_backtrace_excerpt: Option<String>,
+    interpreter_process: Option<InterpreterRunawayProcessEvidence>,
     perl_process: Option<PerlRunawayProcessEvidence>,
     hypothesis: RunawayHypothesis,
     raw_artifacts: BTreeMap<String, String>,
@@ -4487,6 +4506,7 @@ fn maybe_record_runaway_investigation(
         "maps_excerpt": backtrace_capture.and_then(|capture| capture.maps_excerpt.clone()),
         "raw_artifacts": investigation.raw_artifacts,
     });
+    details["interpreter_process"] = json!(investigation.interpreter_process);
     if let Some(pkg) = target.package_name.as_deref() {
         if let Some(version) = installed_version_for_package(pkg) {
             details["installed_package_version"] = json!(version);
@@ -5970,6 +5990,367 @@ fn collect_perl_runaway_process_evidence(
     })
 }
 
+fn collect_interpreter_runaway_process_evidence(
+    command_line: Option<&str>,
+    command_argv: &[String],
+    executable: Option<&str>,
+    profile: &PerfProfileCapture,
+    top_hot_symbols: &[String],
+    backtrace_capture: Option<&GdbBacktraceCapture>,
+) -> Option<InterpreterRunawayProcessEvidence> {
+    let parsed = parse_interpreter_command_hints(command_line, command_argv, executable)?;
+    let mut detection_signals = BTreeSet::new();
+    detection_signals.insert(format!(
+        "process command resolves to {} interpreter",
+        parsed.interpreter
+    ));
+
+    let interpreter_lower = parsed.interpreter.to_ascii_lowercase();
+    let symbols_lower = top_hot_symbols.join("\n").to_ascii_lowercase();
+    let backtrace_lower = backtrace_capture
+        .map(|capture| capture.raw_bt.to_ascii_lowercase())
+        .unwrap_or_default();
+    if profile.hot_paths.iter().any(|path| {
+        path.package_name
+            .as_deref()
+            .is_some_and(|pkg| pkg.to_ascii_lowercase().contains(&interpreter_lower))
+    }) {
+        detection_signals.insert(format!(
+            "hot DSO belongs to a {} runtime package",
+            parsed.interpreter
+        ));
+    }
+    if symbols_lower.contains(&interpreter_lower) || backtrace_lower.contains(&interpreter_lower) {
+        detection_signals.insert(format!(
+            "native samples contain {} runtime frames",
+            parsed.interpreter
+        ));
+    }
+
+    let entrypoint_package_name = parsed
+        .suspected_entrypoint
+        .as_deref()
+        .and_then(|entrypoint| {
+            let path = Path::new(entrypoint);
+            path.is_absolute()
+                .then(|| map_path_to_package(path))
+                .flatten()
+        });
+    let entrypoint_package_metadata = entrypoint_package_name
+        .as_deref()
+        .and_then(resolve_installed_package_metadata_for_investigation);
+    let runtime_package_name = parsed
+        .interpreter_executable
+        .as_deref()
+        .and_then(|runtime| {
+            let path = Path::new(runtime);
+            path.is_absolute()
+                .then(|| map_path_to_package(path))
+                .flatten()
+        })
+        .or_else(|| {
+            profile.hot_paths.iter().find_map(|path| {
+                path.package_name.as_ref().and_then(|pkg| {
+                    pkg.to_ascii_lowercase()
+                        .contains(&interpreter_lower)
+                        .then(|| pkg.clone())
+                })
+            })
+        });
+    let runtime_package_metadata = runtime_package_name
+        .as_deref()
+        .and_then(resolve_installed_package_metadata_for_investigation);
+
+    let evidence_gap = match parsed.entrypoint_kind.as_str() {
+        "script" => format!(
+            "Fixer saw a {} interpreter loop and a script entrypoint, but it did not prove whether the tight loop comes from script/application logic or from the runtime itself.",
+            parsed.interpreter
+        ),
+        "module" => format!(
+            "Fixer saw a {} interpreter loop launched through a module entrypoint, but it did not retain language-level stack evidence tying the loop to a specific module call.",
+            parsed.interpreter
+        ),
+        "inline" | "stdin" => format!(
+            "Fixer saw a {} interpreter loop, but the retained command line used inline or stdin code, so there is no patchable script path in the evidence.",
+            parsed.interpreter
+        ),
+        _ => format!(
+            "Fixer saw a {} interpreter loop, but no script or module entrypoint was visible from the retained process evidence.",
+            parsed.interpreter
+        ),
+    };
+    let recommended_next_steps = vec![
+        "ps -p <pid> -o pid,stat,pcpu,etime,wchan,args".to_string(),
+        format!(
+            "Inspect the {} script or module entrypoint first; only patch the interpreter/runtime after proving it mishandles the workload.",
+            parsed.interpreter
+        ),
+        "Capture a language-level stack, trace, or minimal reproducer that ties the hot loop to the entrypoint before proposing runtime changes.".to_string(),
+        "Keep runtime performance fixes in scope only when they also make bad script code run more predictably or cheaply without changing language semantics.".to_string(),
+    ];
+
+    Some(InterpreterRunawayProcessEvidence {
+        detection_signals: detection_signals.into_iter().collect(),
+        interpreter: parsed.interpreter,
+        interpreter_executable: parsed.interpreter_executable,
+        entrypoint_kind: parsed.entrypoint_kind,
+        suspected_entrypoint: parsed.suspected_entrypoint,
+        entrypoint_package_name,
+        entrypoint_package_metadata,
+        runtime_package_name,
+        runtime_package_metadata,
+        script_candidates: parsed.script_candidates,
+        module_options: parsed.module_options,
+        interpreter_options: parsed.interpreter_options,
+        evidence_gap,
+        recommended_next_steps,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedInterpreterCommandHints {
+    interpreter: String,
+    interpreter_executable: Option<String>,
+    entrypoint_kind: String,
+    suspected_entrypoint: Option<String>,
+    script_candidates: Vec<String>,
+    module_options: Vec<String>,
+    interpreter_options: Vec<String>,
+}
+
+fn parse_interpreter_command_hints(
+    command_line: Option<&str>,
+    command_argv: &[String],
+    executable: Option<&str>,
+) -> Option<ParsedInterpreterCommandHints> {
+    let args = if command_argv.is_empty() {
+        command_line?
+            .split_whitespace()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    } else {
+        command_argv.to_vec()
+    };
+    let first = args.first().map(String::as_str).or(executable)?;
+    let interpreter = normalize_interpreter_name(first)
+        .or_else(|| executable.and_then(normalize_interpreter_name))?;
+    let interpreter_executable = executable
+        .map(ToString::to_string)
+        .or_else(|| args.first().cloned());
+    let mut parsed = ParsedInterpreterCommandHints {
+        interpreter,
+        interpreter_executable,
+        entrypoint_kind: "unknown".to_string(),
+        suspected_entrypoint: None,
+        script_candidates: Vec::new(),
+        module_options: Vec::new(),
+        interpreter_options: Vec::new(),
+    };
+
+    match parsed.interpreter.as_str() {
+        "perl" => {
+            let mut includes = Vec::new();
+            parse_perl_command_argv_hints(
+                &args,
+                &mut parsed.script_candidates,
+                &mut includes,
+                &mut parsed.module_options,
+                &mut parsed.interpreter_options,
+            );
+            parsed.suspected_entrypoint = parsed.script_candidates.first().cloned();
+            parsed.entrypoint_kind = if parsed.suspected_entrypoint.is_some() {
+                "script".to_string()
+            } else if !parsed.module_options.is_empty() {
+                "module".to_string()
+            } else if parsed
+                .interpreter_options
+                .iter()
+                .any(|option| option.contains("inline"))
+            {
+                "inline".to_string()
+            } else {
+                "unknown".to_string()
+            };
+        }
+        "python" => parse_python_command_hints(&args, &mut parsed),
+        "bash" | "sh" | "zsh" | "dash" => parse_shell_command_hints(&args, &mut parsed),
+        "node" => parse_node_command_hints(&args, &mut parsed),
+        "ruby" | "php" | "lua" => parse_script_first_command_hints(&args, &mut parsed),
+        _ => parse_script_first_command_hints(&args, &mut parsed),
+    }
+    Some(parsed)
+}
+
+fn normalize_interpreter_name(value: &str) -> Option<String> {
+    let name = Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value)
+        .trim_start_matches('-')
+        .to_ascii_lowercase();
+    if name.starts_with("python") {
+        return Some("python".to_string());
+    }
+    if name == "perl" || name.starts_with("perl5") {
+        return Some("perl".to_string());
+    }
+    if matches!(name.as_str(), "bash" | "sh" | "zsh" | "dash") {
+        return Some(name);
+    }
+    if name == "node" || name.starts_with("nodejs") {
+        return Some("node".to_string());
+    }
+    if matches!(name.as_str(), "ruby" | "php" | "lua") {
+        return Some(name);
+    }
+    None
+}
+
+fn parse_python_command_hints(args: &[String], parsed: &mut ParsedInterpreterCommandHints) {
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--" {
+            if let Some(script) = args.get(index + 1) {
+                parsed.script_candidates.push(script.clone());
+                parsed.suspected_entrypoint = Some(script.clone());
+                parsed.entrypoint_kind = "script".to_string();
+            }
+            return;
+        }
+        if arg == "-c" {
+            parsed
+                .interpreter_options
+                .push("-c <inline Python omitted>".to_string());
+            parsed.entrypoint_kind = "inline".to_string();
+            return;
+        }
+        if arg == "-m" {
+            if let Some(module) = args.get(index + 1) {
+                parsed.module_options.push(module.clone());
+                parsed.suspected_entrypoint = Some(module.clone());
+                parsed.entrypoint_kind = "module".to_string();
+            }
+            return;
+        }
+        if arg == "-" {
+            parsed.interpreter_options.push("- <stdin>".to_string());
+            parsed.entrypoint_kind = "stdin".to_string();
+            return;
+        }
+        if matches!(arg, "-W" | "-X") {
+            if let Some(value) = args.get(index + 1) {
+                parsed.interpreter_options.push(format!("{arg} {value}"));
+                index += 2;
+                continue;
+            }
+        }
+        if arg.starts_with('-') {
+            parsed.interpreter_options.push(arg.to_string());
+            index += 1;
+            continue;
+        }
+        parsed.script_candidates.push(arg.to_string());
+        parsed.suspected_entrypoint = Some(arg.to_string());
+        parsed.entrypoint_kind = "script".to_string();
+        return;
+    }
+}
+
+fn parse_shell_command_hints(args: &[String], parsed: &mut ParsedInterpreterCommandHints) {
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        if arg == "-c" {
+            parsed
+                .interpreter_options
+                .push("-c <inline shell omitted>".to_string());
+            parsed.entrypoint_kind = "inline".to_string();
+            return;
+        }
+        if arg.starts_with('-') {
+            parsed.interpreter_options.push(arg.to_string());
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    if let Some(script) = args.get(index) {
+        parsed.script_candidates.push(script.clone());
+        parsed.suspected_entrypoint = Some(script.clone());
+        parsed.entrypoint_kind = "script".to_string();
+    }
+}
+
+fn parse_node_command_hints(args: &[String], parsed: &mut ParsedInterpreterCommandHints) {
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if matches!(arg, "-e" | "--eval") {
+            parsed
+                .interpreter_options
+                .push(format!("{arg} <inline JavaScript omitted>"));
+            parsed.entrypoint_kind = "inline".to_string();
+            return;
+        }
+        if matches!(arg, "-r" | "--require") {
+            if let Some(module) = args.get(index + 1) {
+                parsed.module_options.push(module.clone());
+                index += 2;
+                continue;
+            }
+        }
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        if arg.starts_with('-') {
+            parsed.interpreter_options.push(arg.to_string());
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    if let Some(script) = args.get(index) {
+        parsed.script_candidates.push(script.clone());
+        parsed.suspected_entrypoint = Some(script.clone());
+        parsed.entrypoint_kind = "script".to_string();
+    }
+}
+
+fn parse_script_first_command_hints(args: &[String], parsed: &mut ParsedInterpreterCommandHints) {
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if matches!(arg, "-e" | "-E") {
+            parsed
+                .interpreter_options
+                .push(format!("{arg} <inline code omitted>"));
+            parsed.entrypoint_kind = "inline".to_string();
+            return;
+        }
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        if arg.starts_with('-') {
+            parsed.interpreter_options.push(arg.to_string());
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    if let Some(script) = args.get(index) {
+        parsed.script_candidates.push(script.clone());
+        parsed.suspected_entrypoint = Some(script.clone());
+        parsed.entrypoint_kind = "script".to_string();
+    }
+}
+
 fn parse_perl_command_line_hints(
     command_line: &str,
     script_candidates: &mut Vec<String>,
@@ -6097,6 +6478,16 @@ fn build_runaway_investigation_summary(
             backtrace_capture,
         )
     });
+    let interpreter_process = include_richer_evidence.then(|| {
+        collect_interpreter_runaway_process_evidence(
+            proc_snapshot.command_line.as_deref(),
+            &proc_snapshot.command_argv,
+            proc_snapshot.executable.as_deref(),
+            profile,
+            top_hot_symbols,
+            backtrace_capture,
+        )
+    });
     RunawayInvestigationSummary {
         sampled_pid,
         sampled_pid_count: profile.sampled_pids.len(),
@@ -6180,6 +6571,7 @@ fn build_runaway_investigation_summary(
         } else {
             None
         },
+        interpreter_process: interpreter_process.flatten(),
         perl_process: perl_process.flatten(),
         hypothesis: hypothesis.clone(),
         raw_artifacts: if include_richer_evidence {
@@ -7389,19 +7781,21 @@ mod tests {
     use super::{
         RunawayHypothesis, StuckProcessGroup, StuckProcessInvestigationSummary,
         apparmor_finding_from_kernel_line, classify_runaway_loop, classify_stuck_process,
-        collect_perl_runaway_process_evidence, complaint_mentions_keyboard_layout_issue,
-        coredump_debugger_arguments, coredump_debugger_skip_reason, crash_event_executable,
-        crash_event_label, crash_event_process_name, csv_config_values,
-        current_kernel_image_package_name, dominant_syscall_sequence, extend_unique_log_lines,
-        investigation_cooldown_active, is_low_signal_kernel_warning, is_profile_candidate,
-        kernel_module_lookup_names, kernel_module_package_hint, kernel_thread_package_name,
-        kernel_warning_identity, kernel_warning_module_candidates, looks_like_warning,
-        netdev_watchdog_driver, normalize_oom_task_memcg_target, normalize_perf_symbol,
+        collect_interpreter_runaway_process_evidence, collect_perl_runaway_process_evidence,
+        complaint_mentions_keyboard_layout_issue, coredump_debugger_arguments,
+        coredump_debugger_skip_reason, crash_event_executable, crash_event_label,
+        crash_event_process_name, csv_config_values, current_kernel_image_package_name,
+        dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
+        is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
+        kernel_module_package_hint, kernel_thread_package_name, kernel_warning_identity,
+        kernel_warning_module_candidates, looks_like_warning, netdev_watchdog_driver,
+        normalize_oom_task_memcg_target, normalize_perf_symbol,
         normalize_stuck_process_target_name, oom_cgroup_package_candidates, package_lookup_path,
         package_lookup_path_is_dpkg_candidate, parse_apparmor_denial, parse_coredump_info,
         parse_desktop_graphics_session_failure, parse_dkms_status_line, parse_ini_sections,
-        parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
-        parse_network_driver_hang_events, parse_perf_hot_paths, parse_perl_command_line_hints,
+        parse_interpreter_command_hints, parse_kernel_oom_kill_events,
+        parse_latest_desktop_resume_failure, parse_network_driver_hang_events,
+        parse_perf_hot_paths, parse_perl_command_line_hints,
         parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
         prioritize_coredump_events, process_runtime_seconds, process_state_is_uninterruptible,
         richer_evidence_enabled, safe_perf_name, shell_assignment_csv_value,
@@ -8416,6 +8810,131 @@ Stack trace of thread 222:\n\
 
         assert!(scripts.is_empty());
         assert_eq!(options, vec!["-E <inline Perl omitted>"]);
+    }
+
+    #[test]
+    fn parses_python_interpreter_script_and_module_hints() {
+        let parsed = parse_interpreter_command_hints(
+            Some("/usr/bin/python3 -X dev /opt/app/worker.py --queue hot"),
+            &[
+                "/usr/bin/python3".to_string(),
+                "-X".to_string(),
+                "dev".to_string(),
+                "/opt/app/worker.py".to_string(),
+                "--queue".to_string(),
+                "hot".to_string(),
+            ],
+            Some("python3"),
+        )
+        .expect("python command should parse as interpreter");
+
+        assert_eq!(parsed.interpreter, "python");
+        assert_eq!(parsed.entrypoint_kind, "script");
+        assert_eq!(
+            parsed.suspected_entrypoint.as_deref(),
+            Some("/opt/app/worker.py")
+        );
+        assert_eq!(parsed.script_candidates, vec!["/opt/app/worker.py"]);
+        assert_eq!(parsed.interpreter_options, vec!["-X dev"]);
+
+        let parsed = parse_interpreter_command_hints(
+            Some("/usr/bin/python3 -m fixer.worker"),
+            &[
+                "/usr/bin/python3".to_string(),
+                "-m".to_string(),
+                "fixer.worker".to_string(),
+            ],
+            Some("python3"),
+        )
+        .expect("python -m command should parse as interpreter");
+
+        assert_eq!(parsed.entrypoint_kind, "module");
+        assert_eq!(parsed.suspected_entrypoint.as_deref(), Some("fixer.worker"));
+        assert_eq!(parsed.module_options, vec!["fixer.worker"]);
+    }
+
+    #[test]
+    fn parses_shell_interpreter_script_hint_without_inline_code() {
+        let parsed = parse_interpreter_command_hints(
+            Some("/bin/bash -e ./scripts/build.sh"),
+            &[
+                "/bin/bash".to_string(),
+                "-e".to_string(),
+                "./scripts/build.sh".to_string(),
+            ],
+            Some("/bin/bash"),
+        )
+        .expect("bash command should parse as interpreter");
+
+        assert_eq!(parsed.interpreter, "bash");
+        assert_eq!(parsed.entrypoint_kind, "script");
+        assert_eq!(
+            parsed.suspected_entrypoint.as_deref(),
+            Some("./scripts/build.sh")
+        );
+        assert_eq!(parsed.interpreter_options, vec!["-e"]);
+
+        let parsed = parse_interpreter_command_hints(
+            Some("/bin/bash -c 'while true; do :; done'"),
+            &[
+                "/bin/bash".to_string(),
+                "-c".to_string(),
+                "while true; do :; done".to_string(),
+            ],
+            Some("/bin/bash"),
+        )
+        .expect("bash inline command should parse as interpreter");
+
+        assert_eq!(parsed.entrypoint_kind, "inline");
+        assert!(parsed.suspected_entrypoint.is_none());
+        assert_eq!(
+            parsed.interpreter_options,
+            vec!["-c <inline shell omitted>"]
+        );
+    }
+
+    #[test]
+    fn interpreter_runaway_evidence_prefers_entrypoint_over_runtime() {
+        let profile = super::PerfProfileCapture {
+            data_path: PathBuf::from("/tmp/perf.data"),
+            sampled_pids: vec![123],
+            hot_paths: vec![super::PerfHotPath {
+                percent: 100.0,
+                comm: "python3".to_string(),
+                dso: "python3.13".to_string(),
+                dso_path: Some(PathBuf::from("/usr/bin/python3")),
+                package_name: Some("python3.13-minimal".to_string()),
+                symbol: "PyEval_EvalFrameDefault".to_string(),
+            }],
+        };
+        let evidence = collect_interpreter_runaway_process_evidence(
+            Some("/usr/bin/python3 /opt/app/worker.py"),
+            &[
+                "/usr/bin/python3".to_string(),
+                "/opt/app/worker.py".to_string(),
+            ],
+            Some("python3"),
+            &profile,
+            &["PyEval_EvalFrameDefault (90.00% in python3.13)".to_string()],
+            None,
+        )
+        .expect("python interpreter evidence should be collected");
+
+        assert_eq!(evidence.interpreter, "python");
+        assert_eq!(evidence.entrypoint_kind, "script");
+        assert_eq!(
+            evidence.suspected_entrypoint.as_deref(),
+            Some("/opt/app/worker.py")
+        );
+        assert_eq!(
+            evidence.runtime_package_name.as_deref(),
+            Some("python3.13-minimal")
+        );
+        assert!(
+            evidence
+                .evidence_gap
+                .contains("script/application logic or from the runtime")
+        );
     }
 
     #[test]
