@@ -3151,7 +3151,7 @@ fn build_prompt(
     let build_validation_hint = workspace_build_validation_hint(workspace);
     let upstream_style_hint = upstream_style_prompt_hint(workspace);
     format!(
-        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, keep the change upstreamable, prefer the clearest control flow available, and do not keep avoidable `goto` when a simpler structure would read better. Before introducing new file, process, allocation, locking, networking, or platform APIs, inspect nearby code and project contribution docs for existing helpers or compatibility wrappers and use those local patterns unless you can explain why they do not fit. Validate from a reproducible workspace-root entrypoint before falling back to focused leaf commands; if a build or test cannot run, report the exact command, the exact blocker, and any narrower check you ran instead. The final explanation must connect the observed issue evidence to the actual code change, not just paraphrase the diff. Write like a maintainer is going to read the patch mail cold: explain the bug in plain language, define subsystem-specific jargon the first time you need it, and make the causal story obvious. Explicitly classify evidence confidence as `reproduced`, `observed`, or `inferred`: `reproduced` means you reproduced the failure locally; `observed` means Fixer has direct crash/log/trace evidence but you did not independently reproduce it; `inferred` means the patch is based on profiler/strace/indirect signals and must be framed as a cautious mitigation, not as a proven fix. If you introduce non-obvious state translation, index remapping, or backend split logic, add a short source comment that explains the invariant being preserved.{}{}{}{}{} \n\n{}\n\n{}",
+        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, keep the change upstreamable, prefer the clearest control flow available, and do not keep avoidable `goto` when a simpler structure would read better. Before introducing new file, process, allocation, locking, networking, or platform APIs, inspect nearby code and project contribution docs for existing helpers or compatibility wrappers and use those local patterns unless you can explain why they do not fit. Validate from a reproducible workspace-root entrypoint before falling back to focused leaf commands; if a build or test cannot run, report the exact command, the exact blocker, and any narrower check you ran instead. The final explanation must connect the observed issue evidence to the actual code change, not just paraphrase the diff. Write like a maintainer is going to read the patch mail cold: explain the bug in plain language, define subsystem-specific jargon the first time you need it, and make the causal story obvious. Explicitly classify evidence confidence as `reproduced`, `observed`, or `inferred`: `reproduced` means you reproduced the failure locally; `observed` means Fixer has direct crash/log/trace evidence but you did not independently reproduce it; `inferred` means the source patch is not pull-request-ready, so do not leave a source diff unless you first gather stronger observed/reproduced evidence; otherwise return a no-patch diagnosis/report. For any source-changing `observed` patch, say explicitly in `## Issue Connection` that the failure was observed by Fixer and not independently reproduced. If you introduce non-obvious state translation, index remapping, or backend split logic, add a short source comment that explains the invariant being preserved.{}{}{}{}{} \n\n{}\n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -3184,7 +3184,7 @@ fn build_plan_prompt(
     let build_validation_hint = workspace_build_validation_hint(workspace);
     let upstream_style_hint = upstream_style_prompt_hint(workspace);
     format!(
-        "You are planning a fixer patch before any edits happen.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`.{}{}{}{}{} Inspect the relevant code, nearby callers, project contribution docs, and local helper/compat APIs, but do not edit files in this pass.\n\nReturn a short markdown plan with these exact sections:\n\n## Problem\n## Evidence Confidence\n## Proposed Subject\n## Patch Plan\n## Risks\n## Validation\n\nClassify `## Evidence Confidence` as exactly one of `reproduced`, `observed`, or `inferred`. The plan must explain how the proposed code change addresses the observed issue evidence, call out any prior Fixer patch that should be improved or replaced, reject awkward control flow such as avoidable `goto` if there is a cleaner bounded alternative, name any local helper APIs or maintainer conventions the patch should follow, and keep the intended maintainer-facing explanation clear enough that someone unfamiliar with the local complaint wording can still follow the fix. In `## Validation`, name the reproducible configure/build/test entrypoint you will try from the workspace root before any focused leaf compile or smoke check.",
+        "You are planning a fixer patch before any edits happen.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`.{}{}{}{}{} Inspect the relevant code, nearby callers, project contribution docs, and local helper/compat APIs, but do not edit files in this pass.\n\nReturn a short markdown plan with these exact sections:\n\n## Problem\n## Evidence Confidence\n## Proposed Subject\n## Patch Plan\n## Risks\n## Validation\n\nClassify `## Evidence Confidence` as exactly one of `reproduced`, `observed`, or `inferred`. Use `inferred` only for a no-patch diagnosis/report plan unless you can name the extra evidence you will collect before editing; inferred source patches are blocked by Fixer because they are not pull-request-ready. For `observed` source-patch plans, plan to say in the final `## Issue Connection` that the failure was observed by Fixer and not independently reproduced. The plan must explain how the proposed code change addresses the observed issue evidence, call out any prior Fixer patch that should be improved or replaced, reject awkward control flow such as avoidable `goto` if there is a cleaner bounded alternative, name any local helper APIs or maintainer conventions the patch should follow, and keep the intended maintainer-facing explanation clear enough that someone unfamiliar with the local complaint wording can still follow the fix. In `## Validation`, name the reproducible configure/build/test entrypoint you will try from the workspace root before any focused leaf compile or smoke check.",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -3456,6 +3456,7 @@ fn evidence_confidence_quality_failure(response: &str, issue_connection: &str) -
     }
 
     let issue_lower = issue_connection.to_ascii_lowercase();
+    let has_source_changes = response_lists_source_changes(response);
     if confidence == "reproduced" {
         let reproduced_markers = [
             "reproduced",
@@ -3488,13 +3489,31 @@ fn evidence_confidence_quality_failure(response: &str, issue_connection: &str) -
         {
             return Some("Observed-only patches must not imply an independently reproduced failure. Say explicitly that the failure was observed by Fixer and not independently reproduced, or provide the reproduced command/test and use `reproduced`.".to_string());
         }
+        if has_source_changes && !issue_lower.contains("not independently reproduced") {
+            return Some("Observed source patches must say explicitly that the failure was observed by Fixer and not independently reproduced, or provide the reproduced command/test and use `reproduced`.".to_string());
+        }
     }
 
-    if confidence == "inferred" {
+    if confidence == "inferred" && has_source_changes {
         return Some("`## Evidence Confidence` is `inferred`, so Fixer must not mark this source-changing patch as pull-request-ready. Convert it into a diagnosis/report or gather direct observed/reproduced evidence first.".to_string());
     }
 
     None
+}
+
+fn response_lists_source_changes(response: &str) -> bool {
+    extract_git_add_paths_from_response(response)
+        .into_iter()
+        .map(|path| {
+            path.trim()
+                .trim_matches('`')
+                .trim_start_matches("- ")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .any(|path| {
+            !path.is_empty() && !matches!(path.as_str(), "none" | "(none)" | "no changes" | "n/a")
+        })
 }
 
 fn desktop_input_config_semantic_failure(
@@ -4043,7 +4062,7 @@ fn build_refinement_prompt(
 }
 
 fn patch_response_contract() -> &'static str {
-    "In every authoring pass, your final response must start with `Subject: <single-line git commit subject>` and then include these markdown sections exactly:\n\n## Commit Message\nA short upstream-friendly explanation of what changed and why. Write it in plain language that a maintainer can follow without local complaint context. If you use subsystem jargon, define it immediately.\n\n## Evidence Confidence\nExactly one word: `reproduced`, `observed`, or `inferred`. Use `reproduced` only when you reproduced the failure locally with a command or test. Use `observed` when Fixer has direct crash/log/trace evidence but you did not independently reproduce it. Use `inferred` for profiler/strace/indirect evidence; inferred source patches are not pull-request-ready until stronger evidence is gathered.\n\n## Issue Connection\nWrite this as maintainer-facing patch mail, not as local Fixer notes. Cover four things explicitly in readable sentences: the user-visible symptom or the exact collected signal, the code-level cause or the cautious inference from evidence, the specific change you made, and the expected effect. Do not invent a reproducer, command line, crash, or user-visible failure that is not present in the evidence bundle. If the evidence is direct-but-not-reproduced, say it was observed by Fixer and not independently reproduced. If the evidence is indirect, say it is a plausible targeted mitigation rather than a proven root cause. Include an explicit effect sentence such as `The expected effect is ...`, `This should reduce ...`, or `This prevents ...`. If the logic is non-obvious in code, mention that you added a short explanatory comment.\n\n## Git Add Paths\nList the repo-relative paths that belong in the final patch, one per line. Include intentionally new files, and do not list generated build artifacts.\n\n## Validation\nList the checks you ran, or say clearly that you could not run them."
+    "In every authoring pass, your final response must start with `Subject: <single-line git commit subject>` and then include these markdown sections exactly:\n\n## Commit Message\nA short upstream-friendly explanation of what changed and why. Write it in plain language that a maintainer can follow without local complaint context. If you use subsystem jargon, define it immediately.\n\n## Evidence Confidence\nExactly one word: `reproduced`, `observed`, or `inferred`. Use `reproduced` only when you reproduced the failure locally with a command or test. Use `observed` when Fixer has direct crash/log/trace evidence but you did not independently reproduce it. If `## Git Add Paths` lists source files for an `observed` patch, `## Issue Connection` must explicitly say the failure was observed by Fixer and not independently reproduced. Use `inferred` for profiler/strace/indirect evidence; inferred responses may be no-patch diagnoses or reports, but inferred source patches are not pull-request-ready until stronger evidence is gathered.\n\n## Issue Connection\nWrite this as maintainer-facing patch mail, not as local Fixer notes. Cover four things explicitly in readable sentences: the user-visible symptom or the exact collected signal, the code-level cause or the cautious inference from evidence, the specific change you made, and the expected effect. Do not invent a reproducer, command line, crash, or user-visible failure that is not present in the evidence bundle. If the evidence is direct-but-not-reproduced, say it was observed by Fixer and not independently reproduced. If the evidence is indirect and you did not gather stronger evidence, do not leave a source diff; write a no-patch diagnosis/report instead. Include an explicit effect sentence such as `The expected effect is ...`, `This should reduce ...`, or `This prevents ...` for source patches. If the logic is non-obvious in code, mention that you added a short explanatory comment.\n\n## Git Add Paths\nList the repo-relative paths that belong in the final patch, one per line. Use `None` only when you intentionally made no source changes. Include intentionally new files, and do not list generated build artifacts.\n\n## Validation\nList the checks you ran, or say clearly that you could not run them."
 }
 
 fn render_external_bug_report(
@@ -9299,10 +9318,19 @@ Ran `./Configure -des -Dusedevel && make -j2`.
         );
 
         assert!(plan_prompt.contains("Do not invent a reproducer"));
+        assert!(plan_prompt.contains("inferred source patches are blocked"));
         assert!(plan_prompt.contains("## Evidence Confidence"));
         assert!(review_prompt.contains("Reject patches that invent a reproducer"));
         assert!(review_prompt.contains("sound more certain than that evidence level allows"));
         assert!(super::patch_response_contract().contains("Do not invent a reproducer"));
+        assert!(
+            super::patch_response_contract()
+                .contains("inferred source patches are not pull-request-ready")
+        );
+        assert!(
+            super::patch_response_contract()
+                .contains("observed by Fixer and not independently reproduced")
+        );
         assert!(super::patch_response_contract().contains("## Evidence Confidence"));
     }
 
@@ -9422,7 +9450,7 @@ Preserve the logical layout order across the XKB loop mutation.
 observed
 
 ## Issue Connection
-Users reported that layout switching picked the wrong slot after a spare-layout change. The patch updates the runtime XKB list and the logical layout path so the issue is fixed.
+Users reported that layout switching picked the wrong slot after a spare-layout change, and the failure was observed by Fixer and not independently reproduced. The patch updates the runtime XKB list and the logical layout path so the issue is fixed.
 
 ## Git Add Paths
 kcms/keyboard/keyboard_daemon.cpp
@@ -9449,7 +9477,7 @@ Keep Plasma's public layout order aligned with the order saved in its keyboard s
 observed
 
 ## Issue Connection
-Users reported that a spare layout could confuse direct layout selection and the last-used-layout shortcut, and Fixer observed matching keyboard layout configuration evidence. The bug was that Plasma leaked a temporary live reordering back into the public layout order seen by the applet and shortcuts. This patch keeps the public order in the configured order and stores the previous layout before rebuilding the live list, so the spare-layout path still works without changing what each slot means to the rest of the UI.
+Users reported that a spare layout could confuse direct layout selection and the last-used-layout shortcut, and Fixer observed matching keyboard layout configuration evidence; the failure was observed by Fixer and not independently reproduced. The bug was that Plasma leaked a temporary live reordering back into the public layout order seen by the applet and shortcuts. This patch keeps the public order in the configured order and stores the previous layout before rebuilding the live list, so the spare-layout path still works without changing what each slot means to the rest of the UI.
 
 ## Git Add Paths
 kcms/keyboard/keyboard_daemon.cpp
@@ -9533,6 +9561,54 @@ Ran focused subprocess tests.
         let error = super::patch_explanation_quality_failure(response, None).unwrap();
 
         assert!(error.contains("must not mark"));
+    }
+
+    #[test]
+    fn patch_explanation_quality_guard_accepts_inferred_no_patch_diagnosis() {
+        let response = r#"Subject: No patch for idle postmaster wait
+
+## Commit Message
+No source change was made because the collected signal points at an idle wait path.
+
+## Evidence Confidence
+inferred
+
+## Issue Connection
+The profiler signal suggests a wait-loop sample, but the bundle does not contain direct evidence of a user-visible failure. This is a no-patch diagnosis rather than a source patch, so the expected effect is avoiding a speculative change until stronger evidence is gathered.
+
+## Git Add Paths
+None
+
+## Validation
+Ran configure and build checks.
+"#;
+
+        assert!(super::patch_explanation_quality_failure(response, None).is_none());
+    }
+
+    #[test]
+    fn patch_explanation_quality_guard_requires_observed_patch_reproduction_caveat() {
+        let response = r#"Subject: server: throttle cron RSS sampling
+
+## Commit Message
+Reduce periodic RSS sampling during idle cron ticks.
+
+## Evidence Confidence
+observed
+
+## Issue Connection
+Fixer observed a Redis trace repeatedly opening `/proc/self/stat`. This patch throttles the cron sampling path, so the expected effect is fewer idle proc reads.
+
+## Git Add Paths
+src/server.c
+
+## Validation
+Ran make.
+"#;
+
+        let error = super::patch_explanation_quality_failure(response, None).unwrap();
+
+        assert!(error.contains("not independently reproduced"));
     }
 
     #[test]
