@@ -289,6 +289,12 @@ code, pre {
     font-size: 0.94rem;
 }
 
+.outcome-zero-summary {
+    margin: 0.85rem 0 0;
+    color: var(--muted);
+    font-size: 0.92rem;
+}
+
 .snapshot-foot {
     margin-top: 1rem;
     padding-top: 0.95rem;
@@ -12532,36 +12538,51 @@ fn render_attempt_summary_section(issue: &PublicIssueDetail) -> String {
             issue.id
         )
     };
+    let outcome_counts = [
+        ("ready patch attempts", summary.ready_patch_count),
+        ("ready triage handoffs", summary.ready_triage_count),
+        ("diagnosis-only reports", summary.ready_report_count),
+        ("failed patch attempts", summary.failed_patch_count),
+        (
+            "explained impossible attempts",
+            summary.explained_impossible_count,
+        ),
+        ("other attempt states", summary.other_attempt_count),
+    ];
+    let outcome_cards = outcome_counts
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(label, count)| {
+            format!(
+                r#"<div class="snapshot-stat">
+                    <strong>{count}</strong>
+                    <span>{label}</span>
+                </div>"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let zero_outcomes = outcome_counts
+        .iter()
+        .filter(|(_, count)| *count == 0)
+        .map(|(label, _)| *label)
+        .collect::<Vec<_>>();
+    let zero_summary = if zero_outcomes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="outcome-zero-summary">No {}.</p>"#,
+            html_escape(&join_human_list(&zero_outcomes))
+        )
+    };
     format!(
         r#"<section class="panel section">
             <h2>Worker outcome summary</h2>
             <p class="section-intro">This issue has {total} recorded worker attempt{plural}. Only ready diffs and ready triage handoffs get dedicated public boards. Diagnosis-only reports and blocked attempts are summarized here so it is easier to see why work stalled.</p>
             <div class="snapshot-grid">
-                <div class="snapshot-stat">
-                    <strong>{ready_patch}</strong>
-                    <span>ready patch attempts</span>
-                </div>
-                <div class="snapshot-stat">
-                    <strong>{ready_triage}</strong>
-                    <span>ready triage handoffs</span>
-                </div>
-                <div class="snapshot-stat">
-                    <strong>{ready_report}</strong>
-                    <span>diagnosis-only reports</span>
-                </div>
-                <div class="snapshot-stat">
-                    <strong>{failed_patch}</strong>
-                    <span>failed patch attempts</span>
-                </div>
-                <div class="snapshot-stat">
-                    <strong>{explained_impossible}</strong>
-                    <span>explained impossible attempts</span>
-                </div>
-                <div class="snapshot-stat">
-                    <strong>{other}</strong>
-                    <span>other attempt states</span>
-                </div>
+                {outcome_cards}
             </div>
+            {zero_summary}
             {blocker_markup}
             {omitted_note}
         </section>"#,
@@ -12571,15 +12592,24 @@ fn render_attempt_summary_section(issue: &PublicIssueDetail) -> String {
         } else {
             "s"
         },
-        ready_patch = summary.ready_patch_count,
-        ready_triage = summary.ready_triage_count,
-        ready_report = summary.ready_report_count,
-        failed_patch = summary.failed_patch_count,
-        explained_impossible = summary.explained_impossible_count,
-        other = summary.other_attempt_count,
+        outcome_cards = outcome_cards,
+        zero_summary = zero_summary,
         blocker_markup = blocker_markup,
         omitted_note = omitted_note,
     )
+}
+
+fn join_human_list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [first, second] => format!("{first} or {second}"),
+        _ => {
+            let last = items[items.len() - 1];
+            let head = items[..items.len() - 1].join(", ");
+            format!("{head}, or {last}")
+        }
+    }
 }
 
 fn render_best_result_panel(issue: &PublicIssueDetail) -> String {
@@ -15320,6 +15350,48 @@ mod tests {
         assert!(markup.contains("Commit message."));
         assert!(markup.contains("How this patch connects to the issue."));
         assert!(markup.contains("Avoid the retry loop on missing files."));
+    }
+
+    #[test]
+    fn render_attempt_summary_section_collapses_zero_outcomes() {
+        let issue = PublicIssueDetail {
+            id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for sshd-session".to_string(),
+            summary: "sshd-session had a ready patch attempt.".to_string(),
+            package_name: Some("openssh-server".to_string()),
+            source_package: Some("openssh".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 106,
+            corroboration_count: 1,
+            best_patch_available: true,
+            best_triage_available: false,
+            best_patch_diff_url: None,
+            best_patch: None,
+            best_triage: None,
+            best_triage_handoff: None,
+            last_seen: "2026-03-29T00:00:00Z".to_string(),
+            technical_snapshot: None,
+            possible_duplicates: Vec::new(),
+            attempt_summary: PublicAttemptSummary {
+                total_attempt_count: 1,
+                ready_patch_count: 1,
+                ..PublicAttemptSummary::default()
+            },
+            attempts_omitted_count: 0,
+            attempts: Vec::new(),
+            showing_all_attempts: false,
+        };
+
+        let markup = render_attempt_summary_section(&issue);
+
+        assert!(markup.contains("<strong>1</strong>"));
+        assert!(markup.contains("<span>ready patch attempts</span>"));
+        assert!(!markup.contains("<strong>0</strong>"));
+        assert!(markup.contains("outcome-zero-summary"));
+        assert!(markup.contains("No ready triage handoffs"));
+        assert!(markup.contains("other attempt states"));
     }
 
     #[test]
