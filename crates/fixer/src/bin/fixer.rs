@@ -191,7 +191,13 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let app = App::load(cli.config.as_deref())?;
+    let app = App::load(cli.config.as_deref()).map_err(|error| {
+        if is_permission_or_readonly_error(&error) {
+            permission_denied_cli_error(error, cli.config.as_deref(), env::args().collect())
+        } else {
+            error
+        }
+    })?;
 
     match cli.command {
         Commands::Collect => {
@@ -562,6 +568,67 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn permission_denied_cli_error(
+    error: anyhow::Error,
+    config_path: Option<&std::path::Path>,
+    args: Vec<String>,
+) -> anyhow::Error {
+    let database_path = FixerConfig::load(config_path)
+        .ok()
+        .map(|config| config.service.database_path)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/fixer/fixer.sqlite3"));
+    let command = sudo_command_hint(&args);
+    let use_color = io::stderr().is_terminal();
+    let message = format!(
+        "{}\n\n{}\n{}\n\n{} {}\n\n{}",
+        colorize("Fixer cannot open its service database.", "1;31", use_color),
+        format!("Database: `{}`", database_path.display()),
+        "That path belongs to the root-owned Fixer daemon state, so an unprivileged CLI cannot update proposals or worker metadata there.",
+        colorize("Try:", "1;36", use_color),
+        colorize(&command, "1;36", use_color),
+        "For local-only work, use a config whose database_path and state_dir are writable by your user."
+    );
+    error.context(message)
+}
+
+fn sudo_command_hint(args: &[String]) -> String {
+    let mut command = Vec::with_capacity(args.len() + 1);
+    command.push("sudo".to_string());
+    if let Some(program) = args.first() {
+        let program_name = std::path::Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("fixer");
+        command.push(program_name.to_string());
+    } else {
+        command.push("fixer".to_string());
+    }
+    command.extend(args.iter().skip(1).cloned());
+    command
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':' | '='))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn colorize(text: &str, code: &str, use_color: bool) -> String {
+    if use_color {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
 fn print_lease_status(status: &fixer::models::CodexAuthLeaseStatus) {
     println!("ready: {}", status.ready);
     if let Some(lease) = &status.lease {
@@ -719,7 +786,7 @@ fn print_findings(items: Vec<FindingRecord>) {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_complaint_text;
+    use super::{colorize, normalize_complaint_text, shell_quote, sudo_command_hint};
 
     #[test]
     fn complaint_normalization_drops_comment_lines() {
@@ -731,5 +798,37 @@ mod tests {
     fn complaint_normalization_trims_outer_whitespace() {
         let raw = "\n  first line  \nsecond line\t\n\n";
         assert_eq!(normalize_complaint_text(raw), "first line\nsecond line");
+    }
+
+    #[test]
+    fn sudo_hint_preserves_cli_arguments() {
+        let args = vec![
+            "/usr/bin/fixer".to_string(),
+            "--config".to_string(),
+            "/etc/fixer/fixer.toml".to_string(),
+            "propose-fix".to_string(),
+            "88863".to_string(),
+            "--engine".to_string(),
+            "codex".to_string(),
+            "--force".to_string(),
+        ];
+
+        assert_eq!(
+            sudo_command_hint(&args),
+            "sudo fixer --config /etc/fixer/fixer.toml propose-fix 88863 --engine codex --force"
+        );
+    }
+
+    #[test]
+    fn shell_quote_handles_spaces_and_quotes() {
+        assert_eq!(shell_quote("plain/path"), "plain/path");
+        assert_eq!(shell_quote("two words"), "'two words'");
+        assert_eq!(shell_quote("don't"), "'don'\"'\"'t'");
+    }
+
+    #[test]
+    fn colorize_is_optional() {
+        assert_eq!(colorize("Fixer", "1;31", false), "Fixer");
+        assert_eq!(colorize("Fixer", "1;31", true), "\x1b[1;31mFixer\x1b[0m");
     }
 }
