@@ -77,6 +77,15 @@ Typical setup:
 `grant` stores only lease metadata and budget state. It does not copy the
 user's auth into `/root` or into the root service environment.
 
+For unattended machine workers, set `patch.auth_mode = "service-key"` and point
+`patch.codex_home` at a writable state directory such as:
+
+  /var/lib/fixer/codex
+
+Do not put the service-key Codex home under `/etc/fixer`: the packaged service
+uses `ProtectSystem=full`, and Codex needs to write session and app-server state
+under `CODEX_HOME`.
+
 Autonomous worker jobs run in isolated per-job workspace snapshots under:
 
   /var/lib/fixer/proposals/...

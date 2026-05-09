@@ -181,12 +181,14 @@ human lease:
 ```toml
 [patch]
 auth_mode = "service-key"
-codex_home = "/etc/fixer/codex"
+codex_home = "/var/lib/fixer/codex"
 ```
 
 `codex_home` must contain a Codex `config.toml`; Fixer passes it to Codex as
 `CODEX_HOME`, so the service can use a machine-scoped API key without copying a
-person's `~/.codex` login into root.
+person's `~/.codex` login into root. Keep this directory writable by the
+service because Codex stores session and app-server state under `CODEX_HOME`;
+`/etc/fixer` is only for static configuration and token files.
 
 Worker jobs run in isolated per-job workspace snapshots under `/var/lib/fixer/proposals/...`. The goal is not perfect sandboxing yet, but a much more supervised path than “run Codex as root and hope for the best.”
 

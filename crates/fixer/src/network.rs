@@ -62,6 +62,8 @@ const MAX_LOCAL_WORKER_BLOCKERS: usize = 64;
 const MAX_CLIENT_SUBMISSION_BUNDLE_BYTES: usize = 384 * 1024;
 const SUBMITTED_WORKER_RESULT_MARKER: &str = "submitted-worker-result.json";
 const UNRECOVERABLE_WORKER_RESULT_MARKER: &str = "unrecoverable-worker-result.json";
+const OPPORTUNISTIC_DENIED_UNTIL_KEY: &str = "opportunistic_admission_denied_until";
+const DEFAULT_OPPORTUNISTIC_RETRY_AFTER_SECONDS: i64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalWorkerBlocker {
@@ -76,6 +78,12 @@ struct LocalWorkerBlocker {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct LocalWorkerBlockerHistory {
     entries: Vec<LocalWorkerBlocker>,
+}
+
+#[derive(Debug, Clone)]
+struct OpportunisticAdmissionClosed {
+    reason: String,
+    retry_after_seconds: i64,
 }
 
 pub fn bootstrap_codex_auth_user(
@@ -269,6 +277,14 @@ fn codex_service_home_status(config: &FixerConfig) -> Result<()> {
             codex_home.display()
         ));
     }
+    let probe_path = codex_home.join(".fixer-write-test");
+    fs::write(&probe_path, b"ok").with_context(|| {
+        format!(
+            "patch.codex_home `{}` is not writable; service-key Codex needs a state directory, not read-only /etc config",
+            codex_home.display()
+        )
+    })?;
+    let _ = fs::remove_file(probe_path);
     Ok(())
 }
 
@@ -977,7 +993,6 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
             })
         ));
     }
-
     let hello_request =
         build_client_hello(store, config, &participation.identity, &participation.state)?;
     let hello = post_json::<_, ServerHello>(config, "v1/install/hello", &hello_request)?;
@@ -1017,6 +1032,31 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
             }
             Err(error) => return Err(error),
         }
+    }
+    if let Some(denied_until) = opportunistic_denied_until(store)? {
+        if denied_until > Utc::now() {
+            return Ok(WorkerRunOutcome {
+                hello,
+                offer: WorkOffer {
+                    message: format!(
+                        "opportunistic Codex burn window is closed until {}",
+                        denied_until.to_rfc3339()
+                    ),
+                    lease: None,
+                },
+                result: None,
+            });
+        }
+    }
+    if let Some(denial) = opportunistic_admission_denial(store, config)? {
+        return Ok(WorkerRunOutcome {
+            hello,
+            offer: WorkOffer {
+                message: denial.reason,
+                lease: None,
+            },
+            result: None,
+        });
     }
 
     let work_payload_hash = hash_text(serde_json::to_vec(&hello_request)?);
@@ -2276,6 +2316,121 @@ fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
         .with_context(|| format!("failed to parse {path} response"))
 }
 
+fn opportunistic_denied_until(store: &Store) -> Result<Option<DateTime<Utc>>> {
+    let Some(raw) = store.get_local_state::<String>(OPPORTUNISTIC_DENIED_UNTIL_KEY)? else {
+        return Ok(None);
+    };
+    Ok(DateTime::parse_from_rfc3339(&raw)
+        .map(|value| value.with_timezone(&Utc))
+        .ok())
+}
+
+fn remember_opportunistic_denial(
+    store: &Store,
+    denial: &OpportunisticAdmissionClosed,
+) -> Result<DateTime<Utc>> {
+    let retry_after = denial.retry_after_seconds.max(1);
+    let denied_until = Utc::now() + ChronoDuration::seconds(retry_after);
+    store.set_local_state(OPPORTUNISTIC_DENIED_UNTIL_KEY, &denied_until.to_rfc3339())?;
+    Ok(denied_until)
+}
+
+fn opportunistic_admission_denial(
+    store: &Store,
+    config: &FixerConfig,
+) -> Result<Option<OpportunisticAdmissionClosed>> {
+    if !config.patch.opportunistic_worker {
+        return Ok(None);
+    }
+    let token_file = config
+        .patch
+        .opportunistic_admission_token_file
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow!("opportunistic worker requires patch.opportunistic_admission_token_file")
+        })?;
+    let token = read_text(token_file)
+        .with_context(|| format!("failed to read {}", token_file.display()))?
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        return Err(anyhow!(
+            "opportunistic admission token file {} is empty",
+            token_file.display()
+        ));
+    }
+    let url = Url::parse(&config.patch.opportunistic_admission_url).with_context(|| {
+        format!(
+            "invalid opportunistic admission URL {}",
+            config.patch.opportunistic_admission_url
+        )
+    })?;
+    let response = http_client(config)?
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .context("failed to request opportunistic Codex admission")?;
+    if response.status().is_success() {
+        store.clear_local_state(OPPORTUNISTIC_DENIED_UNTIL_KEY)?;
+        return Ok(None);
+    }
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after_seconds = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after_seconds)
+            .unwrap_or(DEFAULT_OPPORTUNISTIC_RETRY_AFTER_SECONDS);
+        let body = response.text().unwrap_or_default();
+        let reason = extract_openai_error_message(&body)
+            .unwrap_or_else(|| "opportunistic burn window closed".to_string());
+        let denial = OpportunisticAdmissionClosed {
+            reason,
+            retry_after_seconds,
+        };
+        let denied_until = remember_opportunistic_denial(store, &denial)?;
+        return Ok(Some(OpportunisticAdmissionClosed {
+            reason: format!(
+                "{}; retry after {}",
+                denial.reason,
+                denied_until.to_rfc3339()
+            ),
+            retry_after_seconds,
+        }));
+    }
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    Err(HttpStatusError {
+        path: config.patch.opportunistic_admission_url.clone(),
+        status,
+        body,
+    }
+    .into())
+}
+
+fn parse_retry_after_seconds(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    if let Ok(seconds) = trimmed.parse::<i64>() {
+        return Some(seconds.max(1));
+    }
+    DateTime::parse_from_rfc2822(trimmed).ok().map(|target| {
+        (target.with_timezone(&Utc) - Utc::now())
+            .num_seconds()
+            .max(1)
+    })
+}
+
+fn extract_openai_error_message(body: &str) -> Option<String> {
+    let payload: Value = serde_json::from_str(body).ok()?;
+    payload
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(ToString::to_string)
+}
+
 #[derive(Debug)]
 struct HttpStatusError {
     path: String,
@@ -3305,6 +3460,22 @@ mod tests {
     }
 
     #[test]
+    fn opportunistic_retry_after_parses_seconds() {
+        assert_eq!(parse_retry_after_seconds("45"), Some(45));
+        assert_eq!(parse_retry_after_seconds("0"), Some(1));
+    }
+
+    #[test]
+    fn opportunistic_denial_extracts_openai_error_message() {
+        let body = r#"{"error":{"code":"rate_limit_exceeded","message":"opportunistic burn window closed: preserve floor"}}"#;
+
+        assert_eq!(
+            extract_openai_error_message(body).as_deref(),
+            Some("opportunistic burn window closed: preserve floor")
+        );
+    }
+
+    #[test]
     fn weak_unknown_runaway_process_investigation_prefers_report_only() {
         let mut opportunity = OpportunityRecord {
             id: 1,
@@ -3438,6 +3609,39 @@ mod tests {
 
         let hello = build_client_hello(&store, &config, &identity, &state).unwrap();
         assert!(hello.has_codex);
+    }
+
+    #[test]
+    fn build_client_hello_hides_service_key_codex_with_readonly_home() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        store
+            .sync_capabilities(&[sample_codex_capability()])
+            .unwrap();
+
+        let codex_home = dir.path().join("codex-home");
+        fs::create_dir(&codex_home).unwrap();
+        fs::write(codex_home.join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
+        let mut permissions = fs::metadata(&codex_home).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&codex_home, permissions).unwrap();
+
+        let mut config = FixerConfig::default();
+        config.patch.auth_mode = CodexAuthMode::ServiceKey;
+        config.patch.codex_home = Some(codex_home.clone());
+        config.patch.codex_command = "sh".to_string();
+        let identity = store.ensure_install_identity().unwrap();
+        let state = ParticipationState {
+            mode: ParticipationMode::SubmitterWorker,
+            ..ParticipationState::default()
+        };
+
+        let hello = build_client_hello(&store, &config, &identity, &state).unwrap();
+        assert!(!hello.has_codex);
+
+        let mut permissions = fs::metadata(&codex_home).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&codex_home, permissions).unwrap();
     }
 
     #[test]

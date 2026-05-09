@@ -29,6 +29,9 @@ review_after_patch = true
 review_fix_passes = 1
 spark_fallback_on_rate_limit = false
 rate_limit_cooldown_seconds = 21600
+opportunistic_worker = false
+opportunistic_admission_url = "http://127.0.0.1:2455/backend-api/codex/opportunistic/admission"
+# opportunistic_admission_token_file = "/etc/fixer/codex-lb.key"
 # For full multi-step repairs, prefer normal Codex with planning.
 # Set spark_model only when the configured Codex token is allowed to use it.
 

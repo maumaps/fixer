@@ -122,6 +122,12 @@ pub struct PatchConfig {
     #[serde(default = "default_rate_limit_cooldown")]
     pub rate_limit_cooldown_seconds: u64,
     #[serde(default)]
+    pub opportunistic_worker: bool,
+    #[serde(default = "default_opportunistic_admission_url")]
+    pub opportunistic_admission_url: String,
+    #[serde(default)]
+    pub opportunistic_admission_token_file: Option<PathBuf>,
+    #[serde(default)]
     pub auth_mode: CodexAuthMode,
     #[serde(default = "default_lease_budget_preset")]
     pub lease_budget_preset: LeaseBudgetPreset,
@@ -295,6 +301,9 @@ impl Default for PatchConfig {
             spark_fallback_on_rate_limit: false,
             spark_weekly_headroom_threshold: default_spark_weekly_headroom_threshold(),
             rate_limit_cooldown_seconds: default_rate_limit_cooldown(),
+            opportunistic_worker: false,
+            opportunistic_admission_url: default_opportunistic_admission_url(),
+            opportunistic_admission_token_file: None,
             auth_mode: CodexAuthMode::UserLease,
             lease_budget_preset: default_lease_budget_preset(),
             lease_default_ttl_seconds: default_lease_default_ttl(),
@@ -539,6 +548,10 @@ fn default_spark_model() -> Option<String> {
 
 fn default_rate_limit_cooldown() -> u64 {
     6 * 60 * 60
+}
+
+fn default_opportunistic_admission_url() -> String {
+    "http://127.0.0.1:2455/backend-api/codex/opportunistic/admission".to_string()
 }
 
 fn default_lease_failure_pause_threshold() -> u32 {

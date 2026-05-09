@@ -492,6 +492,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         .with_context(|| format!("failed to read {}", job.prompt_path.display()))?;
     let source_workspace_root = source_workspace_root_from_bundle(&job.bundle_dir);
     let evidence_path = job.bundle_dir.join("evidence.json");
+    let mut codex_resume_state = CodexResumeState::new(job.bundle_dir.join("codex-session-id.txt"));
     let mut transcripts = Vec::new();
     let mut logs = Vec::new();
     let mut patch_prompt = base_patch_prompt.clone();
@@ -517,6 +518,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
             "Plan Pass",
             &plan_prompt,
             job.subsystem.as_deref(),
+            Some(&mut codex_resume_state),
         )?;
         logs.push(render_stage_log(&plan_stage));
         models_used.extend(plan_stage.models_used.clone());
@@ -575,6 +577,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         "Patch Pass",
         &patch_prompt,
         job.subsystem.as_deref(),
+        Some(&mut codex_resume_state),
     )?;
     logs.push(render_stage_log(&initial_patch_stage));
     models_used.extend(initial_patch_stage.models_used.clone());
@@ -596,6 +599,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
             "Patch Pass Retry 1",
             &retry_prompt,
             job.subsystem.as_deref(),
+            Some(&mut codex_resume_state),
         )?;
         logs.push(render_stage_log(&retry_stage));
         models_used.extend(retry_stage.models_used.clone());
@@ -711,6 +715,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                     &refine_label,
                     &refine_prompt,
                     job.subsystem.as_deref(),
+                    Some(&mut codex_resume_state),
                 )?;
                 logs.push(render_stage_log(&refine_stage));
                 models_used.extend(refine_stage.models_used.clone());
@@ -753,6 +758,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                 &review_label,
                 &review_prompt,
                 job.subsystem.as_deref(),
+                Some(&mut codex_resume_state),
             )?;
             logs.push(render_stage_log(&review_stage));
             models_used.extend(review_stage.models_used.clone());
@@ -821,6 +827,7 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                         &refine_label,
                         &refine_prompt,
                         job.subsystem.as_deref(),
+                        Some(&mut codex_resume_state),
                     )?;
                     logs.push(render_stage_log(&refine_stage));
                     models_used.extend(refine_stage.models_used.clone());
@@ -1969,6 +1976,7 @@ struct CodexProcessOutcome {
     stderr: String,
     model_used: Option<String>,
     exit_status: Option<i32>,
+    session_id: Option<String>,
 }
 
 struct CodexStageOutcome {
@@ -1988,6 +1996,41 @@ struct CodexStageTranscript {
     label: String,
     prompt: String,
     response: String,
+}
+
+#[derive(Debug, Clone)]
+struct CodexResumeState {
+    path: PathBuf,
+    session_id: Option<String>,
+}
+
+impl CodexResumeState {
+    fn new(path: PathBuf) -> Self {
+        let session_id = fs::read_to_string(&path)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        Self { path, session_id }
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    fn remember_from_outcome(&mut self, outcome: &CodexProcessOutcome) -> Result<()> {
+        let Some(session_id) = outcome.session_id.as_deref() else {
+            return Ok(());
+        };
+        if self.session_id.as_deref() == Some(session_id) {
+            return Ok(());
+        }
+        self.session_id = Some(session_id.to_string());
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&self.path, format!("{session_id}\n"))?;
+        Ok(())
+    }
 }
 
 enum CodexReviewVerdict {
@@ -2223,12 +2266,14 @@ fn run_codex_stage(
     label: impl Into<String>,
     prompt: &str,
     subsystem: Option<&str>,
+    codex_resume_state: Option<&mut CodexResumeState>,
 ) -> Result<CodexStageOutcome> {
     let label = label.into();
     fs::write(prompt_path, prompt.as_bytes())?;
     let mut models_used = Vec::new();
     let mut logs = Vec::new();
     let initial_model = initial_stage_model(config, subsystem);
+    let mut codex_resume_state = codex_resume_state;
     let mut outcome = run_driver_process(
         config,
         repo_root,
@@ -2237,7 +2282,11 @@ fn run_codex_stage(
         prompt,
         subsystem,
         initial_model.as_deref(),
+        codex_resume_state.as_deref(),
     )?;
+    if let Some(state) = codex_resume_state.as_deref_mut() {
+        state.remember_from_outcome(&outcome)?;
+    }
     if let Some(model) = outcome.model_used.clone() {
         models_used.push(model);
     }
@@ -2280,7 +2329,11 @@ fn run_codex_stage(
                 prompt,
                 subsystem,
                 Some(&spark_model),
+                codex_resume_state.as_deref(),
             )?;
+            if let Some(state) = codex_resume_state.as_deref_mut() {
+                state.remember_from_outcome(&retry_outcome)?;
+            }
             if let Some(model) = retry_outcome.model_used.clone() {
                 models_used.push(model);
             }
@@ -2411,6 +2464,7 @@ fn run_codex_process(
     prompt: &str,
     subsystem: Option<&str>,
     model: Option<&str>,
+    resume_state: Option<&CodexResumeState>,
 ) -> Result<CodexProcessOutcome> {
     if !command_exists(&config.patch.codex_command) {
         return Err(anyhow!(
@@ -2437,6 +2491,9 @@ fn run_codex_process(
     }
     cmd.arg("exec");
     cmd.arg("--skip-git-repo-check");
+    if !config.patch.codex_args.iter().any(|arg| arg == "--json") {
+        cmd.arg("--json");
+    }
     if let Some(model) = model {
         cmd.arg("-m").arg(model);
     }
@@ -2451,6 +2508,9 @@ fn run_codex_process(
     cmd.arg("-C").arg(&repo_root).arg("-o").arg(output_path);
     for arg in &config.patch.codex_args {
         cmd.arg(arg);
+    }
+    if let Some(session_id) = resume_state.and_then(CodexResumeState::session_id) {
+        cmd.arg("resume").arg(session_id);
     }
     cmd.arg("-")
         .stdin(Stdio::piped())
@@ -2479,6 +2539,7 @@ fn run_codex_process(
     }
     Ok(CodexProcessOutcome {
         success: output.status.success(),
+        session_id: extract_codex_session_id_from_log(&log),
         log,
         stderr,
         model_used: Some(
@@ -2498,11 +2559,18 @@ fn run_driver_process(
     prompt: &str,
     subsystem: Option<&str>,
     model: Option<&str>,
+    codex_resume_state: Option<&CodexResumeState>,
 ) -> Result<CodexProcessOutcome> {
     match config.patch.driver {
-        PatchDriver::Codex => {
-            run_codex_process(config, repo_root, output_path, prompt, subsystem, model)
-        }
+        PatchDriver::Codex => run_codex_process(
+            config,
+            repo_root,
+            output_path,
+            prompt,
+            subsystem,
+            model,
+            codex_resume_state,
+        ),
         PatchDriver::Claude => run_claude_process(config, repo_root, output_path, prompt, model),
         PatchDriver::Gemini => run_gemini_process(config, repo_root, output_path, prompt, model),
         PatchDriver::Aider => run_aider_process(config, repo_root, prompt_path, output_path, model),
@@ -2563,6 +2631,7 @@ fn run_claude_process(
         stderr,
         model_used: Some(model_used),
         exit_status: output.status.code(),
+        session_id: None,
     })
 }
 
@@ -2614,6 +2683,7 @@ fn run_gemini_process(
         stderr,
         model_used: Some(model_used),
         exit_status: output.status.code(),
+        session_id: None,
     })
 }
 
@@ -2663,7 +2733,54 @@ fn run_aider_process(
         stderr,
         model_used: Some(model_used),
         exit_status: output.status.code(),
+        session_id: None,
     })
+}
+
+fn extract_codex_session_id_from_log(log: &str) -> Option<String> {
+    for line in log.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(session_id) = find_codex_session_id(&value) {
+            return Some(session_id);
+        }
+    }
+    None
+}
+
+fn find_codex_session_id(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in ["session_id", "sessionId", "conversation_id", "thread_id"] {
+                if let Some(session_id) = map
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    return Some(session_id.to_string());
+                }
+            }
+            for (key, nested) in map {
+                if key.to_ascii_lowercase().contains("session") {
+                    if let Some(session_id) = nested
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        return Some(session_id.to_string());
+                    }
+                }
+                if let Some(session_id) = find_codex_session_id(nested) {
+                    return Some(session_id);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(find_codex_session_id),
+        _ => None,
+    }
 }
 
 fn write_prompt_to_child(stdin: &mut impl Write, prompt: &str) -> Result<()> {
@@ -8177,6 +8294,114 @@ RESULT: ok
 
         assert!(diff.contains("src/new.c"));
         assert!(!diff.contains(".deps-temp"));
+    }
+
+    #[test]
+    fn codex_rate_limit_fallback_resumes_existing_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_codex = dir.path().join("fake-codex.sh");
+        let args_log = dir.path().join("codex-args.log");
+        let count_file = dir.path().join("codex-count");
+        let repo_root = dir.path().join("workspace");
+        let prompt_path = dir.path().join("prompt.md");
+        let output_path = dir.path().join("output.txt");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::write(
+            &fake_codex,
+            format!(
+                r#"#!/bin/sh
+args_log='{args_log}'
+count_file='{count_file}'
+out=''
+printf '%s\n' "$*" >> "$args_log"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+printf '%s\n' '{{"session_id":"11111111-1111-4111-8111-111111111111"}}'
+if [ "$count" -eq 1 ]; then
+  printf '%s\n' 'HTTP 429 Too Many Requests: rate limit exceeded' >&2
+  exit 1
+fi
+printf '%s\n' 'resumed output' > "$out"
+exit 0
+"#,
+                args_log = args_log.display(),
+                count_file = count_file.display(),
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_codex).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_codex, perms).unwrap();
+        }
+
+        let mut config = FixerConfig::default();
+        config.service.state_dir = dir.path().join("state");
+        config.patch.codex_command = fake_codex.display().to_string();
+        config.patch.codex_timeout_seconds = 0;
+        config.patch.model = Some("gpt-5.4".to_string());
+        config.patch.spark_model = Some("gpt-5.3-codex-spark".to_string());
+        config.patch.spark_fallback_on_rate_limit = true;
+
+        let mut resume_state =
+            super::CodexResumeState::new(dir.path().join("codex-session-id.txt"));
+        let stage = super::run_codex_stage(
+            &config,
+            &repo_root,
+            &prompt_path,
+            &output_path,
+            "Patch Pass",
+            "please patch",
+            None,
+            Some(&mut resume_state),
+        )
+        .unwrap();
+
+        assert!(stage.success);
+        assert!(stage.rate_limit_fallback_used);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("codex-session-id.txt"))
+                .unwrap()
+                .trim(),
+            "11111111-1111-4111-8111-111111111111"
+        );
+        let args = std::fs::read_to_string(args_log).unwrap();
+        let lines = args.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("exec"));
+        assert!(lines[0].contains("--json"));
+        assert!(!lines[0].contains(" resume "));
+        assert!(lines[1].contains(" resume 11111111-1111-4111-8111-111111111111 -"));
+        assert_eq!(
+            stage.models_used,
+            vec!["gpt-5.4".to_string(), "gpt-5.3-codex-spark".to_string()]
+        );
+    }
+
+    #[test]
+    fn extracts_codex_session_id_from_json_events() {
+        let log = r#"{"type":"session.started","session_id":"session-abc"}
+plain stderr line
+{"msg":{"thread_id":"thread-def"}}"#;
+
+        assert_eq!(
+            super::extract_codex_session_id_from_log(log).as_deref(),
+            Some("session-abc")
+        );
     }
 
     #[test]
