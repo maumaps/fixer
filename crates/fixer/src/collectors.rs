@@ -4549,6 +4549,10 @@ fn maybe_record_stuck_process_investigation(
     fs::create_dir_all(&capture_dir)?;
 
     let proc_snapshot = collect_proc_snapshot(group.sample_pid, &capture_dir)?;
+    if !process_snapshot_is_still_uninterruptible(&proc_snapshot) {
+        let _ = fs::remove_dir_all(&capture_dir);
+        return Ok(None);
+    }
     let hypothesis = classify_stuck_process(
         proc_snapshot.stack_excerpt.as_deref(),
         proc_snapshot.wchan.as_deref(),
@@ -6392,6 +6396,17 @@ fn process_state_from_status(status: &str) -> Option<&str> {
     })
 }
 
+fn process_state_is_uninterruptible(state: &str) -> bool {
+    state.trim_start().starts_with('D')
+}
+
+fn process_snapshot_is_still_uninterruptible(snapshot: &ProcSnapshot) -> bool {
+    snapshot
+        .process_state
+        .as_deref()
+        .is_some_and(process_state_is_uninterruptible)
+}
+
 fn excerpt_lines(raw: &str, line_limit: usize) -> String {
     excerpt_list(raw, line_limit).join("\n")
 }
@@ -7388,10 +7403,11 @@ mod tests {
         parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
         parse_network_driver_hang_events, parse_perf_hot_paths, parse_perl_command_line_hints,
         parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
-        prioritize_coredump_events, process_runtime_seconds, richer_evidence_enabled,
-        safe_perf_name, shell_assignment_csv_value, stable_apparmor_denial_name,
-        stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
-        summarize_top_syscalls, system_uptime_seconds, truncate_for_json_field,
+        prioritize_coredump_events, process_runtime_seconds, process_state_is_uninterruptible,
+        richer_evidence_enabled, safe_perf_name, shell_assignment_csv_value,
+        stable_apparmor_denial_name, stuck_process_investigation_fingerprint,
+        stuck_process_source_fingerprint, summarize_top_syscalls, system_uptime_seconds,
+        truncate_for_json_field,
     };
     use crate::config::FixerConfig;
     use crate::models::{ParticipationMode, ParticipationState, PopularBinaryProfile};
@@ -7560,6 +7576,13 @@ Name:\trg\n\
 State:\tD (disk sleep)\n\
 Kthread:\t0\n";
         assert_eq!(kernel_thread_package_name(status, None, "rg"), None);
+    }
+
+    #[test]
+    fn stuck_process_snapshot_must_still_be_uninterruptible() {
+        assert!(process_state_is_uninterruptible("D (disk sleep)"));
+        assert!(!process_state_is_uninterruptible("I (idle)"));
+        assert!(!process_state_is_uninterruptible("R (running)"));
     }
 
     #[test]
