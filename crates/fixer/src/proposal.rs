@@ -898,6 +898,20 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
         }
     }
 
+    if workflow_failure.is_none() && matches!(job.subsystem.as_deref(), Some("apparmor")) {
+        let current_changed_paths = workspace_changed_paths(&job.workspace.repo_root);
+        let current_author_output = read_text(&current_author_output_path).unwrap_or_default();
+        if let Some(error) = apparmor_policy_patch_quality_failure(
+            &current_author_output,
+            &job.workspace.repo_root,
+            &current_changed_paths,
+        ) {
+            workflow_failure = Some(("apparmor-policy-review".to_string(), error));
+            workflow_failure_stage = Some("review".to_string());
+            workflow_review_failure_category = Some("apparmor-policy-review".to_string());
+        }
+    }
+
     if workflow_failure.is_none() {
         let current_changed_paths = workspace_changed_paths(&job.workspace.repo_root);
         let current_author_output = read_text(&current_author_output_path).unwrap_or_default();
@@ -3704,6 +3718,145 @@ fn desktop_graphics_session_semantic_failure(
     None
 }
 
+fn apparmor_policy_patch_quality_failure(
+    authoring_response: &str,
+    workspace_root: &Path,
+    current_changed_paths: &[String],
+) -> Option<String> {
+    let response = latest_patch_authoring_response(authoring_response)
+        .unwrap_or_else(|| authoring_response.trim().to_string());
+    let response_lower = response.to_ascii_lowercase();
+    let confidence = response_evidence_confidence(&response);
+    let changed_paths = sanitize_git_add_paths(
+        &current_changed_paths
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+    );
+    if changed_paths.is_empty() {
+        return None;
+    }
+
+    for path in changed_paths
+        .iter()
+        .filter(|path| is_apparmor_profile_source_path(path))
+    {
+        let profile_path = workspace_root.join(path);
+        let content = read_text(&profile_path).unwrap_or_default();
+        let new_profile = apparmor_profile_path_is_new(workspace_root, path);
+        if new_profile
+            && apparmor_profile_has_author_header(&content)
+            && !apparmor_response_mentions_profile_provenance(&response_lower)
+        {
+            return Some(format!(
+                "New AppArmor profile `{path}` contains an `Author:` header, but the patch explanation does not say where that authorship came from. For new policy files, either preserve a documented existing upstream/installed profile header and mention that provenance, or omit/infer no author instead of copying stale boilerplate into a public patch."
+            ));
+        }
+
+        if apparmor_profile_adds_root_read(workspace_root, path, &content)
+            && confidence.as_deref() != Some("reproduced")
+        {
+            return Some(format!(
+                "AppArmor profile `{path}` grants read access to the root directory (`/ r,`) without reproduced evidence. Root-directory grants are broad enough that Fixer must first reproduce the confined command or collect a direct trace showing the access is normal for the program; otherwise publish a diagnosis/report or investigate whether the confined program should avoid opening `/`."
+            ));
+        }
+    }
+
+    None
+}
+
+fn response_evidence_confidence(response: &str) -> Option<String> {
+    extract_patch_markdown_section_raw(response, "Evidence Confidence")
+        .or_else(|| extract_patch_markdown_section_raw(response, "Confidence"))
+        .and_then(|raw| {
+            raw.lines()
+                .next()
+                .map(str::trim)
+                .map(|value| value.trim_matches('`').trim_start_matches("- ").trim())
+                .map(|value| value.trim_end_matches('.').to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn is_apparmor_profile_source_path(path: &str) -> bool {
+    (path.starts_with("profiles/apparmor.d/") || path.starts_with("etc/apparmor.d/"))
+        && !path.contains("/abstractions/")
+        && !path.contains("/tunables/")
+        && !path.contains("/abi/")
+        && !path.ends_with(".md")
+}
+
+fn apparmor_profile_path_is_new(workspace_root: &Path, path: &str) -> bool {
+    let Ok(output) = command_run_in_dir_with_timeout(
+        "git",
+        &["status", "--porcelain", "--", path],
+        workspace_root,
+        StdDuration::from_secs(PROPOSAL_HELPER_COMMAND_TIMEOUT_SECONDS),
+    ) else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.starts_with("?? ") || line.starts_with("A ") || line.starts_with("AM "))
+}
+
+fn apparmor_profile_has_author_header(content: &str) -> bool {
+    content.lines().any(|line| {
+        line.trim_start_matches(['#', ' ', '\t'])
+            .trim_start()
+            .starts_with("Author:")
+    })
+}
+
+fn apparmor_response_mentions_profile_provenance(response_lower: &str) -> bool {
+    [
+        "copied from",
+        "derived from",
+        "preserved the existing header",
+        "preserve the existing header",
+        "existing installed profile",
+        "installed profile",
+        "existing upstream profile",
+        "upstream profile",
+        "source file already",
+        "authorship provenance",
+    ]
+    .iter()
+    .any(|marker| response_lower.contains(marker))
+}
+
+fn apparmor_profile_adds_root_read(workspace_root: &Path, path: &str, content: &str) -> bool {
+    if apparmor_profile_path_is_new(workspace_root, path) {
+        return content.lines().any(apparmor_profile_line_is_root_read_rule);
+    }
+    let Ok(output) = command_run_in_dir_with_timeout(
+        "git",
+        &["diff", "--unified=0", "--", path],
+        workspace_root,
+        StdDuration::from_secs(PROPOSAL_HELPER_COMMAND_TIMEOUT_SECONDS),
+    ) else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        line.strip_prefix('+')
+            .filter(|added| !added.starts_with("++"))
+            .is_some_and(apparmor_profile_line_is_root_read_rule)
+    })
+}
+
+fn apparmor_profile_line_is_root_read_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed
+        .strip_prefix('/')
+        .is_some_and(|rest| rest.trim_start().starts_with("r,"))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ProjectValidationCommand {
     display: &'static str,
@@ -3918,6 +4071,9 @@ fn investigation_prompt_hint(opportunity: &OpportunityRecord) -> String {
         Some("desktop-graphics-session") => {
             "\n\nTreat this as a graphics/session code fix, not a packaging cleanup task. Start in the source paths implicated by the evidence, such as KWin DRM/backend, compositor, output, or closely related graphics-session tests. Do not pivot to renaming Debian patches, changelog wording, or other packaging-only metadata unless the evidence itself is specifically about packaging breakage. If the prepared source tree already contains the relevant code, stay anchored to that source-level fix path and keep the patch focused on the runtime bug."
         }
+        Some("apparmor") => {
+            "\n\nFor AppArmor denials, first decide whether the right fix belongs in the profile policy or in the confined program. A denial against `/` is especially suspicious: do not add a root-directory read rule unless you reproduce the confined command or collect direct trace evidence showing that access is normal and intentional for that program. If you add a new profile file, verify its provenance. Do not copy an `Author:` line, stale year, or old copyright header from a different profile unless the file is explicitly derived from that existing upstream or installed profile and you say so in the final explanation."
+        }
         _ if supports_process_investigation_report(opportunity) => {
             "\n\nStart by explaining the likely root cause from the collected perf, strace, and /proc evidence. If you cannot land a safe patch, leave a diagnosis that is strong enough for an upstream bug report."
         }
@@ -3937,6 +4093,9 @@ fn investigation_plan_focus_hint(subsystem: Option<&str>) -> String {
         }
         Some("desktop-graphics-session") => {
             " Focus first on source-level graphics/session code such as DRM, compositor, outputs, or directly related graphics tests. Do not spend the plan on Debian patch renames, changelog edits, or other packaging-only cleanup unless the evidence explicitly points to packaging metadata as the user-visible failure."
+        }
+        Some("apparmor") => {
+            " Focus first on ownership and causality: determine whether the denial is a missing AppArmor profile permission or an avoidable access by the confined program. For root-directory accesses such as `name=\"/\"`, plan a bounded reproduction or trace before proposing a policy grant. If the plan creates a new profile file, it must say how the profile header and authorship are derived, or plan to omit copied author metadata."
         }
         _ => "",
     };
@@ -4020,6 +4179,9 @@ fn build_review_prompt(
         Some("desktop-graphics-session") => {
             "\n\nFor `desktop-graphics-session` patches, reject packaging-only answers when the workspace contains the implicated source code. A patch is `fix-needed` if it mainly renames Debian patches, rewrites changelog text, or otherwise changes packaging metadata instead of addressing the runtime graphics/session code path tied to the evidence."
         }
+        Some("apparmor") => {
+            "\n\nFor `apparmor` patches, verify policy causality and profile provenance. A patch is `fix-needed` if it grants `/ r,` from observed-only evidence without reproducing or tracing the confined command, or if it adds a new profile with an `Author:`/copyright header copied from elsewhere without explaining that provenance."
+        }
         _ => "",
     };
     format!(
@@ -4074,6 +4236,9 @@ fn build_refinement_prompt(
     let subsystem_hint = match investigation_subsystem_from_bundle(evidence_path).as_deref() {
         Some("desktop-graphics-session") => {
             " For `desktop-graphics-session`, stay on the runtime graphics/session fix path. If the review points out a correctness bug in the source patch, refine that source patch; do not sidestep into Debian patch renames, changelog edits, or other packaging-only metadata churn unless the review explicitly says the bug is in packaging."
+        }
+        Some("apparmor") => {
+            " For `apparmor`, address review findings by proving policy causality or narrowing/removing the policy change. Do not paper over a suspicious `/` access with a broad profile grant, and do not keep copied author/copyright headers in new profile files without documented provenance."
         }
         _ => "",
     };
@@ -9825,6 +9990,201 @@ not run
         .expect("expected session-fd detour to fail");
 
         assert!(error.contains("session/DBus file-descriptor cleanup"));
+    }
+
+    #[test]
+    fn apparmor_guard_rejects_new_profile_author_without_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let profile_dir = dir.path().join("profiles/apparmor.d");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("lsusb"),
+            r#"# vim:syntax=apparmor
+#    Copyright (C) 2024 Canonical Ltd.
+#    Author: Someone Else <someone@example.com>
+
+profile lsusb /usr/bin/lsusb {
+  include <abstractions/base>
+}
+"#,
+        )
+        .unwrap();
+        let response = r#"Subject: profiles: add lsusb profile
+
+## Commit Message
+Add an AppArmor profile for lsusb.
+
+## Evidence Confidence
+observed
+
+## Issue Connection
+Fixer observed an AppArmor denial for lsusb and did not independently reproduce it. This patch adds a profile, so the expected effect is allowing the observed access.
+
+## Git Add Paths
+profiles/apparmor.d/lsusb
+
+## Validation
+Ran apparmor_parser.
+"#;
+
+        let error = super::apparmor_policy_patch_quality_failure(
+            response,
+            dir.path(),
+            &["profiles/apparmor.d/lsusb".to_string()],
+        )
+        .expect("expected copied author metadata to be rejected");
+
+        assert!(error.contains("Author"));
+        assert!(error.contains("provenance"));
+    }
+
+    #[test]
+    fn apparmor_guard_allows_new_profile_author_with_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let profile_dir = dir.path().join("profiles/apparmor.d");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("lsb_release"),
+            r#"# vim:syntax=apparmor
+#    Author: Existing Maintainer <maintainer@example.com>
+
+profile lsb_release /usr/bin/lsb_release {
+  include <abstractions/base>
+}
+"#,
+        )
+        .unwrap();
+        let response = r#"Subject: profiles: import lsb_release profile
+
+## Commit Message
+Import the existing upstream AppArmor profile for lsb_release.
+
+## Evidence Confidence
+observed
+
+## Issue Connection
+Fixer observed an AppArmor denial for lsb_release and did not independently reproduce it. The file is copied from the existing upstream profile, preserving the existing header, so the expected effect is packaging the policy that upstream already ships.
+
+## Git Add Paths
+profiles/apparmor.d/lsb_release
+
+## Validation
+Ran apparmor_parser.
+"#;
+
+        assert!(
+            super::apparmor_policy_patch_quality_failure(
+                response,
+                dir.path(),
+                &["profiles/apparmor.d/lsb_release".to_string()],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn apparmor_guard_rejects_observed_only_root_directory_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let profile_dir = dir.path().join("profiles/apparmor.d");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("lsusb"),
+            r#"profile lsusb /usr/bin/lsusb {
+  include <abstractions/base>
+  / r,
+}
+"#,
+        )
+        .unwrap();
+        let response = r#"Subject: profiles: allow lsusb to read /
+
+## Commit Message
+Allow lsusb to read the root directory.
+
+## Evidence Confidence
+observed
+
+## Issue Connection
+Fixer observed an AppArmor denial for lsusb opening `/`, and the failure was observed by Fixer and not independently reproduced. This patch grants read access to `/`, so the expected effect is allowing that access.
+
+## Git Add Paths
+profiles/apparmor.d/lsusb
+
+## Validation
+`aa-exec -p lsusb -- lsusb` was blocked by the sandbox.
+"#;
+
+        let error = super::apparmor_policy_patch_quality_failure(
+            response,
+            dir.path(),
+            &["profiles/apparmor.d/lsusb".to_string()],
+        )
+        .expect("expected observed-only root grant to be rejected");
+
+        assert!(error.contains("`/ r,`"));
+        assert!(error.contains("reproduce"));
+    }
+
+    #[test]
+    fn apparmor_guard_allows_reproduced_root_directory_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let profile_dir = dir.path().join("profiles/apparmor.d");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("lsusb"),
+            r#"profile lsusb /usr/bin/lsusb {
+  include <abstractions/base>
+  / r,
+}
+"#,
+        )
+        .unwrap();
+        let response = r#"Subject: profiles: allow lsusb to read /
+
+## Commit Message
+Allow lsusb to read the root directory after reproducing the confined access.
+
+## Evidence Confidence
+reproduced
+
+## Issue Connection
+I reproduced the denial with an aa-exec smoke test and traced lsusb opening `/` during normal enumeration. This patch grants read access to `/`, so the expected effect is allowing that reproduced access.
+
+## Git Add Paths
+profiles/apparmor.d/lsusb
+
+## Validation
+Reproduced with `aa-exec -p lsusb -- lsusb` before the patch and confirmed the denial disappeared after adding the rule.
+"#;
+
+        assert!(
+            super::apparmor_policy_patch_quality_failure(
+                response,
+                dir.path(),
+                &["profiles/apparmor.d/lsusb".to_string()],
+            )
+            .is_none()
+        );
     }
 
     #[test]

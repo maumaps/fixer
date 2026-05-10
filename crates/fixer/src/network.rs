@@ -1264,12 +1264,23 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                             details.insert("patch_refresh_error".to_string(), json!(error));
                         }
                     }
+                    let publication_blocker =
+                        published_session_publication_blocker(&opportunity, published_session_ref);
+                    if let Some(blocker) = publication_blocker.as_deref() {
+                        details.insert("publication_blocker".to_string(), json!(blocker));
+                        details.insert(
+                            "patch_review_failure_category".to_string(),
+                            json!("publication-quality"),
+                        );
+                    }
                     WorkerResultEnvelope {
                         lease_id: lease.lease_id.clone(),
                         attempt: PatchAttempt {
                             cluster_id: lease.issue.id,
                             install_id: participation.identity.install_id.clone(),
-                            outcome: if is_triage_ready {
+                            outcome: if publication_blocker.is_some() {
+                                "report".to_string()
+                            } else if is_triage_ready {
                                 "triage".to_string()
                             } else if invalidates_prior_patch.is_some() {
                                 "report".to_string()
@@ -1281,7 +1292,11 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                             } else {
                                 local_proposal.state.clone()
                             },
-                            summary: if invalidates_prior_patch.is_some() {
+                            summary: if let Some(blocker) = publication_blocker.as_deref() {
+                                format!(
+                                    "Fixer withheld a ready local patch from the public best-patch slot after a publication-quality check: {blocker}"
+                                )
+                            } else if invalidates_prior_patch.is_some() {
                                 if supports_process_report {
                                     format!(
                                         "{} Fixer re-reviewed the previous patch, found it stale or incorrect, and reopened the issue for another pass. No replacement patch survived review yet.",
@@ -1327,7 +1342,9 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                                 .output_path
                                 .as_ref()
                                 .map(|path| path.display().to_string()),
-                            validation_status: Some(if invalidates_prior_patch.is_some() {
+                            validation_status: Some(if publication_blocker.is_some() {
+                                "review-rejected".to_string()
+                            } else if invalidates_prior_patch.is_some() {
                                 "review-rejected".to_string()
                             } else {
                                 local_proposal.state.clone()
@@ -1925,6 +1942,15 @@ fn submission_result_for_local_proposal(
     if published_session.is_none() {
         return Ok(None);
     }
+    let publication_blocker =
+        published_session_publication_blocker(opportunity, published_session.as_ref());
+    if let Some(blocker) = publication_blocker.as_deref() {
+        details.insert("publication_blocker".to_string(), json!(blocker));
+        details.insert(
+            "patch_review_failure_category".to_string(),
+            json!("publication-quality"),
+        );
+    }
     let is_triage_ready = !published_session_has_diff(published_session.as_ref())
         && published_session_marks_successful_triage(published_session.as_ref());
     if is_triage_ready {
@@ -1937,7 +1963,11 @@ fn submission_result_for_local_proposal(
             worker_triage_handoff(opportunity, published_session.as_ref()),
         );
     }
-    let summary = if is_triage_ready {
+    let summary = if let Some(blocker) = publication_blocker.as_deref() {
+        format!(
+            "Fixer withheld a ready local patch from the public best-patch slot after a publication-quality check: {blocker}"
+        )
+    } else if is_triage_ready {
         if supports_process_report {
             format!(
                 "{} A diagnosis report and external handoff were created locally.",
@@ -1962,7 +1992,9 @@ fn submission_result_for_local_proposal(
         attempt: PatchAttempt {
             cluster_id: String::new(),
             install_id: participation.identity.install_id.clone(),
-            outcome: if is_triage_ready {
+            outcome: if publication_blocker.is_some() {
+                "report".to_string()
+            } else if is_triage_ready {
                 "triage".to_string()
             } else {
                 "patch".to_string()
@@ -1974,7 +2006,11 @@ fn submission_result_for_local_proposal(
                 .output_path
                 .as_ref()
                 .map(|path| path.display().to_string()),
-            validation_status: Some(status.state.clone()),
+            validation_status: Some(if publication_blocker.is_some() {
+                "review-rejected".to_string()
+            } else {
+                status.state.clone()
+            }),
             details: Value::Object(details),
             created_at: status.finished_at.clone(),
         },
@@ -3017,6 +3053,141 @@ fn published_session_response(session: Option<&Value>) -> Option<&str> {
         .filter(|value| !value.trim().is_empty())
 }
 
+fn published_session_publication_blocker(
+    opportunity: &OpportunityRecord,
+    session: Option<&Value>,
+) -> Option<String> {
+    if opportunity
+        .evidence
+        .get("details")
+        .and_then(|details| details.get("subsystem"))
+        .and_then(Value::as_str)
+        != Some("apparmor")
+    {
+        return None;
+    }
+    let session = session?;
+    let diff = session
+        .get("diff")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if diff.trim().is_empty() {
+        return None;
+    }
+    let response = session
+        .get("response")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let response_lower = response.to_ascii_lowercase();
+
+    if diff_adds_apparmor_root_read(diff)
+        && published_response_evidence_confidence(response) != Some("reproduced")
+    {
+        return Some(
+            "AppArmor patch grants `/ r,` without reproduced evidence that the confined program normally needs to open the root directory."
+                .to_string(),
+        );
+    }
+    if diff_adds_new_apparmor_profile_with_author(diff)
+        && !published_response_mentions_profile_provenance(&response_lower)
+    {
+        return Some(
+            "AppArmor patch adds a new profile with an `Author:` header but does not document whether that authorship/header was copied from an existing upstream or installed profile."
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn published_response_evidence_confidence(response: &str) -> Option<&'static str> {
+    let mut in_confidence = false;
+    for line in response.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            in_confidence = matches!(heading.trim(), "Evidence Confidence" | "Confidence");
+            continue;
+        }
+        if !in_confidence {
+            continue;
+        }
+        let normalized = line
+            .trim()
+            .trim_matches('`')
+            .trim_start_matches("- ")
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        return match normalized.as_str() {
+            "reproduced" => Some("reproduced"),
+            "observed" => Some("observed"),
+            "inferred" => Some("inferred"),
+            _ if normalized.is_empty() => continue,
+            _ => None,
+        };
+    }
+    None
+}
+
+fn diff_adds_apparmor_root_read(diff: &str) -> bool {
+    diff.lines().any(|line| {
+        line.strip_prefix('+')
+            .filter(|added| !added.starts_with("++"))
+            .is_some_and(apparmor_profile_line_is_root_read_rule)
+    })
+}
+
+fn diff_adds_new_apparmor_profile_with_author(diff: &str) -> bool {
+    let mut in_new_profile = false;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            in_new_profile = false;
+            continue;
+        }
+        if line.starts_with("new file mode ") {
+            in_new_profile = true;
+            continue;
+        }
+        if !in_new_profile {
+            continue;
+        }
+        if line
+            .strip_prefix('+')
+            .filter(|added| !added.starts_with("++"))
+            .is_some_and(|added| {
+                added
+                    .trim_start_matches(['#', ' ', '\t'])
+                    .trim_start()
+                    .starts_with("Author:")
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn apparmor_profile_line_is_root_read_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed
+        .strip_prefix('/')
+        .is_some_and(|rest| rest.trim_start().starts_with("r,"))
+}
+
+fn published_response_mentions_profile_provenance(response_lower: &str) -> bool {
+    [
+        "copied from",
+        "derived from",
+        "preserved the existing header",
+        "preserve the existing header",
+        "existing installed profile",
+        "installed profile",
+        "existing upstream profile",
+        "upstream profile",
+        "source file already",
+        "authorship provenance",
+    ]
+    .iter()
+    .any(|marker| response_lower.contains(marker))
+}
+
 fn prior_patch_review_rejected_for_refresh(
     local_proposal: &ProposalRecord,
     prior_best_patch: Option<&PatchAttempt>,
@@ -3221,6 +3392,70 @@ mod tests {
             jobs_started_today: 0,
             recent_failures: Vec::new(),
         }
+    }
+
+    fn sample_apparmor_opportunity() -> OpportunityRecord {
+        OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "warning".to_string(),
+            title: "AppArmor denial in lsusb".to_string(),
+            score: 64,
+            state: "open".to_string(),
+            summary: "AppArmor denied lsusb: open /".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "apparmor",
+                    "profile": "lsusb",
+                    "operation": "open",
+                    "name": "/"
+                },
+                "package_name": "apparmor"
+            }),
+            repo_root: None,
+            ecosystem: Some("debian".to_string()),
+            created_at: "2026-05-10T00:00:00Z".to_string(),
+            updated_at: "2026-05-10T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn apparmor_publication_guard_blocks_observed_root_directory_grant() {
+        let opportunity = sample_apparmor_opportunity();
+        let session = json!({
+            "response": "Subject: profiles: allow lsusb to read /\n\n## Evidence Confidence\nobserved\n\n## Issue Connection\nFixer observed the denial and did not independently reproduce it.\n",
+            "diff": "diff --git a/profiles/apparmor.d/lsusb b/profiles/apparmor.d/lsusb\nnew file mode 100644\n--- /dev/null\n+++ b/profiles/apparmor.d/lsusb\n@@ -0,0 +1,4 @@\n+profile lsusb /usr/bin/lsusb {\n+  / r,\n+}\n",
+        });
+
+        let blocker = published_session_publication_blocker(&opportunity, Some(&session)).unwrap();
+
+        assert!(blocker.contains("`/ r,`"));
+        assert!(blocker.contains("reproduced"));
+    }
+
+    #[test]
+    fn apparmor_publication_guard_blocks_new_author_without_provenance() {
+        let opportunity = sample_apparmor_opportunity();
+        let session = json!({
+            "response": "Subject: profiles: add lsusb profile\n\n## Evidence Confidence\nreproduced\n\n## Issue Connection\nI reproduced the confined command.\n",
+            "diff": "diff --git a/profiles/apparmor.d/lsusb b/profiles/apparmor.d/lsusb\nnew file mode 100644\n--- /dev/null\n+++ b/profiles/apparmor.d/lsusb\n@@ -0,0 +1,4 @@\n+#    Author: Someone Else <someone@example.com>\n+profile lsusb /usr/bin/lsusb {\n+}\n",
+        });
+
+        let blocker = published_session_publication_blocker(&opportunity, Some(&session)).unwrap();
+
+        assert!(blocker.contains("Author"));
+        assert!(blocker.contains("document"));
+    }
+
+    #[test]
+    fn apparmor_publication_guard_allows_reproduced_root_grant_with_profile_provenance() {
+        let opportunity = sample_apparmor_opportunity();
+        let session = json!({
+            "response": "Subject: profiles: import lsusb profile\n\n## Evidence Confidence\nreproduced\n\n## Issue Connection\nI reproduced the confined command. The profile is copied from the existing upstream profile, preserving the existing header.\n",
+            "diff": "diff --git a/profiles/apparmor.d/lsusb b/profiles/apparmor.d/lsusb\nnew file mode 100644\n--- /dev/null\n+++ b/profiles/apparmor.d/lsusb\n@@ -0,0 +1,5 @@\n+#    Author: Existing Maintainer <maintainer@example.com>\n+profile lsusb /usr/bin/lsusb {\n+  / r,\n+}\n",
+        });
+
+        assert!(published_session_publication_blocker(&opportunity, Some(&session)).is_none());
     }
 
     fn sample_codex_capability() -> Capability {

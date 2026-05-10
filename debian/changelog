@@ -1,3 +1,14 @@
+fixer (0.148.0-1) unstable; urgency=medium
+
+  * Ignore obsolete dpkg conffiles when attributing /etc paths to source
+    packages, so removed AppArmor profiles do not get resurrected as package
+    patches.
+  * Add AppArmor proposal and publication guards that reject unexplained
+    copied authorship headers and broad / root-directory grants without
+    reproduced evidence.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 10 May 2026 11:06:00 +0400
+
 fixer (0.147.0-1) unstable; urgency=medium
 
   * Keep ready Codex proposals in sync payloads before trimming lower-value

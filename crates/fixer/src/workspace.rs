@@ -810,6 +810,43 @@ fn map_system_path_to_package(path: &Path) -> Option<String> {
         .next()
         .and_then(|line| line.split_once(':'))
         .map(|(pkg, _)| pkg.to_string())
+        .filter(|package_name| !path_is_obsolete_conffile(package_name, path))
+}
+
+fn path_is_obsolete_conffile(package_name: &str, path: &Path) -> bool {
+    if !path.starts_with("/etc/") {
+        return false;
+    }
+    let Ok(status) = command_output_with_timeout(
+        "dpkg-query",
+        &["-s", package_name],
+        StdDuration::from_secs(DPKG_QUERY_TIMEOUT_SECONDS),
+    ) else {
+        return false;
+    };
+    package_status_marks_obsolete_conffile(&status, path)
+}
+
+fn package_status_marks_obsolete_conffile(status: &str, path: &Path) -> bool {
+    let lookup = path.to_string_lossy();
+    let mut in_conffiles = false;
+    for line in status.lines() {
+        if line == "Conffiles:" {
+            in_conffiles = true;
+            continue;
+        }
+        if in_conffiles && !line.starts_with(' ') {
+            break;
+        }
+        if !in_conffiles {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        if fields.next() == Some(lookup.as_ref()) && fields.any(|field| field == "obsolete") {
+            return true;
+        }
+    }
+    false
 }
 
 fn normalize_patchable_source_package(package_name: &str, source_package: &str) -> String {
@@ -936,7 +973,7 @@ mod tests {
     };
     use crate::models::{InstalledPackageMetadata, OpportunityRecord};
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn detects_cloneable_urls() {
@@ -1250,6 +1287,32 @@ zoom:\n\
             source_package_from_opportunity(&opportunity).as_deref(),
             Some("apparmor")
         );
+    }
+
+    #[test]
+    fn package_status_detects_obsolete_conffiles() {
+        let status = "\
+Package: apparmor
+Status: install ok installed
+Conffiles:
+ /etc/apparmor.d/lsb_release e658932af849b5084d780d69b792d6f6
+ /etc/apparmor.d/lsusb e0b2a40a7f321065a99a684f576f598a obsolete
+ /etc/apparmor.d/lsblk abb3e20c7baecf2177b3b72b0e1a3409 obsolete
+Description: user-space parser utility for AppArmor
+";
+
+        assert!(super::package_status_marks_obsolete_conffile(
+            status,
+            Path::new("/etc/apparmor.d/lsusb")
+        ));
+        assert!(!super::package_status_marks_obsolete_conffile(
+            status,
+            Path::new("/etc/apparmor.d/lsb_release")
+        ));
+        assert!(!super::package_status_marks_obsolete_conffile(
+            status,
+            Path::new("/etc/apparmor.d/not-present")
+        ));
     }
 
     #[test]

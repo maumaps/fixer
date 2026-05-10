@@ -7378,6 +7378,43 @@ fn map_lookup_path_to_package(lookup_path: &Path) -> Option<String> {
         .next()
         .and_then(|line| line.split_once(':'))
         .map(|(pkg, _)| pkg.to_string())
+        .filter(|package_name| !path_is_obsolete_conffile(package_name, lookup_path))
+}
+
+fn path_is_obsolete_conffile(package_name: &str, lookup_path: &Path) -> bool {
+    if !lookup_path.starts_with("/etc/") {
+        return false;
+    }
+    let Ok(status) = command_output_with_timeout(
+        "dpkg-query",
+        &["-s", package_name],
+        StdDuration::from_secs(PACKAGE_LOOKUP_COMMAND_TIMEOUT_SECONDS),
+    ) else {
+        return false;
+    };
+    package_status_marks_obsolete_conffile(&status, lookup_path)
+}
+
+fn package_status_marks_obsolete_conffile(status: &str, lookup_path: &Path) -> bool {
+    let lookup = lookup_path.to_string_lossy();
+    let mut in_conffiles = false;
+    for line in status.lines() {
+        if line == "Conffiles:" {
+            in_conffiles = true;
+            continue;
+        }
+        if in_conffiles && !line.starts_with(' ') {
+            break;
+        }
+        if !in_conffiles {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        if fields.next() == Some(lookup.as_ref()) && fields.any(|field| field == "obsolete") {
+            return true;
+        }
+    }
+    false
 }
 
 fn package_lookup_path(path: &Path) -> PathBuf {
@@ -8792,6 +8829,32 @@ Stack trace of thread 222:\n\
         assert!(package_lookup_path_is_dpkg_candidate(Path::new(
             "/opt/google/chrome/chrome"
         )));
+    }
+
+    #[test]
+    fn package_status_detects_obsolete_conffiles() {
+        let status = "\
+Package: apparmor
+Status: install ok installed
+Conffiles:
+ /etc/apparmor.d/lsb_release e658932af849b5084d780d69b792d6f6
+ /etc/apparmor.d/lsusb e0b2a40a7f321065a99a684f576f598a obsolete
+ /etc/apparmor.d/lsblk abb3e20c7baecf2177b3b72b0e1a3409 obsolete
+Description: user-space parser utility for AppArmor
+";
+
+        assert!(super::package_status_marks_obsolete_conffile(
+            status,
+            Path::new("/etc/apparmor.d/lsusb")
+        ));
+        assert!(!super::package_status_marks_obsolete_conffile(
+            status,
+            Path::new("/etc/apparmor.d/lsb_release")
+        ));
+        assert!(!super::package_status_marks_obsolete_conffile(
+            status,
+            Path::new("/etc/apparmor.d/not-present")
+        ));
     }
 
     #[test]
