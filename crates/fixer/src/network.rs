@@ -1738,6 +1738,9 @@ fn build_submission_bundle(
 
 fn fit_submission_bundle_to_payload_budget(mut bundle: FindingBundle) -> Result<FindingBundle> {
     while serde_json::to_vec(&bundle)?.len() > MAX_CLIENT_SUBMISSION_BUNDLE_BYTES {
+        if remove_lowest_priority_unreferenced_submission_item(&mut bundle) {
+            continue;
+        }
         if bundle.proposals.pop().is_some() {
             continue;
         }
@@ -1747,6 +1750,24 @@ fn fit_submission_bundle_to_payload_budget(mut bundle: FindingBundle) -> Result<
         break;
     }
     Ok(bundle)
+}
+
+fn remove_lowest_priority_unreferenced_submission_item(bundle: &mut FindingBundle) -> bool {
+    let proposal_item_ids = bundle
+        .proposals
+        .iter()
+        .filter(|proposal| proposal.remote_issue_id.is_none())
+        .map(|proposal| proposal.local_opportunity_id)
+        .collect::<std::collections::HashSet<_>>();
+    let Some(index) = bundle
+        .items
+        .iter()
+        .rposition(|item| !proposal_item_ids.contains(&item.local_opportunity_id))
+    else {
+        return false;
+    };
+    bundle.items.remove(index);
+    true
 }
 
 fn build_submission_proposals(
@@ -3158,7 +3179,7 @@ mod tests {
     use super::*;
     use crate::models::{
         Capability, CodexJobStatus, FindingInput, FindingRecord, OpportunityRecord,
-        ParticipationMode, ParticipationState,
+        ParticipationMode, ParticipationState, StatusSnapshot,
     };
     use crate::storage::Store;
     use serde_json::json;
@@ -3212,6 +3233,75 @@ mod tests {
         }
     }
 
+    fn sample_shared_opportunity(local_id: i64, evidence_bytes: usize) -> SharedOpportunity {
+        SharedOpportunity {
+            local_opportunity_id: local_id,
+            opportunity: OpportunityRecord {
+                id: local_id,
+                finding_id: local_id,
+                kind: "warning".to_string(),
+                title: format!("Sample warning {local_id}"),
+                score: 100 - local_id,
+                state: "open".to_string(),
+                summary: "sample warning".to_string(),
+                evidence: json!({
+                    "padding": "x".repeat(evidence_bytes),
+                }),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "2026-05-10T00:00:00Z".to_string(),
+                updated_at: "2026-05-10T00:00:00Z".to_string(),
+            },
+            finding: FindingRecord {
+                id: local_id,
+                kind: "warning".to_string(),
+                title: format!("Sample warning {local_id}"),
+                severity: "medium".to_string(),
+                fingerprint: format!("sample-warning-{local_id}"),
+                summary: "sample warning".to_string(),
+                details: json!({}),
+                artifact_name: None,
+                artifact_path: None,
+                package_name: None,
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "2026-05-10T00:00:00Z".to_string(),
+                last_seen: "2026-05-10T00:00:00Z".to_string(),
+            },
+        }
+    }
+
+    fn sample_submitted_proposal(local_opportunity_id: i64) -> SubmittedProposal {
+        SubmittedProposal {
+            local_opportunity_id,
+            local_proposal_id: local_opportunity_id + 1000,
+            remote_issue_id: None,
+            result: WorkerResultEnvelope {
+                lease_id: String::new(),
+                attempt: PatchAttempt {
+                    cluster_id: String::new(),
+                    install_id: "install-1".to_string(),
+                    outcome: "patch".to_string(),
+                    state: "ready".to_string(),
+                    summary: "Patch proposal created locally.".to_string(),
+                    bundle_path: None,
+                    output_path: None,
+                    validation_status: Some("ready".to_string()),
+                    details: json!({
+                        "published_session": {
+                            "prompt": "Patch the package.",
+                            "response": "Subject: sample fix\n\nReady.",
+                            "diff": "diff --git a/file b/file\n",
+                        },
+                    }),
+                    created_at: "2026-05-10T00:00:00Z".to_string(),
+                },
+                impossible_reason: None,
+                evidence_request: None,
+            },
+        }
+    }
+
     #[test]
     fn compatible_server_hello_allows_work_to_continue() {
         assert!(ensure_server_hello_compatible(&sample_server_hello()).is_ok());
@@ -3240,6 +3330,42 @@ mod tests {
         assert_eq!(
             server_upgrade_message(&hello),
             Some(hello.upgrade_message.as_str())
+        );
+    }
+
+    #[test]
+    fn payload_budget_trims_unreferenced_items_before_ready_proposals() {
+        let mut bundle = FindingBundle {
+            captured_at: "2026-05-10T00:00:00Z".to_string(),
+            policy_version: "2026-03-29".to_string(),
+            richer_evidence_allowed: false,
+            status: StatusSnapshot {
+                capabilities: 0,
+                artifacts: 0,
+                findings: 0,
+                opportunities: 0,
+                proposals: 0,
+            },
+            capabilities: vec![sample_codex_capability()],
+            items: (1..=8)
+                .map(|local_id| sample_shared_opportunity(local_id, 70 * 1024))
+                .collect(),
+            proposals: vec![sample_submitted_proposal(1)],
+            redactions: Vec::new(),
+        };
+
+        assert!(serde_json::to_vec(&bundle).unwrap().len() > MAX_CLIENT_SUBMISSION_BUNDLE_BYTES);
+
+        bundle = fit_submission_bundle_to_payload_budget(bundle).unwrap();
+
+        assert!(serde_json::to_vec(&bundle).unwrap().len() <= MAX_CLIENT_SUBMISSION_BUNDLE_BYTES);
+        assert_eq!(bundle.proposals.len(), 1);
+        assert_eq!(bundle.proposals[0].local_opportunity_id, 1);
+        assert!(
+            bundle
+                .items
+                .iter()
+                .any(|item| item.local_opportunity_id == 1)
         );
     }
 

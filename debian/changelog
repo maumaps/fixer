@@ -1,3 +1,10 @@
+fixer (0.147.0-1) unstable; urgency=medium
+
+  * Keep ready Codex proposals in sync payloads before trimming lower-value
+    unreferenced findings to the payload budget.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 10 May 2026 10:40:00 +0400
+
 fixer (0.146.0-1) unstable; urgency=medium
 
   * Prioritize ready Codex proposals during sync even when their findings are
