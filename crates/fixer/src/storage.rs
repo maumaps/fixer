@@ -1603,7 +1603,27 @@ impl Store {
             JOIN findings f ON f.id = o.finding_id
             LEFT JOIN artifacts a ON a.id = f.artifact_id
             WHERE o.state IN ('open', 'validated', 'proposed')
-            ORDER BY o.score DESC, o.updated_at DESC
+            ORDER BY
+                EXISTS (
+                    SELECT 1
+                    FROM proposals p
+                    WHERE p.opportunity_id = o.id
+                      AND p.engine = 'codex'
+                      AND p.state = 'ready'
+                      AND NOT EXISTS (
+                            SELECT 1
+                            FROM proposals newer
+                            WHERE newer.opportunity_id = p.opportunity_id
+                              AND newer.engine = 'codex'
+                              AND newer.state = 'ready'
+                              AND (
+                                    newer.updated_at > p.updated_at
+                                    OR (newer.updated_at = p.updated_at AND newer.id > p.id)
+                              )
+                        )
+                ) DESC,
+                o.score DESC,
+                o.updated_at DESC
             LIMIT ?1
             ",
         )?;

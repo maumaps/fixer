@@ -10943,6 +10943,9 @@ fn apparmor_public_issue_title(item: &SharedOpportunity) -> String {
 fn apparmor_public_resource_label(details: &Value) -> String {
     if let Some(name) = details.get("name").and_then(Value::as_str) {
         let normalized = normalize_proc_path(name);
+        if normalized == "/" {
+            return "/".to_string();
+        }
         if normalized.starts_with("/proc/")
             || normalized.starts_with("/etc/")
             || normalized.starts_with("apparmor/")
@@ -11172,12 +11175,64 @@ fn is_publicly_visible(item: &SharedOpportunity) -> bool {
                     .and_then(Value::as_str),
                 Some("apparmor")
             ) {
-                return false;
+                return apparmor_warning_is_publicly_visible(item);
             }
             item.finding.package_name.is_some() || item.opportunity.ecosystem.is_some()
         }
         _ => true,
     }
+}
+
+fn apparmor_warning_is_publicly_visible(item: &SharedOpportunity) -> bool {
+    let details = &item.finding.details;
+    let profile_package_is_public = item.finding.package_name.as_deref() == Some("apparmor")
+        || item
+            .opportunity
+            .evidence
+            .get("package_name")
+            .and_then(Value::as_str)
+            == Some("apparmor")
+        || details.get("profile_package_name").and_then(Value::as_str) == Some("apparmor");
+    if !profile_package_is_public {
+        return false;
+    }
+
+    let profile_path = details
+        .get("profile_path")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            item.finding
+                .artifact_path
+                .as_ref()
+                .and_then(|path| path.to_str())
+        })
+        .or_else(|| {
+            item.opportunity
+                .evidence
+                .get("artifact_path")
+                .and_then(Value::as_str)
+        });
+    if !profile_path.is_some_and(|path| path.starts_with("/etc/apparmor.d/")) {
+        return false;
+    }
+
+    apparmor_denial_target_is_public(details)
+}
+
+fn apparmor_denial_target_is_public(details: &Value) -> bool {
+    let Some(name) = details.get("name").and_then(Value::as_str) else {
+        return details
+            .get("class")
+            .and_then(Value::as_str)
+            .is_some_and(|class| class != "file");
+    };
+    let normalized = normalize_proc_path(name);
+    normalized == "/"
+        || normalized.starts_with("/dev/")
+        || normalized.starts_with("/etc/")
+        || normalized.starts_with("/run/udev/")
+        || normalized.starts_with("/sys/")
+        || normalized.starts_with("apparmor/")
 }
 
 fn is_internal_repair_agent_target(item: &SharedOpportunity) -> bool {
@@ -16860,6 +16915,58 @@ mod tests {
             "AppArmor denial in snap.telegram-desktop.telegram-desktop: open /proc/<pid>/mounts"
         );
         assert!(!proc_public.title.contains("9019"));
+    }
+
+    #[test]
+    fn apparmor_profile_package_denials_can_be_public_when_target_is_safe() {
+        let apparmor = SharedOpportunity {
+            local_opportunity_id: 7456,
+            opportunity: OpportunityRecord {
+                id: 7456,
+                finding_id: 7456,
+                kind: "warning".to_string(),
+                title: "AppArmor denial in lsusb".to_string(),
+                score: 64,
+                state: "open".to_string(),
+                summary: "AppArmor denied lsusb: open /".to_string(),
+                evidence: json!({
+                    "artifact_path": "/etc/apparmor.d/lsusb",
+                    "package_name": "apparmor"
+                }),
+                repo_root: None,
+                ecosystem: None,
+                created_at: "2026-05-10T00:00:00Z".to_string(),
+                updated_at: "2026-05-10T00:00:00Z".to_string(),
+            },
+            finding: FindingRecord {
+                id: 7456,
+                kind: "warning".to_string(),
+                title: "AppArmor denial in lsusb".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "apparmor-lsusb-root".to_string(),
+                summary: "AppArmor denied lsusb: open /".to_string(),
+                details: json!({
+                    "subsystem": "apparmor",
+                    "profile": "lsusb",
+                    "profile_path": "/etc/apparmor.d/lsusb",
+                    "profile_package_name": "apparmor",
+                    "operation": "open",
+                    "class": "file",
+                    "name": "/"
+                }),
+                artifact_name: Some("lsusb".to_string()),
+                artifact_path: Some("/etc/apparmor.d/lsusb".into()),
+                package_name: Some("apparmor".to_string()),
+                repo_root: None,
+                ecosystem: None,
+                first_seen: "2026-05-10T00:00:00Z".to_string(),
+                last_seen: "2026-05-10T00:00:00Z".to_string(),
+            },
+        };
+
+        let public = build_public_issue_fields(&apparmor);
+        assert_eq!(public.title, "AppArmor denial in lsusb: open /");
+        assert!(public.visible);
     }
 
     #[test]

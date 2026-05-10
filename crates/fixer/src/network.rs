@@ -965,7 +965,7 @@ pub fn sync_once(store: &Store, config: &FixerConfig) -> Result<SyncOutcome> {
     };
     let receipt = post_json::<_, SubmissionReceipt>(config, "v1/submissions", &envelope)?;
     remember_synced_issue_links(store, &envelope.bundle, &receipt)?;
-    remember_published_proposals(store, &envelope.bundle)?;
+    remember_published_proposals(store, &envelope.bundle, &receipt)?;
     store.set_local_state("last_sync_at", &now_rfc3339())?;
     store.set_local_state("last_sync_receipt", &receipt)?;
     Ok(SyncOutcome {
@@ -1973,9 +1973,24 @@ fn remember_synced_issue_links(
     Ok(())
 }
 
-fn remember_published_proposals(store: &Store, bundle: &FindingBundle) -> Result<()> {
+fn remember_published_proposals(
+    store: &Store,
+    bundle: &FindingBundle,
+    receipt: &SubmissionReceipt,
+) -> Result<()> {
+    let issue_id_by_local_opportunity_id = bundle
+        .items
+        .iter()
+        .zip(receipt.issue_ids.iter())
+        .map(|(item, issue_id)| (item.local_opportunity_id, issue_id.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
     for proposal in &bundle.proposals {
-        let Some(remote_issue_id) = proposal.remote_issue_id.as_deref() else {
+        let remote_issue_id = proposal.remote_issue_id.as_deref().or_else(|| {
+            issue_id_by_local_opportunity_id
+                .get(&proposal.local_opportunity_id)
+                .copied()
+        });
+        let Some(remote_issue_id) = remote_issue_id else {
             continue;
         };
         let Some(session) = proposal.result.attempt.details.get("published_session") else {
@@ -3866,6 +3881,156 @@ mod tests {
             .unwrap();
         assert!(diff.contains("keyboard_daemon.cpp"));
         assert!(diff.contains("+after"));
+    }
+
+    #[test]
+    fn build_submission_bundle_prioritizes_ready_proposals_below_score_window() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+
+        for index in 0..6 {
+            store
+                .record_finding(&FindingInput {
+                    kind: "investigation".to_string(),
+                    title: format!("High score stuck process investigation {index}"),
+                    severity: "high".to_string(),
+                    fingerprint: format!("stuck-process-{index}"),
+                    summary: "A high-score investigation without a ready patch".to_string(),
+                    details: json!({"subsystem": "stuck-process"}),
+                    artifact: None,
+                    repo_root: None,
+                    ecosystem: None,
+                })
+                .unwrap();
+        }
+
+        let finding_id = store
+            .record_finding(&FindingInput {
+                kind: "warning".to_string(),
+                title: "AppArmor denial in lsusb".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "apparmor-lsusb-root".to_string(),
+                summary: "AppArmor denied lsusb: open /".to_string(),
+                details: json!({
+                    "subsystem": "apparmor",
+                    "profile": "lsusb",
+                    "profile_path": "/etc/apparmor.d/lsusb",
+                    "profile_package_name": "apparmor",
+                    "operation": "open",
+                    "name": "/"
+                }),
+                artifact: Some(ObservedArtifact {
+                    kind: "apparmor-profile".to_string(),
+                    name: "lsusb".to_string(),
+                    path: Some("/etc/apparmor.d/lsusb".into()),
+                    package_name: Some("apparmor".to_string()),
+                    repo_root: None,
+                    ecosystem: None,
+                    metadata: json!({}),
+                }),
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let opportunity = store.get_opportunity_by_finding(finding_id).unwrap();
+
+        let source_root = dir.path().join("source");
+        let workspace_root = dir.path().join("workspace");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::write(source_root.join("lsusb"), "before\n").unwrap();
+        fs::write(workspace_root.join("lsusb"), "after\n").unwrap();
+
+        let bundle_dir = dir.path().join("lsusb-proposal-bundle");
+        fs::create_dir_all(&bundle_dir).unwrap();
+        let output_path = bundle_dir.join("codex-output.txt");
+        fs::write(
+            bundle_dir.join("evidence.json"),
+            serde_json::to_vec_pretty(&json!({
+                "opportunity": opportunity,
+                "workspace": { "repo_root": workspace_root.display().to_string() },
+                "source_workspace": { "repo_root": source_root.display().to_string() },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(bundle_dir.join("prompt.md"), "Patch the lsusb profile.\n").unwrap();
+        fs::write(&output_path, "Allowed the root directory read.\n").unwrap();
+        let proposal = store
+            .create_proposal(
+                opportunity.id,
+                "codex",
+                "ready",
+                &bundle_dir,
+                Some(&output_path),
+            )
+            .unwrap();
+        fs::write(
+            bundle_dir.join("status.json"),
+            serde_json::to_vec_pretty(&CodexJobStatus {
+                job_id: "job-lsusb".to_string(),
+                state: "ready".to_string(),
+                started_at: "2026-05-10T00:00:00Z".to_string(),
+                finished_at: "2026-05-10T00:05:00Z".to_string(),
+                output_path: Some(output_path.clone()),
+                selected_model: Some("codex-default".to_string()),
+                models_used: vec!["codex-default".to_string()],
+                rate_limit_fallback_used: false,
+                failure_stage: None,
+                error: None,
+                failure_kind: None,
+                exit_status: Some(0),
+                last_stderr_excerpt: None,
+                review_failure_category: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut config = FixerConfig::default();
+        config.network.max_submission_items = 3;
+        let identity = store.ensure_install_identity().unwrap();
+        let participation = ParticipationSnapshot {
+            identity,
+            state: ParticipationState {
+                mode: ParticipationMode::SubmitterWorker,
+                ..ParticipationState::default()
+            },
+            server_url: config.network.server_url.clone(),
+            policy_text: "test policy".to_string(),
+        };
+
+        let bundle = build_submission_bundle(&store, &config, &participation).unwrap();
+        assert_eq!(bundle.items.len(), 3);
+        assert!(
+            bundle
+                .items
+                .iter()
+                .any(|item| item.local_opportunity_id == opportunity.id)
+        );
+        assert_eq!(bundle.proposals.len(), 1);
+        assert_eq!(bundle.proposals[0].local_proposal_id, proposal.id);
+        assert_eq!(bundle.proposals[0].remote_issue_id, None);
+
+        let receipt = SubmissionReceipt {
+            submission_id: "submission-1".to_string(),
+            accepted: true,
+            duplicate: false,
+            quarantined: false,
+            promoted_clusters: 1,
+            issue_ids: bundle
+                .items
+                .iter()
+                .map(|item| format!("issue-{}", item.local_opportunity_id))
+                .collect(),
+            message: "accepted".to_string(),
+        };
+        remember_published_proposals(&store, &bundle, &receipt).unwrap();
+        let (published_issue_id, _) = store
+            .proposal_publication_marker(proposal.id)
+            .unwrap()
+            .expect("proposal publication should be marked for same-sync issues");
+        assert_eq!(published_issue_id, format!("issue-{}", opportunity.id));
     }
 
     #[test]

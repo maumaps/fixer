@@ -1,3 +1,14 @@
+fixer (0.146.0-1) unstable; urgency=medium
+
+  * Prioritize ready Codex proposals during sync even when their findings are
+    below the normal score window.
+  * Mark proposals published when their remote issue is created in the same
+    submission.
+  * Publish safe AppArmor profile-package reports so generated patch proposals
+    have working public issue pages.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 10 May 2026 10:30:00 +0400
+
 fixer (0.145.0-1) unstable; urgency=medium
 
   * Add service-key Codex worker auth for unattended machine workers with a
