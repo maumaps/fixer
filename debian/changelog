@@ -1,3 +1,12 @@
+fixer (0.150.0-1) unstable; urgency=medium
+
+  * Prefer upstream git default branches for source patches, including
+    systemd, PackageKit, htop, and kernel fallback workspaces.
+  * Refresh managed upstream source caches back to origin/HEAD before
+    generating autonomous patch proposals.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 11 May 2026 20:37:24 +0400
+
 fixer (0.149.0-1) unstable; urgency=medium
 
   * Add `fixer gc` to sync first and reclaim stale proposal bundles,

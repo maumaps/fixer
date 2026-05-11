@@ -19,6 +19,7 @@ const DPKG_QUERY_TIMEOUT_SECONDS: u64 = 5;
 const VERSION_COMPARE_TIMEOUT_SECONDS: u64 = 2;
 const SOURCE_DOWNLOAD_TIMEOUT_SECONDS: u64 = 120;
 const GIT_CLONE_TIMEOUT_SECONDS: u64 = 300;
+const GIT_REFRESH_TIMEOUT_SECONDS: u64 = 120;
 const CURL_DOWNLOAD_TIMEOUT_SECONDS: u64 = 120;
 const DPKG_SOURCE_TIMEOUT_SECONDS: u64 = 120;
 
@@ -57,11 +58,38 @@ pub fn ensure_workspace_for_opportunity(
     let workspace_target = metadata
         .as_ref()
         .and_then(|pkg| workspace_source_alias(pkg, &requested_source_package))
+        .or_else(|| upstream_source_alias(&requested_source_package))
         .unwrap_or_else(|| WorkspaceSourceTarget {
             source_package: requested_source_package,
             upstream_url: None,
             acquisition_note: None,
         });
+
+    if let Some(upstream_url) = workspace_target
+        .upstream_url
+        .as_deref()
+        .or_else(|| kernel_upstream_repo_url(&workspace_target.source_package))
+    {
+        let repo_root =
+            ensure_upstream_clone(config, &workspace_target.source_package, upstream_url)?;
+        let repo_root = maybe_canonicalize(&repo_root);
+        let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
+        return Ok(PreparedWorkspace {
+            repo_root,
+            ecosystem,
+            source_kind: if workspace_target.upstream_url.is_some() {
+                "upstream-git".to_string()
+            } else {
+                "kernel-upstream-git".to_string()
+            },
+            package_name,
+            source_package: Some(workspace_target.source_package.clone()),
+            homepage: Some(upstream_url.to_string()),
+            acquisition_note: workspace_target.acquisition_note.unwrap_or_else(|| {
+                "Cloned upstream git default branch for a source patch; do not base upstream patches on the installed distro version branch.".to_string()
+            }),
+        });
+    }
 
     if deb_src_enabled() {
         let installed_version = metadata
@@ -87,34 +115,6 @@ pub fn ensure_workspace_for_opportunity(
                     }),
             });
         }
-    }
-
-    if let Some(upstream_url) = workspace_target
-        .upstream_url
-        .as_deref()
-        .or_else(|| kernel_upstream_repo_url(&workspace_target.source_package))
-    {
-        let repo_root =
-            ensure_upstream_clone(config, &workspace_target.source_package, upstream_url)?;
-        let repo_root = maybe_canonicalize(&repo_root);
-        let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
-        return Ok(PreparedWorkspace {
-            repo_root,
-            ecosystem,
-            source_kind: if workspace_target.upstream_url.is_some() {
-                "upstream-git".to_string()
-            } else {
-                "kernel-upstream-git".to_string()
-            },
-            package_name,
-            source_package: Some(workspace_target.source_package.clone()),
-            homepage: Some(upstream_url.to_string()),
-            acquisition_note: workspace_target
-                .acquisition_note
-                .unwrap_or_else(|| {
-                    "Cloned upstream Linux kernel sources because Debian source indexes were unavailable on this worker.".to_string()
-                }),
-        });
     }
 
     if let Some(vcs_url) = source_package_vcs_url(&workspace_target.source_package) {
@@ -373,6 +373,25 @@ fn workspace_source_alias(
     chrome_workspace_alias(metadata, source_package)
 }
 
+fn upstream_source_alias(source_package: &str) -> Option<WorkspaceSourceTarget> {
+    let (upstream_url, project_name) = match source_package {
+        "systemd" => ("https://github.com/systemd/systemd.git", "systemd"),
+        "PackageKit" | "packagekit" => {
+            ("https://github.com/PackageKit/PackageKit.git", "PackageKit")
+        }
+        "htop" => ("https://github.com/htop-dev/htop.git", "htop"),
+        _ => return None,
+    };
+
+    Some(WorkspaceSourceTarget {
+        source_package: source_package.to_string(),
+        upstream_url: Some(upstream_url.to_string()),
+        acquisition_note: Some(format!(
+            "Mapped `{source_package}` to the {project_name} upstream git default branch so source patches are prepared against upstream HEAD instead of the installed distro version."
+        )),
+    })
+}
+
 fn chrome_workspace_alias(
     metadata: &InstalledPackageMetadata,
     source_package: &str,
@@ -475,6 +494,7 @@ fn ensure_upstream_clone(config: &FixerConfig, source_package: &str, url: &str) 
     fs::create_dir_all(&base_dir)?;
     let dest = base_dir.join(sanitize_dir_name(source_package));
     if dest.join(".git").is_dir() {
+        refresh_upstream_clone_default_branch(&dest)?;
         return Ok(dest);
     }
     if dest.exists() {
@@ -496,7 +516,122 @@ fn ensure_upstream_clone(config: &FixerConfig, source_package: &str, url: &str) 
     if !status.success() {
         return Err(anyhow!("git clone failed for {}", url));
     }
+    refresh_upstream_clone_default_branch(&dest)?;
     Ok(dest)
+}
+
+fn refresh_upstream_clone_default_branch(repo_root: &Path) -> Result<()> {
+    let fetch_status = command_status_in_dir_with_timeout(
+        "git",
+        &["fetch", "--depth", "1", "--prune", "origin"],
+        repo_root,
+        StdDuration::from_secs(GIT_REFRESH_TIMEOUT_SECONDS),
+    )
+    .with_context(|| {
+        format!(
+            "failed to fetch upstream default branch in {}",
+            repo_root.display()
+        )
+    })?;
+    if !fetch_status.success() {
+        return Err(anyhow!(
+            "git fetch failed while refreshing upstream clone {}",
+            repo_root.display()
+        ));
+    }
+
+    let default_branch = upstream_default_branch(repo_root)?;
+    let remote_ref = format!("origin/{default_branch}");
+    let checkout_status = command_status_in_dir_with_timeout(
+        "git",
+        &["checkout", "-B", &default_branch, &remote_ref],
+        repo_root,
+        StdDuration::from_secs(GIT_REFRESH_TIMEOUT_SECONDS),
+    )
+    .with_context(|| {
+        format!(
+            "failed to checkout upstream default branch in {}",
+            repo_root.display()
+        )
+    })?;
+    if !checkout_status.success() {
+        return Err(anyhow!(
+            "git checkout failed while refreshing upstream clone {} to {}",
+            repo_root.display(),
+            remote_ref
+        ));
+    }
+
+    let reset_status = command_status_in_dir_with_timeout(
+        "git",
+        &["reset", "--hard", &remote_ref],
+        repo_root,
+        StdDuration::from_secs(GIT_REFRESH_TIMEOUT_SECONDS),
+    )?;
+    if !reset_status.success() {
+        return Err(anyhow!(
+            "git reset failed while refreshing upstream clone {} to {}",
+            repo_root.display(),
+            remote_ref
+        ));
+    }
+
+    let clean_status = command_status_in_dir_with_timeout(
+        "git",
+        &["clean", "-fdx"],
+        repo_root,
+        StdDuration::from_secs(GIT_REFRESH_TIMEOUT_SECONDS),
+    )?;
+    if !clean_status.success() {
+        return Err(anyhow!(
+            "git clean failed while refreshing upstream clone {}",
+            repo_root.display()
+        ));
+    }
+
+    Ok(())
+}
+
+fn upstream_default_branch(repo_root: &Path) -> Result<String> {
+    if let Ok(raw) = command_output_in_dir_with_timeout(
+        "git",
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        repo_root,
+        StdDuration::from_secs(GIT_REFRESH_TIMEOUT_SECONDS),
+    ) && let Some(branch) = raw.trim().strip_prefix("origin/").filter(|x| !x.is_empty())
+    {
+        return Ok(branch.to_string());
+    }
+
+    let set_head_status = command_status_in_dir_with_timeout(
+        "git",
+        &["remote", "set-head", "origin", "--auto"],
+        repo_root,
+        StdDuration::from_secs(GIT_REFRESH_TIMEOUT_SECONDS),
+    )?;
+    if !set_head_status.success() {
+        return Err(anyhow!(
+            "could not resolve origin default branch in {}",
+            repo_root.display()
+        ));
+    }
+
+    let raw = command_output_in_dir_with_timeout(
+        "git",
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        repo_root,
+        StdDuration::from_secs(GIT_REFRESH_TIMEOUT_SECONDS),
+    )?;
+    raw.trim()
+        .strip_prefix("origin/")
+        .filter(|branch| !branch.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "origin/HEAD did not resolve to a branch in {}",
+                repo_root.display()
+            )
+        })
 }
 
 fn find_unpacked_source_dir(
@@ -969,7 +1104,7 @@ mod tests {
         package_name_from_opportunity, parse_apt_origins, parse_maintainer_url,
         parse_showsrc_records, sanitize_dir_name, select_showsrc_record, source_dir_version_hint,
         source_package_from_opportunity, source_package_vcs_url, trim_debian_epoch,
-        vcs_git_clone_url,
+        upstream_source_alias, vcs_git_clone_url,
     };
     use crate::models::{InstalledPackageMetadata, OpportunityRecord};
     use serde_json::json;
@@ -1105,6 +1240,23 @@ zoom:\n\
         assert!(!origin_is_debian_source_friendly(
             "http://dl.google.com/linux/chrome/deb stable/main amd64 Packages"
         ));
+    }
+
+    #[test]
+    fn maps_systemd_to_upstream_default_branch_source() {
+        let target = upstream_source_alias("systemd").expect("systemd should use upstream git");
+        assert_eq!(target.source_package, "systemd");
+        assert_eq!(
+            target.upstream_url.as_deref(),
+            Some("https://github.com/systemd/systemd.git")
+        );
+        assert!(
+            target
+                .acquisition_note
+                .as_deref()
+                .unwrap()
+                .contains("upstream git default branch")
+        );
     }
 
     #[test]
