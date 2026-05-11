@@ -3,6 +3,7 @@ pub mod app;
 pub mod capabilities;
 pub mod collectors;
 pub mod config;
+pub mod gc;
 pub mod models;
 pub mod network;
 pub mod pow;

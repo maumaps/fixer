@@ -115,6 +115,19 @@ cargo run -p fixer -- --config ./fixer.toml opt-in --mode submitter-worker
 cargo run -p fixer -- --config ./fixer.toml worker run
 ```
 
+To reclaim local collector and proposal state after syncing:
+
+```bash
+cargo run -p fixer -- --config ./fixer.toml gc --dry-run
+cargo run -p fixer -- --config ./fixer.toml gc
+```
+
+`gc` syncs first by default, then removes proposal bundles, investigation
+artifacts, and perf samples that are past the configured retention window.
+Use `--retention-days 0` when you want an immediate local cache purge, and
+`--include-sources` only when it is acceptable to delete regenerable source
+checkouts under the Fixer state directory.
+
 To run the server locally:
 
 ```bash

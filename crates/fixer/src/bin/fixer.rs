@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use fixer::app::{App, is_permission_or_readonly_error};
 use fixer::config::FixerConfig;
+use fixer::gc::{GcEntryKind, GcOptions};
 use fixer::models::{FindingRecord, LeaseBudgetPreset, ParticipationMode};
 use fixer::proposal;
 use std::env;
@@ -76,6 +77,16 @@ enum Commands {
     },
     OptOut,
     Sync,
+    Gc {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        skip_sync: bool,
+        #[arg(long)]
+        include_sources: bool,
+        #[arg(long)]
+        retention_days: Option<u64>,
+    },
     Worker {
         #[command(subcommand)]
         command: WorkerCommands,
@@ -456,6 +467,52 @@ fn main() -> Result<()> {
                 println!("redactions: {}", outcome.redactions.join(", "));
             }
         }
+        Commands::Gc {
+            dry_run,
+            skip_sync,
+            include_sources,
+            retention_days,
+        } => {
+            let outcome = app.gc(GcOptions {
+                dry_run,
+                skip_sync,
+                include_sources,
+                retention_days,
+                ..GcOptions::default()
+            })?;
+            if outcome.sync_attempted {
+                println!("sync: completed");
+            } else if let Some(reason) = outcome.sync_skipped_reason {
+                println!("sync: skipped ({reason})");
+            }
+            if let Some(warning) = outcome.sync_warning {
+                println!("sync_warning: {warning}");
+            }
+            println!("candidates: {}", outcome.entries.len());
+            if dry_run {
+                let bytes = outcome.entries.iter().map(|entry| entry.bytes).sum();
+                println!("would_reclaim: {}", format_bytes(bytes));
+            } else {
+                println!("reclaimed: {}", format_bytes(outcome.bytes_reclaimed));
+            }
+            for entry in outcome.entries {
+                let action = if dry_run {
+                    "would_remove"
+                } else if entry.removed {
+                    "removed"
+                } else {
+                    "kept"
+                };
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    action,
+                    gc_entry_kind_label(entry.kind),
+                    format_bytes(entry.bytes),
+                    entry.reason,
+                    entry.path.display()
+                );
+            }
+        }
         Commands::Worker { command } => match command {
             WorkerCommands::Run => {
                 let outcome = app.worker_once()?;
@@ -663,6 +720,30 @@ fn print_lease_status(status: &fixer::models::CodexAuthLeaseStatus) {
     }
     for note in &status.notes {
         println!("note: {note}");
+    }
+}
+
+fn gc_entry_kind_label(kind: GcEntryKind) -> &'static str {
+    match kind {
+        GcEntryKind::ProposalBundle => "proposal",
+        GcEntryKind::Investigation => "investigation",
+        GcEntryKind::PerfSample => "perf",
+        GcEntryKind::SourceCheckout => "source",
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 

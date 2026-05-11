@@ -2,6 +2,7 @@ use crate::adapters::inspect_repo;
 use crate::capabilities::detect_capabilities;
 use crate::collectors::{CollectReport, collect_complaint_context, collect_once};
 use crate::config::FixerConfig;
+use crate::gc::{self, GcOptions, GcOutcome};
 use crate::models::{
     CodexAuthLease, CodexAuthLeaseStatus, CodexAuthMode, ComplaintCollectionReport,
     ComplaintOutcome, LeaseBudgetPreset, ParticipationMode, SharedOpportunity,
@@ -344,6 +345,38 @@ impl App {
         network::sync_once(&self.store, &self.config)
     }
 
+    pub fn gc(&self, options: GcOptions) -> Result<GcOutcome> {
+        let sync_attempted = !options.dry_run && !options.skip_sync;
+        let sync_skipped_reason = if options.dry_run {
+            Some("dry-run".to_string())
+        } else if options.skip_sync {
+            Some("requested by --skip-sync".to_string())
+        } else {
+            None
+        };
+        let sync_warning = if sync_attempted {
+            match self.sync() {
+                Ok(_) => None,
+                Err(error) if sync_error_is_empty_submission(&error) => Some(error.to_string()),
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+
+        let mut options = options;
+        options.protected_paths = self.store.list_unpublished_ready_proposal_bundle_paths()?;
+        let mut entries = gc::collect_gc_candidates(&self.config, &options)?;
+        let bytes_reclaimed = gc::apply_gc_candidates(&mut entries, options.dry_run)?;
+        Ok(GcOutcome {
+            sync_attempted,
+            sync_skipped_reason,
+            sync_warning,
+            entries,
+            bytes_reclaimed,
+        })
+    }
+
     pub fn worker_once(&self) -> Result<WorkerRunOutcome> {
         let outcome = network::worker_once(&self.store, &self.config)?;
         self.store
@@ -565,6 +598,14 @@ pub fn is_permission_or_readonly_error(error: &anyhow::Error) -> bool {
     })
 }
 
+fn sync_error_is_empty_submission(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("no opportunities or ready proposals available for submission")
+    })
+}
+
 fn complaint_workspace_root(description: &str) -> PathBuf {
     let base = env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -582,7 +623,7 @@ fn complaint_workspace_root(description: &str) -> PathBuf {
 mod tests {
     use super::{
         complaint_match_score, complaint_workspace_root, is_permission_or_readonly_error,
-        should_retry_complaint_in_overlay, tokenize_complaint_text,
+        should_retry_complaint_in_overlay, sync_error_is_empty_submission, tokenize_complaint_text,
     };
     use crate::config::FixerConfig;
     use crate::models::{
@@ -602,6 +643,13 @@ mod tests {
         assert!(tokens.contains("sharing"));
         assert!(!tokens.contains("when"));
         assert!(!tokens.contains("after"));
+    }
+
+    #[test]
+    fn gc_treats_empty_submission_sync_as_non_fatal() {
+        let error = anyhow!("no opportunities or ready proposals available for submission");
+
+        assert!(sync_error_is_empty_submission(&error));
     }
 
     #[test]

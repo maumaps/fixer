@@ -1334,6 +1334,23 @@ impl Store {
         ).map_err(Into::into)
     }
 
+    pub fn list_unpublished_ready_proposal_bundle_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT p.bundle_path
+            FROM proposals p
+            LEFT JOIN proposal_publications pp ON pp.proposal_id = p.id
+            WHERE p.engine = 'codex'
+              AND p.state = 'ready'
+              AND pp.proposal_id IS NULL
+            ORDER BY p.id
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| Ok(PathBuf::from(row.get::<_, String>(0)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn latest_ready_codex_proposal_for_opportunity(
         &self,
         opportunity_id: i64,
@@ -1917,6 +1934,53 @@ mod tests {
         assert_eq!(store.count("synced_issue_links").unwrap(), 0);
         assert_eq!(store.count("opportunities").unwrap(), 0);
         assert_eq!(store.count("findings").unwrap(), 0);
+    }
+
+    #[test]
+    fn unpublished_ready_proposal_bundle_paths_skip_published_bundles() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        let finding_id = store
+            .record_finding(&FindingInput {
+                kind: "hotspot".to_string(),
+                title: "Example hotspot".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "hotspot-2".to_string(),
+                summary: "hotspot summary".to_string(),
+                details: json!({"subsystem": "perf-hotspot"}),
+                artifact: None,
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let opportunity = store.get_opportunity_by_finding(finding_id).unwrap();
+        let unpublished = store
+            .create_proposal(
+                opportunity.id,
+                "codex",
+                "ready",
+                &PathBuf::from("/tmp/unpublished"),
+                None,
+            )
+            .unwrap();
+        let published = store
+            .create_proposal(
+                opportunity.id,
+                "codex",
+                "ready",
+                &PathBuf::from("/tmp/published"),
+                None,
+            )
+            .unwrap();
+        store
+            .mark_proposal_published(published.id, "remote-issue", "hash")
+            .unwrap();
+
+        let paths = store
+            .list_unpublished_ready_proposal_bundle_paths()
+            .unwrap();
+
+        assert_eq!(paths, vec![unpublished.bundle_path]);
     }
 
     #[test]
