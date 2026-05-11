@@ -1,3 +1,10 @@
+fixer (0.149.0-1) unstable; urgency=medium
+
+  * Add `fixer gc` to sync first and reclaim stale proposal bundles,
+    investigation artifacts, perf samples, and opt-in source checkouts.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 11 May 2026 18:15:59 +0400
+
 fixer (0.148.0-1) unstable; urgency=medium
 
   * Ignore obsolete dpkg conffiles when attributing /etc paths to source
