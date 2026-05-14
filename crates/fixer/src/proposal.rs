@@ -2161,6 +2161,20 @@ fn codex_supports_reasoning_effort_flag(config: &FixerConfig) -> bool {
     help.contains("--reasoning-effort")
 }
 
+fn codex_supports_json_events_flag(config: &FixerConfig) -> bool {
+    let Ok(output) =
+        command_run_with_patch_command_timeout(&config.patch.codex_command, &["exec", "--help"])
+    else {
+        return false;
+    };
+    let help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    help.contains("--json")
+}
+
 fn command_run_with_patch_command_timeout(
     program: &str,
     args: &[&str],
@@ -2505,7 +2519,9 @@ fn run_codex_process(
     }
     cmd.arg("exec");
     cmd.arg("--skip-git-repo-check");
-    if !config.patch.codex_args.iter().any(|arg| arg == "--json") {
+    let explicit_json_events = config.patch.codex_args.iter().any(|arg| arg == "--json");
+    let supports_json_events = explicit_json_events || codex_supports_json_events_flag(config);
+    if supports_json_events && !explicit_json_events {
         cmd.arg("--json");
     }
     if let Some(model) = model {
@@ -2523,7 +2539,10 @@ fn run_codex_process(
     for arg in &config.patch.codex_args {
         cmd.arg(arg);
     }
-    if let Some(session_id) = resume_state.and_then(CodexResumeState::session_id) {
+    if let Some(session_id) = resume_state
+        .filter(|_| supports_json_events)
+        .and_then(CodexResumeState::session_id)
+    {
         cmd.arg("resume").arg(session_id);
     }
     cmd.arg("-")
@@ -8658,6 +8677,11 @@ RESULT: ok
 args_log='{args_log}'
 count_file='{count_file}'
 out=''
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  printf '%s\n' 'Usage: codex exec [OPTIONS]'
+  printf '%s\n' '      --json'
+  exit 0
+fi
 printf '%s\n' "$*" >> "$args_log"
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "-o" ]; then
@@ -8747,6 +8771,138 @@ plain stderr line
             super::extract_codex_session_id_from_log(log).as_deref(),
             Some("session-abc")
         );
+    }
+
+    #[test]
+    fn codex_resume_skips_json_only_path_when_cli_lacks_json_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_codex = dir.path().join("fake-codex.sh");
+        let args_log = dir.path().join("codex-args.log");
+        let repo_root = dir.path().join("workspace");
+        let output_path = dir.path().join("output.txt");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::write(
+            &fake_codex,
+            format!(
+                r#"#!/bin/sh
+args_log='{args_log}'
+out=''
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  printf '%s\n' 'Usage: codex exec [OPTIONS]'
+  exit 0
+fi
+printf '%s\n' "$*" >> "$args_log"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+printf '%s\n' 'plain output' > "$out"
+exit 0
+"#,
+                args_log = args_log.display(),
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_codex).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_codex, perms).unwrap();
+        }
+
+        let mut config = FixerConfig::default();
+        config.patch.codex_command = fake_codex.display().to_string();
+        config.patch.codex_timeout_seconds = 0;
+        std::fs::write(dir.path().join("codex-session-id.txt"), "session-old\n").unwrap();
+        let resume_state = super::CodexResumeState::new(dir.path().join("codex-session-id.txt"));
+
+        let outcome = super::run_codex_process(
+            &config,
+            &repo_root,
+            &output_path,
+            "please patch",
+            None,
+            None,
+            Some(&resume_state),
+        )
+        .unwrap();
+
+        assert!(outcome.success);
+        let args = std::fs::read_to_string(args_log).unwrap();
+        assert!(!args.contains("--json"));
+        assert!(!args.contains(" resume "));
+    }
+
+    #[test]
+    fn codex_resume_uses_explicit_json_arg_when_help_lacks_json_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_codex = dir.path().join("fake-codex.sh");
+        let args_log = dir.path().join("codex-args.log");
+        let repo_root = dir.path().join("workspace");
+        let output_path = dir.path().join("output.txt");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::write(
+            &fake_codex,
+            format!(
+                r#"#!/bin/sh
+args_log='{args_log}'
+out=''
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  printf '%s\n' 'Usage: codex exec [OPTIONS]'
+  exit 0
+fi
+printf '%s\n' "$*" >> "$args_log"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+printf '%s\n' '{{"session_id":"session-new"}}'
+printf '%s\n' 'resumed output' > "$out"
+exit 0
+"#,
+                args_log = args_log.display(),
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_codex).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_codex, perms).unwrap();
+        }
+
+        let mut config = FixerConfig::default();
+        config.patch.codex_command = fake_codex.display().to_string();
+        config.patch.codex_args = vec!["--json".to_string()];
+        config.patch.codex_timeout_seconds = 0;
+        std::fs::write(dir.path().join("codex-session-id.txt"), "session-old\n").unwrap();
+        let resume_state = super::CodexResumeState::new(dir.path().join("codex-session-id.txt"));
+
+        let outcome = super::run_codex_process(
+            &config,
+            &repo_root,
+            &output_path,
+            "please patch",
+            None,
+            None,
+            Some(&resume_state),
+        )
+        .unwrap();
+
+        assert!(outcome.success);
+        let args = std::fs::read_to_string(args_log).unwrap();
+        assert!(args.contains("--json"));
+        assert!(args.contains(" resume session-old -"));
     }
 
     #[test]
