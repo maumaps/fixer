@@ -1033,7 +1033,7 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
             Err(error) => return Err(error),
         }
     }
-    if let Some(denied_until) = opportunistic_denied_until(store)? {
+    if let Some(denied_until) = opportunistic_cached_denial(store, config)? {
         if denied_until > Utc::now() {
             return Ok(WorkerRunOutcome {
                 hello,
@@ -2395,6 +2395,16 @@ fn opportunistic_denied_until(store: &Store) -> Result<Option<DateTime<Utc>>> {
     Ok(DateTime::parse_from_rfc3339(&raw)
         .map(|value| value.with_timezone(&Utc))
         .ok())
+}
+
+fn opportunistic_cached_denial(
+    store: &Store,
+    config: &FixerConfig,
+) -> Result<Option<DateTime<Utc>>> {
+    if !config.patch.opportunistic_worker {
+        return Ok(None);
+    }
+    opportunistic_denied_until(store)
 }
 
 fn remember_opportunistic_denial(
@@ -3839,6 +3849,30 @@ mod tests {
     fn opportunistic_retry_after_parses_seconds() {
         assert_eq!(parse_retry_after_seconds("45"), Some(45));
         assert_eq!(parse_retry_after_seconds("0"), Some(1));
+    }
+
+    #[test]
+    fn opportunistic_cached_denial_respects_worker_flag() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        let denied_until = Utc::now() + ChronoDuration::seconds(60);
+        store
+            .set_local_state(OPPORTUNISTIC_DENIED_UNTIL_KEY, &denied_until.to_rfc3339())
+            .unwrap();
+
+        let mut config = FixerConfig::default();
+        assert!(
+            opportunistic_cached_denial(&store, &config)
+                .unwrap()
+                .is_none()
+        );
+
+        config.patch.opportunistic_worker = true;
+        assert!(
+            opportunistic_cached_denial(&store, &config)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
