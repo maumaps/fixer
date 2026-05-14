@@ -2539,10 +2539,7 @@ fn run_codex_process(
     for arg in &config.patch.codex_args {
         cmd.arg(arg);
     }
-    if let Some(session_id) = resume_state
-        .filter(|_| supports_json_events)
-        .and_then(CodexResumeState::session_id)
-    {
+    if let Some(session_id) = resume_state.and_then(CodexResumeState::session_id) {
         cmd.arg("resume").arg(session_id);
     }
     cmd.arg("-")
@@ -8774,7 +8771,7 @@ plain stderr line
     }
 
     #[test]
-    fn codex_resume_skips_json_only_path_when_cli_lacks_json_events() {
+    fn codex_resume_keeps_session_when_cli_lacks_json_events() {
         let dir = tempfile::tempdir().unwrap();
         let fake_codex = dir.path().join("fake-codex.sh");
         let args_log = dir.path().join("codex-args.log");
@@ -8835,7 +8832,7 @@ exit 0
         assert!(outcome.success);
         let args = std::fs::read_to_string(args_log).unwrap();
         assert!(!args.contains("--json"));
-        assert!(!args.contains(" resume "));
+        assert!(args.contains(" resume session-old -"));
     }
 
     #[test]
