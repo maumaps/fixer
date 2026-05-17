@@ -1,3 +1,11 @@
+fixer (0.151.0-1) unstable; urgency=medium
+
+  * Reject observed-only security-sensitive source patches, including
+    authentication timing changes, unless Fixer reproduced the behavior and
+    records security-impact analysis.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sun, 17 May 2026 20:34:00 +0400
+
 fixer (0.150.0-1) unstable; urgency=medium
 
   * Prefer upstream git default branches for source patches, including
