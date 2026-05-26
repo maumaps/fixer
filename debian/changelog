@@ -1,3 +1,10 @@
+fixer (0.174.0-1) unstable; urgency=medium
+
+  * Label blocked-validation public patches as harvest needs-review while
+    keeping their published diffs visible for manual upstream triage.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 07:32:00 +0400
+
 fixer (0.173.0-1) unstable; urgency=medium
 
   * Show explicit relation labels for related upstream review badges, so

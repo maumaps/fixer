@@ -1008,6 +1008,8 @@ struct PublicPatchEntry {
     git_add_paths: Vec<String>,
     changed_files: Vec<String>,
     validation_notes: Vec<String>,
+    harvest_status: String,
+    harvest_blockers: Vec<String>,
     upstream_review: Option<PublicPatchUpstreamReview>,
     related_upstream_review: Option<PublicPatchRelatedReview>,
     duplicate_patch: Option<PublicPatchDuplicate>,
@@ -8177,6 +8179,12 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
         .and_then(|session| session.response.as_deref())
         .map(extract_patch_response_metadata)
         .unwrap_or_default();
+    let validation_notes = cover
+        .as_ref()
+        .map(|cover| cover.validation_notes.clone())
+        .unwrap_or_default();
+    let harvest_blockers = public_patch_harvest_blockers(&best_patch, &validation_notes);
+    let harvest_status = public_patch_harvest_status(&harvest_blockers);
     Ok(Some(PublicPatchEntry {
         id: id.clone(),
         kind: row.get(1),
@@ -8199,10 +8207,9 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
             .as_ref()
             .map(|cover| cover.changed_files.clone())
             .unwrap_or_default(),
-        validation_notes: cover
-            .as_ref()
-            .map(|cover| cover.validation_notes.clone())
-            .unwrap_or_default(),
+        validation_notes,
+        harvest_status,
+        harvest_blockers,
         upstream_review: public_patch_upstream_review_from_row(&row),
         related_upstream_review: None,
         duplicate_patch: None,
@@ -9617,6 +9624,12 @@ fn public_patch_from_sqlite_row(
         .and_then(|session| session.response.as_deref())
         .map(extract_patch_response_metadata)
         .unwrap_or_default();
+    let validation_notes = cover
+        .as_ref()
+        .map(|cover| cover.validation_notes.clone())
+        .unwrap_or_default();
+    let harvest_blockers = public_patch_harvest_blockers(&best_patch, &validation_notes);
+    let harvest_status = public_patch_harvest_status(&harvest_blockers);
     Ok(Some(PublicPatchEntry {
         id: id.clone(),
         kind: row.get(1)?,
@@ -9639,10 +9652,9 @@ fn public_patch_from_sqlite_row(
             .as_ref()
             .map(|cover| cover.changed_files.clone())
             .unwrap_or_default(),
-        validation_notes: cover
-            .as_ref()
-            .map(|cover| cover.validation_notes.clone())
-            .unwrap_or_default(),
+        validation_notes,
+        harvest_status,
+        harvest_blockers,
         upstream_review: public_patch_upstream_review_from_sqlite_row(row)?,
         related_upstream_review: None,
         duplicate_patch: None,
@@ -10442,6 +10454,70 @@ fn patch_validation_notes(
         }
     }
     notes
+}
+
+fn public_patch_harvest_status(blockers: &[String]) -> String {
+    if blockers.is_empty() {
+        "ready".to_string()
+    } else {
+        "needs_review".to_string()
+    }
+}
+
+fn public_patch_harvest_blockers(
+    attempt: &PublicAttempt,
+    validation_notes: &[String],
+) -> Vec<String> {
+    let validation_status = attempt
+        .validation_status
+        .as_deref()
+        .unwrap_or(&attempt.state)
+        .to_ascii_lowercase();
+    let validation_text = validation_notes.join("\n").to_ascii_lowercase();
+    let has_blocked_validation = validation_status.contains("blocked_validation")
+        || validation_status.contains("blocked")
+        || validation_text.contains("blocked")
+        || validation_text.contains("could not run")
+        || validation_text.contains("did not run");
+    if has_blocked_validation && !public_patch_has_substantive_validation_success(validation_notes)
+    {
+        vec!["blocked_validation".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn public_patch_has_substantive_validation_success(validation_notes: &[String]) -> bool {
+    validation_notes.iter().any(|note| {
+        let note = note.to_ascii_lowercase();
+        if note.contains("blocked")
+            || note.contains("could not run")
+            || note.contains("did not run")
+        {
+            return false;
+        }
+        let has_project_command = note.contains("go test")
+            || note.contains("cargo test")
+            || note.contains("pytest")
+            || note.contains("make ")
+            || note.contains("ninja")
+            || note.contains("ctest")
+            || note.contains("mvn test")
+            || note.contains("npm test")
+            || note.contains("pnpm test")
+            || note.contains("yarn test")
+            || note.contains("unit test")
+            || note.contains("integration test")
+            || note.contains("full suite")
+            || note.contains("project test")
+            || note.contains("build completed");
+        let has_success = note.contains(" passed")
+            || note.contains(" ok")
+            || note.contains(" successful")
+            || note.contains(" completed successfully")
+            || note.contains(" succeeded");
+        has_project_command && has_success
+    })
 }
 
 fn extract_patch_response_metadata(response: &str) -> PatchResponseMetadata {
@@ -14320,6 +14396,20 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             html_escape(status)
         );
     }
+    if entry.harvest_status != "ready" {
+        let _ = write!(
+            patch_tags,
+            "<span class=\"tag\">harvest: {}</span>",
+            html_escape(&entry.harvest_status.replace('_', " "))
+        );
+        for blocker in &entry.harvest_blockers {
+            let _ = write!(
+                patch_tags,
+                "<span class=\"tag\">{}</span>",
+                html_escape(&blocker.replace('_', " "))
+            );
+        }
+    }
     if let Some(review) = entry.upstream_review.as_ref() {
         let _ = write!(
             patch_tags,
@@ -14350,12 +14440,31 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             duplicate.duplicate_count
         );
     }
+    let harvest_warning = if entry.harvest_blockers.is_empty() {
+        String::new()
+    } else {
+        let blockers = entry
+            .harvest_blockers
+            .iter()
+            .map(|blocker| format!("<li>{}</li>", html_escape(&blocker.replace('_', " "))))
+            .collect::<Vec<_>>()
+            .join("");
+        format!(
+            "<section class=\"patch-summary\"><h4>Harvest review needed</h4><p class=\"issue-summary\">The diff is preserved for inspection, but Fixer should not treat it as upstream-ready until these blockers are cleared.</p><ul class=\"attempt-list\">{}</ul></section>",
+            blockers
+        )
+    };
+    let headline_label = if entry.harvest_status == "ready" {
+        "successful patch"
+    } else {
+        "patch needs review"
+    };
 
     format!(
         r#"<article class="issue-card patch-card">
             <div class="issue-topline">
                 <h3><a href="/issues/{}">{}</a></h3>
-                <span class="tag patch">successful patch</span>
+                <span class="tag patch">{}</span>
             </div>
             <p class="issue-summary">{}</p>
             <div class="meta">{}</div>
@@ -14366,13 +14475,16 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             {}
             {}
             {}
+            {}
             <p class="fine-print">Full published attempt: <a href="/issues/{}">/issues/{}</a>. Issue JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
         </article>"#,
         entry.id,
         html_escape(&entry.title),
+        html_escape(headline_label),
         html_escape(&entry.summary),
         patch_tags,
         html_escape(&entry.best_patch.summary),
+        harvest_warning,
         cover
             .as_ref()
             .map(|cover| format!(
@@ -16158,6 +16270,8 @@ mod tests {
             git_add_paths: Vec::new(),
             changed_files: Vec::new(),
             validation_notes: Vec::new(),
+            harvest_status: "ready".to_string(),
+            harvest_blockers: Vec::new(),
             upstream_review: None,
             related_upstream_review: None,
             duplicate_patch: None,
@@ -16221,6 +16335,8 @@ mod tests {
             git_add_paths: Vec::new(),
             changed_files: Vec::new(),
             validation_notes: Vec::new(),
+            harvest_status: "ready".to_string(),
+            harvest_blockers: Vec::new(),
             upstream_review: None,
             related_upstream_review: None,
             duplicate_patch: None,
@@ -17361,6 +17477,73 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("make -j32 passed"))
         );
+        assert_eq!(patch.harvest_status, "ready");
+        assert!(patch.harvest_blockers.is_empty());
+    }
+
+    #[test]
+    fn public_patch_loader_keeps_blocked_validation_patch_but_marks_needs_review() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "docker.io",
+            "Top frame: daemon.start [dockerd]",
+            &["daemon.start [dockerd]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-1",
+            "cluster-1",
+            120,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        let source_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "daemon startup goroutines can pile up.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("blocked_validation".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: daemon: bound startup goroutine creation\n\n## Evidence Confidence\nobserved\n\n## Git Add Paths\n- engine/daemon/daemon.go\n- engine/daemon/daemon_test.go\n\n## Validation\n- `gofmt -w engine/daemon/daemon.go engine/daemon/daemon_test.go` ran successfully. `git diff --check -- engine/daemon/daemon.go engine/daemon/daemon_test.go` passed. Focused test attempted: `go test ./daemon -run TestStartParallelStartupTaskBoundsWaitingGoroutines -count=1` Blocked because dependencies could not be resolved.\n",
+                    "diff": "--- a/engine/daemon/daemon.go\n+++ b/engine/daemon/daemon.go\n@@ -1 +1 @@\n-old\n+new\n--- a/engine/daemon/daemon_test.go\n+++ b/engine/daemon/daemon_test.go\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params!["issue-1", serde_json::to_string(&source_patch).unwrap()],
+            )
+            .unwrap();
+
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let patch = patches
+            .first()
+            .expect("blocked-validation patch stays visible");
+
+        assert_eq!(
+            patch.best_patch_raw_diff_url.as_deref(),
+            Some("/issues/issue-1/best.diff")
+        );
+        assert_eq!(patch.harvest_status, "needs_review");
+        assert_eq!(patch.harvest_blockers, vec!["blocked_validation"]);
+
+        let card = render_public_patch_card(patch);
+        assert!(card.contains("patch needs review"));
+        assert!(card.contains("harvest: needs review"));
+        assert!(card.contains("blocked validation"));
+        assert!(card.contains("/issues/issue-1/best.diff"));
     }
 
     #[test]
