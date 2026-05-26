@@ -6462,10 +6462,18 @@ fn patch_attempt_needs_worker_refresh(attempt: &PatchAttempt) -> bool {
     if attempt.state != "ready" || attempt.outcome != "patch" {
         return false;
     }
+    if patch_attempt_needs_source_mapping(attempt) {
+        return true;
+    }
     match patch_attempt_fixer_version(attempt) {
         Some(version) => is_binary_upgrade_available(version, current_binary_version()),
         None => true,
     }
+}
+
+fn patch_attempt_needs_source_mapping(attempt: &PatchAttempt) -> bool {
+    attempt_has_public_diff(attempt)
+        && attempt_response_text(attempt).is_some_and(response_declares_no_git_add_paths)
 }
 
 fn patch_attempt_fixer_version(attempt: &PatchAttempt) -> Option<&str> {
@@ -10142,6 +10150,20 @@ fn attempt_response_text(attempt: &PatchAttempt) -> Option<&str> {
         .get("published_session")
         .and_then(|value| value.get("response"))
         .and_then(Value::as_str)
+}
+
+fn response_declares_no_git_add_paths(response: &str) -> bool {
+    let Some(section) = extract_markdown_section_raw(response, "Git Add Paths") else {
+        return false;
+    };
+    let entries = section
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| line.trim_start_matches("- ").trim().trim_matches('`'))
+        .collect::<Vec<_>>();
+    !entries.is_empty() && entries.iter().all(|line| line.eq_ignore_ascii_case("none"))
 }
 
 fn attempt_diff_text(attempt: &PatchAttempt) -> Option<&str> {
@@ -16050,6 +16072,33 @@ mod tests {
 
         assert!(patch_attempt_needs_worker_refresh(&legacy_patch));
         assert!(!patch_attempt_needs_worker_refresh(&current_patch));
+    }
+
+    #[test]
+    fn diff_backed_patch_without_git_paths_stays_available_for_source_mapping() {
+        let attempt = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Patch proposal created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "worker_fixer_version": current_binary_version(),
+                "published_session": {
+                    "prompt": "old prompt",
+                    "response": "Subject: keep patch\n\n## Git Add Paths\nNone\n\n## Validation\nnot run\n",
+                    "diff": "--- old/src/file.c\n+++ new/src/file.c\n@@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+
+        assert!(patch_attempt_is_best_candidate(&attempt));
+        assert!(patch_attempt_needs_source_mapping(&attempt));
+        assert!(patch_attempt_needs_worker_refresh(&attempt));
     }
 
     #[test]

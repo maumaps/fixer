@@ -401,6 +401,7 @@ struct PriorPatchContext {
     fixer_version: Option<String>,
     patch_path: Option<PathBuf>,
     session_path: Option<PathBuf>,
+    needs_source_mapping: bool,
 }
 
 fn materialize_prior_patch_context(
@@ -416,6 +417,7 @@ fn materialize_prior_patch_context(
         fixer_version: prior_patch_fixer_version(prior_best_patch).map(ToString::to_string),
         patch_path: None,
         session_path: None,
+        needs_source_mapping: prior_patch_needs_source_mapping(prior_best_patch),
     };
     if let Some(diff) = prior_best_patch_diff(prior_best_patch) {
         let patch_path = bundle_dir.join("prior-best.patch");
@@ -464,6 +466,7 @@ fn prior_patch_context_json(context: &Option<PriorPatchContext>) -> Option<Value
         "fixer_version": context.fixer_version,
         "patch_path": context.patch_path.as_ref().map(|path| path.display().to_string()),
         "session_path": context.session_path.as_ref().map(|path| path.display().to_string()),
+        "needs_source_mapping": context.needs_source_mapping,
     }))
 }
 
@@ -484,6 +487,28 @@ fn prior_best_patch_diff(attempt: &PatchAttempt) -> Option<&str> {
         .and_then(|session| session.get("diff"))
         .and_then(Value::as_str)
         .filter(|diff| !diff.trim().is_empty())
+}
+
+fn prior_patch_needs_source_mapping(attempt: &PatchAttempt) -> bool {
+    prior_best_patch_diff(attempt).is_some()
+        && prior_best_patch_session(attempt)
+            .and_then(|session| session.get("response"))
+            .and_then(Value::as_str)
+            .is_some_and(response_declares_no_git_add_paths)
+}
+
+fn response_declares_no_git_add_paths(response: &str) -> bool {
+    let Some(section) = extract_markdown_section(response, "Git Add Paths") else {
+        return false;
+    };
+    let entries = section
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| line.trim_start_matches("- ").trim().trim_matches('`'))
+        .collect::<Vec<_>>();
+    !entries.is_empty() && entries.iter().all(|line| line.eq_ignore_ascii_case("none"))
 }
 
 pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<CodexJobStatus> {
@@ -3160,8 +3185,13 @@ fn build_prompt(
                 .as_ref()
                 .map(|path| format!("\n- Prior published session: `{}`", path.display()))
                 .unwrap_or_default();
+            let source_mapping_hint = if context.needs_source_mapping {
+                " The prior attempt retained a diff but did not identify real git add paths. Do not discard that patch: find or reacquire the correct upstream git/source tree, map the diff onto real repo-relative source paths, and only return `## Git Add Paths: None` if the retained diff is proven non-source or unsafe after that mapping attempt."
+            } else {
+                ""
+            };
             format!(
-                "\n\nA previous Fixer patch attempt already exists for this issue. {version} Review that patch before changing code, improve it instead of starting blind, and clean up anything awkward or underexplained. In particular, remove avoidable `goto`, tighten the explanation of what the patch is doing, and make the resulting diff feel ready for upstream git review.{patch_path}{session_path}"
+                "\n\nA previous Fixer patch attempt already exists for this issue. {version} Review that patch before changing code, improve it instead of starting blind, and clean up anything awkward or underexplained. In particular, remove avoidable `goto`, tighten the explanation of what the patch is doing, and make the resulting diff feel ready for upstream git review.{source_mapping_hint}{patch_path}{session_path}"
             )
         })
         .unwrap_or_default();
@@ -9093,6 +9123,79 @@ plain stderr line
                 .map(|path| path.file_name().unwrap().to_string_lossy().to_string()),
             Some("prior-best.patch".to_string())
         );
+        assert_eq!(evidence["prior_best_patch"]["needs_source_mapping"], false);
+    }
+
+    #[test]
+    fn prior_best_patch_without_git_paths_tells_worker_to_find_git_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().join("source");
+        std::fs::create_dir_all(workspace_root.join("src")).unwrap();
+
+        let mut config = FixerConfig::default();
+        config.service.state_dir = dir.path().join("state");
+
+        let opportunity = OpportunityRecord {
+            id: 42,
+            finding_id: 42,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for postgres".to_string(),
+            score: 110,
+            state: "open".to_string(),
+            summary: "postgres is stuck in a likely busy-poll loop.".to_string(),
+            evidence: json!({}),
+            repo_root: None,
+            ecosystem: Some("debian".to_string()),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+            updated_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let workspace = PreparedWorkspace {
+            repo_root: workspace_root,
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("postgresql-18".to_string()),
+            source_package: Some("postgresql-18".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+        let prior_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Patch proposal created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "worker_fixer_version": "0.153.0",
+                "published_session": {
+                    "prompt": "old prompt",
+                    "response": "Subject: keep patch\n\n## Git Add Paths\nNone\n\n## Validation\nnot run\n",
+                    "diff": "--- old/src/file.c\n+++ new/src/file.c\n@@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+
+        let job = prepare_codex_job_with_prior_patch(
+            &config,
+            &opportunity,
+            &workspace,
+            Some(&prior_patch),
+            "kom",
+            false,
+        )
+        .unwrap();
+
+        let prompt = std::fs::read_to_string(&job.prompt_path).unwrap();
+        assert!(prompt.contains("retained a diff but did not identify real git add paths"));
+        assert!(prompt.contains("Do not discard that patch"));
+
+        let evidence: Value =
+            serde_json::from_slice(&std::fs::read(job.bundle_dir.join("evidence.json")).unwrap())
+                .unwrap();
+        assert_eq!(evidence["prior_best_patch"]["needs_source_mapping"], true);
     }
 
     #[test]

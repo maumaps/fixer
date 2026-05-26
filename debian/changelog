@@ -1,3 +1,11 @@
+fixer (0.154.0-1) unstable; urgency=medium
+
+  * Keep diff-backed patches alive when the previous attempt lacked git add
+    paths, and ask the next worker to find the upstream git/source mapping
+    instead of discarding the patch.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 26 May 2026 21:55:00 +0400
+
 fixer (0.153.0-1) unstable; urgency=medium
 
   * Keep diagnosis-only attempts out of the public patch board unless they
