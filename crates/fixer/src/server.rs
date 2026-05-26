@@ -6999,8 +6999,8 @@ async fn load_public_issue_detail(
         severity: issue.severity,
         score: issue.score,
         corroboration_count: issue.corroboration_count,
-        best_patch_available: issue.best_patch_available,
-        best_triage_available: issue.best_triage_available && best_patch.is_none(),
+        best_patch_available: best_patch.is_some(),
+        best_triage_available: best_triage.is_some(),
         best_patch_diff_url,
         best_patch,
         best_triage_handoff: best_triage
@@ -7175,11 +7175,13 @@ async fn load_public_issue_best_patch(
                 .map_err(ApiError::internal)?;
             row.map(|row| {
                 let best_patch_json: Value = row.get(0);
-                serde_json::from_value::<PatchAttempt>(best_patch_json)
-                    .map(public_attempt_from_patch_attempt)
-                    .map_err(ApiError::internal)
+                let attempt = serde_json::from_value::<PatchAttempt>(best_patch_json)
+                    .map_err(ApiError::internal)?;
+                Ok(patch_attempt_is_best_candidate(&attempt)
+                    .then(|| public_attempt_from_patch_attempt(attempt)))
             })
             .transpose()
+            .map(Option::flatten)
         }
         ServerDb::Sqlite(path) => {
             let connection = sqlite_connection(path).map_err(ApiError::internal)?;
@@ -7195,9 +7197,8 @@ async fn load_public_issue_best_patch(
             ",
                     [id],
                     |row| {
-                        let best_patch =
+                        let attempt =
                             serde_json::from_str::<PatchAttempt>(&row.get::<_, String>(0)?)
-                                .map(public_attempt_from_patch_attempt)
                                 .map_err(|error| {
                                     rusqlite::Error::FromSqlConversionFailure(
                                         0,
@@ -7205,11 +7206,13 @@ async fn load_public_issue_best_patch(
                                         Box::new(error),
                                     )
                                 })?;
-                        Ok(best_patch)
+                        Ok(patch_attempt_is_best_candidate(&attempt)
+                            .then(|| public_attempt_from_patch_attempt(attempt)))
                     },
                 )
                 .optional()
                 .map_err(ApiError::internal)
+                .map(Option::flatten)
         }
     }
 }
@@ -7303,7 +7306,11 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
                 .await
                 .map_err(ApiError::internal)?;
             rows.into_iter()
-                .map(public_patch_from_row)
+                .filter_map(|row| match public_patch_from_row(row) {
+                    Ok(Some(entry)) => Some(Ok(entry)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                })
                 .collect::<Result<Vec<_>, _>>()?
         }
         ServerDb::Sqlite(path) => {
@@ -7325,8 +7332,13 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
             let rows = stmt
                 .query_map([limit], public_patch_from_sqlite_row)
                 .map_err(ApiError::internal)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(ApiError::internal)?
+            rows.filter_map(|row| match row {
+                Ok(Some(entry)) => Some(Ok(entry)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(ApiError::internal)?
         }
     };
     patches.sort_by(|left, right| {
@@ -7678,14 +7690,17 @@ fn public_issue_from_row(row: Row) -> Result<PublicIssue, ApiError> {
     })
 }
 
-fn public_patch_from_row(row: Row) -> Result<PublicPatchEntry, ApiError> {
+fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError> {
     let id: String = row.get(0);
     let best_patch_json: Value = row.get(10);
-    let best_patch = serde_json::from_value::<PatchAttempt>(best_patch_json)
-        .map(public_attempt_from_patch_attempt)
-        .map_err(ApiError::internal)?;
+    let attempt =
+        serde_json::from_value::<PatchAttempt>(best_patch_json).map_err(ApiError::internal)?;
+    if !patch_attempt_is_best_candidate(&attempt) {
+        return Ok(None);
+    }
+    let best_patch = public_attempt_from_patch_attempt(attempt);
     let last_seen: DateTime<Utc> = row.get(11);
-    Ok(PublicPatchEntry {
+    Ok(Some(PublicPatchEntry {
         id: id.clone(),
         kind: row.get(1),
         title: row.get(2),
@@ -7699,7 +7714,7 @@ fn public_patch_from_row(row: Row) -> Result<PublicPatchEntry, ApiError> {
         last_seen: last_seen.to_rfc3339(),
         best_patch_diff_url: public_best_patch_diff_url(&id, Some(&best_patch)),
         best_patch,
-    })
+    }))
 }
 
 fn upstream_patch_win_from_row(row: Row) -> Result<UpstreamPatchWin, ApiError> {
@@ -9041,18 +9056,23 @@ fn trigram_set(raw: &str) -> HashSet<String> {
         .collect()
 }
 
-fn public_patch_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicPatchEntry> {
+fn public_patch_from_sqlite_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Option<PublicPatchEntry>> {
     let id: String = row.get(0)?;
-    let best_patch = serde_json::from_str::<PatchAttempt>(&row.get::<_, String>(10)?)
-        .map(public_attempt_from_patch_attempt)
-        .map_err(|error| {
+    let attempt =
+        serde_json::from_str::<PatchAttempt>(&row.get::<_, String>(10)?).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
                 10,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
         })?;
-    Ok(PublicPatchEntry {
+    if !patch_attempt_is_best_candidate(&attempt) {
+        return Ok(None);
+    }
+    let best_patch = public_attempt_from_patch_attempt(attempt);
+    Ok(Some(PublicPatchEntry {
         id: id.clone(),
         kind: row.get(1)?,
         title: row.get(2)?,
@@ -9066,7 +9086,7 @@ fn public_patch_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pub
         last_seen: row.get(11)?,
         best_patch_diff_url: public_best_patch_diff_url(&id, Some(&best_patch)),
         best_patch,
-    })
+    }))
 }
 
 fn upstream_patch_win_from_sqlite_row(
@@ -16471,6 +16491,66 @@ mod tests {
             context.summary,
             "Patch proposal accidentally retained build cache output."
         );
+    }
+
+    #[test]
+    fn public_patch_loader_hides_stale_generated_only_best_patch_json() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "postgres",
+            "Top frame: internal_load_library [postgres]",
+            &["internal_load_library [postgres]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-1",
+            "cluster-1",
+            110,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        let generated_only_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Patch proposal accidentally retained build cache output.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: cache-only\n\n## Git Add Paths\n.pytest_cache/CACHEDIR.TAG\n\n## Validation\nnot run\n",
+                    "diff": "--- a/.pytest_cache/CACHEDIR.TAG\n+++ b/.pytest_cache/CACHEDIR.TAG\n@@ -0,0 +1 @@\n+generated\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-1",
+                    serde_json::to_string(&generated_only_patch).unwrap()
+                ],
+            )
+            .unwrap();
+
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let best_patch = match test_runtime().block_on(load_public_issue_best_patch(&db, "issue-1"))
+        {
+            Ok(value) => value,
+            Err(error) => panic!("load public issue best patch failed: {}", error.message),
+        };
+
+        assert!(patches.is_empty());
+        assert!(best_patch.is_none());
     }
 
     #[test]

@@ -1,3 +1,11 @@
+fixer (0.157.0-1) unstable; urgency=medium
+
+  * Apply the generated/cache-only public-diff guard while reading existing
+    stored best patches, so stale bad attempts disappear from public APIs
+    immediately after deploy.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 26 May 2026 21:44:01 +0400
+
 fixer (0.156.0-1) unstable; urgency=medium
 
   * Keep generated/cache-only diffs off the successful patch board while
