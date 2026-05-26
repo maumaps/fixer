@@ -1,3 +1,10 @@
+fixer (0.176.0-1) unstable; urgency=medium
+
+  * Mark observed source patches with unavailable project-level validation as
+    harvest needs-review while preserving their published diffs.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 08:18:00 +0400
+
 fixer (0.175.0-1) unstable; urgency=medium
 
   * Treat combined formatting-success plus blocked project-test validation

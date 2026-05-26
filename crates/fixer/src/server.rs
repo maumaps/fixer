@@ -8183,7 +8183,8 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
         .as_ref()
         .map(|cover| cover.validation_notes.clone())
         .unwrap_or_default();
-    let harvest_blockers = public_patch_harvest_blockers(&best_patch, &validation_notes);
+    let harvest_blockers =
+        public_patch_harvest_blockers(&best_patch, &response_metadata, &validation_notes);
     let harvest_status = public_patch_harvest_status(&harvest_blockers);
     Ok(Some(PublicPatchEntry {
         id: id.clone(),
@@ -9628,7 +9629,8 @@ fn public_patch_from_sqlite_row(
         .as_ref()
         .map(|cover| cover.validation_notes.clone())
         .unwrap_or_default();
-    let harvest_blockers = public_patch_harvest_blockers(&best_patch, &validation_notes);
+    let harvest_blockers =
+        public_patch_harvest_blockers(&best_patch, &response_metadata, &validation_notes);
     let harvest_status = public_patch_harvest_status(&harvest_blockers);
     Ok(Some(PublicPatchEntry {
         id: id.clone(),
@@ -10466,6 +10468,7 @@ fn public_patch_harvest_status(blockers: &[String]) -> String {
 
 fn public_patch_harvest_blockers(
     attempt: &PublicAttempt,
+    response_metadata: &PatchResponseMetadata,
     validation_notes: &[String],
 ) -> Vec<String> {
     let validation_status = attempt
@@ -10479,12 +10482,17 @@ fn public_patch_harvest_blockers(
         || validation_text.contains("blocked")
         || validation_text.contains("could not run")
         || validation_text.contains("did not run");
+    let mut blockers = Vec::new();
     if has_blocked_validation && !public_patch_has_substantive_validation_success(validation_notes)
     {
-        vec!["blocked_validation".to_string()]
-    } else {
-        Vec::new()
+        blockers.push("blocked_validation".to_string());
     }
+    if blockers.is_empty()
+        && public_patch_has_limited_observed_validation(response_metadata, validation_notes)
+    {
+        blockers.push("limited_validation".to_string());
+    }
+    blockers
 }
 
 fn public_patch_has_substantive_validation_success(validation_notes: &[String]) -> bool {
@@ -10517,6 +10525,54 @@ fn public_patch_has_substantive_validation_success(validation_notes: &[String]) 
             || note.contains(" completed successfully")
             || note.contains(" succeeded");
         has_project_command && has_success
+    })
+}
+
+fn public_patch_has_limited_observed_validation(
+    response_metadata: &PatchResponseMetadata,
+    validation_notes: &[String],
+) -> bool {
+    let Some(confidence) = response_metadata.evidence_confidence.as_deref() else {
+        return false;
+    };
+    if confidence == "reproduced" || response_metadata.git_add_paths.is_empty() {
+        return false;
+    }
+    let validation_text = validation_notes.join("\n").to_ascii_lowercase();
+    let project_validation_unavailable = validation_text.contains("no such target")
+        || validation_text.contains("could not run")
+        || validation_text.contains("did not run")
+        || validation_text.contains("blocked");
+    project_validation_unavailable && !public_patch_has_project_test_success(validation_notes)
+}
+
+fn public_patch_has_project_test_success(validation_notes: &[String]) -> bool {
+    validation_notes.iter().any(|note| {
+        let note = note.to_ascii_lowercase();
+        if note.contains("blocked")
+            || note.contains("could not run")
+            || note.contains("did not run")
+            || note.contains("no such target")
+        {
+            return false;
+        }
+        let has_project_test = note.contains("go test")
+            || note.contains("cargo test")
+            || note.contains("pytest")
+            || note.contains("ctest")
+            || note.contains("mvn test")
+            || note.contains("npm test")
+            || note.contains("pnpm test")
+            || note.contains("yarn test")
+            || note.contains("unit test")
+            || note.contains("integration test")
+            || note.contains("make test")
+            || note.contains("make check")
+            || note.contains("make t-exec");
+        has_project_test
+            && (note.contains("passed")
+                || note.contains("completed successfully")
+                || note.contains("ok"))
     })
 }
 
@@ -17543,6 +17599,70 @@ mod tests {
         assert!(card.contains("patch needs review"));
         assert!(card.contains("harvest: needs review"));
         assert!(card.contains("blocked validation"));
+        assert!(card.contains("/issues/issue-1/best.diff"));
+    }
+
+    #[test]
+    fn public_patch_loader_demotes_observed_patch_without_project_validation() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "openssh",
+            "Top frame: syslog [sshd-session]",
+            &["syslog [sshd-session]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-1",
+            "cluster-1",
+            120,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        let source_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "syslog socket churn was observed.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: log: avoid closing syslog after each message\n\n## Evidence Confidence\nobserved\n\n## Git Add Paths\n- log.c\n\n## Validation\n- `./configure && make` passed from the workspace root. `make check` was attempted, but this generated Makefile has no such target: `make: *** No rule to make target 'check'. Stop.` A temporary counter harness emitted two log messages.\n",
+                    "diff": "--- a/log.c\n+++ b/log.c\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params!["issue-1", serde_json::to_string(&source_patch).unwrap()],
+            )
+            .unwrap();
+
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let patch = patches
+            .first()
+            .expect("limited-validation patch stays visible");
+
+        assert_eq!(
+            patch.best_patch_raw_diff_url.as_deref(),
+            Some("/issues/issue-1/best.diff")
+        );
+        assert_eq!(patch.harvest_status, "needs_review");
+        assert_eq!(patch.harvest_blockers, vec!["limited_validation"]);
+
+        let card = render_public_patch_card(patch);
+        assert!(card.contains("patch needs review"));
+        assert!(card.contains("limited validation"));
         assert!(card.contains("/issues/issue-1/best.diff"));
     }
 
