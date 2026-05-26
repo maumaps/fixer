@@ -237,6 +237,8 @@ EOF
     done
 } >"$ARCHIVE_DIR/conf/distributions"
 
+reprepro -b "$ARCHIVE_DIR" clearvanished
+
 for package in "$@"; do
     if [ ! -f "$package" ]; then
         echo "package not found: $package" >&2
