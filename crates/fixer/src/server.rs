@@ -7628,10 +7628,20 @@ fn public_patch_primary_source_paths(patch: &PublicPatchEntry) -> Vec<String> {
 }
 
 fn public_patch_primary_path(path: &str) -> bool {
-    !path.starts_with("test")
-        && !path.contains("/test")
-        && !path.contains("/fixtures/")
-        && !path.contains("/__tests__/")
+    let normalized = path.replace('\\', "/");
+    let basename = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    !normalized.starts_with("test")
+        && !normalized.contains("/test")
+        && !normalized.contains("/fixtures/")
+        && !normalized.contains("/__tests__/")
+        && !basename.starts_with("test_")
+        && !basename.ends_with("_test.go")
+        && !basename.ends_with("_test.rs")
+        && !basename.ends_with(".test.js")
+        && !basename.ends_with(".test.ts")
+        && !basename.ends_with(".spec.js")
+        && !basename.ends_with(".spec.ts")
+        && !basename.ends_with(".t")
 }
 
 async fn load_public_triage(db: &ServerDb, limit: i64) -> Result<Vec<PublicTriageEntry>, ApiError> {
@@ -17556,6 +17566,125 @@ mod tests {
             "https://github.com/Supervisor/supervisor/pull/1717"
         );
         assert_eq!(family.state, "closed_unmerged");
+        assert_eq!(family.family_count, 2);
+    }
+
+    #[test]
+    fn public_patch_related_review_family_ignores_test_file_suffixes() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "docker.io",
+            "Top frame: processEventStream [dockerd]",
+            &["processEventStream [dockerd]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-reviewed",
+            "cluster-reviewed",
+            110,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-related",
+            "cluster-related",
+            109,
+            "2026-03-31T00:00:00Z",
+            &representative,
+            &["install-2"],
+        );
+        let reviewed_patch = PatchAttempt {
+            cluster_id: "issue-reviewed".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Throttle event stream restarts.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: libcontainerd: throttle event stream restarts\n\n## Git Add Paths\nengine/libcontainerd/remote/client.go\nengine/libcontainerd/remote/client_test.go\n",
+                    "diff": "--- a/engine/libcontainerd/remote/client.go\n+++ b/engine/libcontainerd/remote/client.go\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let related_patch = PatchAttempt {
+            cluster_id: "issue-related".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Handle a closed event stream channel.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: libcontainerd: handle closed event stream channel\n\n## Git Add Paths\nengine/libcontainerd/remote/client.go\n",
+                    "diff": "--- a/engine/libcontainerd/remote/client.go\n+++ b/engine/libcontainerd/remote/client.go\n@@ -1 +1 @@\n-old\n+newer\n",
+                }
+            }),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-reviewed",
+                    serde_json::to_string(&reviewed_patch).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-related",
+                    serde_json::to_string(&related_patch).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO upstream_patch_wins
+                 (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)",
+                rusqlite::params![
+                    "moby-event-stream-throttle",
+                    "Moby",
+                    "Opened Moby review for event stream throttling.",
+                    "Review covers the same source file with test coverage.",
+                    "https://github.com/moby/moby/pull/52643",
+                    "review",
+                    serde_json::to_string(&json!(["upstream review"])).unwrap(),
+                    "issue-reviewed",
+                    "2026-03-31T00:00:00Z",
+                ],
+            )
+            .unwrap();
+
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let related = patches
+            .iter()
+            .find(|patch| patch.id == "issue-related")
+            .expect("source-only related public patch should be visible");
+        let family = related
+            .related_upstream_review
+            .as_ref()
+            .expect("source-only row should match source-plus-test reviewed family");
+
+        assert_eq!(family.issue_id, "issue-reviewed");
+        assert_eq!(family.pr_url, "https://github.com/moby/moby/pull/52643");
+        assert_eq!(family.state, "review");
         assert_eq!(family.family_count, 2);
     }
 

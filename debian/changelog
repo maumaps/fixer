@@ -1,3 +1,11 @@
+fixer (0.171.0-1) unstable; urgency=medium
+
+  * Ignore common test-file suffixes when grouping public patch rows by
+    reviewed source-path families, so source-only variants can point at an
+    existing source-plus-test upstream review.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 06:12:00 +0400
+
 fixer (0.170.0-1) unstable; urgency=medium
 
   * Treat reviewer-reduced upstream attempts as a first-class public review
