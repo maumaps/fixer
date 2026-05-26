@@ -239,6 +239,23 @@ EOF
 
 reprepro -b "$ARCHIVE_DIR" --delete clearvanished
 
+if [ -d "$ARCHIVE_DIR/dists" ]; then
+    for dist_dir in "$ARCHIVE_DIR"/dists/*; do
+        [ -d "$dist_dir" ] || continue
+        dist_name=$(basename "$dist_dir")
+        dist_known=false
+        for suite in $SUITES; do
+            if [ "$suite" = "$dist_name" ]; then
+                dist_known=true
+                break
+            fi
+        done
+        if [ "$dist_known" = false ]; then
+            rm -rf "$dist_dir"
+        fi
+    done
+fi
+
 for package in "$@"; do
     if [ ! -f "$package" ]; then
         echo "package not found: $package" >&2
