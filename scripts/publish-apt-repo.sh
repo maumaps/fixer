@@ -237,7 +237,7 @@ EOF
     done
 } >"$ARCHIVE_DIR/conf/distributions"
 
-reprepro -b "$ARCHIVE_DIR" clearvanished
+reprepro -b "$ARCHIVE_DIR" --delete clearvanished
 
 for package in "$@"; do
     if [ ! -f "$package" ]; then
