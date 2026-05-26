@@ -9707,6 +9707,13 @@ fn public_upstream_review_state_label(state: &str) -> String {
     }
 }
 
+fn public_upstream_review_relation_label(relation: &str) -> String {
+    match relation {
+        "" | "related" | "source_path_family" => String::new(),
+        value => value.replace('_', "-"),
+    }
+}
+
 fn upstream_patch_win_from_sqlite_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<UpstreamPatchWin> {
@@ -14320,10 +14327,20 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             html_escape(&public_upstream_review_state_label(&review.state))
         );
     } else if let Some(review) = entry.related_upstream_review.as_ref() {
+        let relation_label = public_upstream_review_relation_label(&review.relation);
+        let related_label = if relation_label.is_empty() {
+            public_upstream_review_state_label(&review.state)
+        } else {
+            format!(
+                "{} {}",
+                relation_label,
+                public_upstream_review_state_label(&review.state)
+            )
+        };
         let _ = write!(
             patch_tags,
             "<span class=\"tag\">related upstream: {}</span>",
-            html_escape(&public_upstream_review_state_label(&review.state))
+            html_escape(&related_label)
         );
     }
     if let Some(duplicate) = entry.duplicate_patch.as_ref() {

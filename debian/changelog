@@ -1,3 +1,11 @@
+fixer (0.173.0-1) unstable; urgency=medium
+
+  * Show explicit relation labels for related upstream review badges, so
+    alternative reviews are distinguishable from source-path family matches on
+    the public patch board.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 07:02:00 +0400
+
 fixer (0.172.0-1) unstable; urgency=medium
 
   * Add explicit upstream patch relation metadata so public patch rows can
