@@ -1,3 +1,10 @@
+fixer (0.159.0-1) unstable; urgency=medium
+
+  * Hide no-git public patch attempts from the successful patch board while
+    keeping their diffs available as worker source-mapping context.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 26 May 2026 22:06:03 +0400
+
 fixer (0.158.0-1) unstable; urgency=medium
 
   * Treat PostgreSQL generated objfiles and bootstrap parser/scanner outputs as

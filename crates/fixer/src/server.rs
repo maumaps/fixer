@@ -5460,6 +5460,7 @@ fn patch_attempt_is_best_candidate(attempt: &PatchAttempt) -> bool {
         && attempt.outcome == "patch"
         && attempt.validation_status.as_deref() != Some("review-rejected")
         && attempt_has_public_source_diff(attempt)
+        && !patch_attempt_needs_source_mapping(attempt)
 }
 
 fn patch_attempt_is_repair_context(attempt: &PatchAttempt) -> bool {
@@ -5605,6 +5606,7 @@ fn select_latest_patch_context_attempt(candidates: &[PatchAttempt]) -> Option<Pa
         .filter(|attempt| {
             patch_attempt_is_best_candidate(attempt)
                 || patch_attempt_is_repair_context(attempt)
+                || patch_attempt_needs_source_mapping(attempt)
                 || patch_attempt_needs_public_diff_cleanup(attempt)
         })
         .cloned()
@@ -16217,9 +16219,12 @@ mod tests {
             created_at: "2026-03-29T00:00:00Z".to_string(),
         };
 
-        assert!(patch_attempt_is_best_candidate(&attempt));
+        assert!(!patch_attempt_is_best_candidate(&attempt));
         assert!(patch_attempt_needs_source_mapping(&attempt));
         assert!(patch_attempt_needs_worker_refresh(&attempt));
+        let context = select_latest_patch_context_attempt(&[attempt])
+            .expect("diff-backed no-git patch should remain worker source-mapping context");
+        assert_eq!(context.summary, "Patch proposal created locally.");
     }
 
     #[test]
@@ -16555,6 +16560,73 @@ mod tests {
 
         assert!(patches.is_empty());
         assert!(best_patch.is_none());
+    }
+
+    #[test]
+    fn public_patch_loader_hides_no_git_diff_but_keeps_worker_context() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "rsync",
+            "Top frame: pselect6 [rsync]",
+            &["pselect6 [rsync]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-1",
+            "cluster-1",
+            110,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        let no_git_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Patch proposal needs source mapping.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: no git\n\n## Git Add Paths\nNone\n\n## Validation\nnot run\n",
+                    "diff": "--- a/src/file.c\n+++ b/src/file.c\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        insert_test_attempt(
+            &connection,
+            "attempt-patch",
+            "lease-patch",
+            &no_git_patch,
+            "2026-03-29T00:00:00Z",
+        );
+        refresh_issue_cluster_best_results_sqlite(&connection, "issue-1").unwrap();
+
+        let best_patch_json: Option<String> = connection
+            .query_row(
+                "SELECT best_patch_json FROM issue_clusters WHERE id = ?1",
+                ["issue-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(best_patch_json.is_none());
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let worker_context = test_runtime()
+            .block_on(load_latest_patch_context_for_worker(&db, "issue-1"))
+            .unwrap()
+            .expect("no-git diff should remain source-mapping context");
+
+        assert!(patches.is_empty());
+        assert_eq!(worker_context.summary, no_git_patch.summary);
+        assert!(patch_attempt_needs_source_mapping(&worker_context));
     }
 
     #[test]
