@@ -12219,12 +12219,12 @@ fn render_upstream_wins_section(wins: &[UpstreamPatchWin]) -> String {
         <section class="panel upstream-proof section">
             <div class="upstream-proof-copy">
                 <div>
-                    <p class="eyebrow">Merged upstream</p>
-                    <h2>Fixer patches can land in projects people already trust.</h2>
+                    <p class="eyebrow">Upstream review</p>
+                    <h2>Fixer patches can move back to projects people already trust.</h2>
                     <p class="section-intro">The goal is not to generate local workarounds forever. When the evidence is strong and the patch is maintainable, Fixer should help move the fix back to the project that owns the code.</p>
                 </div>
                 <div class="meta">
-                    <span class="tag patch">accepted patch</span>
+                    <span class="tag patch">upstream patch</span>
                     <span class="tag">upstream review</span>
                     <span class="tag">real build validation</span>
                 </div>
@@ -12258,7 +12258,7 @@ fn render_upstream_win_card(win: &UpstreamPatchWin) -> String {
                 <p>{}</p>
                 {}
                 <div class="upstream-win-footer">
-                    <a class="button primary" href="{}">Read merged PR</a>
+                    <a class="button primary" href="{}">Read upstream PR/MR</a>
                     <a class="button soft" href="/patches">Browse Fixer patch attempts</a>
                 </div>
                 <div class="meta">{}</div>
@@ -15162,7 +15162,7 @@ mod tests {
         assert!(markup.contains("Install first, opt in later"));
         assert!(markup.contains("Shared queue, not private guessing"));
         assert!(markup.contains("sanitized issue families, not raw host evidence"));
-        assert!(markup.contains("Merged upstream"));
+        assert!(markup.contains("Upstream review"));
         assert!(markup.contains("htop"));
         assert!(markup.contains("https://github.com/htop-dev/htop/pull/1977"));
         assert!(markup.contains("Compat_readfileat"));
