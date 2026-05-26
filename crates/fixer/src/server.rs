@@ -8183,8 +8183,16 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
         .as_ref()
         .map(|cover| cover.validation_notes.clone())
         .unwrap_or_default();
-    let harvest_blockers =
-        public_patch_harvest_blockers(&best_patch, &response_metadata, &validation_notes);
+    let changed_files = cover
+        .as_ref()
+        .map(|cover| cover.changed_files.clone())
+        .unwrap_or_default();
+    let harvest_blockers = public_patch_harvest_blockers(
+        &best_patch,
+        &response_metadata,
+        &changed_files,
+        &validation_notes,
+    );
     let harvest_status = public_patch_harvest_status(&harvest_blockers);
     Ok(Some(PublicPatchEntry {
         id: id.clone(),
@@ -8204,10 +8212,7 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
         patch_subject: cover.as_ref().map(|cover| cover.subject.clone()),
         evidence_confidence: response_metadata.evidence_confidence,
         git_add_paths: response_metadata.git_add_paths,
-        changed_files: cover
-            .as_ref()
-            .map(|cover| cover.changed_files.clone())
-            .unwrap_or_default(),
+        changed_files,
         validation_notes,
         harvest_status,
         harvest_blockers,
@@ -9629,8 +9634,16 @@ fn public_patch_from_sqlite_row(
         .as_ref()
         .map(|cover| cover.validation_notes.clone())
         .unwrap_or_default();
-    let harvest_blockers =
-        public_patch_harvest_blockers(&best_patch, &response_metadata, &validation_notes);
+    let changed_files = cover
+        .as_ref()
+        .map(|cover| cover.changed_files.clone())
+        .unwrap_or_default();
+    let harvest_blockers = public_patch_harvest_blockers(
+        &best_patch,
+        &response_metadata,
+        &changed_files,
+        &validation_notes,
+    );
     let harvest_status = public_patch_harvest_status(&harvest_blockers);
     Ok(Some(PublicPatchEntry {
         id: id.clone(),
@@ -9650,10 +9663,7 @@ fn public_patch_from_sqlite_row(
         patch_subject: cover.as_ref().map(|cover| cover.subject.clone()),
         evidence_confidence: response_metadata.evidence_confidence,
         git_add_paths: response_metadata.git_add_paths,
-        changed_files: cover
-            .as_ref()
-            .map(|cover| cover.changed_files.clone())
-            .unwrap_or_default(),
+        changed_files,
         validation_notes,
         harvest_status,
         harvest_blockers,
@@ -10469,6 +10479,7 @@ fn public_patch_harvest_status(blockers: &[String]) -> String {
 fn public_patch_harvest_blockers(
     attempt: &PublicAttempt,
     response_metadata: &PatchResponseMetadata,
+    changed_files: &[String],
     validation_notes: &[String],
 ) -> Vec<String> {
     let validation_status = attempt
@@ -10491,6 +10502,13 @@ fn public_patch_harvest_blockers(
         && public_patch_has_limited_observed_validation(response_metadata, validation_notes)
     {
         blockers.push("limited_validation".to_string());
+    }
+    if blockers.is_empty()
+        && !changed_files.is_empty()
+        && (response_metadata.evidence_confidence.is_none()
+            || response_metadata.git_add_paths.is_empty())
+    {
+        blockers.push("missing_patch_metadata".to_string());
     }
     blockers
 }
@@ -17663,6 +17681,77 @@ mod tests {
         let card = render_public_patch_card(patch);
         assert!(card.contains("patch needs review"));
         assert!(card.contains("limited validation"));
+        assert!(card.contains("/issues/issue-1/best.diff"));
+    }
+
+    #[test]
+    fn public_patch_loader_demotes_patch_with_missing_harvest_metadata() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "htop",
+            "Top frame: lock_next_vma [htop]",
+            &["lock_next_vma [htop]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-1",
+            "cluster-1",
+            120,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        let source_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "deleted-library highlighting can rescan maps too often.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: linux: preserve deleted-library flag during LRS-only maps scans\n\n## Commit Message\nKeep deleted-library state separate from LRS maps scans.\n\n## Validation\n- `sh autogen.sh`\n- `./configure`\n- `make -j2`\n",
+                    "diff": "--- a/linux/LinuxProcess.h\n+++ b/linux/LinuxProcess.h\n@@ -1 +1 @@\n-old\n+new\n--- a/linux/LinuxProcessTable.c\n+++ b/linux/LinuxProcessTable.c\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params!["issue-1", serde_json::to_string(&source_patch).unwrap()],
+            )
+            .unwrap();
+
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let patch = patches
+            .first()
+            .expect("metadata-limited patch stays visible");
+
+        assert_eq!(
+            patch.best_patch_raw_diff_url.as_deref(),
+            Some("/issues/issue-1/best.diff")
+        );
+        assert_eq!(
+            patch.changed_files,
+            vec![
+                "linux/LinuxProcess.h".to_string(),
+                "linux/LinuxProcessTable.c".to_string(),
+            ]
+        );
+        assert_eq!(patch.harvest_status, "needs_review");
+        assert_eq!(patch.harvest_blockers, vec!["missing_patch_metadata"]);
+
+        let card = render_public_patch_card(patch);
+        assert!(card.contains("patch needs review"));
+        assert!(card.contains("missing patch metadata"));
         assert!(card.contains("/issues/issue-1/best.diff"));
     }
 

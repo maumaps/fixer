@@ -1,3 +1,10 @@
+fixer (0.177.0-1) unstable; urgency=medium
+
+  * Mark retained source diffs with missing harvest metadata as needs-review
+    while keeping their patch downloads visible.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 11:10:00 +0400
+
 fixer (0.176.0-1) unstable; urgency=medium
 
   * Mark observed source patches with unavailable project-level validation as
