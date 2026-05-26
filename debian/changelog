@@ -1,3 +1,11 @@
+fixer (0.152.0-1) unstable; urgency=medium
+
+  * Clear older public best patches when a newer triage result says the
+    evidence is too weak for a safe automatic source change.
+  * Keep vanished APT suites out of the public repository during release.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 26 May 2026 20:57:02 +0400
+
 fixer (0.151.0-1) unstable; urgency=medium
 
   * Reject observed-only security-sensitive source patches, including

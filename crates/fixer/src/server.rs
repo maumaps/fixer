@@ -5537,7 +5537,7 @@ fn attempt_invalidates_patch(attempt: &PatchAttempt, patch: &PatchAttempt) -> bo
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return false;
+        return later_attempt_blocks_public_patch(attempt, patch);
     }
     if let Some(created_at) = attempt
         .details
@@ -5547,6 +5547,24 @@ fn attempt_invalidates_patch(attempt: &PatchAttempt, patch: &PatchAttempt) -> bo
         return created_at == patch.created_at;
     }
     compare_attempt_created_at(attempt, patch) != Ordering::Less
+}
+
+fn later_attempt_blocks_public_patch(attempt: &PatchAttempt, patch: &PatchAttempt) -> bool {
+    if attempt.state != "ready"
+        || !matches!(attempt.outcome.as_str(), "report" | "triage")
+        || compare_attempt_created_at(attempt, patch) == Ordering::Less
+    {
+        return false;
+    }
+    matches!(
+        attempt_blocker_reason(attempt).as_deref(),
+        Some(
+            "weak-unknown-runaway-evidence"
+                | "no-safe-local-change"
+                | "publication-quality"
+                | "stale-best-patch"
+        )
+    )
 }
 
 fn select_best_patch_attempt(candidates: &[PatchAttempt]) -> Option<PatchAttempt> {
@@ -16233,6 +16251,58 @@ mod tests {
 
         assert!(best_patch.is_none());
         assert!(best_triage.is_none());
+    }
+
+    #[test]
+    fn newer_weak_evidence_triage_clears_public_best_patch() {
+        let legacy_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Legacy patch proposal created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "legacy prompt",
+                    "response": "legacy response",
+                    "diff": "--- a/src/userdb/userwork.c\n+++ b/src/userdb/userwork.c\n",
+                }
+            }),
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+        };
+        let weak_evidence_triage = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "reviewer-install".to_string(),
+            outcome: "triage".to_string(),
+            state: "ready".to_string(),
+            summary: "Fixer intentionally skipped an automatic package patch attempt because the evidence is not specific enough to choose a safe source change.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "report_only_reason": "weak-unknown-runaway-evidence",
+                "handoff": {
+                    "reason": "weak-unknown-runaway-evidence",
+                    "target": "systemd-userwork",
+                    "next_steps": ["Collect a fresh perf and strace sample before retrying."]
+                }
+            }),
+            created_at: "2026-05-10T00:00:00Z".to_string(),
+        };
+
+        let (best_patch, best_triage) =
+            best_attempts_from_candidates(vec![legacy_patch, weak_evidence_triage.clone()]);
+
+        assert!(best_patch.is_none());
+        assert_eq!(
+            best_triage
+                .expect("weak evidence handoff should become the public best triage")
+                .summary,
+            weak_evidence_triage.summary
+        );
     }
 
     #[test]
