@@ -1267,11 +1267,14 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                     let publication_blocker =
                         published_session_publication_blocker(&opportunity, published_session_ref);
                     if let Some(blocker) = publication_blocker.as_deref() {
-                        details.insert("publication_blocker".to_string(), json!(blocker));
-                        details.insert(
-                            "patch_review_failure_category".to_string(),
-                            json!("publication-quality"),
-                        );
+                        append_publication_repair_details(&mut details, blocker);
+                        if let Some(best_patch) = lease.issue.best_patch.as_ref() {
+                            details.insert("invalidates_best_patch".to_string(), json!(true));
+                            details.insert(
+                                "invalidates_patch_created_at".to_string(),
+                                json!(best_patch.created_at.clone()),
+                            );
+                        }
                     }
                     WorkerResultEnvelope {
                         lease_id: lease.lease_id.clone(),
@@ -1945,11 +1948,7 @@ fn submission_result_for_local_proposal(
     let publication_blocker =
         published_session_publication_blocker(opportunity, published_session.as_ref());
     if let Some(blocker) = publication_blocker.as_deref() {
-        details.insert("publication_blocker".to_string(), json!(blocker));
-        details.insert(
-            "patch_review_failure_category".to_string(),
-            json!("publication-quality"),
-        );
+        append_publication_repair_details(&mut details, blocker);
     }
     let is_triage_ready = !published_session_has_diff(published_session.as_ref())
         && published_session_marks_successful_triage(published_session.as_ref());
@@ -3013,6 +3012,35 @@ fn append_job_status_details(
     if let Some(category) = status.review_failure_category.as_deref() {
         details.insert("patch_review_failure_category".to_string(), json!(category));
     }
+}
+
+fn append_publication_repair_details(details: &mut serde_json::Map<String, Value>, blocker: &str) {
+    details.insert("publication_blocker".to_string(), json!(blocker));
+    details.insert(
+        "patch_review_failure_category".to_string(),
+        json!("publication-quality"),
+    );
+    details.insert(
+        "patch_refresh_failure_kind".to_string(),
+        json!("publication-quality"),
+    );
+    details.insert(
+        "report_only_reason".to_string(),
+        json!("publication-quality"),
+    );
+    details.insert(
+        "next_worker_action".to_string(),
+        json!("repair-withheld-public-patch"),
+    );
+    details.insert("rerun_reason".to_string(), json!(blocker));
+    details.insert(
+        "rerun_constraints".to_string(),
+        json!([
+            "review the withheld diff as prior context",
+            "gather the evidence or validation required by the blocker before keeping a source diff",
+            "return an explicit no-patch diagnosis when the blocker cannot be resolved safely"
+        ]),
+    );
 }
 
 fn process_investigation_blocked_patch_summary(

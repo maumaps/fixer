@@ -1272,7 +1272,7 @@ async fn public_issue_best_diff(
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "public patch diff not found"))?;
     Ok((
         [(header::CONTENT_TYPE, "text/x-diff; charset=utf-8")],
-        diff.to_string(),
+        public_download_text(diff),
     )
         .into_response())
 }
@@ -5461,6 +5461,17 @@ fn patch_attempt_is_best_candidate(attempt: &PatchAttempt) -> bool {
         && attempt.validation_status.as_deref() != Some("review-rejected")
 }
 
+fn patch_attempt_is_repair_context(attempt: &PatchAttempt) -> bool {
+    attempt.state == "ready"
+        && attempt.outcome == "report"
+        && attempt
+            .details
+            .get("next_worker_action")
+            .and_then(Value::as_str)
+            == Some("repair-withheld-public-patch")
+        && attempt_has_public_diff(attempt)
+}
+
 fn validation_quality_rank(attempt: &PatchAttempt) -> i32 {
     match attempt
         .details
@@ -5572,7 +5583,9 @@ fn select_best_patch_attempt(candidates: &[PatchAttempt]) -> Option<PatchAttempt
 fn select_latest_patch_context_attempt(candidates: &[PatchAttempt]) -> Option<PatchAttempt> {
     candidates
         .iter()
-        .filter(|attempt| patch_attempt_is_best_candidate(attempt))
+        .filter(|attempt| {
+            patch_attempt_is_best_candidate(attempt) || patch_attempt_is_repair_context(attempt)
+        })
         .cloned()
         .max_by(compare_attempt_created_at)
 }
@@ -6482,6 +6495,7 @@ fn attempt_blocker_reason(attempt: &PatchAttempt) -> Option<String> {
         "patch_failure_kind",
         "workspace_failure_kind",
         "patch_refresh_failure_kind",
+        "publication_blocker",
     ] {
         if let Some(reason) = attempt
             .details
@@ -9365,6 +9379,14 @@ fn public_attempt_diff(attempt: &PublicAttempt) -> Option<&str> {
         .filter(|diff| !diff.trim().is_empty())
 }
 
+fn public_download_text(text: &str) -> String {
+    if text.ends_with('\n') {
+        text.to_string()
+    } else {
+        format!("{text}\n")
+    }
+}
+
 fn public_best_patch_diff_url(
     issue_id: &str,
     best_patch: Option<&PublicAttempt>,
@@ -10249,6 +10271,9 @@ fn canonicalize_patch_attempt(mut attempt: PatchAttempt) -> PatchAttempt {
         return attempt;
     }
     if attempt.state != "ready" {
+        return attempt;
+    }
+    if patch_attempt_is_repair_context(&attempt) {
         return attempt;
     }
     if attempt_has_public_diff(&attempt) {
@@ -15844,6 +15869,18 @@ mod tests {
     }
 
     #[test]
+    fn public_download_text_adds_missing_final_newline() {
+        assert_eq!(
+            public_download_text("--- a/src/file.c\n+++ b/src/file.c"),
+            "--- a/src/file.c\n+++ b/src/file.c\n"
+        );
+        assert_eq!(
+            public_download_text("--- a/src/file.c\n+++ b/src/file.c\n"),
+            "--- a/src/file.c\n+++ b/src/file.c\n"
+        );
+    }
+
+    #[test]
     fn render_public_patch_email_rewrites_keyboard_jargon_into_plain_language() {
         let issue = PublicIssueDetail {
             id: "019d5954-5300-75b1-b0a0-16d9cf5259e1".to_string(),
@@ -16380,6 +16417,107 @@ mod tests {
             .unwrap();
         assert_eq!(worker_context.summary, legacy_patch.summary);
         assert_eq!(worker_context.created_at, legacy_patch.created_at);
+    }
+
+    #[test]
+    fn publication_quality_report_reopens_best_patch_for_repair_context() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "postgres",
+            "Top frame: internal_load_library [postgres]",
+            &["internal_load_library [postgres]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-1",
+            "cluster-1",
+            110,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["other-install"],
+        );
+        let legacy_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Legacy patch proposal created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "legacy prompt",
+                    "response": "legacy response",
+                    "diff": "--- a/src/backend/utils/fmgr/dfmgr.c\n+++ b/src/backend/utils/fmgr/dfmgr.c\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let withheld_repair = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "reviewer-install".to_string(),
+            outcome: "report".to_string(),
+            state: "ready".to_string(),
+            summary: "Fixer withheld a ready local patch from the public best-patch slot after a publication-quality check.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("review-rejected".to_string()),
+            details: json!({
+                "invalidates_best_patch": true,
+                "invalidates_patch_created_at": legacy_patch.created_at.clone(),
+                "publication_blocker": "weak evidence needs a reproduced validation before publication",
+                "patch_review_failure_category": "publication-quality",
+                "patch_refresh_failure_kind": "publication-quality",
+                "report_only_reason": "publication-quality",
+                "next_worker_action": "repair-withheld-public-patch",
+                "rerun_reason": "weak evidence needs a reproduced validation before publication",
+                "published_session": {
+                    "prompt": "repair prompt",
+                    "response": "withheld response",
+                    "diff": "--- a/src/backend/utils/fmgr/dfmgr.c\n+++ b/src/backend/utils/fmgr/dfmgr.c\n@@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-30T00:00:00Z".to_string(),
+        };
+        insert_test_attempt(
+            &connection,
+            "attempt-patch",
+            "lease-patch",
+            &legacy_patch,
+            "2026-03-29T00:00:00Z",
+        );
+        insert_test_attempt(
+            &connection,
+            "attempt-report",
+            "lease-report",
+            &withheld_repair,
+            "2026-03-30T00:00:00Z",
+        );
+
+        refresh_issue_cluster_best_results_sqlite(&connection, "issue-1").unwrap();
+        let best_patch_json: Option<String> = connection
+            .query_row(
+                "SELECT best_patch_json FROM issue_clusters WHERE id = ?1",
+                ["issue-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(best_patch_json.is_none());
+
+        let worker_context = test_runtime()
+            .block_on(load_latest_patch_context_for_worker(&db, "issue-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(worker_context.summary, withheld_repair.summary);
+        assert_eq!(
+            worker_context
+                .details
+                .get("next_worker_action")
+                .and_then(Value::as_str),
+            Some("repair-withheld-public-patch")
+        );
     }
 
     #[test]
