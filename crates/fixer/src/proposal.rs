@@ -402,6 +402,7 @@ struct PriorPatchContext {
     patch_path: Option<PathBuf>,
     session_path: Option<PathBuf>,
     needs_source_mapping: bool,
+    needs_public_diff_cleanup: bool,
 }
 
 fn materialize_prior_patch_context(
@@ -418,6 +419,7 @@ fn materialize_prior_patch_context(
         patch_path: None,
         session_path: None,
         needs_source_mapping: prior_patch_needs_source_mapping(prior_best_patch),
+        needs_public_diff_cleanup: prior_patch_needs_public_diff_cleanup(prior_best_patch),
     };
     if let Some(diff) = prior_best_patch_diff(prior_best_patch) {
         let patch_path = bundle_dir.join("prior-best.patch");
@@ -467,6 +469,7 @@ fn prior_patch_context_json(context: &Option<PriorPatchContext>) -> Option<Value
         "patch_path": context.patch_path.as_ref().map(|path| path.display().to_string()),
         "session_path": context.session_path.as_ref().map(|path| path.display().to_string()),
         "needs_source_mapping": context.needs_source_mapping,
+        "needs_public_diff_cleanup": context.needs_public_diff_cleanup,
     }))
 }
 
@@ -495,6 +498,13 @@ fn prior_patch_needs_source_mapping(attempt: &PatchAttempt) -> bool {
             .and_then(|session| session.get("response"))
             .and_then(Value::as_str)
             .is_some_and(response_declares_no_git_add_paths)
+}
+
+fn prior_patch_needs_public_diff_cleanup(attempt: &PatchAttempt) -> bool {
+    prior_best_patch_diff(attempt).is_some_and(|diff| {
+        let paths = public_diff_changed_paths(diff);
+        !paths.is_empty() && paths.iter().all(|path| is_generated_public_diff_path(path))
+    })
 }
 
 fn response_declares_no_git_add_paths(response: &str) -> bool {
@@ -1865,10 +1875,47 @@ fn is_generated_public_diff_path(path: &str) -> bool {
         || normalized.starts_with(".deps/")
         || normalized.contains("/.libs/")
         || normalized.starts_with(".libs/")
+        || normalized.contains("/.pytest_cache/")
+        || normalized.starts_with(".pytest_cache/")
+        || normalized.contains("/autom4te.cache/")
+        || normalized.starts_with("autom4te.cache/")
         || matches!(
             basename,
-            "Makefile" | "config.status" | "config.cache" | "config.log" | "config.h" | "stamp-h1"
+            "Makefile"
+                | "GNUmakefile"
+                | "config.status"
+                | "config.cache"
+                | "config.log"
+                | "config.h"
+                | "stamp-h1"
         )
+}
+
+fn public_diff_changed_paths(diff: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in diff.lines() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            let path = extract_public_diff_path(line);
+            if !path.is_empty() && path != "/dev/null" {
+                paths.push(path);
+            }
+        } else if let Some(rest) = line.strip_prefix("diff --git ") {
+            for token in rest.split_whitespace().take(2) {
+                let path = token
+                    .trim()
+                    .trim_start_matches("a/")
+                    .trim_start_matches("b/")
+                    .trim_start_matches("./")
+                    .to_string();
+                if !path.is_empty() && path != "/dev/null" {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn extract_git_add_paths_from_response(response: &str) -> Vec<String> {
@@ -3190,8 +3237,13 @@ fn build_prompt(
             } else {
                 ""
             };
+            let public_diff_cleanup_hint = if context.needs_public_diff_cleanup {
+                " The prior attempt retained only generated, cache, or build-output paths in its public diff. Do not treat that as a successful patch and do not merely go silent: reacquire or clean the workspace, map the intended source change onto real repo-relative source/test files, and return a source diff only if such a patch remains valid after that cleanup."
+            } else {
+                ""
+            };
             format!(
-                "\n\nA previous Fixer patch attempt already exists for this issue. {version} Review that patch before changing code, improve it instead of starting blind, and clean up anything awkward or underexplained. In particular, remove avoidable `goto`, tighten the explanation of what the patch is doing, and make the resulting diff feel ready for upstream git review.{source_mapping_hint}{patch_path}{session_path}"
+                "\n\nA previous Fixer patch attempt already exists for this issue. {version} Review that patch before changing code, improve it instead of starting blind, and clean up anything awkward or underexplained. In particular, remove avoidable `goto`, tighten the explanation of what the patch is doing, and make the resulting diff feel ready for upstream git review.{source_mapping_hint}{public_diff_cleanup_hint}{patch_path}{session_path}"
             )
         })
         .unwrap_or_default();
@@ -8648,6 +8700,9 @@ printf 'Subject: test patch\n\n## Commit Message\nok\n\n## Issue Connection\nok\
         assert!(is_generated_public_diff_path(".deps/Action.Po"));
         assert!(is_generated_public_diff_path("linux/.deps/ProcessTable.Po"));
         assert!(is_generated_public_diff_path("Makefile"));
+        assert!(is_generated_public_diff_path("GNUmakefile"));
+        assert!(is_generated_public_diff_path(".pytest_cache/CACHEDIR.TAG"));
+        assert!(is_generated_public_diff_path("autom4te.cache/output.0"));
         assert!(!is_generated_public_diff_path("linux/LinuxProcessTable.c"));
     }
 
@@ -9196,6 +9251,81 @@ plain stderr line
             serde_json::from_slice(&std::fs::read(job.bundle_dir.join("evidence.json")).unwrap())
                 .unwrap();
         assert_eq!(evidence["prior_best_patch"]["needs_source_mapping"], true);
+    }
+
+    #[test]
+    fn prior_best_patch_with_generated_only_diff_tells_worker_to_repair_public_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_root = dir.path().join("source");
+        std::fs::create_dir_all(workspace_root.join("src")).unwrap();
+
+        let mut config = FixerConfig::default();
+        config.service.state_dir = dir.path().join("state");
+
+        let opportunity = OpportunityRecord {
+            id: 42,
+            finding_id: 42,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for postgres".to_string(),
+            score: 110,
+            state: "open".to_string(),
+            summary: "postgres is stuck in a likely busy-poll loop.".to_string(),
+            evidence: json!({}),
+            repo_root: None,
+            ecosystem: Some("debian".to_string()),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+            updated_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let workspace = PreparedWorkspace {
+            repo_root: workspace_root,
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("postgresql-18".to_string()),
+            source_package: Some("postgresql-18".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from apt source".to_string(),
+        };
+        let prior_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Patch proposal retained generated output.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "worker_fixer_version": "0.155.0",
+                "published_session": {
+                    "prompt": "old prompt",
+                    "response": "Subject: cache-only\n\n## Git Add Paths\n.pytest_cache/CACHEDIR.TAG\nGNUmakefile\n\n## Validation\nnot run\n",
+                    "diff": "--- a/.pytest_cache/CACHEDIR.TAG\n+++ b/.pytest_cache/CACHEDIR.TAG\n@@ -0,0 +1 @@\n+generated\n--- a/GNUmakefile\n+++ b/GNUmakefile\n@@ -0,0 +1 @@\n+generated\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+
+        let job = prepare_codex_job_with_prior_patch(
+            &config,
+            &opportunity,
+            &workspace,
+            Some(&prior_patch),
+            "kom",
+            false,
+        )
+        .unwrap();
+
+        let prompt = std::fs::read_to_string(&job.prompt_path).unwrap();
+        assert!(prompt.contains("retained only generated, cache, or build-output paths"));
+        assert!(prompt.contains("do not merely go silent"));
+
+        let evidence: Value =
+            serde_json::from_slice(&std::fs::read(job.bundle_dir.join("evidence.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            evidence["prior_best_patch"]["needs_public_diff_cleanup"],
+            true
+        );
     }
 
     #[test]

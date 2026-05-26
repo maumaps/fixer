@@ -5459,7 +5459,7 @@ fn patch_attempt_is_best_candidate(attempt: &PatchAttempt) -> bool {
     attempt.state == "ready"
         && attempt.outcome == "patch"
         && attempt.validation_status.as_deref() != Some("review-rejected")
-        && attempt_has_public_diff(attempt)
+        && attempt_has_public_source_diff(attempt)
 }
 
 fn patch_attempt_is_repair_context(attempt: &PatchAttempt) -> bool {
@@ -5603,7 +5603,9 @@ fn select_latest_patch_context_attempt(candidates: &[PatchAttempt]) -> Option<Pa
     candidates
         .iter()
         .filter(|attempt| {
-            patch_attempt_is_best_candidate(attempt) || patch_attempt_is_repair_context(attempt)
+            patch_attempt_is_best_candidate(attempt)
+                || patch_attempt_is_repair_context(attempt)
+                || patch_attempt_needs_public_diff_cleanup(attempt)
         })
         .cloned()
         .max_by(compare_attempt_created_at)
@@ -6462,6 +6464,9 @@ fn patch_attempt_needs_worker_refresh(attempt: &PatchAttempt) -> bool {
     if attempt.state != "ready" || attempt.outcome != "patch" {
         return false;
     }
+    if patch_attempt_needs_public_diff_cleanup(attempt) {
+        return true;
+    }
     if patch_attempt_needs_source_mapping(attempt) {
         return true;
     }
@@ -6474,6 +6479,13 @@ fn patch_attempt_needs_worker_refresh(attempt: &PatchAttempt) -> bool {
 fn patch_attempt_needs_source_mapping(attempt: &PatchAttempt) -> bool {
     attempt_has_public_diff(attempt)
         && attempt_response_text(attempt).is_some_and(response_declares_no_git_add_paths)
+}
+
+fn patch_attempt_needs_public_diff_cleanup(attempt: &PatchAttempt) -> bool {
+    attempt.state == "ready"
+        && attempt.outcome == "patch"
+        && attempt_has_public_diff(attempt)
+        && !attempt_has_public_source_diff(attempt)
 }
 
 fn patch_attempt_fixer_version(attempt: &PatchAttempt) -> Option<&str> {
@@ -10184,6 +10196,84 @@ fn attempt_diff_text(attempt: &PatchAttempt) -> Option<&str> {
 
 fn attempt_has_public_diff(attempt: &PatchAttempt) -> bool {
     attempt_diff_text(attempt).is_some()
+}
+
+fn attempt_has_public_source_diff(attempt: &PatchAttempt) -> bool {
+    attempt_diff_text(attempt).is_some_and(public_diff_has_non_generated_path)
+}
+
+fn public_diff_has_non_generated_path(diff: &str) -> bool {
+    public_diff_changed_paths(diff)
+        .iter()
+        .any(|path| !is_generated_public_diff_path(path))
+}
+
+fn public_diff_changed_paths(diff: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in diff.lines() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            let path = extract_public_diff_path(line);
+            if !path.is_empty() && path != "/dev/null" {
+                paths.push(path);
+            }
+        } else if let Some(rest) = line.strip_prefix("diff --git ") {
+            for token in rest.split_whitespace().take(2) {
+                let path = normalize_public_diff_path(token);
+                if !path.is_empty() && path != "/dev/null" {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn extract_public_diff_path(header_line: &str) -> String {
+    header_line
+        .split_whitespace()
+        .nth(1)
+        .map(normalize_public_diff_path)
+        .unwrap_or_default()
+}
+
+fn normalize_public_diff_path(path: &str) -> String {
+    path.trim()
+        .trim_start_matches("a/")
+        .trim_start_matches("b/")
+        .trim_start_matches("./")
+        .to_string()
+}
+
+fn is_generated_public_diff_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "/dev/null" {
+        return false;
+    }
+    let normalized = normalize_public_diff_path(trimmed);
+    if normalized == ".codex" || normalized.starts_with(".codex/") {
+        return true;
+    }
+    let basename = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    normalized.contains("/.deps/")
+        || normalized.starts_with(".deps/")
+        || normalized.contains("/.libs/")
+        || normalized.starts_with(".libs/")
+        || normalized.contains("/.pytest_cache/")
+        || normalized.starts_with(".pytest_cache/")
+        || normalized.contains("/autom4te.cache/")
+        || normalized.starts_with("autom4te.cache/")
+        || matches!(
+            basename,
+            "Makefile"
+                | "GNUmakefile"
+                | "config.status"
+                | "config.cache"
+                | "config.log"
+                | "config.h"
+                | "stamp-h1"
+        )
 }
 
 fn response_marks_successful_triage(response: &str) -> bool {
@@ -16342,6 +16432,44 @@ mod tests {
                 .get("report_only_reason")
                 .and_then(Value::as_str),
             Some("no-safe-local-change")
+        );
+    }
+
+    #[test]
+    fn generated_only_diff_is_not_public_best_patch_but_stays_worker_context() {
+        let generated_only_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Patch proposal accidentally retained build cache output.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: cache-only\n\n## Git Add Paths\n.pytest_cache/CACHEDIR.TAG\n\n## Validation\nnot run\n",
+                    "diff": "--- a/.pytest_cache/CACHEDIR.TAG\n+++ b/.pytest_cache/CACHEDIR.TAG\n@@ -0,0 +1 @@\n+generated\n--- a/GNUmakefile\n+++ b/GNUmakefile\n@@ -0,0 +1 @@\n+generated\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+
+        let (best_patch, best_triage) =
+            best_attempts_from_candidates(vec![generated_only_patch.clone()]);
+
+        assert!(best_patch.is_none());
+        assert!(best_triage.is_none());
+        assert!(patch_attempt_needs_public_diff_cleanup(
+            &generated_only_patch
+        ));
+        assert!(patch_attempt_needs_worker_refresh(&generated_only_patch));
+        let context = select_latest_patch_context_attempt(&[generated_only_patch])
+            .expect("generated-only patch should remain worker repair context");
+        assert_eq!(
+            context.summary,
+            "Patch proposal accidentally retained build cache output."
         );
     }
 
