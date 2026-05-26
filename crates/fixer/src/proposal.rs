@@ -1331,6 +1331,10 @@ pub fn prepare_submission(store: &Store, proposal_id: i64) -> Result<PathBuf> {
     )?;
     writeln!(
         file,
+        "- For public upstream merge requests, recreate or rebase the final patch on the upstream default integration branch, usually `master` or `main`. Installed/stable source trees are useful for reproducing and backport checks, but stable branch fixes should normally be cherry-picked after the default-branch MR is accepted."
+    )?;
+    writeln!(
+        file,
         "- Keep the upstream message at or below the stated evidence confidence: `observed` means direct Fixer evidence but not independently reproduced, and `inferred` should become an issue/discussion or diagnosis rather than a pull request."
     )?;
     if let Some(homepage) = workspace_metadata
@@ -3226,7 +3230,7 @@ fn build_compact_patch_retry_prompt(base_patch_prompt: &str) -> String {
 
 fn upstream_style_prompt_hint(workspace: &PreparedWorkspace) -> String {
     let mut hint = String::from(
-        "\n\nUpstream-style expectation: before planning or editing, check for contribution/style docs (`CONTRIBUTING`, `HACKING`, `README-hacking`, `README.md`, `docs/`, `dev-docs/`) and scan the touched subsystem for local helpers. If the project has wrappers for file IO, path-relative IO, process spawning, memory allocation, logging, locking, or platform compatibility, prefer those wrappers over generic libc/std APIs. Do not invent a reproducer or user-visible failure that is not in the evidence bundle; if the evidence is profiler-only or indirect, describe it as a targeted mitigation or stop with a diagnosis instead of presenting a speculative patch as a confirmed bug fix. In the plan and final validation, name any such helper, convention, or evidence limit you found, or say that no relevant local helper was found.",
+        "\n\nUpstream-style expectation: before planning or editing, check for contribution/style docs (`CONTRIBUTING`, `HACKING`, `README-hacking`, `README.md`, `docs/`, `dev-docs/`) and scan the touched subsystem for local helpers. If the project has wrappers for file IO, path-relative IO, process spawning, memory allocation, logging, locking, or platform compatibility, prefer those wrappers over generic libc/std APIs. For public upstream review, prepare the final patch against the upstream default integration branch, usually `master` or `main`; use installed or stable source trees for reproduction/backport validation, not as the default merge-request base unless the contribution docs explicitly say to target a stable branch. Do not invent a reproducer or user-visible failure that is not in the evidence bundle; if the evidence is profiler-only or indirect, describe it as a targeted mitigation or stop with a diagnosis instead of presenting a speculative patch as a confirmed bug fix. In the plan and final validation, name any such helper, convention, branch-base choice, or evidence limit you found, or say that no relevant local helper was found.",
     );
     if let Some(package) = workspace
         .source_package
@@ -9285,6 +9289,8 @@ plain stderr line
             assert!(prompt.contains("local helper"));
             assert!(prompt.contains("compat"));
             assert!(prompt.contains("generic libc"));
+            assert!(prompt.contains("upstream default integration branch"));
+            assert!(prompt.contains("stable source trees for reproduction/backport validation"));
             assert!(prompt.contains("`htop` upstream patch"));
         }
     }
