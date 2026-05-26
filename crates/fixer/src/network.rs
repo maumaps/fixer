@@ -1,10 +1,11 @@
 use crate::config::FixerConfig;
 use crate::models::{
     ClientHello, CodexAuthLease, CodexAuthLeaseStatus, CodexAuthMode, CodexJobSpec, CodexJobStatus,
-    CodexLeaseBudget, FindingBundle, FindingInput, ImpossibleReason, InstallIdentity,
-    LeaseBudgetPreset, ObservedArtifact, OpportunityRecord, ParticipationMode, ParticipationState,
-    PatchAttempt, PatchDriver, ProposalRecord, ServerHello, SharedOpportunity, SubmissionEnvelope,
-    SubmissionReceipt, SubmittedProposal, WorkOffer, WorkPullRequest, WorkerResultEnvelope,
+    CodexLeaseBudget, EvidenceUpgradeRequest, FindingBundle, FindingInput, ImpossibleReason,
+    InstallIdentity, LeaseBudgetPreset, ObservedArtifact, OpportunityRecord, ParticipationMode,
+    ParticipationState, PatchAttempt, PatchDriver, ProposalRecord, ServerHello, SharedOpportunity,
+    SubmissionEnvelope, SubmissionReceipt, SubmittedProposal, WorkOffer, WorkPullRequest,
+    WorkerResultEnvelope,
 };
 use crate::pow::{mine_pow, verify_pow};
 use crate::privacy::{consent_policy_digest, consent_policy_text, redact_string, redact_value};
@@ -1101,6 +1102,11 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                 process_investigation_worker_summary(&opportunity)
             )
         };
+        let evidence_request = weak_runaway_evidence_upgrade_request(
+            &opportunity,
+            &lease.issue.id,
+            Some(&participation.identity.install_id),
+        );
         let result = WorkerResultEnvelope {
             lease_id: lease.lease_id.clone(),
             attempt: PatchAttempt {
@@ -1125,7 +1131,7 @@ pub fn worker_once(store: &Store, config: &FixerConfig) -> Result<WorkerRunOutco
                 created_at: now_rfc3339(),
             },
             impossible_reason: None,
-            evidence_request: None,
+            evidence_request,
         };
         let endpoint = format!("v1/work/{}/result", lease.lease_id);
         let submitted = post_json::<_, WorkerResultEnvelope>(config, &endpoint, &result)?;
@@ -2696,6 +2702,42 @@ fn weak_unknown_runaway_process_evidence(details: &Value) -> bool {
             .is_none_or(|value| value.trim().is_empty())
 }
 
+fn weak_runaway_evidence_upgrade_request(
+    opportunity: &crate::models::OpportunityRecord,
+    issue_id: &str,
+    install_id: Option<&str>,
+) -> Option<EvidenceUpgradeRequest> {
+    let details = process_investigation_worker_diagnosis(opportunity);
+    if !weak_unknown_runaway_process_evidence(&details) {
+        return None;
+    }
+    let target = details
+        .get("profile_target")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("the hot process");
+    let reason = format!(
+        "Fixer saw {target} in an unclassified userspace CPU loop, but the retained evidence was too weak to choose a safe source change."
+    );
+    Some(EvidenceUpgradeRequest {
+        issue_id: issue_id.to_string(),
+        requested_by_install_id: install_id.map(ToString::to_string),
+        reason,
+        requested_fields: vec![
+            format!(
+                "fresh multi-thread gdb backtrace for {target} at the moment of the CPU spike"
+            ),
+            format!("longer perf sample for {target} with owning DSO/package for hot frames"),
+            format!("timed strace excerpt for {target} while the loop is active"),
+            format!("/proc/<pid>/maps and executable path for {target}"),
+            "command line, parent process, and package version for the sampled process".to_string(),
+            "if the hot process is an interpreter, the script/module entrypoint and language-level stack or reproducer".to_string(),
+        ],
+        requested_at: now_rfc3339(),
+    })
+}
+
 fn evidence_array_is_empty(details: &Value, key: &str) -> bool {
     details
         .get(key)
@@ -3913,6 +3955,31 @@ mod tests {
         assert!(process_investigation_prefers_report_only(&opportunity));
         let blocker = process_investigation_report_only_blocker_for_opportunity(&opportunity);
         assert_eq!(blocker.machine_reason, "weak-unknown-runaway-evidence");
+        let request =
+            weak_runaway_evidence_upgrade_request(&opportunity, "issue-1", Some("install-1"))
+                .expect("weak runaway evidence should ask for stronger follow-up artifacts");
+        assert_eq!(request.issue_id, "issue-1");
+        assert_eq!(
+            request.requested_by_install_id.as_deref(),
+            Some("install-1")
+        );
+        assert!(
+            request
+                .reason
+                .contains("too weak to choose a safe source change")
+        );
+        assert!(
+            request
+                .requested_fields
+                .iter()
+                .any(|field| field.contains("multi-thread gdb backtrace"))
+        );
+        assert!(
+            request
+                .requested_fields
+                .iter()
+                .any(|field| field.contains("/proc/<pid>/maps"))
+        );
 
         opportunity.evidence = json!({
             "details": {
@@ -3925,6 +3992,7 @@ mod tests {
         });
 
         assert!(!process_investigation_prefers_report_only(&opportunity));
+        assert!(weak_runaway_evidence_upgrade_request(&opportunity, "issue-1", None).is_none());
     }
 
     #[test]

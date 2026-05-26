@@ -5459,6 +5459,7 @@ fn patch_attempt_is_best_candidate(attempt: &PatchAttempt) -> bool {
     attempt.state == "ready"
         && attempt.outcome == "patch"
         && attempt.validation_status.as_deref() != Some("review-rejected")
+        && attempt_has_public_diff(attempt)
 }
 
 fn patch_attempt_is_repair_context(attempt: &PatchAttempt) -> bool {
@@ -16251,6 +16252,41 @@ mod tests {
 
         assert!(best_patch.is_none());
         assert!(best_triage.is_none());
+    }
+
+    #[test]
+    fn ready_patch_without_public_diff_is_not_public_best_patch() {
+        let diagnosis_only_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "No patch: report inconclusive runtime evidence.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "diagnose the runtime evidence",
+                    "response": "No source change landed. The collected evidence is inconclusive.",
+                    "diff": "",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+
+        let (best_patch, best_triage) =
+            best_attempts_from_candidates(vec![canonicalize_patch_attempt(diagnosis_only_patch)]);
+
+        assert!(best_patch.is_none());
+        assert_eq!(
+            best_triage
+                .expect("diagnosis-only patch attempts should remain visible as triage")
+                .details
+                .get("report_only_reason")
+                .and_then(Value::as_str),
+            Some("no-safe-local-change")
+        );
     }
 
     #[test]

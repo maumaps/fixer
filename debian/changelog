@@ -1,3 +1,12 @@
+fixer (0.153.0-1) unstable; urgency=medium
+
+  * Keep diagnosis-only attempts out of the public patch board unless they
+    include a real public diff.
+  * Ask for targeted follow-up evidence when weak runaway CPU investigations
+    are too thin for a safe source patch.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 26 May 2026 21:35:00 +0400
+
 fixer (0.152.0-1) unstable; urgency=medium
 
   * Clear older public best patches when a newer triage result says the
