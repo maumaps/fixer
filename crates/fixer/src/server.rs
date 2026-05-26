@@ -9515,11 +9515,21 @@ fn effective_upstream_review_state(raw_state: Option<&str>, merged_at: Option<&s
     if merged_at.is_some() {
         return "merged".to_string();
     }
-    let state = raw_state.unwrap_or("review").trim();
+    let state = raw_state.unwrap_or("review").trim().replace('-', "_");
     if state.is_empty() {
-        "review".to_string()
-    } else {
-        state.to_string()
+        return "review".to_string();
+    }
+    match state.as_str() {
+        "closed" | "closed_unmerged" | "merged" | "rejected" | "review" | "reviewer_reduced"
+        | "superseded" => state,
+        _ => state,
+    }
+}
+
+fn public_upstream_review_state_label(state: &str) -> String {
+    match state {
+        "reviewer_reduced" => "reviewer-reduced".to_string(),
+        _ => state.replace('_', "-"),
     }
 }
 
@@ -14133,13 +14143,13 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
         let _ = write!(
             patch_tags,
             "<span class=\"tag\">upstream: {}</span>",
-            html_escape(&review.state)
+            html_escape(&public_upstream_review_state_label(&review.state))
         );
     } else if let Some(review) = entry.related_upstream_review.as_ref() {
         let _ = write!(
             patch_tags,
             "<span class=\"tag\">related upstream: {}</span>",
-            html_escape(&review.state)
+            html_escape(&public_upstream_review_state_label(&review.state))
         );
     }
     if let Some(duplicate) = entry.duplicate_patch.as_ref() {
@@ -17347,6 +17357,83 @@ mod tests {
                 "upstream review".to_string(),
                 "resource hardening".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn public_patch_loader_exposes_reviewer_reduced_state() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "perl",
+            "Top frame: pp_sselect [perl]",
+            &["pp_sselect [perl]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-1",
+            "cluster-1",
+            110,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        let source_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Preserve tiny positive select timeouts.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: pp_sselect: preserve tiny positive timeouts\n\n## Git Add Paths\npp_sys.c\nt/op/sselect.t\n",
+                    "diff": "--- a/pp_sys.c\n+++ b/pp_sys.c\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params!["issue-1", serde_json::to_string(&source_patch).unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO upstream_patch_wins
+                 (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)",
+                rusqlite::params![
+                    "perl-sselect-reviewer-reduced",
+                    "Perl",
+                    "Perl review reduced a tiny-timeout patch.",
+                    "The public PR kept only a narrower typo fix after maintainer review.",
+                    "https://github.com/Perl/perl5/pull/24402",
+                    "reviewer-reduced",
+                    serde_json::to_string(&json!(["reviewer reduced"])).unwrap(),
+                    "issue-1",
+                    "2026-03-31T00:00:00Z",
+                ],
+            )
+            .unwrap();
+
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let review = patches
+            .first()
+            .and_then(|patch| patch.upstream_review.as_ref())
+            .expect("reviewer-reduced review should be annotated");
+
+        assert_eq!(review.state, "reviewer_reduced");
+        assert_eq!(
+            public_upstream_review_state_label(&review.state),
+            "reviewer-reduced"
         );
     }
 

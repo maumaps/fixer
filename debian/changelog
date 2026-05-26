@@ -1,3 +1,11 @@
+fixer (0.170.0-1) unstable; urgency=medium
+
+  * Treat reviewer-reduced upstream attempts as a first-class public review
+    state, so generated source patches narrowed after maintainer review do not
+    look like active reviews or fresh upstream candidates.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 05:35:00 +0400
+
 fixer (0.169.0-1) unstable; urgency=medium
 
   * Expose exact duplicate patch-diff groups on public patch API rows and
