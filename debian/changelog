@@ -1,3 +1,11 @@
+fixer (0.162.0-1) unstable; urgency=medium
+
+  * Prefer interpreter script entrypoint source metadata for public runaway
+    process issue source packages, so Python-hosted application fixes harvest
+    as their owning upstream project instead of the Python runtime.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 26 May 2026 22:55:00 +0400
+
 fixer (0.161.0-1) unstable; urgency=medium
 
   * Sort upstream review cards by their review or merge timestamp so fresh open

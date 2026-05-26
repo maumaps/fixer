@@ -8301,6 +8301,7 @@ fn inferred_public_source_package(item: &SharedOpportunity) -> Option<String> {
             .get("source_package")
             .and_then(Value::as_str)
             .map(ToString::to_string)
+            .or_else(|| interpreter_entrypoint_source_package(&item.finding.details))
             .or_else(|| {
                 item.opportunity
                     .evidence
@@ -8344,6 +8345,15 @@ fn inferred_public_source_package(item: &SharedOpportunity) -> Option<String> {
     .or_else(|| inferred_oom_source_package(&item.finding.details))
     .or_else(|| inferred_runaway_mapped_executable_source_package(&item.finding.details))
     .or_else(|| inferred_kernel_hot_path_source_package(&item.finding.details))
+}
+
+fn interpreter_entrypoint_source_package(details: &Value) -> Option<String> {
+    let source = details
+        .get("interpreter_process")
+        .and_then(|value| value.get("entrypoint_package_metadata"))
+        .and_then(|metadata| metadata.get("source_package"))
+        .and_then(Value::as_str)?;
+    canonical_public_source_package(None, Some(source.to_string()))
 }
 
 fn inferred_apparmor_source_package(item: &SharedOpportunity) -> Option<String> {
@@ -17809,6 +17819,32 @@ mod tests {
         nvidia_runaway.finding.details["implicated_package_names"] =
             json!(["libcuda1", "linux-image-6.17.10+deb14-amd64"]);
         assert_eq!(inferred_public_source_package(&nvidia_runaway), None);
+
+        let mut interpreter_runaway =
+            sample_runaway_investigation("python3.13", Some("python3.13-minimal"));
+        interpreter_runaway.finding.details["package_metadata"] = json!({
+            "package_name": "python3.13-minimal",
+            "source_package": "python3.13"
+        });
+        interpreter_runaway.finding.details["interpreter_process"] = json!({
+            "interpreter": "python",
+            "entrypoint_kind": "script",
+            "suspected_entrypoint": "/usr/bin/unattended-upgrade",
+            "entrypoint_package_name": "unattended-upgrades",
+            "entrypoint_package_metadata": {
+                "package_name": "unattended-upgrades",
+                "source_package": "unattended-upgrades"
+            },
+            "runtime_package_name": "python3.13-minimal",
+            "runtime_package_metadata": {
+                "package_name": "python3.13-minimal",
+                "source_package": "python3.13"
+            }
+        });
+        assert_eq!(
+            inferred_public_source_package(&interpreter_runaway).as_deref(),
+            Some("unattended-upgrades")
+        );
 
         let mut oom_with_metadata = sample_oom_kill_investigation("chrome", "google-chrome");
         oom_with_metadata.finding.details["package_metadata"] = json!({
