@@ -777,7 +777,7 @@ struct PublishedAttemptSession {
     rate_limit_fallback_used: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct PublicPatchCover {
     subject: String,
     commit_message: String,
@@ -1001,6 +1001,12 @@ struct PublicPatchEntry {
     corroboration_count: i64,
     last_seen: String,
     best_patch_diff_url: Option<String>,
+    best_patch_raw_diff_url: Option<String>,
+    patch_subject: Option<String>,
+    evidence_confidence: Option<String>,
+    git_add_paths: Vec<String>,
+    changed_files: Vec<String>,
+    validation_notes: Vec<String>,
     best_patch: PublicAttempt,
 }
 
@@ -7704,19 +7710,49 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
     }
     let best_patch = public_attempt_from_patch_attempt(attempt);
     let last_seen: DateTime<Utc> = row.get(11);
+    let last_seen = last_seen.to_rfc3339();
+    let package_name: Option<String> = row.get(4);
+    let source_package: Option<String> = row.get(5);
+    let cover = build_public_patch_cover(
+        row.get::<_, String>(2).as_str(),
+        row.get::<_, String>(3).as_str(),
+        package_name.as_deref(),
+        source_package.as_deref(),
+        row.get(9),
+        &last_seen,
+        &best_patch,
+    );
+    let response_metadata = best_patch
+        .published_session
+        .as_ref()
+        .and_then(|session| session.response.as_deref())
+        .map(extract_patch_response_metadata)
+        .unwrap_or_default();
     Ok(Some(PublicPatchEntry {
         id: id.clone(),
         kind: row.get(1),
         title: row.get(2),
         summary: row.get(3),
-        package_name: row.get(4),
-        source_package: row.get(5),
+        package_name,
+        source_package,
         ecosystem: row.get(6),
         severity: row.get(7),
         score: row.get(8),
         corroboration_count: row.get(9),
-        last_seen: last_seen.to_rfc3339(),
+        last_seen,
         best_patch_diff_url: public_best_patch_diff_url(&id, Some(&best_patch)),
+        best_patch_raw_diff_url: public_best_patch_raw_diff_url(&id, Some(&best_patch)),
+        patch_subject: cover.as_ref().map(|cover| cover.subject.clone()),
+        evidence_confidence: response_metadata.evidence_confidence,
+        git_add_paths: response_metadata.git_add_paths,
+        changed_files: cover
+            .as_ref()
+            .map(|cover| cover.changed_files.clone())
+            .unwrap_or_default(),
+        validation_notes: cover
+            .as_ref()
+            .map(|cover| cover.validation_notes.clone())
+            .unwrap_or_default(),
         best_patch,
     }))
 }
@@ -9086,19 +9122,52 @@ fn public_patch_from_sqlite_row(
         return Ok(None);
     }
     let best_patch = public_attempt_from_patch_attempt(attempt);
+    let title: String = row.get(2)?;
+    let summary: String = row.get(3)?;
+    let package_name: Option<String> = row.get(4)?;
+    let source_package: Option<String> = row.get(5)?;
+    let corroboration_count: i64 = row.get(9)?;
+    let last_seen: String = row.get(11)?;
+    let cover = build_public_patch_cover(
+        &title,
+        &summary,
+        package_name.as_deref(),
+        source_package.as_deref(),
+        corroboration_count,
+        &last_seen,
+        &best_patch,
+    );
+    let response_metadata = best_patch
+        .published_session
+        .as_ref()
+        .and_then(|session| session.response.as_deref())
+        .map(extract_patch_response_metadata)
+        .unwrap_or_default();
     Ok(Some(PublicPatchEntry {
         id: id.clone(),
         kind: row.get(1)?,
-        title: row.get(2)?,
-        summary: row.get(3)?,
-        package_name: row.get(4)?,
-        source_package: row.get(5)?,
+        title,
+        summary,
+        package_name,
+        source_package,
         ecosystem: row.get(6)?,
         severity: row.get(7)?,
         score: row.get(8)?,
-        corroboration_count: row.get(9)?,
-        last_seen: row.get(11)?,
+        corroboration_count,
+        last_seen,
         best_patch_diff_url: public_best_patch_diff_url(&id, Some(&best_patch)),
+        best_patch_raw_diff_url: public_best_patch_raw_diff_url(&id, Some(&best_patch)),
+        patch_subject: cover.as_ref().map(|cover| cover.subject.clone()),
+        evidence_confidence: response_metadata.evidence_confidence,
+        git_add_paths: response_metadata.git_add_paths,
+        changed_files: cover
+            .as_ref()
+            .map(|cover| cover.changed_files.clone())
+            .unwrap_or_default(),
+        validation_notes: cover
+            .as_ref()
+            .map(|cover| cover.validation_notes.clone())
+            .unwrap_or_default(),
         best_patch,
     }))
 }
@@ -9633,6 +9702,8 @@ struct PatchResponseMetadata {
     subject: Option<String>,
     commit_message: Option<String>,
     issue_connection: Option<String>,
+    evidence_confidence: Option<String>,
+    git_add_paths: Vec<String>,
     validation_notes: Vec<String>,
 }
 
@@ -9833,12 +9904,47 @@ fn extract_patch_response_metadata(response: &str) -> PatchResponseMetadata {
     let validation_notes = extract_markdown_section_raw(&authoring_response, "Validation")
         .map(|section| parse_validation_notes(&section))
         .unwrap_or_default();
+    let evidence_confidence =
+        extract_markdown_section_raw(&authoring_response, "Evidence Confidence")
+            .or_else(|| extract_markdown_section_raw(&authoring_response, "Confidence"))
+            .and_then(|section| first_metadata_line(&section))
+            .map(|value| value.to_ascii_lowercase());
+    let git_add_paths = extract_markdown_section_raw(&authoring_response, "Git Add Paths")
+        .map(|section| parse_git_add_path_notes(&section))
+        .unwrap_or_default();
     PatchResponseMetadata {
         subject: extract_labeled_line(&authoring_response, "Subject:"),
         commit_message: extract_markdown_section_raw(&authoring_response, "Commit Message"),
         issue_connection: extract_markdown_section_raw(&authoring_response, "Issue Connection"),
+        evidence_confidence,
+        git_add_paths,
         validation_notes,
     }
+}
+
+fn first_metadata_line(section: &str) -> Option<String> {
+    section
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.trim_matches('`').to_string())
+}
+
+fn parse_git_add_path_notes(section: &str) -> Vec<String> {
+    section
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            let value = line
+                .strip_prefix("- ")
+                .or_else(|| line.strip_prefix("* "))
+                .unwrap_or(line)
+                .trim()
+                .trim_matches('`')
+                .trim();
+            (!value.is_empty() && !value.eq_ignore_ascii_case("none")).then(|| value.to_string())
+        })
+        .collect()
 }
 
 fn extract_added_comment_rationale(diff: &str) -> Option<String> {
@@ -15467,6 +15573,14 @@ mod tests {
             best_patch_diff_url: Some(
                 "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch".to_string(),
             ),
+            best_patch_raw_diff_url: Some(
+                "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.diff".to_string(),
+            ),
+            patch_subject: None,
+            evidence_confidence: None,
+            git_add_paths: Vec::new(),
+            changed_files: Vec::new(),
+            validation_notes: Vec::new(),
             best_patch: PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -15518,6 +15632,14 @@ mod tests {
             best_patch_diff_url: Some(
                 "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5fa/best.patch".to_string(),
             ),
+            best_patch_raw_diff_url: Some(
+                "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5fa/best.diff".to_string(),
+            ),
+            patch_subject: None,
+            evidence_confidence: None,
+            git_add_paths: Vec::new(),
+            changed_files: Vec::new(),
+            validation_notes: Vec::new(),
             best_patch: PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -16572,6 +16694,80 @@ mod tests {
 
         assert!(patches.is_empty());
         assert!(best_patch.is_none());
+    }
+
+    #[test]
+    fn public_patch_loader_exposes_harvest_metadata() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "postfix",
+            "Top frame: smtp_get [smtpd]",
+            &["smtp_get [smtpd]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-1",
+            "cluster-1",
+            110,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        let source_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "smtpd keeps draining an overlong command.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: smtpd: disconnect after overlong commands\n\n## Evidence Confidence\nreproduced\n\n## Git Add Paths\n- src/smtpd/smtpd.c\n- src/smtpd/smtpd_chat.c\n\n## Validation\n- make -j32 passed\n",
+                    "diff": "--- a/src/smtpd/smtpd.c\n+++ b/src/smtpd/smtpd.c\n@@ -1 +1 @@\n-old\n+new\n--- a/src/smtpd/smtpd_chat.c\n+++ b/src/smtpd/smtpd_chat.c\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params!["issue-1", serde_json::to_string(&source_patch).unwrap()],
+            )
+            .unwrap();
+
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let patch = patches.first().expect("public patch should be visible");
+
+        assert_eq!(
+            patch.best_patch_raw_diff_url.as_deref(),
+            Some("/issues/issue-1/best.diff")
+        );
+        assert_eq!(
+            patch.patch_subject.as_deref(),
+            Some("smtpd: disconnect after overlong commands")
+        );
+        assert_eq!(patch.evidence_confidence.as_deref(), Some("reproduced"));
+        assert_eq!(
+            patch.git_add_paths,
+            vec![
+                "src/smtpd/smtpd.c".to_string(),
+                "src/smtpd/smtpd_chat.c".to_string()
+            ]
+        );
+        assert_eq!(patch.changed_files, patch.git_add_paths);
+        assert!(
+            patch
+                .validation_notes
+                .iter()
+                .any(|note| note.contains("make -j32 passed"))
+        );
     }
 
     #[test]

@@ -1,3 +1,11 @@
+fixer (0.164.0-1) unstable; urgency=medium
+
+  * Expose structured harvest metadata on public patch API rows, including
+    subject, confidence, git-add paths, changed files, validation notes, and
+    raw diff URLs for upstream submission tooling.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 26 May 2026 23:46:59 +0400
+
 fixer (0.163.0-1) unstable; urgency=medium
 
   * Show more upstream review cards on the landing page so fresh open
