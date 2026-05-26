@@ -1,3 +1,11 @@
+fixer (0.169.0-1) unstable; urgency=medium
+
+  * Expose exact duplicate patch-diff groups on public patch API rows and
+    patch cards so identical retained diffs point at a canonical issue instead
+    of looking like independent upstream candidates.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 04:35:00 +0400
+
 fixer (0.168.0-1) unstable; urgency=medium
 
   * Expose related upstream review families on public patch API rows and

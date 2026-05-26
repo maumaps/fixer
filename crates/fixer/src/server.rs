@@ -1010,6 +1010,7 @@ struct PublicPatchEntry {
     validation_notes: Vec<String>,
     upstream_review: Option<PublicPatchUpstreamReview>,
     related_upstream_review: Option<PublicPatchRelatedReview>,
+    duplicate_patch: Option<PublicPatchDuplicate>,
     best_patch: PublicAttempt,
 }
 
@@ -1030,6 +1031,14 @@ struct PublicPatchRelatedReview {
     pr_url: String,
     state: String,
     family_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicPatchDuplicate {
+    canonical_issue_id: String,
+    canonical_subject: Option<String>,
+    patch_diff_hash: String,
+    duplicate_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -7488,6 +7497,7 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
             .map_err(ApiError::internal)?
         }
     };
+    annotate_public_patch_duplicates(&mut patches);
     annotate_public_patch_related_reviews(&mut patches);
     patches.sort_by(|left, right| {
         parse_timestamp(&right.best_patch.created_at)
@@ -7495,6 +7505,64 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
             .then_with(|| right.score.cmp(&left.score))
     });
     Ok(patches)
+}
+
+fn annotate_public_patch_duplicates(patches: &mut [PublicPatchEntry]) {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, patch) in patches.iter().enumerate() {
+        let Some(diff_hash) = patch.patch_diff_hash.as_ref() else {
+            continue;
+        };
+        groups.entry(diff_hash.clone()).or_default().push(index);
+    }
+
+    for indexes in groups.values() {
+        if indexes.len() <= 1 {
+            continue;
+        }
+        let Some(canonical_index) = indexes.iter().copied().max_by(|left, right| {
+            public_patch_duplicate_rank(&patches[*left])
+                .cmp(&public_patch_duplicate_rank(&patches[*right]))
+                .then_with(|| {
+                    parse_timestamp(&patches[*left].best_patch.created_at)
+                        .cmp(&parse_timestamp(&patches[*right].best_patch.created_at))
+                })
+                .then_with(|| patches[*left].score.cmp(&patches[*right].score))
+        }) else {
+            continue;
+        };
+        let canonical_issue_id = patches[canonical_index].id.clone();
+        let canonical_subject = patches[canonical_index].patch_subject.clone();
+        let patch_diff_hash = patches[canonical_index]
+            .patch_diff_hash
+            .clone()
+            .unwrap_or_default();
+        for index in indexes {
+            if *index == canonical_index {
+                continue;
+            }
+            patches[*index].duplicate_patch = Some(PublicPatchDuplicate {
+                canonical_issue_id: canonical_issue_id.clone(),
+                canonical_subject: canonical_subject.clone(),
+                patch_diff_hash: patch_diff_hash.clone(),
+                duplicate_count: indexes.len() as i64,
+            });
+        }
+    }
+}
+
+fn public_patch_duplicate_rank(patch: &PublicPatchEntry) -> i32 {
+    match patch
+        .upstream_review
+        .as_ref()
+        .map(|review| review.state.as_str())
+    {
+        Some("merged") => 4,
+        Some("review") => 3,
+        Some(_) => 2,
+        None if patch.related_upstream_review.is_some() => 1,
+        None => 0,
+    }
 }
 
 fn annotate_public_patch_related_reviews(patches: &mut [PublicPatchEntry]) {
@@ -7963,6 +8031,7 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
             .unwrap_or_default(),
         upstream_review: public_patch_upstream_review_from_row(&row),
         related_upstream_review: None,
+        duplicate_patch: None,
         best_patch,
     }))
 }
@@ -9402,6 +9471,7 @@ fn public_patch_from_sqlite_row(
             .unwrap_or_default(),
         upstream_review: public_patch_upstream_review_from_sqlite_row(row)?,
         related_upstream_review: None,
+        duplicate_patch: None,
         best_patch,
     }))
 }
@@ -14072,6 +14142,13 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             html_escape(&review.state)
         );
     }
+    if let Some(duplicate) = entry.duplicate_patch.as_ref() {
+        let _ = write!(
+            patch_tags,
+            "<span class=\"tag\">duplicate diff: {}</span>",
+            duplicate.duplicate_count
+        );
+    }
 
     format!(
         r#"<article class="issue-card patch-card">
@@ -15882,6 +15959,7 @@ mod tests {
             validation_notes: Vec::new(),
             upstream_review: None,
             related_upstream_review: None,
+            duplicate_patch: None,
             best_patch: PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -15944,6 +16022,7 @@ mod tests {
             validation_notes: Vec::new(),
             upstream_review: None,
             related_upstream_review: None,
+            duplicate_patch: None,
             best_patch: PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -17080,6 +17159,108 @@ mod tests {
                 .validation_notes
                 .iter()
                 .any(|note| note.contains("make -j32 passed"))
+        );
+    }
+
+    #[test]
+    fn public_patch_loader_exposes_duplicate_patch_group() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "openssh",
+            "Top frame: channel_prepare_pollfd [sshd]",
+            &["channel_prepare_pollfd [sshd]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-old",
+            "cluster-old",
+            100,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-new",
+            "cluster-new",
+            101,
+            "2026-03-31T00:00:00Z",
+            &representative,
+            &["install-2"],
+        );
+        let diff = "--- a/channels.c\n+++ b/channels.c\n@@ -1 +1 @@\n-old\n+new\n";
+        let old_patch = PatchAttempt {
+            cluster_id: "issue-old".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Patch proposal created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: channels: arm poll events\n\n## Git Add Paths\nchannels.c\n",
+                    "diff": diff,
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let new_patch = PatchAttempt {
+            cluster_id: "issue-new".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Patch proposal created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: channels: set poll events\n\n## Git Add Paths\nchannels.c\n",
+                    "diff": diff,
+                }
+            }),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params!["issue-old", serde_json::to_string(&old_patch).unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params!["issue-new", serde_json::to_string(&new_patch).unwrap()],
+            )
+            .unwrap();
+
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let older = patches
+            .iter()
+            .find(|patch| patch.id == "issue-old")
+            .expect("older duplicate should be visible");
+        let duplicate = older
+            .duplicate_patch
+            .as_ref()
+            .expect("older patch should point at canonical duplicate");
+
+        assert_eq!(duplicate.canonical_issue_id, "issue-new");
+        assert_eq!(duplicate.duplicate_count, 2);
+        assert_eq!(
+            duplicate.patch_diff_hash.as_str(),
+            hash_text(normalize_published_diff(diff)).as_str()
+        );
+        assert_eq!(
+            duplicate.canonical_subject.as_deref(),
+            Some("channels: set poll events")
         );
     }
 
