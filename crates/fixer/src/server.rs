@@ -8526,21 +8526,21 @@ fn inferred_runaway_mapped_executable_source_package(details: &Value) -> Option<
         .get("hot_path_dso")
         .and_then(Value::as_str)
         .map(normalize_deleted_file_marker)
+        .map(|value| file_name_or_self(&value).to_string())
         .unwrap_or_default();
     if !hot_path_dso.is_empty() && hot_path_dso != target_name {
         return None;
     }
     let path_is_system_binary = target_path
         .as_deref()
-        .is_some_and(|path| path.starts_with("/usr/bin/") || path.starts_with("/usr/sbin/"));
+        .is_some_and(|path| known_runaway_executable_path_matches(path, &target_name));
     let maps_contain_system_binary = details
         .get("maps_excerpt")
         .and_then(Value::as_str)
         .is_some_and(|maps| {
             maps.lines().any(|line| {
                 let normalized = normalize_deleted_file_marker(line);
-                normalized.contains(&format!("/usr/bin/{target_name}"))
-                    || normalized.contains(&format!("/usr/sbin/{target_name}"))
+                known_runaway_executable_path_matches(&normalized, &target_name)
             })
         });
     if !path_is_system_binary && !maps_contain_system_binary {
@@ -8549,9 +8549,16 @@ fn inferred_runaway_mapped_executable_source_package(details: &Value) -> Option<
     known_runaway_executable_source_package_alias(&target_name)
 }
 
+fn known_runaway_executable_path_matches(path: &str, target_name: &str) -> bool {
+    path.contains(&format!("/usr/bin/{target_name}"))
+        || path.contains(&format!("/usr/sbin/{target_name}"))
+        || path.contains(&format!("/usr/lib/systemd/{target_name}"))
+}
+
 fn known_runaway_executable_source_package_alias(value: &str) -> Option<String> {
     match value.trim() {
         "containerd-shim-runc-v2" => Some("containerd".to_string()),
+        "systemd-userdbd" | "systemd-userwork" => Some("systemd".to_string()),
         _ => None,
     }
 }
@@ -17583,6 +17590,33 @@ mod tests {
         assert_eq!(
             inferred_public_source_package(&deleted_containerd_hotspot).as_deref(),
             Some("containerd")
+        );
+
+        let mut systemd_userwork =
+            sample_runaway_investigation("systemd-userwork", Option::<&str>::None);
+        systemd_userwork.finding.details["profile_target"] = json!({
+            "name": "systemd-userwork",
+            "path": "/usr/lib/systemd/systemd-userwork",
+        });
+        systemd_userwork.finding.details["hot_path_dso"] =
+            json!("/usr/lib/systemd/systemd-userwork");
+        assert_eq!(
+            inferred_public_source_package(&systemd_userwork).as_deref(),
+            Some("systemd")
+        );
+
+        let mut systemd_userdbd_maps_only =
+            sample_runaway_investigation("systemd-userdbd", Option::<&str>::None);
+        systemd_userdbd_maps_only.finding.details["profile_target"] = json!({
+            "name": "systemd-userdbd",
+        });
+        systemd_userdbd_maps_only.finding.details["hot_path_dso"] = json!("systemd-userdbd");
+        systemd_userdbd_maps_only.finding.details["maps_excerpt"] = json!(
+            "00400000-00799000 r--p 00000000 fe:00 69883374 /usr/lib/systemd/systemd-userdbd"
+        );
+        assert_eq!(
+            inferred_public_source_package(&systemd_userdbd_maps_only).as_deref(),
+            Some("systemd")
         );
 
         let mut local_ollama = sample_runaway_investigation("ollama", Option::<&str>::None);

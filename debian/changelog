@@ -1,3 +1,11 @@
+fixer (0.155.0-1) unstable; urgency=medium
+
+  * Map systemd-userwork and systemd-userdbd runaway reports back to the
+    systemd upstream source tree when the collector only has executable or maps
+    evidence.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 26 May 2026 21:25:15 +0400
+
 fixer (0.154.0-1) unstable; urgency=medium
 
   * Keep diff-backed patches alive when the previous attempt lacked git add
