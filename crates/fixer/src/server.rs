@@ -1009,6 +1009,7 @@ struct PublicPatchEntry {
     changed_files: Vec<String>,
     validation_notes: Vec<String>,
     upstream_review: Option<PublicPatchUpstreamReview>,
+    related_upstream_review: Option<PublicPatchRelatedReview>,
     best_patch: PublicAttempt,
 }
 
@@ -1021,6 +1022,14 @@ struct PublicPatchUpstreamReview {
     state: String,
     merged_at: Option<String>,
     tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicPatchRelatedReview {
+    issue_id: String,
+    pr_url: String,
+    state: String,
+    family_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -7479,12 +7488,82 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
             .map_err(ApiError::internal)?
         }
     };
+    annotate_public_patch_related_reviews(&mut patches);
     patches.sort_by(|left, right| {
         parse_timestamp(&right.best_patch.created_at)
             .cmp(&parse_timestamp(&left.best_patch.created_at))
             .then_with(|| right.score.cmp(&left.score))
     });
     Ok(patches)
+}
+
+fn annotate_public_patch_related_reviews(patches: &mut [PublicPatchEntry]) {
+    let mut families: HashMap<(String, Vec<String>), Vec<usize>> = HashMap::new();
+    for (index, patch) in patches.iter().enumerate() {
+        let source = patch
+            .source_package
+            .as_deref()
+            .or(patch.package_name.as_deref())
+            .unwrap_or("");
+        let source_paths = public_patch_primary_source_paths(patch);
+        if source.is_empty() || source_paths.is_empty() {
+            continue;
+        }
+        families
+            .entry((source.to_string(), source_paths))
+            .or_default()
+            .push(index);
+    }
+
+    for indexes in families.values() {
+        if indexes.len() <= 1 {
+            continue;
+        }
+        let Some((review_index, review)) = indexes.iter().find_map(|index| {
+            patches[*index]
+                .upstream_review
+                .clone()
+                .map(|review| (*index, review))
+        }) else {
+            continue;
+        };
+        for index in indexes {
+            if patches[*index].upstream_review.is_some() {
+                continue;
+            }
+            patches[*index].related_upstream_review = Some(PublicPatchRelatedReview {
+                issue_id: patches[review_index].id.clone(),
+                pr_url: review.pr_url.clone(),
+                state: review.state.clone(),
+                family_count: indexes.len() as i64,
+            });
+        }
+    }
+}
+
+fn public_patch_primary_source_paths(patch: &PublicPatchEntry) -> Vec<String> {
+    let paths = if patch.git_add_paths.is_empty() {
+        &patch.changed_files
+    } else {
+        &patch.git_add_paths
+    };
+    let source_paths = paths
+        .iter()
+        .filter(|path| public_patch_primary_path(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if source_paths.is_empty() {
+        paths.clone()
+    } else {
+        source_paths
+    }
+}
+
+fn public_patch_primary_path(path: &str) -> bool {
+    !path.starts_with("test")
+        && !path.contains("/test")
+        && !path.contains("/fixtures/")
+        && !path.contains("/__tests__/")
 }
 
 async fn load_public_triage(db: &ServerDb, limit: i64) -> Result<Vec<PublicTriageEntry>, ApiError> {
@@ -7883,6 +7962,7 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
             .map(|cover| cover.validation_notes.clone())
             .unwrap_or_default(),
         upstream_review: public_patch_upstream_review_from_row(&row),
+        related_upstream_review: None,
         best_patch,
     }))
 }
@@ -9321,6 +9401,7 @@ fn public_patch_from_sqlite_row(
             .map(|cover| cover.validation_notes.clone())
             .unwrap_or_default(),
         upstream_review: public_patch_upstream_review_from_sqlite_row(row)?,
+        related_upstream_review: None,
         best_patch,
     }))
 }
@@ -13978,6 +14059,19 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             html_escape(status)
         );
     }
+    if let Some(review) = entry.upstream_review.as_ref() {
+        let _ = write!(
+            patch_tags,
+            "<span class=\"tag\">upstream: {}</span>",
+            html_escape(&review.state)
+        );
+    } else if let Some(review) = entry.related_upstream_review.as_ref() {
+        let _ = write!(
+            patch_tags,
+            "<span class=\"tag\">related upstream: {}</span>",
+            html_escape(&review.state)
+        );
+    }
 
     format!(
         r#"<article class="issue-card patch-card">
@@ -15787,6 +15881,7 @@ mod tests {
             changed_files: Vec::new(),
             validation_notes: Vec::new(),
             upstream_review: None,
+            related_upstream_review: None,
             best_patch: PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -15848,6 +15943,7 @@ mod tests {
             changed_files: Vec::new(),
             validation_notes: Vec::new(),
             upstream_review: None,
+            related_upstream_review: None,
             best_patch: PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -17071,6 +17167,128 @@ mod tests {
                 "resource hardening".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn public_patch_loader_exposes_related_review_family() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "supervisor",
+            "Top frame: waitpid [supervisord]",
+            &["waitpid [supervisord]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-reviewed",
+            "cluster-reviewed",
+            110,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-related",
+            "cluster-related",
+            109,
+            "2026-03-31T00:00:00Z",
+            &representative,
+            &["install-2"],
+        );
+        let reviewed_patch = PatchAttempt {
+            cluster_id: "issue-reviewed".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Skip idle child reaping.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: supervisord: skip idle reaping\n\n## Git Add Paths\nsupervisor/supervisord.py\nsupervisor/tests/test_supervisord.py\n",
+                    "diff": "--- a/supervisor/supervisord.py\n+++ b/supervisor/supervisord.py\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let related_patch = PatchAttempt {
+            cluster_id: "issue-related".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Another idle reap variant.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: supervisord: avoid idle waitpid polling\n\n## Git Add Paths\nsupervisor/supervisord.py\nsupervisor/tests/base.py\nsupervisor/tests/test_supervisord.py\n",
+                    "diff": "--- a/supervisor/supervisord.py\n+++ b/supervisor/supervisord.py\n@@ -1 +1 @@\n-old\n+newer\n",
+                }
+            }),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-reviewed",
+                    serde_json::to_string(&reviewed_patch).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-related",
+                    serde_json::to_string(&related_patch).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO upstream_patch_wins
+                 (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)",
+                rusqlite::params![
+                    "supervisor-idle-reap",
+                    "Supervisor",
+                    "Supervisor idle reap PR closed without merge.",
+                    "Closed after maintainer review.",
+                    "https://github.com/Supervisor/supervisor/pull/1717",
+                    "closed_unmerged",
+                    serde_json::to_string(&json!(["upstream review"])).unwrap(),
+                    "issue-reviewed",
+                    "2026-03-31T00:00:00Z",
+                ],
+            )
+            .unwrap();
+
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let related = patches
+            .iter()
+            .find(|patch| patch.id == "issue-related")
+            .expect("related public patch should be visible");
+        let family = related
+            .related_upstream_review
+            .as_ref()
+            .expect("related patch should point at reviewed source-path family");
+
+        assert_eq!(family.issue_id, "issue-reviewed");
+        assert_eq!(
+            family.pr_url,
+            "https://github.com/Supervisor/supervisor/pull/1717"
+        );
+        assert_eq!(family.state, "closed_unmerged");
+        assert_eq!(family.family_count, 2);
     }
 
     #[test]

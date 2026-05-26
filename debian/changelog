@@ -1,3 +1,11 @@
+fixer (0.168.0-1) unstable; urgency=medium
+
+  * Expose related upstream review families on public patch API rows and
+    patch cards so repeated source-path variants point at an existing review
+    outcome instead of looking like fresh upstream candidates.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 04:05:00 +0400
+
 fixer (0.167.0-1) unstable; urgency=medium
 
   * Expose upstream review state on public patch API rows so harvest tooling
