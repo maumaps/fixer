@@ -1,3 +1,10 @@
+fixer (0.161.0-1) unstable; urgency=medium
+
+  * Sort upstream review cards by their review or merge timestamp so fresh open
+    PR/MR links remain visible before older merged wins.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 26 May 2026 22:47:00 +0400
+
 fixer (0.160.0-1) unstable; urgency=medium
 
   * Label landing-page upstream patch links neutrally so open review links are

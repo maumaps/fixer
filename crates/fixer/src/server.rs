@@ -6867,7 +6867,7 @@ async fn load_upstream_patch_wins(
                     "
             SELECT id, project, title, summary, pr_url, merged_at, tags_json
             FROM upstream_patch_wins
-            ORDER BY merged_at DESC NULLS LAST, created_at DESC
+            ORDER BY COALESCE(merged_at, created_at) DESC, created_at DESC
             LIMIT $1
             ",
                     &[&limit],
@@ -6885,7 +6885,7 @@ async fn load_upstream_patch_wins(
                     "
             SELECT id, project, title, summary, pr_url, merged_at, tags_json
             FROM upstream_patch_wins
-            ORDER BY merged_at DESC, created_at DESC
+            ORDER BY COALESCE(merged_at, created_at) DESC, created_at DESC
             LIMIT ?1
             ",
                 )
