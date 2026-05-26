@@ -1,3 +1,10 @@
+fixer (0.163.0-1) unstable; urgency=medium
+
+  * Show more upstream review cards on the landing page so fresh open
+    reviews do not immediately hide merged success stories.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 26 May 2026 23:08:00 +0400
+
 fixer (0.162.0-1) unstable; urgency=medium
 
   * Prefer interpreter script entrypoint source metadata for public runaway

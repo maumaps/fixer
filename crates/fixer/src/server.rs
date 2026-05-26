@@ -32,6 +32,8 @@ use std::time::Duration as StdDuration;
 use tokio_postgres::{Client, NoTls, Row};
 use uuid::Uuid;
 
+const LANDING_UPSTREAM_REVIEW_LIMIT: i64 = 6;
+
 const APP_CSS: &str = r#"
 :root {
     color-scheme: light;
@@ -6774,7 +6776,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 largest_public_cluster_size: row.get(7),
                 last_submission_at,
                 top_issues: load_public_issue_candidates(db, 8).await?,
-                upstream_wins: load_upstream_patch_wins(db, 3).await?,
+                upstream_wins: load_upstream_patch_wins(db, LANDING_UPSTREAM_REVIEW_LIMIT).await?,
             })
         }
         ServerDb::Sqlite(path) => {
@@ -6850,7 +6852,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 largest_public_cluster_size,
                 last_submission_at,
                 top_issues: load_public_issue_candidates(db, 8).await?,
-                upstream_wins: load_upstream_patch_wins(db, 3).await?,
+                upstream_wins: load_upstream_patch_wins(db, LANDING_UPSTREAM_REVIEW_LIMIT).await?,
             })
         }
     }
