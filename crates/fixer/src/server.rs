@@ -1018,6 +1018,7 @@ struct PublicPatchUpstreamReview {
     project: String,
     title: String,
     pr_url: String,
+    state: String,
     merged_at: Option<String>,
     tags: Vec<String>,
 }
@@ -1868,6 +1869,7 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             title TEXT NOT NULL,
             summary TEXT NOT NULL,
             pr_url TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'review',
             merged_at TIMESTAMPTZ,
             tags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
             patch_issue_id TEXT REFERENCES issue_clusters(id) ON DELETE SET NULL,
@@ -1989,6 +1991,7 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             title TEXT NOT NULL,
             summary TEXT NOT NULL,
             pr_url TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'review',
             merged_at TEXT,
             tags_json TEXT NOT NULL DEFAULT '[]',
             patch_issue_id TEXT REFERENCES issue_clusters(id) ON DELETE SET NULL,
@@ -2018,6 +2021,35 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
     }
     ensure_forward_issue_cluster_schema(db).await?;
     ensure_forward_installs_schema(db).await?;
+    ensure_forward_upstream_patch_wins_schema(db).await?;
+    Ok(())
+}
+
+async fn ensure_forward_upstream_patch_wins_schema(db: &ServerDb) -> Result<()> {
+    match db {
+        ServerDb::Postgres(db) => {
+            db.batch_execute(
+                "
+            ALTER TABLE upstream_patch_wins
+            ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'review'
+            ",
+            )
+            .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let mut stmt = connection.prepare("PRAGMA table_info(upstream_patch_wins)")?;
+            let columns = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !columns.iter().any(|name| name == "state") {
+                connection.execute(
+                    "ALTER TABLE upstream_patch_wins ADD COLUMN state TEXT NOT NULL DEFAULT 'review'",
+                    [],
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -7351,7 +7383,13 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
-                   ) AS upstream_review_tags_json
+                   ) AS upstream_review_tags_json,
+                   (
+                       SELECT upw.state FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_state
             FROM issue_clusters
             WHERE promoted = TRUE
               AND public_visible = TRUE
@@ -7413,7 +7451,13 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
-                   ) AS upstream_review_tags_json
+                   ) AS upstream_review_tags_json,
+                   (
+                       SELECT upw.state FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_state
             FROM issue_clusters
             WHERE promoted = 1
               AND public_visible = 1
@@ -7846,14 +7890,17 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
 fn public_patch_upstream_review_from_row(row: &Row) -> Option<PublicPatchUpstreamReview> {
     let id: Option<String> = row.get(12);
     let tags_json: Option<Value> = row.get(17);
+    let merged_at = row
+        .get::<_, Option<DateTime<Utc>>>(16)
+        .map(|value| value.to_rfc3339());
+    let raw_state: Option<String> = row.get(18);
     Some(PublicPatchUpstreamReview {
         id: id?,
         project: row.get(13),
         title: row.get(14),
         pr_url: row.get(15),
-        merged_at: row
-            .get::<_, Option<DateTime<Utc>>>(16)
-            .map(|value| value.to_rfc3339()),
+        state: effective_upstream_review_state(raw_state.as_deref(), merged_at.as_deref()),
+        merged_at,
         tags: tags_json
             .as_ref()
             .map(string_array_from_value)
@@ -9285,6 +9332,8 @@ fn public_patch_upstream_review_from_sqlite_row(
         return Ok(None);
     };
     let tags_raw: Option<String> = row.get(17)?;
+    let merged_at: Option<String> = row.get(16)?;
+    let raw_state: Option<String> = row.get(18)?;
     let tags = tags_raw
         .as_deref()
         .map(|raw| {
@@ -9305,9 +9354,22 @@ fn public_patch_upstream_review_from_sqlite_row(
         project: row.get(13)?,
         title: row.get(14)?,
         pr_url: row.get(15)?,
-        merged_at: row.get(16)?,
+        state: effective_upstream_review_state(raw_state.as_deref(), merged_at.as_deref()),
+        merged_at,
         tags,
     }))
+}
+
+fn effective_upstream_review_state(raw_state: Option<&str>, merged_at: Option<&str>) -> String {
+    if merged_at.is_some() {
+        return "merged".to_string();
+    }
+    let state = raw_state.unwrap_or("review").trim();
+    if state.is_empty() {
+        "review".to_string()
+    } else {
+        state.to_string()
+    }
 }
 
 fn upstream_patch_win_from_sqlite_row(
@@ -17001,6 +17063,7 @@ mod tests {
             review.pr_url,
             "https://github.com/vdukhovni/postfix/pull/22"
         );
+        assert_eq!(review.state, "review");
         assert_eq!(
             review.tags,
             vec![

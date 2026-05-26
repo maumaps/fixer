@@ -1,3 +1,10 @@
+fixer (0.167.0-1) unstable; urgency=medium
+
+  * Expose upstream review state on public patch API rows so harvest tooling
+    can distinguish active, merged, and closed-unmerged upstream attempts.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 00:38:00 +0400
+
 fixer (0.166.0-1) unstable; urgency=medium
 
   * Add a stable published-diff hash to public patch API rows so upstream
