@@ -1,3 +1,11 @@
+fixer (0.172.0-1) unstable; urgency=medium
+
+  * Add explicit upstream patch relation metadata so public patch rows can
+    point at a selected alternative review without pretending the alternative
+    patch itself was submitted upstream.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 06:46:00 +0400
+
 fixer (0.171.0-1) unstable; urgency=medium
 
   * Ignore common test-file suffixes when grouping public patch rows by

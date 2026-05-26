@@ -1030,6 +1030,7 @@ struct PublicPatchRelatedReview {
     issue_id: String,
     pr_url: String,
     state: String,
+    relation: String,
     family_count: i64,
 }
 
@@ -1894,6 +1895,14 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
 
+        CREATE TABLE IF NOT EXISTS upstream_patch_relations (
+            id TEXT PRIMARY KEY,
+            issue_id TEXT NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
+            upstream_patch_win_id TEXT NOT NULL REFERENCES upstream_patch_wins(id) ON DELETE CASCADE,
+            relation TEXT NOT NULL DEFAULT 'related',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
         CREATE TABLE IF NOT EXISTS evidence_requests (
             id TEXT PRIMARY KEY,
             issue_id TEXT NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
@@ -2016,6 +2025,14 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             created_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS upstream_patch_relations (
+            id TEXT PRIMARY KEY,
+            issue_id TEXT NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
+            upstream_patch_win_id TEXT NOT NULL REFERENCES upstream_patch_wins(id) ON DELETE CASCADE,
+            relation TEXT NOT NULL DEFAULT 'related',
+            created_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS evidence_requests (
             id TEXT PRIMARY KEY,
             issue_id TEXT NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
@@ -2040,6 +2057,41 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
     ensure_forward_issue_cluster_schema(db).await?;
     ensure_forward_installs_schema(db).await?;
     ensure_forward_upstream_patch_wins_schema(db).await?;
+    ensure_forward_upstream_patch_relations_schema(db).await?;
+    Ok(())
+}
+
+async fn ensure_forward_upstream_patch_relations_schema(db: &ServerDb) -> Result<()> {
+    match db {
+        ServerDb::Postgres(db) => {
+            db.batch_execute(
+                "
+            CREATE TABLE IF NOT EXISTS upstream_patch_relations (
+                id TEXT PRIMARY KEY,
+                issue_id TEXT NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
+                upstream_patch_win_id TEXT NOT NULL REFERENCES upstream_patch_wins(id) ON DELETE CASCADE,
+                relation TEXT NOT NULL DEFAULT 'related',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            ",
+            )
+            .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            connection.execute_batch(
+                "
+            CREATE TABLE IF NOT EXISTS upstream_patch_relations (
+                id TEXT PRIMARY KEY,
+                issue_id TEXT NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
+                upstream_patch_win_id TEXT NOT NULL REFERENCES upstream_patch_wins(id) ON DELETE CASCADE,
+                relation TEXT NOT NULL DEFAULT 'related',
+                created_at TEXT NOT NULL
+            )
+            ",
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -7497,6 +7549,8 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
             .map_err(ApiError::internal)?
         }
     };
+    let manual_related_reviews = load_public_patch_manual_related_reviews(db).await?;
+    annotate_public_patch_manual_related_reviews(&mut patches, manual_related_reviews);
     annotate_public_patch_duplicates(&mut patches);
     annotate_public_patch_related_reviews(&mut patches);
     patches.sort_by(|left, right| {
@@ -7505,6 +7559,115 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
             .then_with(|| right.score.cmp(&left.score))
     });
     Ok(patches)
+}
+
+async fn load_public_patch_manual_related_reviews(
+    db: &ServerDb,
+) -> Result<HashMap<String, PublicPatchRelatedReview>, ApiError> {
+    let mut relations = HashMap::new();
+    match db {
+        ServerDb::Postgres(db) => {
+            let rows = db
+                .query(
+                    "
+            SELECT rel.issue_id,
+                   COALESCE(upw.patch_issue_id, rel.issue_id) AS review_issue_id,
+                   upw.pr_url,
+                   upw.state,
+                   upw.merged_at,
+                   rel.relation
+            FROM upstream_patch_relations rel
+            JOIN upstream_patch_wins upw ON upw.id = rel.upstream_patch_win_id
+            ORDER BY rel.created_at DESC
+            ",
+                    &[],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            for row in rows {
+                let issue_id: String = row.get(0);
+                let review_issue_id: String = row.get(1);
+                let pr_url: String = row.get(2);
+                let raw_state: Option<String> = row.get(3);
+                let merged_at = row
+                    .get::<_, Option<DateTime<Utc>>>(4)
+                    .map(|value| value.to_rfc3339());
+                let relation: String = row.get(5);
+                relations
+                    .entry(issue_id)
+                    .or_insert(PublicPatchRelatedReview {
+                        issue_id: review_issue_id,
+                        pr_url,
+                        state: effective_upstream_review_state(
+                            raw_state.as_deref(),
+                            merged_at.as_deref(),
+                        ),
+                        relation,
+                        family_count: 1,
+                    });
+            }
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            let mut stmt = connection
+                .prepare(
+                    "
+            SELECT rel.issue_id,
+                   COALESCE(upw.patch_issue_id, rel.issue_id) AS review_issue_id,
+                   upw.pr_url,
+                   upw.state,
+                   upw.merged_at,
+                   rel.relation
+            FROM upstream_patch_relations rel
+            JOIN upstream_patch_wins upw ON upw.id = rel.upstream_patch_win_id
+            ORDER BY rel.created_at DESC
+            ",
+                )
+                .map_err(ApiError::internal)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let issue_id: String = row.get(0)?;
+                    let review_issue_id: String = row.get(1)?;
+                    let pr_url: String = row.get(2)?;
+                    let raw_state: Option<String> = row.get(3)?;
+                    let merged_at: Option<String> = row.get(4)?;
+                    let relation: String = row.get(5)?;
+                    Ok((
+                        issue_id,
+                        PublicPatchRelatedReview {
+                            issue_id: review_issue_id,
+                            pr_url,
+                            state: effective_upstream_review_state(
+                                raw_state.as_deref(),
+                                merged_at.as_deref(),
+                            ),
+                            relation,
+                            family_count: 1,
+                        },
+                    ))
+                })
+                .map_err(ApiError::internal)?;
+            for row in rows {
+                let (issue_id, relation) = row.map_err(ApiError::internal)?;
+                relations.entry(issue_id).or_insert(relation);
+            }
+        }
+    }
+    Ok(relations)
+}
+
+fn annotate_public_patch_manual_related_reviews(
+    patches: &mut [PublicPatchEntry],
+    manual_related_reviews: HashMap<String, PublicPatchRelatedReview>,
+) {
+    for patch in patches {
+        if patch.upstream_review.is_some() || patch.related_upstream_review.is_some() {
+            continue;
+        }
+        if let Some(review) = manual_related_reviews.get(&patch.id) {
+            patch.related_upstream_review = Some(review.clone());
+        }
+    }
 }
 
 fn annotate_public_patch_duplicates(patches: &mut [PublicPatchEntry]) {
@@ -7603,6 +7766,7 @@ fn annotate_public_patch_related_reviews(patches: &mut [PublicPatchEntry]) {
                 issue_id: patches[review_index].id.clone(),
                 pr_url: review.pr_url.clone(),
                 state: review.state.clone(),
+                relation: "source_path_family".to_string(),
                 family_count: indexes.len() as i64,
             });
         }
@@ -17686,6 +17850,141 @@ mod tests {
         assert_eq!(family.pr_url, "https://github.com/moby/moby/pull/52643");
         assert_eq!(family.state, "review");
         assert_eq!(family.family_count, 2);
+    }
+
+    #[test]
+    fn public_patch_loader_exposes_manual_related_review() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "redis-tools",
+            "Top frame: cronUpdateMemoryStats [redis-server]",
+            &["cronUpdateMemoryStats [redis-server]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-reviewed",
+            "cluster-reviewed",
+            110,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-alternative",
+            "cluster-alternative",
+            109,
+            "2026-03-31T00:00:00Z",
+            &representative,
+            &["install-2"],
+        );
+        let reviewed_patch = PatchAttempt {
+            cluster_id: "issue-reviewed".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Reuse the proc stat fd.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: zmalloc: reuse proc stat fd for RSS sampling\n\n## Git Add Paths\nsrc/zmalloc.c\n",
+                    "diff": "--- a/src/zmalloc.c\n+++ b/src/zmalloc.c\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let alternative_patch = PatchAttempt {
+            cluster_id: "issue-alternative".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Reduce memory cron cadence.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: server: sample memory stats less often in cron\n\n## Git Add Paths\nsrc/server.c\n",
+                    "diff": "--- a/src/server.c\n+++ b/src/server.c\n@@ -1 +1 @@\n-old\n+newer\n",
+                }
+            }),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-reviewed",
+                    serde_json::to_string(&reviewed_patch).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-alternative",
+                    serde_json::to_string(&alternative_patch).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO upstream_patch_wins
+                 (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)",
+                rusqlite::params![
+                    "redis-proc-stat-fd-rss-sampling",
+                    "Redis",
+                    "Opened Redis review for RSS sampling fd reuse.",
+                    "Review keeps memory freshness while reducing proc-stat opens.",
+                    "https://github.com/redis/redis/pull/15271",
+                    "review",
+                    serde_json::to_string(&json!(["upstream review"])).unwrap(),
+                    "issue-reviewed",
+                    "2026-03-31T00:00:00Z",
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO upstream_patch_relations
+                 (id, issue_id, upstream_patch_win_id, relation, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "redis-memory-cadence-alternative",
+                    "issue-alternative",
+                    "redis-proc-stat-fd-rss-sampling",
+                    "alternative",
+                    "2026-04-01T00:00:00Z",
+                ],
+            )
+            .unwrap();
+
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let alternative = patches
+            .iter()
+            .find(|patch| patch.id == "issue-alternative")
+            .expect("manual related public patch should be visible");
+        let review = alternative
+            .related_upstream_review
+            .as_ref()
+            .expect("manual related row should point at selected upstream review");
+
+        assert_eq!(review.issue_id, "issue-reviewed");
+        assert_eq!(review.pr_url, "https://github.com/redis/redis/pull/15271");
+        assert_eq!(review.state, "review");
+        assert_eq!(review.relation, "alternative");
+        assert_eq!(review.family_count, 1);
+        assert!(alternative.upstream_review.is_none());
     }
 
     #[test]
