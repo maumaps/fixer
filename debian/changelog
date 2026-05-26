@@ -1,3 +1,11 @@
+fixer (0.166.0-1) unstable; urgency=medium
+
+  * Add a stable published-diff hash to public patch API rows so upstream
+    harvest tooling can group repeated identical patch families instead of
+    reviewing each duplicate issue as a separate upstream candidate.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 00:09:01 +0400
+
 fixer (0.165.0-1) unstable; urgency=medium
 
   * Annotate public patch API rows with already-open upstream reviews linked

@@ -1002,6 +1002,7 @@ struct PublicPatchEntry {
     last_seen: String,
     best_patch_diff_url: Option<String>,
     best_patch_raw_diff_url: Option<String>,
+    patch_diff_hash: Option<String>,
     patch_subject: Option<String>,
     evidence_confidence: Option<String>,
     git_add_paths: Vec<String>,
@@ -7825,6 +7826,7 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
         last_seen,
         best_patch_diff_url: public_best_patch_diff_url(&id, Some(&best_patch)),
         best_patch_raw_diff_url: public_best_patch_raw_diff_url(&id, Some(&best_patch)),
+        patch_diff_hash: public_patch_diff_hash(Some(&best_patch)),
         patch_subject: cover.as_ref().map(|cover| cover.subject.clone()),
         evidence_confidence: response_metadata.evidence_confidence,
         git_add_paths: response_metadata.git_add_paths,
@@ -9259,6 +9261,7 @@ fn public_patch_from_sqlite_row(
         last_seen,
         best_patch_diff_url: public_best_patch_diff_url(&id, Some(&best_patch)),
         best_patch_raw_diff_url: public_best_patch_raw_diff_url(&id, Some(&best_patch)),
+        patch_diff_hash: public_patch_diff_hash(Some(&best_patch)),
         patch_subject: cover.as_ref().map(|cover| cover.subject.clone()),
         evidence_confidence: response_metadata.evidence_confidence,
         git_add_paths: response_metadata.git_add_paths,
@@ -9683,6 +9686,10 @@ fn public_best_patch_raw_diff_url(
     best_patch: Option<&PublicAttempt>,
 ) -> Option<String> {
     public_attempt_diff(best_patch?).map(|_| format!("/issues/{issue_id}/best.diff"))
+}
+
+fn public_patch_diff_hash(best_patch: Option<&PublicAttempt>) -> Option<String> {
+    public_attempt_diff(best_patch?).map(|diff| hash_text(normalize_published_diff(diff)))
 }
 
 fn build_public_patch_cover(
@@ -15711,6 +15718,7 @@ mod tests {
             best_patch_raw_diff_url: Some(
                 "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.diff".to_string(),
             ),
+            patch_diff_hash: None,
             patch_subject: None,
             evidence_confidence: None,
             git_add_paths: Vec::new(),
@@ -15771,6 +15779,7 @@ mod tests {
             best_patch_raw_diff_url: Some(
                 "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5fa/best.diff".to_string(),
             ),
+            patch_diff_hash: None,
             patch_subject: None,
             evidence_confidence: None,
             git_add_paths: Vec::new(),
@@ -16889,6 +16898,15 @@ mod tests {
         assert_eq!(
             patch.patch_subject.as_deref(),
             Some("smtpd: disconnect after overlong commands")
+        );
+        assert_eq!(
+            patch.patch_diff_hash.as_deref(),
+            Some(
+                hash_text(normalize_published_diff(
+                    "--- a/src/smtpd/smtpd.c\n+++ b/src/smtpd/smtpd.c\n@@ -1 +1 @@\n-old\n+new\n--- a/src/smtpd/smtpd_chat.c\n+++ b/src/smtpd/smtpd_chat.c\n@@ -1 +1 @@\n-old\n+new\n",
+                ))
+                .as_str()
+            )
         );
         assert_eq!(patch.evidence_confidence.as_deref(), Some("reproduced"));
         assert_eq!(
