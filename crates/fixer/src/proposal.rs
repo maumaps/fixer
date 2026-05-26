@@ -1887,6 +1887,10 @@ fn is_generated_public_diff_path(path: &str) -> bool {
                 | "config.cache"
                 | "config.log"
                 | "config.h"
+                | "objfiles.txt"
+                | "bootparse.c"
+                | "bootparse.h"
+                | "bootscanner.c"
                 | "stamp-h1"
         )
 }
@@ -8703,6 +8707,12 @@ printf 'Subject: test patch\n\n## Commit Message\nok\n\n## Issue Connection\nok\
         assert!(is_generated_public_diff_path("GNUmakefile"));
         assert!(is_generated_public_diff_path(".pytest_cache/CACHEDIR.TAG"));
         assert!(is_generated_public_diff_path("autom4te.cache/output.0"));
+        assert!(is_generated_public_diff_path(
+            "src/backend/access/brin/objfiles.txt"
+        ));
+        assert!(is_generated_public_diff_path(
+            "src/backend/bootstrap/bootparse.c"
+        ));
         assert!(!is_generated_public_diff_path("linux/LinuxProcessTable.c"));
     }
 

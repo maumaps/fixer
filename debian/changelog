@@ -1,3 +1,11 @@
+fixer (0.158.0-1) unstable; urgency=medium
+
+  * Treat PostgreSQL generated objfiles and bootstrap parser/scanner outputs as
+    generated public-diff paths, so tarball/build output cannot keep a stale
+    patch marked successful.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 26 May 2026 21:48:38 +0400
+
 fixer (0.157.0-1) unstable; urgency=medium
 
   * Apply the generated/cache-only public-diff guard while reading existing

@@ -10292,6 +10292,10 @@ fn is_generated_public_diff_path(path: &str) -> bool {
                 | "config.cache"
                 | "config.log"
                 | "config.h"
+                | "objfiles.txt"
+                | "bootparse.c"
+                | "bootparse.h"
+                | "bootscanner.c"
                 | "stamp-h1"
         )
 }
