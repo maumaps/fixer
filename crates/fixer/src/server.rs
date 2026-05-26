@@ -1007,7 +1007,18 @@ struct PublicPatchEntry {
     git_add_paths: Vec<String>,
     changed_files: Vec<String>,
     validation_notes: Vec<String>,
+    upstream_review: Option<PublicPatchUpstreamReview>,
     best_patch: PublicAttempt,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicPatchUpstreamReview {
+    id: String,
+    project: String,
+    title: String,
+    pr_url: String,
+    merged_at: Option<String>,
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -7303,7 +7314,43 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
                 .query(
                     "
             SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
-                   severity, score, corroboration_count, best_patch_json, last_seen
+                   severity, score, corroboration_count, best_patch_json, last_seen,
+                   (
+                       SELECT upw.id FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_id,
+                   (
+                       SELECT upw.project FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_project,
+                   (
+                       SELECT upw.title FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_title,
+                   (
+                       SELECT upw.pr_url FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_pr_url,
+                   (
+                       SELECT upw.merged_at FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_merged_at,
+                   (
+                       SELECT upw.tags_json FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_tags_json
             FROM issue_clusters
             WHERE promoted = TRUE
               AND public_visible = TRUE
@@ -7329,7 +7376,43 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
                 .prepare(
                     "
             SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
-                   severity, score, corroboration_count, best_patch_json, last_seen
+                   severity, score, corroboration_count, best_patch_json, last_seen,
+                   (
+                       SELECT upw.id FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_id,
+                   (
+                       SELECT upw.project FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_project,
+                   (
+                       SELECT upw.title FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_title,
+                   (
+                       SELECT upw.pr_url FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_pr_url,
+                   (
+                       SELECT upw.merged_at FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_merged_at,
+                   (
+                       SELECT upw.tags_json FROM upstream_patch_wins upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_tags_json
             FROM issue_clusters
             WHERE promoted = 1
               AND public_visible = 1
@@ -7753,8 +7836,27 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
             .as_ref()
             .map(|cover| cover.validation_notes.clone())
             .unwrap_or_default(),
+        upstream_review: public_patch_upstream_review_from_row(&row),
         best_patch,
     }))
+}
+
+fn public_patch_upstream_review_from_row(row: &Row) -> Option<PublicPatchUpstreamReview> {
+    let id: Option<String> = row.get(12);
+    let tags_json: Option<Value> = row.get(17);
+    Some(PublicPatchUpstreamReview {
+        id: id?,
+        project: row.get(13),
+        title: row.get(14),
+        pr_url: row.get(15),
+        merged_at: row
+            .get::<_, Option<DateTime<Utc>>>(16)
+            .map(|value| value.to_rfc3339()),
+        tags: tags_json
+            .as_ref()
+            .map(string_array_from_value)
+            .unwrap_or_default(),
+    })
 }
 
 fn upstream_patch_win_from_row(row: Row) -> Result<UpstreamPatchWin, ApiError> {
@@ -9168,7 +9270,40 @@ fn public_patch_from_sqlite_row(
             .as_ref()
             .map(|cover| cover.validation_notes.clone())
             .unwrap_or_default(),
+        upstream_review: public_patch_upstream_review_from_sqlite_row(row)?,
         best_patch,
+    }))
+}
+
+fn public_patch_upstream_review_from_sqlite_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Option<PublicPatchUpstreamReview>> {
+    let Some(id) = row.get::<_, Option<String>>(12)? else {
+        return Ok(None);
+    };
+    let tags_raw: Option<String> = row.get(17)?;
+    let tags = tags_raw
+        .as_deref()
+        .map(|raw| {
+            serde_json::from_str::<Value>(raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    17,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?
+        .as_ref()
+        .map(string_array_from_value)
+        .unwrap_or_default();
+    Ok(Some(PublicPatchUpstreamReview {
+        id,
+        project: row.get(13)?,
+        title: row.get(14)?,
+        pr_url: row.get(15)?,
+        merged_at: row.get(16)?,
+        tags,
     }))
 }
 
@@ -15581,6 +15716,7 @@ mod tests {
             git_add_paths: Vec::new(),
             changed_files: Vec::new(),
             validation_notes: Vec::new(),
+            upstream_review: None,
             best_patch: PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -15640,6 +15776,7 @@ mod tests {
             git_add_paths: Vec::new(),
             changed_files: Vec::new(),
             validation_notes: Vec::new(),
+            upstream_review: None,
             best_patch: PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -16767,6 +16904,91 @@ mod tests {
                 .validation_notes
                 .iter()
                 .any(|note| note.contains("make -j32 passed"))
+        );
+    }
+
+    #[test]
+    fn public_patch_loader_exposes_upstream_review_annotation() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "postfix",
+            "Top frame: smtp_get [smtpd]",
+            &["smtp_get [smtpd]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-1",
+            "cluster-1",
+            110,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        let source_patch = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "smtpd keeps draining an overlong command.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: smtpd: disconnect after overlong commands\n\n## Evidence Confidence\nreproduced\n\n## Git Add Paths\nsrc/smtpd/smtpd.c\n\n## Validation\nmake -j32 passed\n",
+                    "diff": "--- a/src/smtpd/smtpd.c\n+++ b/src/smtpd/smtpd.c\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params!["issue-1", serde_json::to_string(&source_patch).unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO upstream_patch_wins
+                 (id, project, title, summary, pr_url, merged_at, tags_json, patch_issue_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)",
+                rusqlite::params![
+                    "postfix-overlong-smtp-command-disconnect",
+                    "Postfix",
+                    "Opened Postfix review for overlong SMTP command disconnect.",
+                    "Opened an upstream Postfix review.",
+                    "https://github.com/vdukhovni/postfix/pull/22",
+                    serde_json::to_string(&json!(["upstream review", "resource hardening"]))
+                        .unwrap(),
+                    "issue-1",
+                    "2026-03-31T00:00:00Z",
+                ],
+            )
+            .unwrap();
+
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let review = patches
+            .first()
+            .and_then(|patch| patch.upstream_review.as_ref())
+            .expect("upstream review should be annotated");
+
+        assert_eq!(review.id, "postfix-overlong-smtp-command-disconnect");
+        assert_eq!(review.project, "Postfix");
+        assert_eq!(
+            review.pr_url,
+            "https://github.com/vdukhovni/postfix/pull/22"
+        );
+        assert_eq!(
+            review.tags,
+            vec![
+                "upstream review".to_string(),
+                "resource hardening".to_string()
+            ]
         );
     }
 

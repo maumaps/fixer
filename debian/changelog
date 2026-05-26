@@ -1,3 +1,11 @@
+fixer (0.165.0-1) unstable; urgency=medium
+
+  * Annotate public patch API rows with already-open upstream reviews linked
+    through the upstream patch wins table, so harvest tooling can skip
+    submitted reviews without hiding their public evidence.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 26 May 2026 23:57:58 +0400
+
 fixer (0.164.0-1) unstable; urgency=medium
 
   * Expose structured harvest metadata on public patch API rows, including
