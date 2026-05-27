@@ -1,3 +1,9 @@
+fixer (0.193.0-1) unstable; urgency=medium
+
+  * Render needs-review issue details conservatively.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 07:42:43 +0400
+
 fixer (0.192.0-1) unstable; urgency=medium
 
   * Classify report-only public triage handoffs.

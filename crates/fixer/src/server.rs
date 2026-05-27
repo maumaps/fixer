@@ -802,6 +802,13 @@ struct PublicAttempt {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct PublicPatchHarvestReview {
+    status: String,
+    blockers: Vec<String>,
+    next_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct PublicFailureDiagnostics {
     failure_kind: Option<String>,
     review_failure_category: Option<String>,
@@ -890,6 +897,8 @@ struct PublicIssueDetail {
     best_patch_available: bool,
     best_triage_available: bool,
     best_patch_diff_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_patch_harvest: Option<PublicPatchHarvestReview>,
     best_patch: Option<PublicAttempt>,
     best_triage: Option<PublicAttempt>,
     best_triage_handoff: Option<PublicTriageHandoff>,
@@ -7136,6 +7145,17 @@ async fn load_public_issue_detail(
     } else {
         load_public_issue_best_triage(db, &id).await?
     };
+    let best_patch_harvest = best_patch.as_ref().and_then(|attempt| {
+        public_patch_harvest_review_for_attempt(
+            &issue.title,
+            &issue.summary,
+            issue.package_name.as_deref(),
+            issue.source_package.as_deref(),
+            issue.corroboration_count,
+            &issue.last_seen,
+            attempt,
+        )
+    });
     let best_patch_diff_url = public_best_patch_diff_url(&id, best_patch.as_ref());
     let possible_duplicates = load_possible_duplicates(db, &id, &issue, 6).await?;
     let all_attempts = load_public_attempts(db, &id, 1024).await?;
@@ -7160,6 +7180,7 @@ async fn load_public_issue_detail(
         best_patch_available: best_patch.is_some(),
         best_triage_available: best_triage.is_some(),
         best_patch_diff_url,
+        best_patch_harvest,
         best_patch,
         best_triage_handoff: best_triage
             .as_ref()
@@ -7913,8 +7934,31 @@ fn public_patch_harvest_next_actions(patch: &PublicPatchEntry) -> Vec<String> {
         return Vec::new();
     }
 
+    let mut actions = public_patch_harvest_next_actions_for_blockers(&patch.harvest_blockers);
+
+    if let Some(review) = patch.related_upstream_review.as_ref() {
+        if review.relation == "source_path_family"
+            && public_upstream_review_state_is_closed(&review.state)
+        {
+            let action = "Review this distinct issue against the closed source-path-family upstream rationale before opening another PR.".to_string();
+            if !actions.contains(&action) {
+                actions.push(action);
+            }
+        }
+    }
+
+    if actions.is_empty() {
+        actions.push(
+            "Inspect the retained diff and add a concrete proof plan before upstream submission."
+                .to_string(),
+        );
+    }
+    actions
+}
+
+fn public_patch_harvest_next_actions_for_blockers(blockers: &[String]) -> Vec<String> {
     let mut actions = Vec::new();
-    for blocker in &patch.harvest_blockers {
+    for blocker in blockers {
         let action = match blocker.as_str() {
             "blocked_validation" => {
                 "Rerun in an environment where the blocked runtime or test validation can complete before upstream submission.".to_string()
@@ -7933,24 +7977,6 @@ fn public_patch_harvest_next_actions(patch: &PublicPatchEntry) -> Vec<String> {
         if !actions.contains(&action) {
             actions.push(action);
         }
-    }
-
-    if let Some(review) = patch.related_upstream_review.as_ref() {
-        if review.relation == "source_path_family"
-            && public_upstream_review_state_is_closed(&review.state)
-        {
-            let action = "Review this distinct issue against the closed source-path-family upstream rationale before opening another PR.".to_string();
-            if !actions.contains(&action) {
-                actions.push(action);
-            }
-        }
-    }
-
-    if actions.is_empty() {
-        actions.push(
-            "Inspect the retained diff and add a concrete proof plan before upstream submission."
-                .to_string(),
-        );
     }
     actions
 }
@@ -10732,6 +10758,45 @@ fn public_patch_harvest_status(blockers: &[String]) -> String {
     } else {
         "needs_review".to_string()
     }
+}
+
+fn public_patch_harvest_review_for_attempt(
+    title: &str,
+    summary: &str,
+    package_name: Option<&str>,
+    source_package: Option<&str>,
+    corroboration_count: i64,
+    last_seen: &str,
+    attempt: &PublicAttempt,
+) -> Option<PublicPatchHarvestReview> {
+    let cover = build_public_patch_cover(
+        title,
+        summary,
+        package_name,
+        source_package,
+        corroboration_count,
+        last_seen,
+        attempt,
+    )?;
+    let response_metadata = attempt
+        .published_session
+        .as_ref()
+        .and_then(|session| session.response.as_deref())
+        .map(extract_patch_response_metadata)
+        .unwrap_or_default();
+    let blockers = public_patch_harvest_blockers(
+        attempt,
+        &response_metadata,
+        &cover.changed_files,
+        &cover.validation_notes,
+    );
+    let status = public_patch_harvest_status(&blockers);
+    let next_actions = public_patch_harvest_next_actions_for_blockers(&blockers);
+    Some(PublicPatchHarvestReview {
+        status,
+        blockers,
+        next_actions,
+    })
 }
 
 fn public_patch_harvest_blockers(
@@ -14035,6 +14100,10 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
             issue.score,
             issue.corroboration_count,
             issue.best_patch_available,
+            issue
+                .best_patch_harvest
+                .as_ref()
+                .is_some_and(|review| { review.status != "ready" || !review.blockers.is_empty() }),
             issue.best_triage_available,
         ),
         html_escape(&format_timestamp(&issue.last_seen)),
@@ -14271,6 +14340,67 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
             )
         })
         .unwrap_or_default();
+    let harvest_review = issue.best_patch_harvest.as_ref();
+    let needs_harvest_review = harvest_review
+        .is_some_and(|review| review.status != "ready" || !review.blockers.is_empty());
+    let heading = if needs_harvest_review {
+        "Patch needs harvest review"
+    } else {
+        "Pull-request-ready diff"
+    };
+    let intro = if needs_harvest_review {
+        "This is the current best preserved diff for the issue, but Fixer should not treat it as upstream-ready until the proof blockers below are cleared. The downloadable `.patch` is useful for review and repair; do not send it upstream unchanged."
+    } else {
+        "This is the current best public patch attempt for the issue. The downloadable `.patch` now includes a short cover letter so it reads like something you could send upstream with `git am`. If you only want the raw diff, grab the `.diff` instead."
+    };
+    let harvest_tags = harvest_review
+        .filter(|review| review.status != "ready" || !review.blockers.is_empty())
+        .map(|review| {
+            let mut tags = format!(
+                "<span class=\"tag\">harvest: {}</span>",
+                html_escape(&review.status.replace('_', " "))
+            );
+            for blocker in &review.blockers {
+                let _ = write!(
+                    tags,
+                    "<span class=\"tag\">{}</span>",
+                    html_escape(&blocker.replace('_', " "))
+                );
+            }
+            tags
+        })
+        .unwrap_or_default();
+    let harvest_warning = harvest_review
+        .filter(|review| !review.blockers.is_empty() || !review.next_actions.is_empty())
+        .map(|review| {
+            let blockers = review
+                .blockers
+                .iter()
+                .map(|blocker| format!("<li>{}</li>", html_escape(&blocker.replace('_', " "))))
+                .collect::<Vec<_>>()
+                .join("");
+            let blocker_section = if blockers.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<h4>Harvest review needed</h4><p class=\"issue-summary\">The diff is preserved for inspection, but Fixer should not treat it as upstream-ready until these blockers are cleared.</p><ul class=\"attempt-list\">{}</ul>",
+                    blockers
+                )
+            };
+            let actions = review
+                .next_actions
+                .iter()
+                .map(|action| format!("<li>{}</li>", html_escape(action)))
+                .collect::<Vec<_>>()
+                .join("");
+            let action_section = if actions.is_empty() {
+                String::new()
+            } else {
+                format!("<h4>Next proof/action</h4><ul class=\"attempt-list\">{actions}</ul>")
+            };
+            format!("<section class=\"patch-summary\">{blocker_section}{action_section}</section>")
+        })
+        .unwrap_or_default();
     let changed_files = if cover.changed_files.is_empty() {
         String::new()
     } else {
@@ -14308,9 +14438,9 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
         .unwrap_or_default();
     Some(format!(
         r#"<section class="panel section patch-panel">
-            <h2>Pull-request-ready diff</h2>
-            <p class="fine-print">This is the current best public patch attempt for the issue. The downloadable <code>.patch</code> now includes a short cover letter so it reads like something you could send upstream with <code>git am</code>. If you only want the raw diff, grab the <code>.diff</code> instead.</p>
-            <div class="meta"><span class="tag patch">best patch</span><span class="tag">created: {}</span>{}</div>
+            <h2>{}</h2>
+            <p class="fine-print">{}</p>
+            <div class="meta"><span class="tag patch">best patch</span><span class="tag">created: {}</span>{}{}</div>
             <p class="issue-summary">{}</p>
             <section class="patch-summary">
                 <h4>Suggested subject</h4>
@@ -14323,6 +14453,7 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
             </section>
             {}
             {}
+            {}
             <div class="hero-actions">
                 <a class="button primary" href="{}" download="fixer-{}.patch">Download .patch</a>
                 {}
@@ -14330,8 +14461,11 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
             </div>
             <pre class="code-block"><code>{}</code></pre>
         </section>"#,
+        html_escape(heading),
+        html_escape(intro),
         html_escape(&format_timestamp(&best_patch.created_at)),
         validation,
+        harvest_tags,
         html_escape(&best_patch.summary),
         html_escape(&cover.subject),
         render_patch_response_markup(&cover.commit_message),
@@ -14339,6 +14473,7 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
         render_patch_response_markup(&cover.issue_connection),
         changed_files,
         validation_notes,
+        harvest_warning,
         patch_url,
         issue.id,
         raw_diff_button,
@@ -14607,6 +14742,7 @@ fn render_public_attempt_entry_card(entry: &PublicAttemptEntry) -> String {
             entry.score,
             entry.corroboration_count,
             entry.best_patch_available,
+            false,
             entry.best_triage_available,
         ),
         html_escape(&format_timestamp(&entry.attempt.created_at)),
@@ -14956,6 +15092,7 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
         entry.corroboration_count,
         true,
         false,
+        false,
     );
     let _ = write!(
         patch_tags,
@@ -15139,6 +15276,7 @@ fn render_public_triage_card(entry: &PublicTriageEntry) -> String {
         entry.score,
         entry.corroboration_count,
         false,
+        false,
         true,
     );
     let _ = write!(
@@ -15223,6 +15361,7 @@ fn render_possible_duplicate_card(issue: &PublicPossibleDuplicate) -> String {
             issue.score,
             issue.corroboration_count,
             issue.best_patch_available,
+            false,
             issue.best_triage_available,
         ),
         format_similarity_percent(issue.similarity_score),
@@ -15278,6 +15417,7 @@ fn render_issue_tags(
     score: i64,
     corroboration_count: i64,
     best_patch_available: bool,
+    best_patch_needs_review: bool,
     best_triage_available: bool,
 ) -> String {
     let mut tags = Vec::new();
@@ -15312,7 +15452,12 @@ fn render_issue_tags(
         corroboration_count
     ));
     if best_patch_available {
-        tags.push("<span class=\"tag patch\">patch attempt ready</span>".to_string());
+        let label = if best_patch_needs_review {
+            "patch needs review"
+        } else {
+            "patch attempt ready"
+        };
+        tags.push(format!("<span class=\"tag patch\">{}</span>", label));
     }
     if best_triage_available {
         tags.push("<span class=\"tag triage\">successful triage</span>".to_string());
@@ -17031,6 +17176,7 @@ mod tests {
             best_patch_diff_url: Some(
                 "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch".to_string(),
             ),
+            best_patch_harvest: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -17077,6 +17223,78 @@ mod tests {
     }
 
     #[test]
+    fn render_issue_detail_page_marks_harvest_blocked_patch() {
+        let issue = PublicIssueDetail {
+            id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for postgres".to_string(),
+            summary: "postgres is stuck in a file-not-found retry loop.".to_string(),
+            package_name: Some("postgresql-18".to_string()),
+            source_package: Some("postgresql-18".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 106,
+            corroboration_count: 2,
+            best_patch_available: true,
+            best_triage_available: false,
+            best_patch_diff_url: Some(
+                "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch".to_string(),
+            ),
+            best_patch_harvest: Some(PublicPatchHarvestReview {
+                status: "needs_review".to_string(),
+                blockers: vec!["missing_patch_metadata".to_string()],
+                next_actions: public_patch_harvest_next_actions_for_blockers(&[
+                    "missing_patch_metadata".to_string(),
+                ]),
+            }),
+            best_patch: Some(PublicAttempt {
+                outcome: "patch".to_string(),
+                state: "ready".to_string(),
+                summary: "Patch proposal created locally.".to_string(),
+                validation_status: Some("ready".to_string()),
+                created_at: "2026-03-29T00:00:00Z".to_string(),
+                published_session: Some(PublishedAttemptSession {
+                    prompt: "Read ./evidence.json".to_string(),
+                    response: Some("Patched ./workspace/src/file.c".to_string()),
+                    diff: Some(
+                        "--- a/src/file.c\n+++ b/src/file.c\n@@\n+/* Avoid the retry loop on missing files. */\n"
+                            .to_string(),
+                    ),
+                    model: Some("gpt-5.4".to_string()),
+                    models_used: vec!["gpt-5.4".to_string()],
+                    rate_limit_fallback_used: false,
+                }),
+                handoff: None,
+                blocker_reason: None,
+                failure_diagnostics: None,
+                failure_context: None,
+            }),
+            best_triage: None,
+            best_triage_handoff: None,
+            last_seen: "2026-03-29T00:00:00Z".to_string(),
+            technical_snapshot: None,
+            possible_duplicates: Vec::new(),
+            attempt_summary: PublicAttemptSummary::default(),
+            attempts_omitted_count: 0,
+            attempts: Vec::new(),
+            showing_all_attempts: false,
+        };
+
+        let markup = render_issue_detail_page(&issue);
+
+        assert!(markup.contains("Patch needs harvest review"));
+        assert!(markup.contains("patch needs review"));
+        assert!(markup.contains("harvest: needs review"));
+        assert!(markup.contains("missing patch metadata"));
+        assert!(markup.contains("Harvest review needed"));
+        assert!(markup.contains("Backfill proposal metadata"));
+        assert!(markup.contains("do not send it upstream unchanged"));
+        assert!(!markup.contains("Pull-request-ready diff"));
+        assert!(!markup.contains("patch attempt ready"));
+        assert!(!markup.contains("send upstream with"));
+    }
+
+    #[test]
     fn render_attempt_summary_section_collapses_zero_outcomes() {
         let issue = PublicIssueDetail {
             id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
@@ -17092,6 +17310,7 @@ mod tests {
             best_patch_available: true,
             best_triage_available: false,
             best_patch_diff_url: None,
+            best_patch_harvest: None,
             best_patch: None,
             best_triage: None,
             best_triage_handoff: None,
@@ -17136,6 +17355,7 @@ mod tests {
             best_patch_diff_url: Some(
                 "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch".to_string(),
             ),
+            best_patch_harvest: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -17210,6 +17430,7 @@ mod tests {
             106,
             2,
             true,
+            false,
             true,
         );
 
@@ -17233,6 +17454,7 @@ mod tests {
             best_patch_available: false,
             best_triage_available: true,
             best_patch_diff_url: None,
+            best_patch_harvest: None,
             best_patch: None,
             best_triage: Some(PublicAttempt {
                 outcome: "triage".to_string(),
@@ -17309,6 +17531,7 @@ mod tests {
             best_patch_available: false,
             best_triage_available: false,
             best_patch_diff_url: None,
+            best_patch_harvest: None,
             best_patch: None,
             best_triage: None,
             best_triage_handoff: None,
@@ -17364,6 +17587,7 @@ mod tests {
             best_patch_available: false,
             best_triage_available: false,
             best_patch_diff_url: None,
+            best_patch_harvest: None,
             best_patch: None,
             best_triage: None,
             best_triage_handoff: None,
@@ -17416,6 +17640,7 @@ mod tests {
             best_patch_available: false,
             best_triage_available: false,
             best_patch_diff_url: None,
+            best_patch_harvest: None,
             best_patch: None,
             best_triage: None,
             best_triage_handoff: None,
@@ -17462,6 +17687,13 @@ mod tests {
             best_patch_diff_url: Some(
                 "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch".to_string(),
             ),
+            best_patch_harvest: Some(PublicPatchHarvestReview {
+                status: "needs_review".to_string(),
+                blockers: vec!["missing_patch_metadata".to_string()],
+                next_actions: public_patch_harvest_next_actions_for_blockers(&[
+                    "missing_patch_metadata".to_string(),
+                ]),
+            }),
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -17546,6 +17778,7 @@ mod tests {
             best_patch_diff_url: Some(
                 "/issues/019d5954-5300-75b1-b0a0-16d9cf5259e1/best.patch".to_string(),
             ),
+            best_patch_harvest: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
