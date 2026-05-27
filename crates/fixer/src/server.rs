@@ -8073,7 +8073,136 @@ async fn load_public_triage(db: &ServerDb, limit: i64) -> Result<Vec<PublicTriag
             .cmp(&parse_timestamp(&left.best_triage.created_at))
             .then_with(|| right.score.cmp(&left.score))
     });
+    propagate_public_triage_report_urls(&mut triage);
     Ok(triage)
+}
+
+fn public_triage_handoff_key(handoff: &PublicTriageHandoff) -> Option<(String, String)> {
+    let classification = handoff
+        .classification
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let target = normalized_public_triage_handoff_target(classification, &handoff.target)?;
+    Some((classification.to_string(), target))
+}
+
+fn normalized_public_triage_handoff_target(classification: &str, target: &str) -> Option<String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let normalized = if classification == "external-local-executable" {
+        target
+            .strip_prefix("local executable ")
+            .unwrap_or(target)
+            .trim()
+    } else {
+        target
+    };
+    (!normalized.is_empty()).then(|| normalized.to_ascii_lowercase())
+}
+
+fn public_source_repo_url_for_handoff_inheritance(url: &str) -> bool {
+    let url = url.trim();
+    if url.contains(char::is_whitespace)
+        || url.starts_with('/')
+        || url.starts_with("file:")
+        || url.starts_with("ssh:")
+    {
+        return false;
+    }
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or_default();
+    if host.is_empty()
+        || matches!(host, "localhost" | "127.0.0.1" | "::1")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("172.16.")
+        || host.starts_with("172.17.")
+        || host.starts_with("172.18.")
+        || host.starts_with("172.19.")
+        || host.starts_with("172.2")
+        || host.starts_with("172.30.")
+        || host.starts_with("172.31.")
+    {
+        return false;
+    }
+    matches!(host, "github.com" | "gitlab.com" | "bitbucket.org") || url.ends_with(".git")
+}
+
+fn refresh_public_triage_handoff_next_steps(handoff: &mut PublicTriageHandoff) {
+    match handoff.classification.as_deref() {
+        Some("external-local-executable") => {
+            handoff.next_steps =
+                local_executable_triage_next_steps(&handoff.target, handoff.report_url.as_deref());
+        }
+        Some("interpreter-workload") => {
+            handoff.next_steps = interpreter_workload_triage_next_steps(
+                &handoff.target,
+                handoff.report_url.as_deref(),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn propagate_public_triage_report_urls(entries: &mut [PublicTriageEntry]) {
+    let mut urls_by_handoff = HashMap::<(String, String), HashSet<String>>::new();
+    for entry in entries.iter() {
+        let Some(key) = public_triage_handoff_key(&entry.handoff) else {
+            continue;
+        };
+        let Some(report_url) = entry
+            .handoff
+            .report_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| public_source_repo_url_for_handoff_inheritance(value))
+        else {
+            continue;
+        };
+        urls_by_handoff
+            .entry(key)
+            .or_default()
+            .insert(report_url.to_string());
+    }
+    let inherited_urls = urls_by_handoff
+        .into_iter()
+        .filter_map(|(key, urls)| {
+            (urls.len() == 1).then(|| {
+                let url = urls.into_iter().next().expect("singleton source url");
+                (key, url)
+            })
+        })
+        .collect::<HashMap<_, _>>();
+
+    for entry in entries.iter_mut() {
+        if entry.handoff.report_url.is_some() {
+            continue;
+        }
+        let Some(key) = public_triage_handoff_key(&entry.handoff) else {
+            continue;
+        };
+        let Some(report_url) = inherited_urls.get(&key).cloned() else {
+            continue;
+        };
+        entry.handoff.report_url = Some(report_url.clone());
+        refresh_public_triage_handoff_next_steps(&mut entry.handoff);
+        if let Some(handoff) = entry.best_triage.handoff.as_mut() {
+            if handoff.report_url.is_none()
+                && public_triage_handoff_key(handoff).as_ref() == Some(&key)
+            {
+                handoff.report_url = Some(report_url);
+                refresh_public_triage_handoff_next_steps(handoff);
+            }
+        }
+    }
 }
 
 async fn load_public_attempts(
@@ -18084,6 +18213,202 @@ mod tests {
                 .iter()
                 .any(|step| step.contains("source repository identified"))
         );
+    }
+
+    #[test]
+    fn triage_rows_inherit_unique_source_repo_for_matching_handoff_target() {
+        fn entry(id: &str, report_url: Option<&str>) -> PublicTriageEntry {
+            let handoff = PublicTriageHandoff {
+                reason: "workspace-acquisition".to_string(),
+                classification: Some("external-local-executable".to_string()),
+                target: "local executable synthetic-llm".to_string(),
+                report_url: report_url.map(ToString::to_string),
+                next_steps: local_executable_triage_next_steps(
+                    "local executable synthetic-llm",
+                    report_url,
+                ),
+            };
+            PublicTriageEntry {
+                id: id.to_string(),
+                kind: "investigation".to_string(),
+                title: "Runaway CPU investigation for synthetic-llm".to_string(),
+                summary: "synthetic-llm burned CPU in a native loop.".to_string(),
+                package_name: None,
+                source_package: None,
+                ecosystem: None,
+                severity: Some("high".to_string()),
+                score: 106,
+                corroboration_count: 2,
+                last_seen: "2026-05-27T00:00:00Z".to_string(),
+                best_triage: PublicAttempt {
+                    outcome: "triage".to_string(),
+                    state: "ready".to_string(),
+                    summary: "A diagnosis and external handoff were created locally.".to_string(),
+                    validation_status: Some("ready".to_string()),
+                    created_at: "2026-05-27T00:00:00Z".to_string(),
+                    published_session: None,
+                    handoff: Some(handoff.clone()),
+                    blocker_reason: None,
+                    failure_diagnostics: None,
+                    failure_context: None,
+                },
+                handoff,
+            }
+        }
+
+        let mut entries = vec![
+            entry(
+                "issue-with-source",
+                Some("https://github.com/example/synthetic-llm.git"),
+            ),
+            entry("older-sibling", None),
+        ];
+
+        propagate_public_triage_report_urls(&mut entries);
+
+        assert_eq!(
+            entries[1].handoff.report_url.as_deref(),
+            Some("https://github.com/example/synthetic-llm.git")
+        );
+        assert_eq!(
+            entries[1]
+                .best_triage
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.report_url.as_deref()),
+            Some("https://github.com/example/synthetic-llm.git")
+        );
+        assert!(
+            entries[1]
+                .handoff
+                .next_steps
+                .iter()
+                .any(|step| step.contains("source repository identified"))
+        );
+    }
+
+    #[test]
+    fn triage_rows_do_not_inherit_conflicting_source_repos() {
+        fn entry(id: &str, report_url: Option<&str>) -> PublicTriageEntry {
+            let handoff = PublicTriageHandoff {
+                reason: "workspace-acquisition".to_string(),
+                classification: Some("external-local-executable".to_string()),
+                target: "local executable synthetic-runner".to_string(),
+                report_url: report_url.map(ToString::to_string),
+                next_steps: local_executable_triage_next_steps(
+                    "local executable synthetic-runner",
+                    report_url,
+                ),
+            };
+            PublicTriageEntry {
+                id: id.to_string(),
+                kind: "investigation".to_string(),
+                title: "Runaway CPU investigation for synthetic-runner".to_string(),
+                summary: "synthetic-runner burned CPU in a native loop.".to_string(),
+                package_name: None,
+                source_package: None,
+                ecosystem: None,
+                severity: Some("high".to_string()),
+                score: 106,
+                corroboration_count: 2,
+                last_seen: "2026-05-27T00:00:00Z".to_string(),
+                best_triage: PublicAttempt {
+                    outcome: "triage".to_string(),
+                    state: "ready".to_string(),
+                    summary: "A diagnosis and external handoff were created locally.".to_string(),
+                    validation_status: Some("ready".to_string()),
+                    created_at: "2026-05-27T00:00:00Z".to_string(),
+                    published_session: None,
+                    handoff: Some(handoff.clone()),
+                    blocker_reason: None,
+                    failure_diagnostics: None,
+                    failure_context: None,
+                },
+                handoff,
+            }
+        }
+
+        let mut entries = vec![
+            entry(
+                "source-a",
+                Some("https://github.com/example/synthetic-runner.git"),
+            ),
+            entry(
+                "source-b",
+                Some("https://gitlab.com/example/synthetic-runner.git"),
+            ),
+            entry("ambiguous-sibling", None),
+        ];
+
+        propagate_public_triage_report_urls(&mut entries);
+
+        assert!(entries[2].handoff.report_url.is_none());
+    }
+
+    #[test]
+    fn triage_rows_do_not_inherit_private_or_non_source_urls() {
+        fn entry(id: &str, target: &str, report_url: Option<&str>) -> PublicTriageEntry {
+            let handoff = PublicTriageHandoff {
+                reason: "workspace-acquisition".to_string(),
+                classification: Some("external-local-executable".to_string()),
+                target: target.to_string(),
+                report_url: report_url.map(ToString::to_string),
+                next_steps: local_executable_triage_next_steps(target, report_url),
+            };
+            PublicTriageEntry {
+                id: id.to_string(),
+                kind: "investigation".to_string(),
+                title: format!("Runaway CPU investigation for {target}"),
+                summary: "A native executable burned CPU in a loop.".to_string(),
+                package_name: None,
+                source_package: None,
+                ecosystem: None,
+                severity: Some("high".to_string()),
+                score: 106,
+                corroboration_count: 2,
+                last_seen: "2026-05-27T00:00:00Z".to_string(),
+                best_triage: PublicAttempt {
+                    outcome: "triage".to_string(),
+                    state: "ready".to_string(),
+                    summary: "A diagnosis and external handoff were created locally.".to_string(),
+                    validation_status: Some("ready".to_string()),
+                    created_at: "2026-05-27T00:00:00Z".to_string(),
+                    published_session: None,
+                    handoff: Some(handoff.clone()),
+                    blocker_reason: None,
+                    failure_diagnostics: None,
+                    failure_context: None,
+                },
+                handoff,
+            }
+        }
+
+        let mut entries = vec![
+            entry(
+                "private-path",
+                "local executable synthetic-a",
+                Some("/home/kom/proj/synthetic-a"),
+            ),
+            entry("private-sibling", "local executable synthetic-a", None),
+            entry(
+                "bug-url",
+                "local executable synthetic-b",
+                Some("https://bugs.example.test/synthetic-b"),
+            ),
+            entry("bug-sibling", "local executable synthetic-b", None),
+            entry(
+                "real-source",
+                "local executable synthetic-c",
+                Some("https://github.com/example/synthetic-c.git"),
+            ),
+            entry("different-target", "local executable synthetic-d", None),
+        ];
+
+        propagate_public_triage_report_urls(&mut entries);
+
+        assert!(entries[1].handoff.report_url.is_none());
+        assert!(entries[3].handoff.report_url.is_none());
+        assert!(entries[5].handoff.report_url.is_none());
     }
 
     #[test]
