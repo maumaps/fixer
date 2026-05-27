@@ -7867,9 +7867,9 @@ fn public_patch_harvest_bucket_and_reason(patch: &PublicPatchEntry) -> (String, 
         if review.relation == "source_path_family" {
             if public_upstream_review_state_is_closed(&review.state) {
                 return (
-                    "needs-review".to_string(),
+                    "evidence-upgrade".to_string(),
                     format!(
-                        "related source-path family review {} needs distinct-issue review",
+                        "related source-path family review {} needs new evidence or a distinct fix",
                         review.state.replace('_', "-")
                     ),
                 );
@@ -7931,7 +7931,7 @@ fn public_patch_harvest_bucket_without_related_review(
 }
 
 fn public_patch_harvest_next_actions(patch: &PublicPatchEntry) -> Vec<String> {
-    if patch.harvest_bucket != "needs-review" {
+    if patch.harvest_bucket != "needs-review" && patch.harvest_bucket != "evidence-upgrade" {
         return Vec::new();
     }
 
@@ -7941,7 +7941,7 @@ fn public_patch_harvest_next_actions(patch: &PublicPatchEntry) -> Vec<String> {
         if review.relation == "source_path_family"
             && public_upstream_review_state_is_closed(&review.state)
         {
-            let action = "Review this distinct issue against the closed source-path-family upstream rationale before opening another PR.".to_string();
+            let action = "Do not open another source-path-family PR from this retained diff; gather new reproduction evidence or a materially distinct fix before rerunning upstream.".to_string();
             if !actions.contains(&action) {
                 actions.push(action);
             }
@@ -10014,6 +10014,10 @@ fn public_patch_headline_label(entry: &PublicPatchEntry) -> String {
             "superseded" => "superseded upstream".to_string(),
             state => format!("{} upstream", public_upstream_review_state_label(state)),
         };
+    }
+
+    if entry.harvest_bucket == "evidence-upgrade" {
+        return "needs evidence upgrade".to_string();
     }
 
     if entry.harvest_status == "ready" {
@@ -19145,10 +19149,20 @@ mod tests {
         );
         assert_eq!(family.state, "closed_unmerged");
         assert_eq!(family.family_count, 2);
-        assert_eq!(related.harvest_bucket, "needs-review");
+        assert_eq!(related.harvest_bucket, "evidence-upgrade");
         assert_eq!(
             related.harvest_reason,
-            "related source-path family review closed-unmerged needs distinct-issue review"
+            "related source-path family review closed-unmerged needs new evidence or a distinct fix"
+        );
+        assert_eq!(
+            related.harvest_next_actions,
+            vec![
+                "Do not open another source-path-family PR from this retained diff; gather new reproduction evidence or a materially distinct fix before rerunning upstream."
+            ]
+        );
+        assert_eq!(
+            public_patch_headline_label(related),
+            "needs evidence upgrade"
         );
     }
 

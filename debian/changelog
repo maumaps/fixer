@@ -1,3 +1,9 @@
+fixer (0.205.0-1) unstable; urgency=medium
+
+  * Classify closed source-path families as evidence-upgrade work.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 11:08:00 +0400
+
 fixer (0.204.0-1) unstable; urgency=medium
 
   * Block observed-only OpenSSH pre-authentication timing patches from ready
