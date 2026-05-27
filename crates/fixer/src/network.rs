@@ -1814,11 +1814,19 @@ fn build_submission_proposals(
         if proposals.len() >= config.network.max_submission_proposals {
             break;
         }
-        let Some(local_proposal) =
-            store.latest_ready_codex_proposal_for_opportunity(item.local_opportunity_id)?
-        else {
-            continue;
-        };
+        let local_proposal =
+            match store.latest_ready_codex_proposal_for_opportunity(item.local_opportunity_id)? {
+                Some(proposal) => proposal,
+                None => {
+                    let Some(report) = store.latest_ready_process_report_proposal_for_opportunity(
+                        item.local_opportunity_id,
+                    )?
+                    else {
+                        continue;
+                    };
+                    report
+                }
+            };
         let remote_issue_id = store.synced_issue_link(item.local_opportunity_id)?;
         let Some(result) = submission_result_for_local_proposal(
             participation,
@@ -1845,6 +1853,44 @@ fn build_submission_proposals(
 
     for (local_proposal, remote_issue_id) in store
         .list_latest_ready_codex_proposals_with_issue_links(
+            config.network.max_submission_proposals,
+        )?
+    {
+        if proposals.len() >= config.network.max_submission_proposals {
+            break;
+        }
+        if item_ids.contains(&local_proposal.opportunity_id) {
+            continue;
+        }
+        let opportunity = match store.get_opportunity(local_proposal.opportunity_id) {
+            Ok(opportunity) => opportunity,
+            Err(_) => continue,
+        };
+        let Some(result) = submission_result_for_local_proposal(
+            participation,
+            &opportunity,
+            &local_proposal,
+            Some(&remote_issue_id),
+        )?
+        else {
+            continue;
+        };
+        let candidate = SubmittedProposal {
+            local_opportunity_id: local_proposal.opportunity_id,
+            local_proposal_id: local_proposal.id,
+            remote_issue_id: Some(remote_issue_id),
+            result,
+        };
+        if !proposal_needs_publication(store, &candidate)? {
+            continue;
+        }
+        if !push_submission_proposal(&mut proposals, &mut used_bytes, config, candidate)? {
+            break;
+        }
+    }
+
+    for (local_proposal, remote_issue_id) in store
+        .list_latest_ready_process_report_proposals_with_issue_links(
             config.network.max_submission_proposals,
         )?
     {
@@ -1910,6 +1956,17 @@ fn submission_result_for_local_proposal(
     local_proposal: &ProposalRecord,
     remote_issue_id: Option<&str>,
 ) -> Result<Option<WorkerResultEnvelope>> {
+    if local_proposal.engine == "deterministic" {
+        return process_report_submission_result_for_local_proposal(
+            participation,
+            opportunity,
+            local_proposal,
+            remote_issue_id,
+        );
+    }
+    if local_proposal.engine != "codex" {
+        return Ok(None);
+    }
     let status = match proposal::load_codex_job_status(&local_proposal.bundle_path) {
         Ok(status) => status,
         Err(_) => return Ok(None),
@@ -2025,6 +2082,70 @@ fn submission_result_for_local_proposal(
     }))
 }
 
+fn process_report_submission_result_for_local_proposal(
+    participation: &ParticipationSnapshot,
+    opportunity: &OpportunityRecord,
+    local_proposal: &ProposalRecord,
+    remote_issue_id: Option<&str>,
+) -> Result<Option<WorkerResultEnvelope>> {
+    if !proposal::supports_process_investigation_report(opportunity)
+        || local_proposal.state != "ready"
+        || !local_proposal.bundle_path.join("evidence.json").exists()
+    {
+        return Ok(None);
+    }
+    let mut details = serde_json::Map::from_iter([
+        ("local_opportunity_id".to_string(), json!(opportunity.id)),
+        ("local_proposal_id".to_string(), json!(local_proposal.id)),
+        (
+            "worker_fixer_version".to_string(),
+            json!(current_binary_version()),
+        ),
+        ("submitted_via_sync".to_string(), json!(true)),
+        (
+            "diagnosis".to_string(),
+            process_investigation_worker_diagnosis(opportunity),
+        ),
+        (
+            "report_only_reason".to_string(),
+            json!("workspace-acquisition"),
+        ),
+        (
+            "handoff".to_string(),
+            workspace_blocked_handoff(
+                opportunity,
+                "no patchable workspace or source tree was available",
+            ),
+        ),
+    ]);
+    if let Some(remote_issue_id) = remote_issue_id {
+        details.insert("remote_issue_id".to_string(), json!(remote_issue_id));
+    }
+    Ok(Some(WorkerResultEnvelope {
+        lease_id: String::new(),
+        attempt: PatchAttempt {
+            cluster_id: String::new(),
+            install_id: participation.identity.install_id.clone(),
+            outcome: "triage".to_string(),
+            state: local_proposal.state.clone(),
+            summary: format!(
+                "{} A diagnosis report and external handoff were created locally.",
+                process_investigation_worker_summary(opportunity)
+            ),
+            bundle_path: Some(local_proposal.bundle_path.display().to_string()),
+            output_path: local_proposal
+                .output_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            validation_status: Some(local_proposal.state.clone()),
+            details: Value::Object(details),
+            created_at: local_proposal.updated_at.clone(),
+        },
+        impossible_reason: None,
+        evidence_request: None,
+    }))
+}
+
 fn remember_synced_issue_links(
     store: &Store,
     bundle: &FindingBundle,
@@ -2056,13 +2177,13 @@ fn remember_published_proposals(
         let Some(remote_issue_id) = remote_issue_id else {
             continue;
         };
-        let Some(session) = proposal.result.attempt.details.get("published_session") else {
+        let Some(publication_hash) = proposal_publication_payload_hash(proposal)? else {
             continue;
         };
         store.mark_proposal_published(
             proposal.local_proposal_id,
             remote_issue_id,
-            &hash_text(serde_json::to_vec(session)?),
+            &publication_hash,
         )?;
     }
     Ok(())
@@ -2072,16 +2193,29 @@ fn proposal_needs_publication(store: &Store, candidate: &SubmittedProposal) -> R
     let Some(remote_issue_id) = candidate.remote_issue_id.as_deref() else {
         return Ok(true);
     };
-    let Some(session) = candidate.result.attempt.details.get("published_session") else {
+    let Some(publication_hash) = proposal_publication_payload_hash(candidate)? else {
         return Ok(true);
     };
-    let session_hash = hash_text(serde_json::to_vec(session)?);
     let prior = store.proposal_publication_marker(candidate.local_proposal_id)?;
     Ok(!matches!(
         prior,
         Some((ref published_issue_id, ref published_hash))
-            if published_issue_id == remote_issue_id && published_hash == &session_hash
+            if published_issue_id == remote_issue_id && published_hash == &publication_hash
     ))
+}
+
+fn proposal_publication_payload_hash(candidate: &SubmittedProposal) -> Result<Option<String>> {
+    if let Some(session) = candidate.result.attempt.details.get("published_session") {
+        return Ok(Some(hash_text(serde_json::to_vec(session)?)));
+    }
+    if candidate.result.attempt.outcome == "triage"
+        && candidate.result.attempt.details.get("diagnosis").is_some()
+    {
+        return Ok(Some(hash_text(serde_json::to_vec(
+            &candidate.result.attempt,
+        )?)));
+    }
+    Ok(None)
 }
 
 fn append_public_patch_quality_details(
@@ -4729,6 +4863,112 @@ mod tests {
             .unwrap();
         assert!(diff.contains("keyboard_daemon.cpp"));
         assert!(diff.contains("+after"));
+    }
+
+    #[test]
+    fn build_submission_bundle_includes_ready_process_reports_with_source_provenance() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+        let finding_id = store
+            .record_finding(&FindingInput {
+                kind: "investigation".to_string(),
+                title: "Runaway CPU investigation for synthetic-llm".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "runaway-synthetic-llm".to_string(),
+                summary: "synthetic-llm spins in a userspace loop".to_string(),
+                details: json!({
+                    "subsystem": "runaway-process",
+                    "profile_target": {
+                        "name": "synthetic-llm",
+                        "path": "/usr/local/bin/synthetic-llm"
+                    },
+                    "command_line": "/usr/local/bin/synthetic-llm serve",
+                    "loop_classification": "unknown-userspace-loop",
+                    "native_executable_provenance": {
+                        "executable_name": "synthetic-llm",
+                        "executable_path": "synthetic-llm",
+                        "ownership": "external-non-dpkg-application",
+                        "source_name": "github.com/example/synthetic-llm",
+                        "source_repo_url": "https://github.com/example/synthetic-llm.git"
+                    }
+                }),
+                artifact: Some(ObservedArtifact {
+                    kind: "executable".to_string(),
+                    name: "synthetic-llm".to_string(),
+                    path: Some("/usr/local/bin/synthetic-llm".into()),
+                    package_name: None,
+                    repo_root: None,
+                    ecosystem: None,
+                    metadata: json!({}),
+                }),
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let opportunity = store.get_opportunity_by_finding(finding_id).unwrap();
+        let bundle_dir = dir.path().join("process-report-bundle");
+        fs::create_dir_all(&bundle_dir).unwrap();
+        let output_path = bundle_dir.join("proposal.md");
+        fs::write(
+            bundle_dir.join("evidence.json"),
+            serde_json::to_vec_pretty(&json!({
+                "report_kind": "runaway-process-investigation",
+                "opportunity": opportunity,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(&output_path, "## Native Executable Source\n").unwrap();
+        let proposal = store
+            .create_proposal(
+                opportunity.id,
+                "deterministic",
+                "ready",
+                &bundle_dir,
+                Some(&output_path),
+            )
+            .unwrap();
+
+        let config = FixerConfig::default();
+        let identity = store.ensure_install_identity().unwrap();
+        let participation = ParticipationSnapshot {
+            identity,
+            state: ParticipationState {
+                mode: ParticipationMode::SubmitterWorker,
+                ..ParticipationState::default()
+            },
+            server_url: config.network.server_url.clone(),
+            policy_text: "test policy".to_string(),
+        };
+
+        let bundle = build_submission_bundle(&store, &config, &participation).unwrap();
+        assert_eq!(bundle.items.len(), 1);
+        assert_eq!(bundle.proposals.len(), 1);
+        assert_eq!(bundle.proposals[0].local_proposal_id, proposal.id);
+        assert_eq!(bundle.proposals[0].result.attempt.outcome, "triage");
+        let details = &bundle.proposals[0].result.attempt.details;
+        assert_eq!(
+            details
+                .get("diagnosis")
+                .and_then(|value| value.get("native_executable_provenance"))
+                .and_then(|value| value.get("source_repo_url"))
+                .and_then(Value::as_str),
+            Some("https://github.com/example/synthetic-llm.git")
+        );
+        assert_eq!(
+            details
+                .get("handoff")
+                .and_then(|value| value.get("classification"))
+                .and_then(Value::as_str),
+            Some("external-local-executable")
+        );
+        assert_eq!(
+            details
+                .get("handoff")
+                .and_then(|value| value.get("report_url"))
+                .and_then(Value::as_str),
+            Some("https://github.com/example/synthetic-llm.git")
+        );
     }
 
     #[test]

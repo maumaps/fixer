@@ -1384,6 +1384,39 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn latest_ready_process_report_proposal_for_opportunity(
+        &self,
+        opportunity_id: i64,
+    ) -> Result<Option<ProposalRecord>> {
+        self.conn
+            .query_row(
+                "
+                SELECT id, opportunity_id, engine, state, bundle_path, output_path, created_at, updated_at
+                FROM proposals
+                WHERE opportunity_id = ?1
+                  AND engine = 'deterministic'
+                  AND state = 'ready'
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                ",
+                [opportunity_id],
+                |row| {
+                    Ok(ProposalRecord {
+                        id: row.get(0)?,
+                        opportunity_id: row.get(1)?,
+                        engine: row.get(2)?,
+                        state: row.get(3)?,
+                        bundle_path: PathBuf::from(row.get::<_, String>(4)?),
+                        output_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn list_latest_ready_codex_proposals_with_issue_links(
         &self,
         limit: usize,
@@ -1409,6 +1442,60 @@ impl Store {
                     FROM proposals newer
                     WHERE newer.opportunity_id = p.opportunity_id
                       AND newer.engine = 'codex'
+                      AND newer.state = 'ready'
+                      AND (
+                            newer.updated_at > p.updated_at
+                            OR (newer.updated_at = p.updated_at AND newer.id > p.id)
+                      )
+                )
+            ORDER BY p.updated_at DESC, p.id DESC
+            LIMIT ?1
+            ",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok((
+                ProposalRecord {
+                    id: row.get(0)?,
+                    opportunity_id: row.get(1)?,
+                    engine: row.get(2)?,
+                    state: row.get(3)?,
+                    bundle_path: PathBuf::from(row.get::<_, String>(4)?),
+                    output_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                },
+                row.get(8)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list_latest_ready_process_report_proposals_with_issue_links(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(ProposalRecord, String)>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT
+                p.id,
+                p.opportunity_id,
+                p.engine,
+                p.state,
+                p.bundle_path,
+                p.output_path,
+                p.created_at,
+                p.updated_at,
+                sil.remote_issue_id
+            FROM proposals p
+            JOIN synced_issue_links sil ON sil.local_opportunity_id = p.opportunity_id
+            WHERE p.engine = 'deterministic'
+              AND p.state = 'ready'
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM proposals newer
+                    WHERE newer.opportunity_id = p.opportunity_id
+                      AND newer.engine = 'deterministic'
                       AND newer.state = 'ready'
                       AND (
                             newer.updated_at > p.updated_at

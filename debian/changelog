@@ -1,3 +1,9 @@
+fixer (0.199.0-1) unstable; urgency=medium
+
+  * Publish deterministic process reports with executable source provenance.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 09:25:22 +0400
+
 fixer (0.198.0-1) unstable; urgency=medium
 
   * Backfill source provenance for old local executable investigations.

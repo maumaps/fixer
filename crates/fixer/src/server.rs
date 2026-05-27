@@ -11841,7 +11841,7 @@ fn public_triage_handoff_from_attempt(
         .filter(|_| classification.as_deref() != Some("interpreter-workload"))
         .unwrap_or_else(|| {
             if classification.as_deref() == Some("external-local-executable") {
-                local_executable_triage_next_steps(&target)
+                local_executable_triage_next_steps(&target, report_url.as_deref())
             } else if classification.as_deref() == Some("interpreter-workload") {
                 interpreter_workload_triage_next_steps(&target, report_url.as_deref())
             } else {
@@ -12024,11 +12024,18 @@ fn local_non_dpkg_executable_path(path: &str) -> bool {
         || normalized.starts_with("/snap/")
 }
 
-fn local_executable_triage_next_steps(target: &str) -> Vec<String> {
-    vec![
+fn local_executable_triage_next_steps(target: &str, report_url: Option<&str>) -> Vec<String> {
+    let first_step = if let Some(report_url) = report_url {
+        format!(
+            "Use the source repository identified from the executable metadata ({report_url}) before asking Fixer for a patch."
+        )
+    } else {
         format!(
             "Find the upstream project, local checkout, container image, or manual install source that provided {target}."
-        ),
+        )
+    };
+    vec![
+        first_step,
         "Attach that source tree to the opportunity before asking Fixer for a patch, or file an upstream issue with the retained diagnosis bundle.".to_string(),
         "Record the executable distribution channel so future Fixer runs can acquire the right workspace automatically.".to_string(),
     ]
@@ -18071,7 +18078,7 @@ mod tests {
             handoff
                 .next_steps
                 .iter()
-                .any(|step| step.contains("local checkout"))
+                .any(|step| step.contains("source repository identified"))
         );
     }
 
