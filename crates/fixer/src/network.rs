@@ -3016,6 +3016,11 @@ fn workspace_blocked_handoff(opportunity: &crate::models::OpportunityRecord, err
                 .get("package_metadata")
                 .and_then(|value| value.get("homepage"))
                 .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            local_native_executable_provenance(&diagnosis)
+                .and_then(|value| value.get("source_repo_url"))
+                .and_then(Value::as_str)
         });
     let next_steps = match classification.as_str() {
         "kernel-source-unavailable" => vec![
@@ -3027,7 +3032,11 @@ fn workspace_blocked_handoff(opportunity: &crate::models::OpportunityRecord, err
             "Include the workspace acquisition note so maintainers know why no local source patch was attempted.".to_string(),
         ],
         "external-local-executable" => vec![
-            "Find the upstream project, local checkout, container image, or manual install source that provided this executable.".to_string(),
+            if report_url.is_some() {
+                "Use the source repository identified from the executable metadata before asking Fixer for a patch.".to_string()
+            } else {
+                "Find the upstream project, local checkout, container image, or manual install source that provided this executable.".to_string()
+            },
             "Attach that source tree to the opportunity before asking Fixer for a patch, or file an upstream issue with the retained diagnosis bundle.".to_string(),
             "Record the executable distribution channel so future Fixer runs can acquire the right workspace automatically.".to_string(),
         ],
@@ -3991,7 +4000,8 @@ mod tests {
                     "native_executable_provenance": {
                         "executable_name": "synthetic-llm",
                         "executable_path": "/usr/local/bin/synthetic-llm",
-                        "ownership": "external-non-dpkg-application"
+                        "ownership": "external-non-dpkg-application",
+                        "source_repo_url": "https://github.com/example/synthetic-llm.git"
                     }
                 }
             }),
@@ -4021,6 +4031,10 @@ mod tests {
             handoff.get("classification").and_then(Value::as_str),
             Some("external-local-executable")
         );
+        assert_eq!(
+            handoff.get("report_url").and_then(Value::as_str),
+            Some("https://github.com/example/synthetic-llm.git")
+        );
         assert!(
             handoff
                 .get("next_steps")
@@ -4028,7 +4042,7 @@ mod tests {
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str)
-                .any(|step| step.contains("local checkout"))
+                .any(|step| step.contains("source repository identified"))
         );
     }
 

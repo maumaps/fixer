@@ -11808,6 +11808,14 @@ fn public_triage_handoff_from_attempt(
         .get("handoff")
         .and_then(|value| value.get("report_url"))
         .and_then(Value::as_str)
+        .or_else(|| {
+            attempt
+                .details
+                .get("diagnosis")
+                .and_then(|value| value.get("native_executable_provenance"))
+                .and_then(|value| value.get("source_repo_url"))
+                .and_then(Value::as_str)
+        })
         .map(ToString::to_string)
         .filter(|value| !value.trim().is_empty());
     let next_steps = attempt
@@ -18013,6 +18021,11 @@ mod tests {
                         "name": "synthetic-llm",
                         "path": "/usr/local/bin/synthetic-llm",
                         "package_name": null
+                    },
+                    "native_executable_provenance": {
+                        "executable_name": "synthetic-llm",
+                        "executable_path": "/usr/local/bin/synthetic-llm",
+                        "source_repo_url": "https://github.com/example/synthetic-llm.git"
                     }
                 },
                 "handoff": {
@@ -18037,6 +18050,10 @@ mod tests {
             Some("external-local-executable")
         );
         assert_eq!(handoff.target, "local executable synthetic-llm");
+        assert_eq!(
+            handoff.report_url.as_deref(),
+            Some("https://github.com/example/synthetic-llm.git")
+        );
         assert!(
             handoff
                 .next_steps

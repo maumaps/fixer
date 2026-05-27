@@ -1,3 +1,9 @@
+fixer (0.194.0-1) unstable; urgency=medium
+
+  * Acquire Go module sources for local executable investigations.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 07:55:53 +0400
+
 fixer (0.193.0-1) unstable; urgency=medium
 
   * Render needs-review issue details conservatively.

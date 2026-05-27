@@ -41,6 +41,30 @@ pub fn ensure_workspace_for_opportunity(
         });
     }
 
+    if let Some(workspace_target) = native_executable_source_target(opportunity) {
+        let repo_root = ensure_upstream_clone(
+            config,
+            &workspace_target.source_package,
+            workspace_target
+                .upstream_url
+                .as_deref()
+                .expect("native executable source target requires an upstream URL"),
+        )?;
+        let repo_root = maybe_canonicalize(&repo_root);
+        let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
+        return Ok(PreparedWorkspace {
+            repo_root,
+            ecosystem,
+            source_kind: "local-executable-upstream-git".to_string(),
+            package_name: None,
+            source_package: Some(workspace_target.source_package.clone()),
+            homepage: workspace_target.upstream_url.clone(),
+            acquisition_note: workspace_target.acquisition_note.unwrap_or_else(|| {
+                "Cloned upstream git from local executable build metadata.".to_string()
+            }),
+        });
+    }
+
     let package_name = package_name_from_opportunity(opportunity);
     let source_package_hint = source_package_from_opportunity(opportunity);
     let metadata = package_name
@@ -388,6 +412,37 @@ fn upstream_source_alias(source_package: &str) -> Option<WorkspaceSourceTarget> 
         upstream_url: Some(upstream_url.to_string()),
         acquisition_note: Some(format!(
             "Mapped `{source_package}` to the {project_name} upstream git default branch so source patches are prepared against upstream HEAD instead of the installed distro version."
+        )),
+    })
+}
+
+fn native_executable_source_target(
+    opportunity: &OpportunityRecord,
+) -> Option<WorkspaceSourceTarget> {
+    let provenance = opportunity
+        .evidence
+        .get("details")?
+        .get("native_executable_provenance")?;
+    let repo_url = provenance
+        .get("source_repo_url")
+        .and_then(Value::as_str)
+        .filter(|value| is_cloneable_repo_url(value))?;
+    let source_name = provenance
+        .get("source_name")
+        .and_then(Value::as_str)
+        .or_else(|| provenance.get("executable_name").and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("local-executable-source");
+    let executable_name = provenance
+        .get("executable_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(source_name);
+    Some(WorkspaceSourceTarget {
+        source_package: sanitize_dir_name(source_name),
+        upstream_url: Some(repo_url.to_string()),
+        acquisition_note: Some(format!(
+            "Cloned {repo_url} from local executable build metadata for {executable_name}; rerun Fixer against upstream HEAD instead of discarding the retained local-executable evidence."
         )),
     })
 }
@@ -1100,11 +1155,11 @@ mod tests {
         WorkspaceSourceTarget, apparmor_profile_path_candidates, chrome_workspace_alias,
         is_cloneable_repo_url, is_external_binary_package_without_workspace,
         kernel_source_package_from_opportunity, kernel_upstream_repo_url,
-        normalize_patchable_source_package, origin_is_debian_source_friendly,
-        package_name_from_opportunity, parse_apt_origins, parse_maintainer_url,
-        parse_showsrc_records, sanitize_dir_name, select_showsrc_record, source_dir_version_hint,
-        source_package_from_opportunity, source_package_vcs_url, trim_debian_epoch,
-        upstream_source_alias, vcs_git_clone_url,
+        native_executable_source_target, normalize_patchable_source_package,
+        origin_is_debian_source_friendly, package_name_from_opportunity, parse_apt_origins,
+        parse_maintainer_url, parse_showsrc_records, sanitize_dir_name, select_showsrc_record,
+        source_dir_version_hint, source_package_from_opportunity, source_package_vcs_url,
+        trim_debian_epoch, upstream_source_alias, vcs_git_clone_url,
     };
     use crate::models::{InstalledPackageMetadata, OpportunityRecord};
     use serde_json::json;
@@ -1256,6 +1311,50 @@ zoom:\n\
                 .as_deref()
                 .unwrap()
                 .contains("upstream git default branch")
+        );
+    }
+
+    #[test]
+    fn maps_local_go_executable_metadata_to_upstream_source() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "ollama spins CPU".to_string(),
+            score: 100,
+            state: "open".to_string(),
+            summary: "ollama spins".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "runaway-process",
+                    "native_executable_provenance": {
+                        "executable_name": "ollama",
+                        "executable_path": "/usr/local/bin/ollama",
+                        "source_kind": "go-module",
+                        "source_name": "github.com/ollama/ollama",
+                        "source_repo_url": "https://github.com/ollama/ollama.git"
+                    }
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+            updated_at: "2026-05-27T00:00:00Z".to_string(),
+        };
+
+        let target = native_executable_source_target(&opportunity)
+            .expect("local executable metadata should map to an upstream source");
+
+        assert_eq!(target.source_package, "github.com_ollama_ollama");
+        assert_eq!(
+            target.upstream_url.as_deref(),
+            Some("https://github.com/ollama/ollama.git")
+        );
+        assert!(
+            target
+                .acquisition_note
+                .as_deref()
+                .is_some_and(|note| note.contains("local executable build metadata"))
         );
     }
 

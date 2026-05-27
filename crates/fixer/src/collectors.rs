@@ -4338,8 +4338,12 @@ struct NativeExecutableProvenance {
     detection_signals: Vec<String>,
     executable_name: String,
     executable_path: String,
+    resolved_executable_path: Option<String>,
     command_line: Option<String>,
     ownership: String,
+    source_kind: Option<String>,
+    source_name: Option<String>,
+    source_repo_url: Option<String>,
     evidence_gap: String,
     recommended_next_steps: Vec<String>,
 }
@@ -6218,23 +6222,106 @@ fn collect_native_executable_provenance(
     if command_line.is_some_and(|line| line.contains(&executable_path)) {
         detection_signals.push("retained command line starts with the same executable".to_string());
     }
+    let resolved_executable_path = fs::canonicalize(&executable_path)
+        .ok()
+        .map(|path| path.display().to_string());
+    let go_source = go_binary_source_hint(
+        resolved_executable_path
+            .as_deref()
+            .unwrap_or(executable_path.as_str()),
+    );
+    if let Some(source) = go_source.as_ref() {
+        detection_signals.push(format!(
+            "Go build metadata identifies module {}",
+            source.module_path
+        ));
+    }
+    let source_kind = go_source.as_ref().map(|_| "go-module".to_string());
+    let source_name = go_source.as_ref().map(|source| source.module_path.clone());
+    let source_repo_url = go_source
+        .as_ref()
+        .and_then(|source| source.repo_url.clone());
+    let mut recommended_next_steps = Vec::new();
+    if let Some(repo_url) = source_repo_url.as_ref() {
+        recommended_next_steps.push(format!(
+            "Acquire the upstream source from {repo_url} and rerun Fixer against that repository before proposing a patch."
+        ));
+        recommended_next_steps.push(format!(
+            "Keep the retained perf/strace/backtrace bundle attached to the {executable_name} source investigation."
+        ));
+    } else {
+        recommended_next_steps.push(format!(
+            "Find the upstream project or local checkout that installed {executable_name} before asking Fixer for a source patch."
+        ));
+        recommended_next_steps.push("Attach that repository as the opportunity workspace or file an upstream issue with the retained perf/strace/backtrace bundle.".to_string());
+        recommended_next_steps.push("If the executable came from a container, manual install, or model runtime bundle, record that distribution channel so future runs can acquire the right source.".to_string());
+    }
     Some(NativeExecutableProvenance {
         detection_signals,
         executable_name: executable_name.clone(),
         executable_path: executable_path.clone(),
+        resolved_executable_path,
         command_line: command_line.map(ToString::to_string),
         ownership: "external-non-dpkg-application".to_string(),
+        source_kind,
+        source_name,
+        source_repo_url,
         evidence_gap: format!(
             "Fixer captured a native userspace process at {executable_path}, but no Debian package or source package owns that executable."
         ),
-        recommended_next_steps: vec![
-            format!(
-                "Find the upstream project or local checkout that installed {executable_name} before asking Fixer for a source patch."
-            ),
-            "Attach that repository as the opportunity workspace or file an upstream issue with the retained perf/strace/backtrace bundle.".to_string(),
-            "If the executable came from a container, manual install, or model runtime bundle, record that distribution channel so future runs can acquire the right source.".to_string(),
-        ],
+        recommended_next_steps,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoBinarySourceHint {
+    module_path: String,
+    repo_url: Option<String>,
+}
+
+fn go_binary_source_hint(path: &str) -> Option<GoBinarySourceHint> {
+    if !command_exists("go") {
+        return None;
+    }
+    let output = command_output_os_with_timeout(
+        "go",
+        &[OsStr::new("version"), OsStr::new("-m"), OsStr::new(path)],
+        StdDuration::from_secs(BASIC_COMMAND_TIMEOUT_SECONDS),
+    )
+    .ok()?;
+    parse_go_binary_source_hint(&output)
+}
+
+fn parse_go_binary_source_hint(output: &str) -> Option<GoBinarySourceHint> {
+    let module_path = output.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("path\t")
+            .or_else(|| {
+                line.strip_prefix("mod\t")
+                    .and_then(|rest| rest.split('\t').next())
+            })
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.contains('/'))
+            .map(ToString::to_string)
+    })?;
+    let repo_url = go_module_repo_url(&module_path);
+    Some(GoBinarySourceHint {
+        module_path,
+        repo_url,
+    })
+}
+
+fn go_module_repo_url(module_path: &str) -> Option<String> {
+    let mut parts = module_path.split('/');
+    let host = parts.next()?;
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    match host {
+        "github.com" | "gitlab.com" | "bitbucket.org" => {
+            Some(format!("https://{host}/{owner}/{repo}.git"))
+        }
+        _ => None,
+    }
 }
 
 fn first_command_token(command_line: &str) -> Option<&str> {
@@ -7983,10 +8070,10 @@ mod tests {
         normalize_oom_task_memcg_target, normalize_perf_symbol,
         normalize_stuck_process_target_name, oom_cgroup_package_candidates, package_lookup_path,
         package_lookup_path_is_dpkg_candidate, parse_apparmor_denial, parse_coredump_info,
-        parse_desktop_graphics_session_failure, parse_dkms_status_line, parse_ini_sections,
-        parse_interpreter_command_hints, parse_kernel_oom_kill_events,
-        parse_latest_desktop_resume_failure, parse_network_driver_hang_events,
-        parse_perf_hot_paths, parse_perl_command_line_hints,
+        parse_desktop_graphics_session_failure, parse_dkms_status_line,
+        parse_go_binary_source_hint, parse_ini_sections, parse_interpreter_command_hints,
+        parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
+        parse_network_driver_hang_events, parse_perf_hot_paths, parse_perl_command_line_hints,
         parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
         prioritize_coredump_events, process_runtime_seconds, process_state_is_uninterruptible,
         richer_evidence_enabled, safe_perf_name, shell_assignment_csv_value,
@@ -9180,6 +9267,7 @@ Description: user-space parser utility for AppArmor
         assert_eq!(evidence.executable_name, "synthetic-llm");
         assert_eq!(evidence.executable_path, "/usr/local/bin/synthetic-llm");
         assert_eq!(evidence.ownership, "external-non-dpkg-application");
+        assert_eq!(evidence.source_kind, None);
         assert!(
             evidence
                 .recommended_next_steps
@@ -9193,6 +9281,22 @@ Description: user-space parser utility for AppArmor
                 Some("/usr/bin/synthetic-llm"),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn go_build_metadata_maps_local_binary_to_upstream_source() {
+        let hint = parse_go_binary_source_hint(
+            "/usr/local/bin/ollama: go1.26.0\n\
+             \tpath\tgithub.com/ollama/ollama\n\
+             \tmod\tgithub.com/ollama/ollama\t(devel)\t\n",
+        )
+        .expect("go build metadata should identify the module source");
+
+        assert_eq!(hint.module_path, "github.com/ollama/ollama");
+        assert_eq!(
+            hint.repo_url.as_deref(),
+            Some("https://github.com/ollama/ollama.git")
         );
     }
 
