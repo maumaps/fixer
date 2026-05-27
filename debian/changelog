@@ -1,3 +1,11 @@
+fixer (0.212.0-1) unstable; urgency=medium
+
+  * Show upstream review handoffs on public issue detail pages.
+  * Keep submitted and source-family retained diffs from rendering as fresh
+    harvest-review work on their issue pages.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 14:40:07 +0400
+
 fixer (0.211.0-1) unstable; urgency=medium
 
   * Show manual patch dispositions on public issue detail pages.

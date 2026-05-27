@@ -902,6 +902,10 @@ struct PublicIssueDetail {
     best_patch_harvest: Option<PublicPatchHarvestReview>,
     #[serde(skip_serializing_if = "Option::is_none")]
     best_patch_manual_disposition: Option<PublicPatchDisposition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_patch_upstream_review: Option<PublicPatchUpstreamReview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_patch_related_upstream_review: Option<PublicPatchRelatedReview>,
     best_patch: Option<PublicAttempt>,
     best_triage: Option<PublicAttempt>,
     best_triage_handoff: Option<PublicTriageHandoff>,
@@ -7342,6 +7346,16 @@ async fn load_public_issue_detail(
     } else {
         None
     };
+    let (best_patch_upstream_review, best_patch_related_upstream_review) = if best_patch.is_some() {
+        load_public_patches(db, 512)
+            .await?
+            .into_iter()
+            .find(|patch| patch.id == id)
+            .map(|patch| (patch.upstream_review, patch.related_upstream_review))
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
     let best_patch_diff_url = public_best_patch_diff_url(&id, best_patch.as_ref());
     let possible_duplicates = load_possible_duplicates(db, &id, &issue, 6).await?;
     let all_attempts = load_public_attempts(db, &id, 1024).await?;
@@ -7384,6 +7398,8 @@ async fn load_public_issue_detail(
         best_patch_diff_url,
         best_patch_harvest,
         best_patch_manual_disposition,
+        best_patch_upstream_review,
+        best_patch_related_upstream_review,
         best_patch,
         best_triage_handoff,
         best_triage,
@@ -14564,6 +14580,8 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
     let duplicates_markup = render_possible_duplicates_section(issue);
     let attempt_summary_markup = render_attempt_summary_section(issue);
     let best_patch_needs_review = issue.best_patch_manual_disposition.is_none()
+        && issue.best_patch_upstream_review.is_none()
+        && issue.best_patch_related_upstream_review.is_none()
         && issue
             .best_patch_harvest
             .as_ref()
@@ -14585,6 +14603,29 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
             issue_tags,
             "<span class=\"tag\">manual: {}</span>",
             html_escape(&disposition.disposition.replace('_', " "))
+        );
+    }
+    if let Some(review) = issue.best_patch_upstream_review.as_ref() {
+        let _ = write!(
+            issue_tags,
+            "<span class=\"tag\">upstream: {}</span>",
+            html_escape(&public_upstream_review_state_label(&review.state))
+        );
+    } else if let Some(review) = issue.best_patch_related_upstream_review.as_ref() {
+        let relation_label = public_upstream_review_relation_label(&review.relation);
+        let related_label = if relation_label.is_empty() {
+            public_upstream_review_state_label(&review.state)
+        } else {
+            format!(
+                "{} {}",
+                relation_label,
+                public_upstream_review_state_label(&review.state)
+            )
+        };
+        let _ = write!(
+            issue_tags,
+            "<span class=\"tag\">related upstream: {}</span>",
+            html_escape(&related_label)
         );
     }
     let attempts_markup = if issue.attempts.is_empty() {
@@ -14857,12 +14898,20 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
         .unwrap_or_default();
     let harvest_review = issue.best_patch_harvest.as_ref();
     let manual_disposition = issue.best_patch_manual_disposition.as_ref();
+    let upstream_review = issue.best_patch_upstream_review.as_ref();
+    let related_upstream_review = issue.best_patch_related_upstream_review.as_ref();
     let manual_disposition_summary =
         manual_disposition.map(public_patch_manual_disposition_bucket_and_reason);
     let needs_harvest_review = manual_disposition.is_none()
+        && upstream_review.is_none()
+        && related_upstream_review.is_none()
         && harvest_review
             .is_some_and(|review| review.status != "ready" || !review.blockers.is_empty());
-    let heading = if let Some((bucket, _)) = manual_disposition_summary.as_ref() {
+    let heading = if upstream_review.is_some() {
+        "Patch tracked upstream"
+    } else if related_upstream_review.is_some() {
+        "Patch related to upstream review"
+    } else if let Some((bucket, _)) = manual_disposition_summary.as_ref() {
         match bucket.as_str() {
             "semantic-risk" => "Patch retained for semantic-risk review",
             "fixer-defect" => "Patch retained for Fixer repair",
@@ -14874,7 +14923,11 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
     } else {
         "Pull-request-ready diff"
     };
-    let intro = if manual_disposition.is_some() {
+    let intro = if upstream_review.is_some() {
+        "This diff is preserved for inspection, but the current handoff is the upstream review linked below. The original harvest blockers remain visible as historical context for the retained local artifact."
+    } else if related_upstream_review.is_some() {
+        "This diff is preserved for inspection, but a related source-family upstream review is the current handoff. Use the retained patch as evidence only; do not open a duplicate review from this artifact."
+    } else if manual_disposition.is_some() {
         "This diff is preserved as useful evidence, but a manual disposition supersedes the original harvest blockers. Use the patch to understand the failure mode; do not send it upstream unchanged."
     } else if needs_harvest_review {
         "This is the current best preserved diff for the issue, but Fixer should not treat it as upstream-ready until the proof blockers below are cleared. The downloadable `.patch` is useful for review and repair; do not send it upstream unchanged."
@@ -14889,7 +14942,27 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
             )
         })
         .unwrap_or_default();
-    if manual_disposition.is_none() {
+    if let Some(review) = upstream_review {
+        harvest_tags = format!(
+            "<span class=\"tag\">upstream: {}</span>",
+            html_escape(&public_upstream_review_state_label(&review.state))
+        );
+    } else if let Some(review) = related_upstream_review {
+        let relation_label = public_upstream_review_relation_label(&review.relation);
+        let related_label = if relation_label.is_empty() {
+            public_upstream_review_state_label(&review.state)
+        } else {
+            format!(
+                "{} {}",
+                relation_label,
+                public_upstream_review_state_label(&review.state)
+            )
+        };
+        harvest_tags = format!(
+            "<span class=\"tag\">related upstream: {}</span>",
+            html_escape(&related_label)
+        );
+    } else if manual_disposition.is_none() {
         if let Some(review) =
             harvest_review.filter(|review| review.status != "ready" || !review.blockers.is_empty())
         {
@@ -14906,7 +14979,60 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
             }
         }
     }
-    let harvest_warning = if let Some(disposition) = manual_disposition {
+    let upstream_review_summary = upstream_review
+        .map(|review| {
+            format!(
+                "<section class=\"patch-summary\"><h4>Upstream review</h4><p class=\"issue-summary\">This patch is already tracked upstream as <a href=\"{}\">{}: {}</a> ({}).</p></section>",
+                html_escape(&review.pr_url),
+                html_escape(&review.project),
+                html_escape(&review.title),
+                html_escape(&public_upstream_review_state_label(&review.state))
+            )
+        })
+        .unwrap_or_default();
+    let related_upstream_review_summary = related_upstream_review
+        .map(|review| {
+            let relation_label = public_upstream_review_relation_label(&review.relation);
+            let state_label = public_upstream_review_state_label(&review.state);
+            let related_label = if relation_label.is_empty() {
+                state_label
+            } else {
+                format!("{relation_label} {state_label}")
+            };
+            format!(
+                "<section class=\"patch-summary\"><h4>Related upstream review</h4><p class=\"issue-summary\">This retained diff belongs to an issue family already tracked upstream as <a href=\"{}\">{}</a> ({}; {} related row{}).</p></section>",
+                html_escape(&review.pr_url),
+                html_escape(&review.pr_url),
+                html_escape(&related_label),
+                review.family_count,
+                if review.family_count == 1 { "" } else { "s" }
+            )
+        })
+        .unwrap_or_default();
+    let harvest_warning = if upstream_review.is_some() || related_upstream_review.is_some() {
+        harvest_review
+            .filter(|review| !review.blockers.is_empty())
+            .map(|review| {
+                let blockers = review
+                    .blockers
+                    .iter()
+                    .map(|blocker| {
+                        format!("<li>{}</li>", html_escape(&blocker.replace('_', " ")))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                let handoff = if upstream_review.is_some() {
+                    "the upstream review above"
+                } else {
+                    "the related upstream review above"
+                };
+                format!(
+                    "<section class=\"patch-summary\"><h4>Original harvest blockers</h4><p class=\"issue-summary\">These blockers remain on the preserved local diff, but {handoff} is the current handoff.</p><ul class=\"attempt-list\">{}</ul></section>",
+                    blockers
+                )
+            })
+            .unwrap_or_default()
+    } else if let Some(disposition) = manual_disposition {
         let (_, reason) = manual_disposition_summary
             .as_ref()
             .cloned()
@@ -15030,6 +15156,8 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
             {}
             {}
             {}
+            {}
+            {}
             <div class="hero-actions">
                 <a class="button primary" href="{}" download="fixer-{}.patch">Download .patch</a>
                 {}
@@ -15049,6 +15177,8 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
         render_patch_response_markup(&cover.issue_connection),
         changed_files,
         validation_notes,
+        upstream_review_summary,
+        related_upstream_review_summary,
         harvest_warning,
         patch_url,
         issue.id,
@@ -17781,6 +17911,8 @@ mod tests {
             ),
             best_patch_harvest: None,
             best_patch_manual_disposition: None,
+            best_patch_upstream_review: None,
+            best_patch_related_upstream_review: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -17852,6 +17984,8 @@ mod tests {
                 ]),
             }),
             best_patch_manual_disposition: None,
+            best_patch_upstream_review: None,
+            best_patch_related_upstream_review: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -17929,6 +18063,8 @@ mod tests {
                 reason: "changes visible $libdir/foo lookup precedence".to_string(),
                 created_at: "2026-04-01T00:00:00Z".to_string(),
             }),
+            best_patch_upstream_review: None,
+            best_patch_related_upstream_review: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -17979,6 +18115,90 @@ mod tests {
     }
 
     #[test]
+    fn render_issue_detail_page_prefers_upstream_review_over_harvest_blockers() {
+        let issue = PublicIssueDetail {
+            id: "019d3a17-ed96-71d2-b0d6-b5e31a22daa2".to_string(),
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for htop".to_string(),
+            summary: "htop is stuck in a maps scan loop.".to_string(),
+            package_name: Some("htop".to_string()),
+            source_package: Some("htop".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 106,
+            corroboration_count: 2,
+            best_patch_available: true,
+            best_triage_available: false,
+            best_patch_diff_url: Some(
+                "/issues/019d3a17-ed96-71d2-b0d6-b5e31a22daa2/best.patch".to_string(),
+            ),
+            best_patch_harvest: Some(PublicPatchHarvestReview {
+                status: "needs_review".to_string(),
+                blockers: vec!["missing_patch_metadata".to_string()],
+                next_actions: public_patch_harvest_next_actions_for_blockers(&[
+                    "missing_patch_metadata".to_string(),
+                ]),
+            }),
+            best_patch_manual_disposition: None,
+            best_patch_upstream_review: Some(PublicPatchUpstreamReview {
+                id: "htop-deleted-library-maps-scan-cadence-2011".to_string(),
+                project: "htop".to_string(),
+                title: "Decouple deleted-library maps scan cadence".to_string(),
+                pr_url: "https://github.com/htop-dev/htop/pull/2011".to_string(),
+                state: "review".to_string(),
+                merged_at: None,
+                tags: vec!["upstream review".to_string()],
+            }),
+            best_patch_related_upstream_review: None,
+            best_patch: Some(PublicAttempt {
+                outcome: "patch".to_string(),
+                state: "ready".to_string(),
+                summary: "Patch proposal created locally.".to_string(),
+                validation_status: Some("ready".to_string()),
+                created_at: "2026-03-30T00:00:00Z".to_string(),
+                published_session: Some(PublishedAttemptSession {
+                    prompt: "Read ./evidence.json".to_string(),
+                    response: Some("Patched ./workspace/linux/LinuxProcessTable.c".to_string()),
+                    diff: Some(
+                        "--- a/linux/LinuxProcessTable.c\n+++ b/linux/LinuxProcessTable.c\n@@\n+/* Preserve deleted-library state. */\n"
+                            .to_string(),
+                    ),
+                    model: Some("gpt-5.4".to_string()),
+                    models_used: vec!["gpt-5.4".to_string()],
+                    rate_limit_fallback_used: false,
+                }),
+                handoff: None,
+                blocker_reason: None,
+                failure_diagnostics: None,
+                failure_context: None,
+            }),
+            best_triage: None,
+            best_triage_handoff: None,
+            last_seen: "2026-03-30T00:00:00Z".to_string(),
+            technical_snapshot: None,
+            possible_duplicates: Vec::new(),
+            attempt_summary: PublicAttemptSummary::default(),
+            attempts_omitted_count: 0,
+            attempts: Vec::new(),
+            showing_all_attempts: false,
+        };
+
+        let markup = render_issue_detail_page(&issue);
+
+        assert!(markup.contains("Patch tracked upstream"));
+        assert!(markup.contains("upstream: review"));
+        assert!(markup.contains("Upstream review"));
+        assert!(markup.contains("https://github.com/htop-dev/htop/pull/2011"));
+        assert!(markup.contains("Original harvest blockers"));
+        assert!(markup.contains("upstream review above is the current handoff"));
+        assert!(markup.contains("missing patch metadata"));
+        assert!(!markup.contains("Patch needs harvest review"));
+        assert!(!markup.contains("patch needs review"));
+        assert!(!markup.contains("Harvest review needed"));
+        assert!(!markup.contains("Backfill proposal metadata"));
+    }
+
+    #[test]
     fn render_attempt_summary_section_collapses_zero_outcomes() {
         let issue = PublicIssueDetail {
             id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
@@ -17996,6 +18216,8 @@ mod tests {
             best_patch_diff_url: None,
             best_patch_harvest: None,
             best_patch_manual_disposition: None,
+            best_patch_upstream_review: None,
+            best_patch_related_upstream_review: None,
             best_patch: None,
             best_triage: None,
             best_triage_handoff: None,
@@ -18042,6 +18264,8 @@ mod tests {
             ),
             best_patch_harvest: None,
             best_patch_manual_disposition: None,
+            best_patch_upstream_review: None,
+            best_patch_related_upstream_review: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -18142,6 +18366,8 @@ mod tests {
             best_patch_diff_url: None,
             best_patch_harvest: None,
             best_patch_manual_disposition: None,
+            best_patch_upstream_review: None,
+            best_patch_related_upstream_review: None,
             best_patch: None,
             best_triage: Some(PublicAttempt {
                 outcome: "triage".to_string(),
@@ -18220,6 +18446,8 @@ mod tests {
             best_patch_diff_url: None,
             best_patch_harvest: None,
             best_patch_manual_disposition: None,
+            best_patch_upstream_review: None,
+            best_patch_related_upstream_review: None,
             best_patch: None,
             best_triage: None,
             best_triage_handoff: None,
@@ -18277,6 +18505,8 @@ mod tests {
             best_patch_diff_url: None,
             best_patch_harvest: None,
             best_patch_manual_disposition: None,
+            best_patch_upstream_review: None,
+            best_patch_related_upstream_review: None,
             best_patch: None,
             best_triage: None,
             best_triage_handoff: None,
@@ -18331,6 +18561,8 @@ mod tests {
             best_patch_diff_url: None,
             best_patch_harvest: None,
             best_patch_manual_disposition: None,
+            best_patch_upstream_review: None,
+            best_patch_related_upstream_review: None,
             best_patch: None,
             best_triage: None,
             best_triage_handoff: None,
@@ -18385,6 +18617,8 @@ mod tests {
                 ]),
             }),
             best_patch_manual_disposition: None,
+            best_patch_upstream_review: None,
+            best_patch_related_upstream_review: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -18471,6 +18705,8 @@ mod tests {
             ),
             best_patch_harvest: None,
             best_patch_manual_disposition: None,
+            best_patch_upstream_review: None,
+            best_patch_related_upstream_review: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
