@@ -2923,6 +2923,9 @@ fn workspace_blocker_classification(
                 .and_then(Value::as_str)
         })
         .unwrap_or_default();
+    if diagnosis_has_local_native_executable(&diagnosis) {
+        return Some("external-local-executable".to_string());
+    }
     if package_name.starts_with("linux-")
         || source_package == "linux"
         || diagnosis_points_to_kernel_target(&diagnosis)
@@ -2974,21 +2977,26 @@ fn workspace_blocked_handoff(opportunity: &crate::models::OpportunityRecord, err
     let diagnosis = process_investigation_worker_diagnosis(opportunity);
     let classification = workspace_blocker_classification(opportunity, error)
         .unwrap_or_else(|| "workspace-unavailable".to_string());
-    let target = opportunity
-        .evidence
-        .get("source_package")
-        .and_then(Value::as_str)
+    let native_target = local_native_executable_target(&diagnosis);
+    let target = native_target
+        .as_deref()
         .or_else(|| {
             opportunity
                 .evidence
-                .get("package_name")
+                .get("source_package")
                 .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            diagnosis
-                .get("package_metadata")
-                .and_then(|value| value.get("source_package"))
-                .and_then(Value::as_str)
+                .or_else(|| {
+                    opportunity
+                        .evidence
+                        .get("package_name")
+                        .and_then(Value::as_str)
+                })
+                .or_else(|| {
+                    diagnosis
+                        .get("package_metadata")
+                        .and_then(|value| value.get("source_package"))
+                        .and_then(Value::as_str)
+                })
         })
         .unwrap_or("the upstream maintainer")
         .to_string();
@@ -3011,6 +3019,11 @@ fn workspace_blocked_handoff(opportunity: &crate::models::OpportunityRecord, err
             "File an upstream or vendor issue with the diagnosis bundle and package metadata.".to_string(),
             "Include the workspace acquisition note so maintainers know why no local source patch was attempted.".to_string(),
         ],
+        "external-local-executable" => vec![
+            "Find the upstream project, local checkout, container image, or manual install source that provided this executable.".to_string(),
+            "Attach that source tree to the opportunity before asking Fixer for a patch, or file an upstream issue with the retained diagnosis bundle.".to_string(),
+            "Record the executable distribution channel so future Fixer runs can acquire the right workspace automatically.".to_string(),
+        ],
         _ => vec![
             "Review the package metadata and attach a source tree or upstream clone if one exists.".to_string(),
             "If no patchable tree is available, file an external bug using the diagnosis bundle.".to_string(),
@@ -3021,6 +3034,68 @@ fn workspace_blocked_handoff(opportunity: &crate::models::OpportunityRecord, err
         "report_url": report_url,
         "next_steps": next_steps,
     })
+}
+
+fn diagnosis_has_local_native_executable(diagnosis: &Value) -> bool {
+    local_native_executable_provenance(diagnosis).is_some()
+        || diagnosis
+            .get("profile_target")
+            .and_then(|value| value.get("path"))
+            .and_then(Value::as_str)
+            .is_some_and(local_non_dpkg_executable_path)
+        || diagnosis
+            .get("command_line")
+            .and_then(Value::as_str)
+            .and_then(first_command_token)
+            .is_some_and(local_non_dpkg_executable_path)
+}
+
+fn local_native_executable_target(diagnosis: &Value) -> Option<String> {
+    local_native_executable_provenance(diagnosis)
+        .and_then(|provenance| {
+            provenance
+                .get("executable_name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(|name| format!("local executable {name}"))
+                .or_else(|| {
+                    provenance
+                        .get("executable_path")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(|path| format!("local executable {path}"))
+                })
+        })
+        .or_else(|| {
+            diagnosis
+                .get("profile_target")
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(|name| format!("local executable {name}"))
+        })
+}
+
+fn local_native_executable_provenance(diagnosis: &Value) -> Option<&Value> {
+    diagnosis
+        .get("native_executable_provenance")
+        .filter(|value| !value.is_null())
+}
+
+fn first_command_token(command_line: &str) -> Option<&str> {
+    command_line.split_whitespace().next()
+}
+
+fn local_non_dpkg_executable_path(path: &str) -> bool {
+    let normalized = path
+        .trim()
+        .trim_start_matches("(deleted) ")
+        .trim_end_matches(" (deleted)");
+    normalized.starts_with("/usr/local/")
+        || normalized.starts_with("/opt/")
+        || normalized.starts_with("/home/")
+        || normalized.starts_with("/var/lib/flatpak/")
+        || normalized.starts_with("/snap/")
 }
 
 fn append_job_status_details(
@@ -3777,6 +3852,65 @@ mod tests {
             )
             .as_deref(),
             Some("external-package")
+        );
+    }
+
+    #[test]
+    fn workspace_blocker_classification_routes_local_native_executables() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "synthetic agent spins CPU".to_string(),
+            score: 10,
+            state: "open".to_string(),
+            repo_root: None,
+            summary: "synthetic agent spins".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "runaway-process",
+                    "profile_target": {
+                        "name": "synthetic-llm",
+                        "path": "/usr/local/bin/synthetic-llm"
+                    },
+                    "command_line": "/usr/local/bin/synthetic-llm serve",
+                    "native_executable_provenance": {
+                        "executable_name": "synthetic-llm",
+                        "executable_path": "/usr/local/bin/synthetic-llm",
+                        "ownership": "external-non-dpkg-application"
+                    }
+                }
+            }),
+            ecosystem: None,
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+            updated_at: "2026-05-27T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            workspace_blocker_classification(
+                &opportunity,
+                "opportunity 42 has no repo root, package name, or source package"
+            )
+            .as_deref(),
+            Some("external-local-executable")
+        );
+
+        let handoff = workspace_blocked_handoff(
+            &opportunity,
+            "opportunity 42 has no repo root, package name, or source package",
+        );
+        assert_eq!(
+            handoff.get("target").and_then(Value::as_str),
+            Some("local executable synthetic-llm")
+        );
+        assert!(
+            handoff
+                .get("next_steps")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|step| step.contains("local checkout"))
         );
     }
 

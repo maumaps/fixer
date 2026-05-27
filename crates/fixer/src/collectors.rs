@@ -4334,6 +4334,17 @@ struct InterpreterRunawayProcessEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NativeExecutableProvenance {
+    detection_signals: Vec<String>,
+    executable_name: String,
+    executable_path: String,
+    command_line: Option<String>,
+    ownership: String,
+    evidence_gap: String,
+    recommended_next_steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct RunawayFrameCluster {
     signature: String,
     thread_count: usize,
@@ -4377,6 +4388,7 @@ struct RunawayInvestigationSummary {
     thread_backtrace_summary: Option<String>,
     raw_backtrace_excerpt: Option<String>,
     interpreter_process: Option<InterpreterRunawayProcessEvidence>,
+    native_executable_provenance: Option<NativeExecutableProvenance>,
     perl_process: Option<PerlRunawayProcessEvidence>,
     hypothesis: RunawayHypothesis,
     raw_artifacts: BTreeMap<String, String>,
@@ -4580,6 +4592,7 @@ fn maybe_record_runaway_investigation(
         "raw_artifacts": investigation.raw_artifacts,
     });
     details["interpreter_process"] = json!(investigation.interpreter_process);
+    details["native_executable_provenance"] = json!(investigation.native_executable_provenance);
     if let Some(pkg) = target.package_name.as_deref() {
         if let Some(version) = installed_version_for_package(pkg) {
             details["installed_package_version"] = json!(version);
@@ -6180,6 +6193,66 @@ fn collect_interpreter_runaway_process_evidence(
     })
 }
 
+fn collect_native_executable_provenance(
+    command_line: Option<&str>,
+    executable: Option<&str>,
+) -> Option<NativeExecutableProvenance> {
+    let executable_path = executable
+        .filter(|path| local_non_dpkg_executable_path(path))
+        .map(ToString::to_string)
+        .or_else(|| {
+            command_line
+                .and_then(first_command_token)
+                .filter(|path| local_non_dpkg_executable_path(path))
+                .map(ToString::to_string)
+        })?;
+    let executable_name = Path::new(&executable_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(executable_path.as_str())
+        .to_string();
+    let mut detection_signals = vec![format!(
+        "sampled executable path is outside dpkg-owned system binary directories: {executable_path}"
+    )];
+    if command_line.is_some_and(|line| line.contains(&executable_path)) {
+        detection_signals.push("retained command line starts with the same executable".to_string());
+    }
+    Some(NativeExecutableProvenance {
+        detection_signals,
+        executable_name: executable_name.clone(),
+        executable_path: executable_path.clone(),
+        command_line: command_line.map(ToString::to_string),
+        ownership: "external-non-dpkg-application".to_string(),
+        evidence_gap: format!(
+            "Fixer captured a native userspace process at {executable_path}, but no Debian package or source package owns that executable."
+        ),
+        recommended_next_steps: vec![
+            format!(
+                "Find the upstream project or local checkout that installed {executable_name} before asking Fixer for a source patch."
+            ),
+            "Attach that repository as the opportunity workspace or file an upstream issue with the retained perf/strace/backtrace bundle.".to_string(),
+            "If the executable came from a container, manual install, or model runtime bundle, record that distribution channel so future runs can acquire the right source.".to_string(),
+        ],
+    })
+}
+
+fn first_command_token(command_line: &str) -> Option<&str> {
+    command_line.split_whitespace().next()
+}
+
+fn local_non_dpkg_executable_path(path: &str) -> bool {
+    let normalized = path
+        .trim()
+        .trim_start_matches("(deleted) ")
+        .trim_end_matches(" (deleted)");
+    normalized.starts_with("/usr/local/")
+        || normalized.starts_with("/opt/")
+        || normalized.starts_with("/home/")
+        || normalized.starts_with("/var/lib/flatpak/")
+        || normalized.starts_with("/snap/")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedInterpreterCommandHints {
     interpreter: String,
@@ -6561,6 +6634,12 @@ fn build_runaway_investigation_summary(
             backtrace_capture,
         )
     });
+    let native_executable_provenance = include_richer_evidence.then(|| {
+        collect_native_executable_provenance(
+            proc_snapshot.command_line.as_deref(),
+            proc_snapshot.executable.as_deref(),
+        )
+    });
     RunawayInvestigationSummary {
         sampled_pid,
         sampled_pid_count: profile.sampled_pids.len(),
@@ -6645,6 +6724,7 @@ fn build_runaway_investigation_summary(
             None
         },
         interpreter_process: interpreter_process.flatten(),
+        native_executable_provenance: native_executable_provenance.flatten(),
         perl_process: perl_process.flatten(),
         hypothesis: hypothesis.clone(),
         raw_artifacts: if include_richer_evidence {
@@ -7892,14 +7972,15 @@ mod tests {
         RunawayHypothesis, StuckProcessGroup, StuckProcessInvestigationSummary,
         apparmor_finding_from_kernel_line, apparmor_profile_path_candidates, classify_runaway_loop,
         classify_stuck_process, collect_interpreter_runaway_process_evidence,
-        collect_perl_runaway_process_evidence, complaint_mentions_keyboard_layout_issue,
-        coredump_debugger_arguments, coredump_debugger_skip_reason, crash_event_executable,
-        crash_event_label, crash_event_process_name, csv_config_values,
-        current_kernel_image_package_name, dominant_syscall_sequence, extend_unique_log_lines,
-        investigation_cooldown_active, is_low_signal_kernel_warning, is_profile_candidate,
-        kernel_module_lookup_names, kernel_module_package_hint, kernel_thread_package_name,
-        kernel_warning_identity, kernel_warning_module_candidates, looks_like_warning,
-        netdev_watchdog_driver, normalize_oom_task_memcg_target, normalize_perf_symbol,
+        collect_native_executable_provenance, collect_perl_runaway_process_evidence,
+        complaint_mentions_keyboard_layout_issue, coredump_debugger_arguments,
+        coredump_debugger_skip_reason, crash_event_executable, crash_event_label,
+        crash_event_process_name, csv_config_values, current_kernel_image_package_name,
+        dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
+        is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
+        kernel_module_package_hint, kernel_thread_package_name, kernel_warning_identity,
+        kernel_warning_module_candidates, looks_like_warning, netdev_watchdog_driver,
+        normalize_oom_task_memcg_target, normalize_perf_symbol,
         normalize_stuck_process_target_name, oom_cgroup_package_candidates, package_lookup_path,
         package_lookup_path_is_dpkg_candidate, parse_apparmor_denial, parse_coredump_info,
         parse_desktop_graphics_session_failure, parse_dkms_status_line, parse_ini_sections,
@@ -9085,6 +9166,33 @@ Description: user-space parser utility for AppArmor
             evidence
                 .evidence_gap
                 .contains("script/application logic or from the runtime")
+        );
+    }
+
+    #[test]
+    fn native_executable_provenance_records_local_non_dpkg_target() {
+        let evidence = collect_native_executable_provenance(
+            Some("/usr/local/bin/synthetic-llm serve --model test"),
+            Some("/usr/local/bin/synthetic-llm"),
+        )
+        .expect("local native executable provenance should be retained");
+
+        assert_eq!(evidence.executable_name, "synthetic-llm");
+        assert_eq!(evidence.executable_path, "/usr/local/bin/synthetic-llm");
+        assert_eq!(evidence.ownership, "external-non-dpkg-application");
+        assert!(
+            evidence
+                .recommended_next_steps
+                .iter()
+                .any(|step| step.contains("upstream project or local checkout"))
+        );
+
+        assert!(
+            collect_native_executable_provenance(
+                Some("/usr/bin/synthetic-llm serve"),
+                Some("/usr/bin/synthetic-llm"),
+            )
+            .is_none()
         );
     }
 

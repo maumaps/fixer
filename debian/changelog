@@ -1,3 +1,11 @@
+fixer (0.181.0-1) unstable; urgency=medium
+
+  * Preserve native executable provenance for local non-dpkg runaway
+    investigations and route their workspace blockers as external local
+    executable handoffs instead of generic upstream-maintainer handoffs.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 15:35:00 +0400
+
 fixer (0.180.0-1) unstable; urgency=medium
 
   * Recluster stale local runaway reports so previously stored linux
