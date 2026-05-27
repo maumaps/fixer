@@ -1,3 +1,9 @@
+fixer (0.192.0-1) unstable; urgency=medium
+
+  * Classify report-only public triage handoffs.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 08:10:00 +0400
+
 fixer (0.191.0-1) unstable; urgency=medium
 
   * Route interpreter module workspace handoffs to source discovery.

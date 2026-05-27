@@ -3481,6 +3481,12 @@ fn worker_triage_handoff(
     session: Option<&Value>,
 ) -> Value {
     let diagnosis = process_investigation_worker_diagnosis(opportunity);
+    let reason = worker_triage_reason(session);
+    let classification = match reason {
+        "likely-external-root-cause" => "external-root-cause",
+        "no-safe-local-change" => "no-safe-local-change",
+        _ => "triage-handoff",
+    };
     let target = diagnosis
         .get("profile_target")
         .and_then(|value| value.get("name"))
@@ -3513,6 +3519,7 @@ fn worker_triage_handoff(
                 .filter(|value| !value.trim().is_empty())
         });
     json!({
+        "classification": classification,
         "target": target,
         "report_url": report_url,
         "next_steps": [
@@ -4297,6 +4304,45 @@ mod tests {
 
         assert!(!process_investigation_prefers_report_only(&opportunity));
         assert!(weak_runaway_evidence_upgrade_request(&opportunity, "issue-1", None).is_none());
+    }
+
+    #[test]
+    fn worker_triage_handoff_classifies_external_root_cause() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for daemon".to_string(),
+            score: 10,
+            state: "open".to_string(),
+            repo_root: None,
+            summary: "daemon loops outside this source tree".to_string(),
+            evidence: json!({
+                "details": {
+                    "profile_target": { "name": "libexternal.so" },
+                    "package_metadata": {
+                        "homepage": "https://example.invalid/project"
+                    }
+                }
+            }),
+            ecosystem: None,
+            created_at: "2026-04-01T00:00:00Z".to_string(),
+            updated_at: "2026-04-01T00:00:00Z".to_string(),
+        };
+        let session = json!({
+            "response": "No source change landed. The hot path is outside this source tree."
+        });
+
+        let handoff = worker_triage_handoff(&opportunity, Some(&session));
+
+        assert_eq!(
+            handoff.get("classification").and_then(Value::as_str),
+            Some("external-root-cause")
+        );
+        assert_eq!(
+            handoff.get("target").and_then(Value::as_str),
+            Some("libexternal.so")
+        );
     }
 
     #[test]

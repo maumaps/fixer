@@ -11406,6 +11406,15 @@ fn inferred_triage_reason(attempt: &PatchAttempt) -> Option<String> {
     Some("no-safe-local-change".to_string())
 }
 
+fn triage_reason_classification(reason: &str) -> Option<&'static str> {
+    match reason {
+        "weak-unknown-runaway-evidence" => Some("weak-unknown-runaway"),
+        "likely-external-root-cause" => Some("external-root-cause"),
+        "no-safe-local-change" => Some("no-safe-local-change"),
+        _ => None,
+    }
+}
+
 fn canonical_triage_summary(summary: &str) -> String {
     summary
         .replace(
@@ -11712,7 +11721,8 @@ fn public_triage_handoff_from_attempt(
                 .and_then(Value::as_str)
         })
         .map(sanitize_public_text)
-        .filter(|value| !value.trim().is_empty());
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| triage_reason_classification(&reason).map(ToString::to_string));
     let local_executable = legacy_local_executable_handoff_target(&attempt.details);
     let interpreter_workload = interpreter_workload_handoff_target(&attempt.details);
     let target = if classification.as_deref() == Some("workspace-unavailable") {
@@ -19365,11 +19375,13 @@ mod tests {
             best_attempts_from_candidates(vec![legacy_patch, weak_evidence_triage.clone()]);
 
         assert!(best_patch.is_none());
+        let best_triage =
+            best_triage.expect("weak evidence handoff should become the public best triage");
+        assert_eq!(best_triage.summary, weak_evidence_triage.summary);
         assert_eq!(
-            best_triage
-                .expect("weak evidence handoff should become the public best triage")
-                .summary,
-            weak_evidence_triage.summary
+            public_triage_handoff_from_attempt(&best_triage, None)
+                .and_then(|handoff| handoff.classification),
+            Some("weak-unknown-runaway".to_string())
         );
     }
 
