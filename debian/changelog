@@ -1,3 +1,9 @@
+fixer (0.197.0-1) unstable; urgency=medium
+
+  * Preserve local executable source provenance without richer evidence.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 08:31:09 +0400
+
 fixer (0.196.0-1) unstable; urgency=medium
 
   * Read Go build metadata without requiring the Go tool.

@@ -6342,6 +6342,7 @@ fn source_repo_url_from_project_url(url: &str) -> Option<String> {
 fn collect_native_executable_provenance(
     command_line: Option<&str>,
     executable: Option<&str>,
+    include_sensitive_process_details: bool,
 ) -> Option<NativeExecutableProvenance> {
     let executable_path = executable
         .filter(|path| local_non_dpkg_executable_path(path))
@@ -6358,10 +6359,18 @@ fn collect_native_executable_provenance(
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(executable_path.as_str())
         .to_string();
-    let mut detection_signals = vec![format!(
-        "sampled executable path is outside dpkg-owned system binary directories: {executable_path}"
-    )];
-    if command_line.is_some_and(|line| line.contains(&executable_path)) {
+    let mut detection_signals = if include_sensitive_process_details {
+        vec![format!(
+            "sampled executable path is outside dpkg-owned system binary directories: {executable_path}"
+        )]
+    } else {
+        vec![format!(
+            "sampled executable {executable_name} is outside dpkg-owned system binary directories"
+        )]
+    };
+    if include_sensitive_process_details
+        && command_line.is_some_and(|line| line.contains(&executable_path))
+    {
         detection_signals.push("retained command line starts with the same executable".to_string());
     }
     let resolved_executable_path = fs::canonicalize(&executable_path)
@@ -6401,16 +6410,30 @@ fn collect_native_executable_provenance(
     Some(NativeExecutableProvenance {
         detection_signals,
         executable_name: executable_name.clone(),
-        executable_path: executable_path.clone(),
-        resolved_executable_path,
-        command_line: command_line.map(ToString::to_string),
+        executable_path: if include_sensitive_process_details {
+            executable_path.clone()
+        } else {
+            executable_name.clone()
+        },
+        resolved_executable_path: include_sensitive_process_details
+            .then_some(resolved_executable_path)
+            .flatten(),
+        command_line: include_sensitive_process_details
+            .then(|| command_line.map(ToString::to_string))
+            .flatten(),
         ownership: "external-non-dpkg-application".to_string(),
         source_kind,
         source_name,
         source_repo_url,
-        evidence_gap: format!(
-            "Fixer captured a native userspace process at {executable_path}, but no Debian package or source package owns that executable."
-        ),
+        evidence_gap: if include_sensitive_process_details {
+            format!(
+                "Fixer captured a native userspace process at {executable_path}, but no Debian package or source package owns that executable."
+            )
+        } else {
+            format!(
+                "Fixer captured native userspace executable {executable_name}, but no Debian package or source package owns that executable."
+            )
+        },
         recommended_next_steps,
     })
 }
@@ -6938,12 +6961,11 @@ fn build_runaway_investigation_summary(
             backtrace_capture,
         )
     });
-    let native_executable_provenance = include_richer_evidence.then(|| {
-        collect_native_executable_provenance(
-            proc_snapshot.command_line.as_deref(),
-            proc_snapshot.executable.as_deref(),
-        )
-    });
+    let native_executable_provenance = collect_native_executable_provenance(
+        proc_snapshot.command_line.as_deref(),
+        proc_snapshot.executable.as_deref(),
+        include_richer_evidence,
+    );
     RunawayInvestigationSummary {
         sampled_pid,
         sampled_pid_count: profile.sampled_pids.len(),
@@ -7028,7 +7050,7 @@ fn build_runaway_investigation_summary(
             None
         },
         interpreter_process: interpreter_process.flatten(),
-        native_executable_provenance: native_executable_provenance.flatten(),
+        native_executable_provenance,
         perl_process: perl_process.flatten(),
         hypothesis: hypothesis.clone(),
         raw_artifacts: if include_richer_evidence {
@@ -9495,6 +9517,7 @@ Description: user-space parser utility for AppArmor
         let evidence = collect_native_executable_provenance(
             Some("/usr/local/bin/synthetic-llm serve --model test"),
             Some("/usr/local/bin/synthetic-llm"),
+            true,
         )
         .expect("local native executable provenance should be retained");
 
@@ -9513,8 +9536,57 @@ Description: user-space parser utility for AppArmor
             collect_native_executable_provenance(
                 Some("/usr/bin/synthetic-llm serve"),
                 Some("/usr/bin/synthetic-llm"),
+                true,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn native_executable_provenance_can_keep_source_without_sensitive_process_details() {
+        let dir = tempfile::Builder::new()
+            .prefix("fixer-go-provenance-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let binary_path = dir.path().join("synthetic-llm");
+        let mut blob = vec![0u8; 16];
+        blob.extend_from_slice(b"\xff Go buildinf:");
+        blob.push(8);
+        blob.push(2);
+        blob.extend_from_slice(&[0u8; 16]);
+        push_uvarint(&mut blob, "go1.26.0".len() as u64);
+        blob.extend_from_slice(b"go1.26.0");
+        let module_info = "path\tgithub.com/example/synthetic-llm\nmod\tgithub.com/example/synthetic-llm\t(devel)\t\n";
+        push_uvarint(&mut blob, module_info.len() as u64);
+        blob.extend_from_slice(module_info.as_bytes());
+        std::fs::write(&binary_path, blob).unwrap();
+        let binary = binary_path.to_string_lossy().into_owned();
+
+        let evidence = collect_native_executable_provenance(
+            Some(&format!("{binary} serve --model /home/user/private-model")),
+            Some(&binary),
+            false,
+        )
+        .expect("local native executable provenance should survive privacy filtering");
+
+        assert_eq!(evidence.executable_name, "synthetic-llm");
+        assert_eq!(evidence.executable_path, "synthetic-llm");
+        assert_eq!(evidence.resolved_executable_path, None);
+        assert_eq!(evidence.command_line, None);
+        assert_eq!(evidence.source_kind.as_deref(), Some("go-module"));
+        assert_eq!(
+            evidence.source_name.as_deref(),
+            Some("github.com/example/synthetic-llm")
+        );
+        assert_eq!(
+            evidence.source_repo_url.as_deref(),
+            Some("https://github.com/example/synthetic-llm.git")
+        );
+        assert!(
+            evidence
+                .detection_signals
+                .iter()
+                .all(|signal| !signal.contains(dir.path().to_string_lossy().as_ref()))
         );
     }
 
