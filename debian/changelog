@@ -1,3 +1,17 @@
+fixer (0.180.0-1) unstable; urgency=medium
+
+  * Recluster stale local runaway reports so previously stored linux
+    source-package hints are cleared after the local-userspace inference fix.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 14:45:00 +0400
+
+fixer (0.179.0-1) unstable; urgency=medium
+
+  * Avoid routing local userspace runaway reports to linux just because their
+    sampled hot path was in the kernel.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 14:30:00 +0400
+
 fixer (0.178.0-1) unstable; urgency=medium
 
   * Show direct upstream reviews as submitted, merged, or closed handoffs on

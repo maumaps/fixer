@@ -2700,21 +2700,28 @@ fn recluster_issue_state(
         let package_name = representative.finding.package_name.clone();
         let source_package = inferred_public_source_package(&representative)
             .or_else(|| inferred_warning_source_package_from_name(&row.kind, &row.package_name));
+        let refresh_stale_source_package =
+            stale_public_source_package_should_clear(row, &representative, &source_package);
         if cluster_key != row.cluster_key
             || public_fields.title != row.public_title
             || public_fields.summary != row.public_summary
             || public_fields.visible != row.public_visible
             || (package_name.is_some() && package_name != row.package_name)
             || (optional_string_is_empty(&row.source_package) && source_package.is_some())
+            || refresh_stale_source_package
         {
             needs_recluster = true;
         }
         match grouped_clusters.entry(cluster_key.clone()) {
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 needs_recluster = true;
-                entry
-                    .get_mut()
-                    .absorb(row, &public_fields, package_name, source_package);
+                entry.get_mut().absorb(
+                    row,
+                    &public_fields,
+                    package_name,
+                    source_package,
+                    refresh_stale_source_package,
+                );
             }
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(CurrentClusterAccumulator::new(
@@ -2723,6 +2730,7 @@ fn recluster_issue_state(
                     &public_fields,
                     package_name,
                     source_package,
+                    refresh_stale_source_package,
                 ));
             }
         }
@@ -3627,7 +3635,13 @@ impl CurrentClusterAccumulator {
         public_fields: &PublicIssueFields,
         package_name: Option<String>,
         source_package: Option<String>,
+        refresh_stale_source_package: bool,
     ) -> Self {
+        let source_package = if refresh_stale_source_package {
+            source_package
+        } else {
+            source_package.or_else(|| nonempty_optional_string(&row.source_package))
+        };
         Self {
             existing_ids: vec![row.id.clone()],
             canonical_id: row.id.clone(),
@@ -3643,8 +3657,7 @@ impl CurrentClusterAccumulator {
             public_summary: public_fields.summary.clone(),
             public_visible: public_fields.visible,
             package_name: package_name.or_else(|| row.package_name.clone()),
-            source_package: source_package
-                .or_else(|| nonempty_optional_string(&row.source_package)),
+            source_package,
             ecosystem: row.ecosystem.clone(),
             severity: row.severity.clone(),
             score: row.score,
@@ -3670,6 +3683,7 @@ impl CurrentClusterAccumulator {
         public_fields: &PublicIssueFields,
         package_name: Option<String>,
         source_package: Option<String>,
+        refresh_stale_source_package: bool,
     ) {
         self.existing_ids.push(row.id.clone());
         self.public_visible |= public_fields.visible;
@@ -3697,7 +3711,9 @@ impl CurrentClusterAccumulator {
         if self.package_name.is_none() {
             self.package_name = package_name.clone().or_else(|| row.package_name.clone());
         }
-        if optional_string_is_empty(&self.source_package) {
+        if refresh_stale_source_package && is_kernelish_package_name_opt(&self.source_package) {
+            self.source_package = source_package.clone();
+        } else if optional_string_is_empty(&self.source_package) {
             self.source_package =
                 source_package.or_else(|| nonempty_optional_string(&row.source_package));
         }
@@ -8796,6 +8812,23 @@ fn is_kernelish_package_name(value: &str) -> bool {
         || normalized == "linux"
 }
 
+fn is_kernelish_package_name_opt(value: &Option<String>) -> bool {
+    value.as_deref().is_some_and(is_kernelish_package_name)
+}
+
+fn stale_public_source_package_should_clear(
+    row: &CurrentIssueCluster,
+    representative: &SharedOpportunity,
+    source_package: &Option<String>,
+) -> bool {
+    source_package.is_none()
+        && row
+            .source_package
+            .as_deref()
+            .is_some_and(is_kernelish_package_name)
+        && runaway_target_is_local_userspace_executable(&representative.finding.details)
+}
+
 fn canonical_public_source_package(
     package_name: Option<&str>,
     source_package: Option<String>,
@@ -9173,6 +9206,9 @@ fn inferred_kernel_hot_path_source_package(details: &Value) -> Option<String> {
     if !is_linux_kernel_hot_path_dso(hot_path_dso) {
         return None;
     }
+    if runaway_target_is_local_userspace_executable(details) {
+        return None;
+    }
     details
         .get("implicated_package_names")
         .and_then(Value::as_array)
@@ -9181,6 +9217,32 @@ fn inferred_kernel_hot_path_source_package(details: &Value) -> Option<String> {
         .filter_map(Value::as_str)
         .find_map(|package| canonical_public_source_package(Some(package), None))
         .or_else(|| Some("linux".to_string()))
+}
+
+fn runaway_target_is_local_userspace_executable(details: &Value) -> bool {
+    details
+        .get("profile_target")
+        .and_then(|target| target.get("path"))
+        .and_then(Value::as_str)
+        .is_some_and(is_local_userspace_executable_path)
+        || details
+            .get("command_line")
+            .and_then(Value::as_str)
+            .and_then(first_command_token)
+            .is_some_and(is_local_userspace_executable_path)
+}
+
+fn first_command_token(command_line: &str) -> Option<&str> {
+    command_line.split_whitespace().next()
+}
+
+fn is_local_userspace_executable_path(path: &str) -> bool {
+    let normalized = normalize_deleted_file_marker(path);
+    normalized.starts_with("/usr/local/")
+        || normalized.starts_with("/opt/")
+        || normalized.starts_with("/home/")
+        || normalized.starts_with("/var/lib/flatpak/")
+        || normalized.starts_with("/snap/")
 }
 
 fn is_linux_kernel_hot_path_dso(value: &str) -> bool {
@@ -19688,6 +19750,31 @@ mod tests {
             Some("linux")
         );
 
+        let mut local_kernel_runaway =
+            sample_runaway_investigation("nova-worker", Option::<&str>::None);
+        local_kernel_runaway.finding.details["profile_target"] = json!({
+            "name": "nova-worker",
+            "path": "/opt/acme-spin/bin/nova-worker",
+        });
+        local_kernel_runaway.finding.details["command_line"] =
+            json!("/opt/acme-spin/bin/nova-worker --serve");
+        local_kernel_runaway.finding.details["hot_path_dso"] = json!("[kernel.kallsyms]");
+        local_kernel_runaway.finding.details["implicated_package_names"] =
+            json!(["linux-image-6.17.10+deb14-amd64"]);
+        assert_eq!(inferred_public_source_package(&local_kernel_runaway), None);
+
+        let mut local_command_only_runaway =
+            sample_runaway_investigation("aurora-agent", Option::<&str>::None);
+        local_command_only_runaway.finding.details["command_line"] =
+            json!("/usr/local/bin/aurora-agent --foreground");
+        local_command_only_runaway.finding.details["hot_path_dso"] = json!("[kernel.kallsyms]");
+        local_command_only_runaway.finding.details["implicated_package_names"] =
+            json!(["linux-image-6.17.10+deb14-amd64"]);
+        assert_eq!(
+            inferred_public_source_package(&local_command_only_runaway),
+            None
+        );
+
         let mut nvidia_runaway = sample_runaway_investigation("ollama", Option::<&str>::None);
         nvidia_runaway.finding.details["hot_path_dso"] = json!("[nvidia]");
         nvidia_runaway.finding.details["implicated_package_names"] =
@@ -20294,6 +20381,49 @@ mod tests {
             reclustered.issue_clusters[0].source_package.as_deref(),
             Some("nvidia-graphics-drivers")
         );
+    }
+
+    #[test]
+    fn recluster_issue_state_clears_stale_linux_for_local_runaway() {
+        let mut runaway = sample_runaway_investigation("aurora-agent", Option::<&str>::None);
+        runaway.finding.details["command_line"] = json!("/usr/local/bin/aurora-agent --serve");
+        runaway.finding.details["hot_path_dso"] = json!("[kernel.kallsyms]");
+        runaway.finding.details["implicated_package_names"] =
+            json!(["linux-image-6.17.10+deb14-amd64"]);
+        let public = build_public_issue_fields(&runaway);
+        let state = CurrentIssueState {
+            issue_clusters: vec![CurrentIssueCluster {
+                id: "issue-a".to_string(),
+                cluster_key: cluster_key_for(&runaway),
+                kind: runaway.opportunity.kind.clone(),
+                title: runaway.opportunity.title.clone(),
+                summary: runaway.opportunity.summary.clone(),
+                public_title: public.title,
+                public_summary: public.summary,
+                public_visible: public.visible,
+                package_name: None,
+                source_package: Some("linux".to_string()),
+                ecosystem: None,
+                severity: Some("high".to_string()),
+                score: runaway.opportunity.score,
+                corroboration_count: 1,
+                quarantined: false,
+                promoted: true,
+                representative_json: serde_json::to_value(&runaway).unwrap(),
+                best_patch_json: None,
+                best_triage_json: None,
+                last_seen: "2026-05-26T02:24:00Z".to_string(),
+            }],
+            cluster_reports: Vec::new(),
+            worker_leases: Vec::new(),
+            patch_attempts: Vec::new(),
+            evidence_requests: Vec::new(),
+        };
+
+        let reclustered = recluster_issue_state(state, 2).unwrap().unwrap();
+
+        assert_eq!(reclustered.issue_clusters.len(), 1);
+        assert_eq!(reclustered.issue_clusters[0].source_package, None);
     }
 
     #[test]
