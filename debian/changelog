@@ -1,3 +1,9 @@
+fixer (0.214.0-1) unstable; urgency=medium
+
+  * Keep the landing-page upstream wins section limited to merged reviews.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 28 May 2026 00:00:00 +0400
+
 fixer (0.213.0-1) unstable; urgency=medium
 
   * Tighten the public landing page hero and live snapshot layout.

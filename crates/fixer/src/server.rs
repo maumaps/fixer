@@ -7251,6 +7251,7 @@ async fn load_upstream_patch_wins(
                     "
             SELECT id, project, title, summary, pr_url, merged_at, tags_json
             FROM upstream_patch_wins
+            WHERE state = 'merged' AND merged_at IS NOT NULL
             ORDER BY COALESCE(merged_at, created_at) DESC, created_at DESC
             LIMIT $1
             ",
@@ -7269,6 +7270,7 @@ async fn load_upstream_patch_wins(
                     "
             SELECT id, project, title, summary, pr_url, merged_at, tags_json
             FROM upstream_patch_wins
+            WHERE state = 'merged' AND merged_at IS NOT NULL
             ORDER BY COALESCE(merged_at, created_at) DESC, created_at DESC
             LIMIT ?1
             ",
@@ -17515,6 +17517,63 @@ mod tests {
         };
 
         assert_eq!(snapshot.unlinked_upstream_win_count, 1);
+    }
+
+    #[test]
+    fn landing_upstream_wins_loader_only_returns_merged_reviews() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        for (id, project, state, merged_at, created_at) in [
+            (
+                "active-review",
+                "Moby",
+                "review",
+                None,
+                "2026-05-27T00:00:00Z",
+            ),
+            (
+                "closed-review",
+                "OpenSSH",
+                "closed_unmerged",
+                None,
+                "2026-05-26T00:00:00Z",
+            ),
+            (
+                "accepted-review",
+                "htop",
+                "merged",
+                Some("2026-05-01T14:42:20Z"),
+                "2026-05-01T00:00:00Z",
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO upstream_patch_wins
+                     (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
+                    rusqlite::params![
+                        id,
+                        project,
+                        format!("{project} upstream review"),
+                        "Upstream review summary.",
+                        "https://example.test/review",
+                        state,
+                        merged_at,
+                        serde_json::to_string(&json!(["upstream review"])).unwrap(),
+                        created_at,
+                    ],
+                )
+                .unwrap();
+        }
+
+        let wins = match test_runtime().block_on(load_upstream_patch_wins(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("upstream wins load failed: {}", error.message),
+        };
+
+        assert_eq!(wins.len(), 1);
+        assert_eq!(wins[0].id, "accepted-review");
+        assert_eq!(wins[0].project, "htop");
     }
 
     #[test]
