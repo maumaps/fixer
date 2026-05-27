@@ -2145,6 +2145,43 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
     ensure_forward_upstream_reviews_schema(db).await?;
     ensure_forward_upstream_patch_relations_schema(db).await?;
     ensure_forward_patch_issue_dispositions_schema(db).await?;
+    ensure_forward_server_indexes(db).await?;
+    Ok(())
+}
+
+async fn ensure_forward_server_indexes(db: &ServerDb) -> Result<()> {
+    match db {
+        ServerDb::Postgres(db) => {
+            db.batch_execute(
+                "
+            CREATE INDEX IF NOT EXISTS idx_issue_clusters_worker_candidates
+                ON issue_clusters (promoted, public_visible, score DESC, last_seen DESC);
+            CREATE INDEX IF NOT EXISTS idx_cluster_reports_cluster_install
+                ON cluster_reports (cluster_id, install_id);
+            CREATE INDEX IF NOT EXISTS idx_patch_attempts_cluster_created
+                ON patch_attempts (cluster_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_worker_leases_active_cluster
+                ON worker_leases (cluster_id, state, expires_at);
+            ",
+            )
+            .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            connection.execute_batch(
+                "
+            CREATE INDEX IF NOT EXISTS idx_issue_clusters_worker_candidates
+                ON issue_clusters (promoted, public_visible, score DESC, last_seen DESC);
+            CREATE INDEX IF NOT EXISTS idx_cluster_reports_cluster_install
+                ON cluster_reports (cluster_id, install_id);
+            CREATE INDEX IF NOT EXISTS idx_patch_attempts_cluster_created
+                ON patch_attempts (cluster_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_worker_leases_active_cluster
+                ON worker_leases (cluster_id, state, expires_at);
+            ",
+            )?;
+        }
+    }
     Ok(())
 }
 
