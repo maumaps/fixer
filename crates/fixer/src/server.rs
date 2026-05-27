@@ -11714,9 +11714,13 @@ fn public_triage_handoff_from_attempt(
         .map(sanitize_public_text)
         .filter(|value| !value.trim().is_empty());
     let local_executable = legacy_local_executable_handoff_target(&attempt.details);
+    let interpreter_workload = interpreter_workload_handoff_target(&attempt.details);
     let target = if classification.as_deref() == Some("workspace-unavailable") {
         if let Some(target) = local_executable.as_ref() {
             classification = Some("external-local-executable".to_string());
+            target.clone()
+        } else if let Some(target) = interpreter_workload.as_ref() {
+            classification = Some("interpreter-workload".to_string());
             target.clone()
         } else {
             raw_target
@@ -11745,9 +11749,12 @@ fn public_triage_handoff_from_attempt(
         })
         .filter(|items| !items.is_empty())
         .filter(|_| classification.as_deref() != Some("external-local-executable"))
+        .filter(|_| classification.as_deref() != Some("interpreter-workload"))
         .unwrap_or_else(|| {
             if classification.as_deref() == Some("external-local-executable") {
                 local_executable_triage_next_steps(&target)
+            } else if classification.as_deref() == Some("interpreter-workload") {
+                interpreter_workload_triage_next_steps(&target)
             } else {
                 default_triage_next_steps(&target)
             }
@@ -11800,6 +11807,106 @@ fn legacy_local_executable_handoff_target(details: &Value) -> Option<String> {
     Some(format!("local executable {name}"))
 }
 
+fn interpreter_workload_handoff_target(details: &Value) -> Option<String> {
+    let diagnosis = details.get("diagnosis")?;
+    diagnosis
+        .get("interpreter_process")
+        .and_then(interpreter_process_handoff_target)
+        .or_else(|| {
+            diagnosis
+                .get("command_line")
+                .and_then(Value::as_str)
+                .and_then(interpreter_command_line_handoff_target)
+        })
+}
+
+fn interpreter_process_handoff_target(process: &Value) -> Option<String> {
+    let interpreter = process
+        .get("interpreter")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("interpreter");
+    let entrypoint_kind = process
+        .get("entrypoint_kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let entrypoint = process
+        .get("suspected_entrypoint")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            process
+                .get("module_options")
+                .and_then(Value::as_array)
+                .and_then(|items| items.iter().filter_map(Value::as_str).next())
+        })
+        .filter(|value| !value.trim().is_empty())?;
+    Some(interpreter_workload_target(
+        interpreter,
+        entrypoint_kind,
+        entrypoint,
+    ))
+}
+
+fn interpreter_command_line_handoff_target(command_line: &str) -> Option<String> {
+    let args = command_line.split_whitespace().collect::<Vec<_>>();
+    let first = args.first()?;
+    let interpreter = interpreter_name(first)?;
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = args[index];
+        if arg == "-m" {
+            return args
+                .get(index + 1)
+                .map(|module| interpreter_workload_target(interpreter, "module", module));
+        }
+        if arg == "-c" || arg == "-" {
+            return None;
+        }
+        if matches!(arg, "-W" | "-X") {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return Some(interpreter_workload_target(interpreter, "script", arg));
+    }
+    None
+}
+
+fn interpreter_name(path_or_name: &str) -> Option<&str> {
+    let name = path_or_name
+        .rsplit('/')
+        .next()
+        .unwrap_or(path_or_name)
+        .trim_start_matches('-');
+    if name.starts_with("python") {
+        Some("python")
+    } else if name == "perl" || name.starts_with("perl5") {
+        Some("perl")
+    } else if matches!(name, "node" | "nodejs") {
+        Some("node")
+    } else if matches!(name, "ruby" | "php" | "lua") {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn interpreter_workload_target(
+    interpreter: &str,
+    entrypoint_kind: &str,
+    entrypoint: &str,
+) -> String {
+    let entrypoint = sanitize_public_text(entrypoint);
+    match entrypoint_kind {
+        "module" => format!("{interpreter} module {entrypoint}"),
+        "script" => format!("{interpreter} script {entrypoint}"),
+        _ => format!("{interpreter} workload {entrypoint}"),
+    }
+}
+
 fn diagnosis_profile_target_has_local_non_dpkg_path(diagnosis: &Value) -> bool {
     diagnosis
         .get("profile_target")
@@ -11835,6 +11942,16 @@ fn local_executable_triage_next_steps(target: &str) -> Vec<String> {
         ),
         "Attach that source tree to the opportunity before asking Fixer for a patch, or file an upstream issue with the retained diagnosis bundle.".to_string(),
         "Record the executable distribution channel so future Fixer runs can acquire the right workspace automatically.".to_string(),
+    ]
+}
+
+fn interpreter_workload_triage_next_steps(target: &str) -> Vec<String> {
+    vec![
+        format!(
+            "Find the application, module repository, Home Assistant add-on, container image, or local checkout that provides {target}."
+        ),
+        "Attach that source tree before asking Fixer for a patch; only patch the interpreter/runtime after a language-level stack or minimal reproducer proves the runtime is at fault.".to_string(),
+        "Capture a fresh process sample with the module entrypoint, Python stack or native extension frames, and container/image provenance so the next run can acquire the right workspace.".to_string(),
     ]
 }
 
@@ -17682,6 +17799,58 @@ mod tests {
                 .next_steps
                 .iter()
                 .any(|step| step.contains("local checkout"))
+        );
+    }
+
+    #[test]
+    fn legacy_interpreter_module_workspace_handoff_is_canonicalized() {
+        let attempt = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "triage".to_string(),
+            state: "ready".to_string(),
+            summary: "A diagnosis and external handoff were created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "report_only_reason": "workspace-acquisition",
+                "workspace_classification": "workspace-unavailable",
+                "diagnosis": {
+                    "command_line": ".venv/bin/python3 -m synthetic_worker --serve",
+                    "profile_target": {
+                        "name": "python3.11",
+                        "path": "/usr/bin/python3.11",
+                        "package_name": null
+                    }
+                },
+                "handoff": {
+                    "classification": "workspace-unavailable",
+                    "target": "the upstream maintainer",
+                    "next_steps": [
+                        "Review the package metadata and attach a source tree or upstream clone if one exists.",
+                        "If no patchable tree is available, file an external bug using the diagnosis bundle."
+                    ]
+                }
+            }),
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+        };
+
+        let public_attempt = public_attempt_from_patch_attempt(attempt);
+        let handoff = public_attempt
+            .handoff
+            .expect("legacy interpreter handoff should stay public");
+
+        assert_eq!(
+            handoff.classification.as_deref(),
+            Some("interpreter-workload")
+        );
+        assert_eq!(handoff.target, "python module synthetic_worker");
+        assert!(
+            handoff
+                .next_steps
+                .iter()
+                .any(|step| step.contains("language-level stack"))
         );
     }
 

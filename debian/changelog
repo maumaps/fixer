@@ -1,3 +1,9 @@
+fixer (0.191.0-1) unstable; urgency=medium
+
+  * Route interpreter module workspace handoffs to source discovery.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 07:18:00 +0400
+
 fixer (0.190.0-1) unstable; urgency=medium
 
   * Canonicalize retained local-executable workspace handoffs.

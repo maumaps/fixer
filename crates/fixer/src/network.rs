@@ -2926,6 +2926,9 @@ fn workspace_blocker_classification(
     if diagnosis_has_local_native_executable(&diagnosis) {
         return Some("external-local-executable".to_string());
     }
+    if interpreter_workload_target(&diagnosis).is_some() {
+        return Some("interpreter-workload".to_string());
+    }
     if package_name.starts_with("linux-")
         || source_package == "linux"
         || diagnosis_points_to_kernel_target(&diagnosis)
@@ -2977,9 +2980,13 @@ fn workspace_blocked_handoff(opportunity: &crate::models::OpportunityRecord, err
     let diagnosis = process_investigation_worker_diagnosis(opportunity);
     let classification = workspace_blocker_classification(opportunity, error)
         .unwrap_or_else(|| "workspace-unavailable".to_string());
-    let native_target = local_native_executable_target(&diagnosis);
+    let native_target = (classification == "external-local-executable")
+        .then(|| local_native_executable_target(&diagnosis))
+        .flatten();
+    let interpreter_target = interpreter_workload_target(&diagnosis);
     let target = native_target
         .as_deref()
+        .or(interpreter_target.as_deref())
         .or_else(|| {
             opportunity
                 .evidence
@@ -3023,6 +3030,11 @@ fn workspace_blocked_handoff(opportunity: &crate::models::OpportunityRecord, err
             "Find the upstream project, local checkout, container image, or manual install source that provided this executable.".to_string(),
             "Attach that source tree to the opportunity before asking Fixer for a patch, or file an upstream issue with the retained diagnosis bundle.".to_string(),
             "Record the executable distribution channel so future Fixer runs can acquire the right workspace automatically.".to_string(),
+        ],
+        "interpreter-workload" => vec![
+            "Find the application, module repository, Home Assistant add-on, container image, or local checkout that provides this interpreter workload.".to_string(),
+            "Attach that source tree before asking Fixer for a patch; only patch the interpreter/runtime after a language-level stack or minimal reproducer proves the runtime is at fault.".to_string(),
+            "Capture a fresh process sample with the module entrypoint, language stack or native extension frames, and container/image provenance so the next run can acquire the right workspace.".to_string(),
         ],
         _ => vec![
             "Review the package metadata and attach a source tree or upstream clone if one exists.".to_string(),
@@ -3081,6 +3093,100 @@ fn local_native_executable_provenance(diagnosis: &Value) -> Option<&Value> {
     diagnosis
         .get("native_executable_provenance")
         .filter(|value| !value.is_null())
+}
+
+fn interpreter_workload_target(diagnosis: &Value) -> Option<String> {
+    diagnosis
+        .get("interpreter_process")
+        .and_then(interpreter_process_target)
+        .or_else(|| {
+            diagnosis
+                .get("command_line")
+                .and_then(Value::as_str)
+                .and_then(interpreter_command_line_target)
+        })
+}
+
+fn interpreter_process_target(process: &Value) -> Option<String> {
+    let interpreter = process
+        .get("interpreter")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("interpreter");
+    let entrypoint_kind = process
+        .get("entrypoint_kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let entrypoint = process
+        .get("suspected_entrypoint")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            process
+                .get("module_options")
+                .and_then(Value::as_array)
+                .and_then(|items| items.iter().filter_map(Value::as_str).next())
+        })
+        .filter(|value| !value.trim().is_empty())?;
+    Some(format_interpreter_target(
+        interpreter,
+        entrypoint_kind,
+        entrypoint,
+    ))
+}
+
+fn interpreter_command_line_target(command_line: &str) -> Option<String> {
+    let args = command_line.split_whitespace().collect::<Vec<_>>();
+    let first = args.first()?;
+    let interpreter = interpreter_name(first)?;
+    let mut index = 1usize;
+    while index < args.len() {
+        let arg = args[index];
+        if arg == "-m" {
+            return args
+                .get(index + 1)
+                .map(|module| format_interpreter_target(interpreter, "module", module));
+        }
+        if arg == "-c" || arg == "-" {
+            return None;
+        }
+        if matches!(arg, "-W" | "-X") {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return Some(format_interpreter_target(interpreter, "script", arg));
+    }
+    None
+}
+
+fn interpreter_name(path_or_name: &str) -> Option<&str> {
+    let name = path_or_name
+        .rsplit('/')
+        .next()
+        .unwrap_or(path_or_name)
+        .trim_start_matches('-');
+    if name.starts_with("python") {
+        Some("python")
+    } else if name == "perl" || name.starts_with("perl5") {
+        Some("perl")
+    } else if matches!(name, "node" | "nodejs") {
+        Some("node")
+    } else if matches!(name, "ruby" | "php" | "lua") {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn format_interpreter_target(interpreter: &str, entrypoint_kind: &str, entrypoint: &str) -> String {
+    match entrypoint_kind {
+        "module" => format!("{interpreter} module {entrypoint}"),
+        "script" => format!("{interpreter} script {entrypoint}"),
+        _ => format!("{interpreter} workload {entrypoint}"),
+    }
 }
 
 fn first_command_token(command_line: &str) -> Option<&str> {
@@ -3916,6 +4022,65 @@ mod tests {
                 .flatten()
                 .filter_map(Value::as_str)
                 .any(|step| step.contains("local checkout"))
+        );
+    }
+
+    #[test]
+    fn workspace_blocker_classification_routes_interpreter_module_workloads() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "python module waits in a poll loop".to_string(),
+            score: 10,
+            state: "open".to_string(),
+            repo_root: None,
+            summary: "python module waits".to_string(),
+            evidence: json!({
+                "source_package": "linux",
+                "details": {
+                    "subsystem": "runaway-process",
+                    "command_line": ".venv/bin/python3 -m synthetic_worker --serve",
+                    "profile_target": {
+                        "name": "python3.11",
+                        "path": "/usr/bin/python3.11"
+                    }
+                }
+            }),
+            ecosystem: None,
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+            updated_at: "2026-05-27T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            workspace_blocker_classification(
+                &opportunity,
+                "opportunity 42 has no repo root, package name, or source package"
+            )
+            .as_deref(),
+            Some("interpreter-workload")
+        );
+
+        let handoff = workspace_blocked_handoff(
+            &opportunity,
+            "opportunity 42 has no repo root, package name, or source package",
+        );
+        assert_eq!(
+            handoff.get("target").and_then(Value::as_str),
+            Some("python module synthetic_worker")
+        );
+        assert_eq!(
+            handoff.get("classification").and_then(Value::as_str),
+            Some("interpreter-workload")
+        );
+        assert!(
+            handoff
+                .get("next_steps")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|step| step.contains("language-level stack"))
         );
     }
 
