@@ -6568,12 +6568,7 @@ async fn next_issue_for_worker(
                                 Box::new(error),
                             )
                         })?;
-                    let rerunnable_source_handoff =
-                        best_triage.as_ref().and_then(rerunnable_source_handoff);
                     let mut issue = issue_from_sqlite_row(row)?;
-                    if let Some(handoff) = rerunnable_source_handoff.as_ref() {
-                        attach_rerunnable_source_handoff_to_issue(&mut issue, handoff);
-                    }
                     let has_foreign_reports = row.get::<_, i64>(17)? != 0;
                     let last_attempt_at = row
                         .get::<_, Option<String>>(18)?
@@ -6582,6 +6577,13 @@ async fn next_issue_for_worker(
                     let latest_attempt = row
                         .get::<_, Option<String>>(19)?
                         .and_then(|raw| latest_attempt_from_json_str(&raw).ok());
+                    let rerunnable_source_handoff = best_triage
+                        .as_ref()
+                        .and_then(rerunnable_source_handoff)
+                        .or_else(|| latest_attempt.as_ref().and_then(rerunnable_source_handoff));
+                    if let Some(handoff) = rerunnable_source_handoff.as_ref() {
+                        attach_rerunnable_source_handoff_to_issue(&mut issue, handoff);
+                    }
                     let last_attempt_model = patch_attempt_model(issue.best_patch.as_ref());
                     Ok(WorkerCandidate {
                         issue,
@@ -7060,13 +7062,16 @@ fn worker_candidate_from_row(row: Row) -> Result<WorkerCandidate> {
         .get::<_, Option<Value>>(16)
         .map(serde_json::from_value::<PatchAttempt>)
         .transpose()?;
-    let rerunnable_source_handoff = best_triage.as_ref().and_then(rerunnable_source_handoff);
     let has_foreign_reports: bool = row.get(17);
     let last_attempt_at: Option<DateTime<Utc>> = row.get(18);
     let latest_attempt = row
         .get::<_, Option<Value>>(19)
         .map(latest_attempt_from_json_value)
         .transpose()?;
+    let rerunnable_source_handoff = best_triage
+        .as_ref()
+        .and_then(rerunnable_source_handoff)
+        .or_else(|| latest_attempt.as_ref().and_then(rerunnable_source_handoff));
     let mut issue = issue_from_row(row)?;
     if let Some(handoff) = rerunnable_source_handoff.as_ref() {
         attach_rerunnable_source_handoff_to_issue(&mut issue, handoff);
@@ -21682,6 +21687,63 @@ mod tests {
             "attempt-ollama-triage",
             "lease-ollama-triage",
             &triage,
+            "2026-03-30T10:05:00Z",
+        );
+
+        let issue = test_runtime()
+            .block_on(next_issue_for_worker(&db, "new-worker-install", 0, None))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(issue.id, "issue-ollama");
+        assert_eq!(
+            issue.representative.finding.details["handoff"]["report_url"].as_str(),
+            Some("https://github.com/ollama/ollama.git")
+        );
+        assert_eq!(
+            issue.representative.finding.details["rerun_reason"].as_str(),
+            Some("rerunnable-source-handoff")
+        );
+    }
+
+    #[test]
+    fn worker_queue_reopens_latest_cloneable_handoff_report_for_source_rerun() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let ollama = sample_runaway_investigation("ollama", None);
+        insert_test_issue(
+            &connection,
+            "issue-ollama",
+            "cluster-ollama",
+            210,
+            "2026-03-30T10:00:00Z",
+            &ollama,
+            &["other-install"],
+        );
+        let report = PatchAttempt {
+            cluster_id: "issue-ollama".to_string(),
+            install_id: "worker-install-b".to_string(),
+            outcome: "report".to_string(),
+            state: "ready".to_string(),
+            summary: "A diagnosis and external handoff were created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "report_only_reason": "workspace-acquisition",
+                "handoff": {
+                    "classification": "external-local-executable",
+                    "target": "local executable ollama",
+                    "report_url": "https://github.com/ollama/ollama.git"
+                }
+            }),
+            created_at: "2026-03-30T10:05:00Z".to_string(),
+        };
+        insert_test_attempt(
+            &connection,
+            "attempt-ollama-report",
+            "lease-ollama-report",
+            &report,
             "2026-03-30T10:05:00Z",
         );
 

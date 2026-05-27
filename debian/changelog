@@ -1,3 +1,12 @@
+fixer (0.216.0-1) unstable; urgency=medium
+
+  * Acquire source repositories from retained local-executable handoff URLs
+    even when build metadata is not present on the rerun opportunity.
+  * Let the worker queue reopen the latest cloneable workspace-acquisition
+    handoff report as source-backed work before it becomes best triage.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 28 May 2026 00:00:00 +0400
+
 fixer (0.215.0-1) unstable; urgency=medium
 
   * Rename upstream review storage away from wins and require explicit Fixer

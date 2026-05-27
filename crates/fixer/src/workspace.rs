@@ -453,7 +453,10 @@ fn native_executable_source_target(
         .evidence
         .get("artifact_path")
         .and_then(Value::as_str);
-    let source_hint = native_executable_source_hint(details, artifact_path)?;
+    let source_hint = match native_executable_source_hint(details, artifact_path) {
+        Some(source_hint) => source_hint,
+        None => return native_executable_handoff_source_target(opportunity),
+    };
     let repo_url = source_hint
         .source_repo_url
         .as_deref()
@@ -474,6 +477,53 @@ fn native_executable_source_target(
             "Cloned {repo_url} from local executable build metadata for {}; rerun Fixer against upstream HEAD instead of discarding the retained local-executable evidence.",
             source_hint.executable_name
         )),
+    })
+}
+
+fn native_executable_handoff_source_target(
+    opportunity: &OpportunityRecord,
+) -> Option<WorkspaceSourceTarget> {
+    [
+        opportunity.evidence.get("details")?.get("handoff"),
+        opportunity.evidence.get("handoff"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|handoff| {
+        handoff
+            .get("classification")
+            .and_then(Value::as_str)
+            .filter(|classification| *classification == "external-local-executable")?;
+        let target = handoff
+            .get("target")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        let repo_url = handoff
+            .get("report_url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| is_cloneable_repo_url(value))?;
+        let source_name = source_name_from_repo_url(repo_url)
+            .unwrap_or_else(|| "local-executable-source".to_string());
+        let executable = target
+            .strip_prefix("local executable ")
+            .unwrap_or(target)
+            .trim();
+        let acquisition_note = if executable.is_empty() {
+            format!(
+                "Cloned {repo_url} from retained {target} handoff; rerun Fixer against upstream HEAD instead of leaving the collected local-executable evidence as report-only."
+            )
+        } else {
+            format!(
+                "Cloned {repo_url} from retained local executable handoff for {executable}; rerun Fixer against upstream HEAD instead of leaving the collected local-executable evidence as report-only."
+            )
+        };
+        Some(WorkspaceSourceTarget {
+            source_package: sanitize_dir_name(&source_name),
+            upstream_url: Some(repo_url.to_string()),
+            acquisition_note: Some(acquisition_note),
+        })
     })
 }
 
@@ -1539,6 +1589,48 @@ zoom:\n\
         assert_eq!(
             target.upstream_url.as_deref(),
             Some("https://github.com/ollama/ollama.git")
+        );
+    }
+
+    #[test]
+    fn maps_handoff_only_local_executable_report_url_to_upstream_source() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "ollama spins CPU".to_string(),
+            score: 100,
+            state: "open".to_string(),
+            summary: "ollama spins".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "runaway-process",
+                    "handoff": {
+                        "classification": "external-local-executable",
+                        "target": "local executable ollama",
+                        "report_url": "https://github.com/ollama/ollama.git"
+                    }
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-05-28T00:00:00Z".to_string(),
+            updated_at: "2026-05-28T00:00:00Z".to_string(),
+        };
+
+        let target = native_executable_source_target(&opportunity)
+            .expect("handoff-only source URL should map to an upstream source");
+
+        assert_eq!(target.source_package, "ollama_ollama");
+        assert_eq!(
+            target.upstream_url.as_deref(),
+            Some("https://github.com/ollama/ollama.git")
+        );
+        assert!(
+            target
+                .acquisition_note
+                .as_deref()
+                .is_some_and(|note| note.contains("retained local executable handoff"))
         );
     }
 
