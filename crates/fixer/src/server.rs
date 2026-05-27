@@ -7793,7 +7793,9 @@ fn annotate_public_patch_related_reviews(patches: &mut [PublicPatchEntry]) {
             continue;
         };
         for index in indexes {
-            if patches[*index].upstream_review.is_some() {
+            if patches[*index].upstream_review.is_some()
+                || patches[*index].related_upstream_review.is_some()
+            {
                 continue;
             }
             patches[*index].related_upstream_review = Some(PublicPatchRelatedReview {
@@ -7842,7 +7844,10 @@ fn public_patch_harvest_bucket_and_reason(patch: &PublicPatchEntry) -> (String, 
                     ),
                 );
             }
-            return public_patch_harvest_bucket_without_related_review(patch);
+            return (
+                "source-family-review".to_string(),
+                "related source-path family review is active".to_string(),
+            );
         }
         if review.state == "merged" {
             return (
@@ -18567,8 +18572,11 @@ mod tests {
         assert_eq!(family.pr_url, "https://github.com/moby/moby/pull/52643");
         assert_eq!(family.state, "review");
         assert_eq!(family.family_count, 2);
-        assert_eq!(related.harvest_bucket, "realish");
-        assert_eq!(related.harvest_reason, "candidate source diff");
+        assert_eq!(related.harvest_bucket, "source-family-review");
+        assert_eq!(
+            related.harvest_reason,
+            "related source-path family review is active"
+        );
     }
 
     #[test]

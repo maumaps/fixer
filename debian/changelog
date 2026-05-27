@@ -1,3 +1,10 @@
+fixer (0.187.0-1) unstable; urgency=medium
+
+  * Put active source-path-family reviews into their own advisory harvest
+    bucket and preserve explicit manual relations over automatic family links.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 19:15:00 +0400
+
 fixer (0.186.0-1) unstable; urgency=medium
 
   * Keep closed source-path-family reviews in needs-review instead of
