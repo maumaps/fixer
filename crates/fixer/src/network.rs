@@ -4989,6 +4989,150 @@ mod tests {
     }
 
     #[test]
+    fn build_submission_bundle_prioritizes_recent_ready_reports_for_proposal_slots() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+
+        let older_finding_id = store
+            .record_finding(&FindingInput {
+                kind: "investigation".to_string(),
+                title: "Stuck D-state investigation for synthetic-db".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "stuck-synthetic-db".to_string(),
+                summary: "synthetic-db is stuck in an uninterruptible wait".to_string(),
+                details: json!({
+                    "subsystem": "stuck-process",
+                    "profile_target": {
+                        "name": "synthetic-db",
+                        "path": "/usr/bin/synthetic-db"
+                    },
+                    "loop_classification": "unknown-uninterruptible-wait"
+                }),
+                artifact: Some(ObservedArtifact {
+                    kind: "executable".to_string(),
+                    name: "synthetic-db".to_string(),
+                    path: Some("/usr/bin/synthetic-db".into()),
+                    package_name: Some("synthetic-db".to_string()),
+                    repo_root: None,
+                    ecosystem: None,
+                    metadata: json!({}),
+                }),
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let older_opportunity = store.get_opportunity_by_finding(older_finding_id).unwrap();
+        let older_bundle_dir = dir.path().join("older-process-report-bundle");
+        fs::create_dir_all(&older_bundle_dir).unwrap();
+        fs::write(
+            older_bundle_dir.join("evidence.json"),
+            serde_json::to_vec_pretty(&json!({
+                "report_kind": "process-investigation",
+                "opportunity": older_opportunity,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let older_proposal = store
+            .create_proposal(
+                older_opportunity.id,
+                "deterministic",
+                "ready",
+                &older_bundle_dir,
+                Some(&older_bundle_dir.join("proposal.md")),
+            )
+            .unwrap();
+
+        let newer_finding_id = store
+            .record_finding(&FindingInput {
+                kind: "investigation".to_string(),
+                title: "Runaway CPU investigation for synthetic-llm".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "runaway-synthetic-llm-recent".to_string(),
+                summary: "synthetic-llm spins in a userspace loop".to_string(),
+                details: json!({
+                    "subsystem": "runaway-process",
+                    "profile_target": {
+                        "name": "synthetic-llm",
+                        "path": "/usr/local/bin/synthetic-llm"
+                    },
+                    "command_line": "/usr/local/bin/synthetic-llm serve",
+                    "loop_classification": "unknown-userspace-loop",
+                    "native_executable_provenance": {
+                        "executable_name": "synthetic-llm",
+                        "executable_path": "synthetic-llm",
+                        "ownership": "external-non-dpkg-application",
+                        "source_name": "github.com/example/synthetic-llm",
+                        "source_repo_url": "https://github.com/example/synthetic-llm.git"
+                    }
+                }),
+                artifact: Some(ObservedArtifact {
+                    kind: "executable".to_string(),
+                    name: "synthetic-llm".to_string(),
+                    path: Some("/usr/local/bin/synthetic-llm".into()),
+                    package_name: None,
+                    repo_root: None,
+                    ecosystem: None,
+                    metadata: json!({}),
+                }),
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let newer_opportunity = store.get_opportunity_by_finding(newer_finding_id).unwrap();
+        let newer_bundle_dir = dir.path().join("newer-process-report-bundle");
+        fs::create_dir_all(&newer_bundle_dir).unwrap();
+        fs::write(
+            newer_bundle_dir.join("evidence.json"),
+            serde_json::to_vec_pretty(&json!({
+                "report_kind": "runaway-process-investigation",
+                "opportunity": newer_opportunity,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let newer_proposal = store
+            .create_proposal(
+                newer_opportunity.id,
+                "deterministic",
+                "ready",
+                &newer_bundle_dir,
+                Some(&newer_bundle_dir.join("proposal.md")),
+            )
+            .unwrap();
+
+        let mut config = FixerConfig::default();
+        config.network.max_submission_items = 2;
+        config.network.max_submission_proposals = 1;
+        let identity = store.ensure_install_identity().unwrap();
+        let participation = ParticipationSnapshot {
+            identity,
+            state: ParticipationState {
+                mode: ParticipationMode::SubmitterWorker,
+                ..ParticipationState::default()
+            },
+            server_url: config.network.server_url.clone(),
+            policy_text: "test policy".to_string(),
+        };
+
+        let bundle = build_submission_bundle(&store, &config, &participation).unwrap();
+        assert_eq!(bundle.items.len(), 2);
+        assert_eq!(bundle.proposals.len(), 1);
+        assert_eq!(bundle.proposals[0].local_proposal_id, newer_proposal.id);
+        assert_ne!(bundle.proposals[0].local_proposal_id, older_proposal.id);
+        assert_eq!(
+            bundle.proposals[0]
+                .result
+                .attempt
+                .details
+                .get("handoff")
+                .and_then(|value| value.get("report_url"))
+                .and_then(Value::as_str),
+            Some("https://github.com/example/synthetic-llm.git")
+        );
+    }
+
+    #[test]
     fn build_submission_bundle_prioritizes_ready_proposals_below_score_window() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
