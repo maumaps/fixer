@@ -11631,6 +11631,12 @@ fn public_triage_handoff_from_attempt(
         .get("handoff")
         .and_then(|value| value.get("classification"))
         .and_then(Value::as_str)
+        .or_else(|| {
+            attempt
+                .details
+                .get("workspace_classification")
+                .and_then(Value::as_str)
+        })
         .map(sanitize_public_text)
         .filter(|value| !value.trim().is_empty());
     let report_url = attempt
