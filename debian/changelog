@@ -1,3 +1,10 @@
+fixer (0.208.0-1) unstable; urgency=medium
+
+  * Requeue cloneable local-executable triage handoffs as source reruns.
+  * Preserve normalized source handoff URLs on issue detail pages.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 12:20:00 +0400
+
 fixer (0.207.0-1) unstable; urgency=medium
 
   * Preserve retained patch file paths from published diffs when proposal

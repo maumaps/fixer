@@ -6276,6 +6276,8 @@ struct WorkerCandidate {
     last_attempt_at: Option<DateTime<Utc>>,
     last_attempt_model: Option<String>,
     latest_attempt: Option<PatchAttempt>,
+    has_best_triage: bool,
+    rerunnable_source_handoff: Option<PublicTriageHandoff>,
 }
 
 async fn next_issue_for_worker(
@@ -6292,7 +6294,7 @@ async fn next_issue_for_worker(
                     "
         SELECT id, cluster_key, kind, title, summary, package_name, source_package, ecosystem,
                severity, score, corroboration_count, quarantined, promoted, representative_json,
-               best_patch_json, last_seen,
+               best_patch_json, last_seen, best_triage_json,
                EXISTS (
                     SELECT 1
                     FROM cluster_reports report
@@ -6314,7 +6316,6 @@ async fn next_issue_for_worker(
         FROM issue_clusters issue
         WHERE promoted = TRUE
           AND public_visible = TRUE
-          AND best_triage_json IS NULL
           AND NOT EXISTS (
                 SELECT 1
                 FROM worker_leases lease
@@ -6345,7 +6346,7 @@ async fn next_issue_for_worker(
                 "
         SELECT id, cluster_key, kind, title, summary, package_name, source_package, ecosystem,
                severity, score, corroboration_count, quarantined, promoted, representative_json,
-               best_patch_json, last_seen,
+               best_patch_json, last_seen, best_triage_json,
                EXISTS (
                     SELECT 1
                     FROM cluster_reports report
@@ -6367,7 +6368,6 @@ async fn next_issue_for_worker(
         FROM issue_clusters issue
         WHERE promoted = 1
           AND public_visible = 1
-          AND best_triage_json IS NULL
           AND NOT EXISTS (
                 SELECT 1
                 FROM worker_leases lease
@@ -6382,14 +6382,30 @@ async fn next_issue_for_worker(
             let rows = stmt.query_map(
                 params![worker_install_id, now.as_str(), candidate_limit],
                 |row| {
-                    let issue = issue_from_sqlite_row(row)?;
-                    let has_foreign_reports = row.get::<_, i64>(16)? != 0;
+                    let best_triage = row
+                        .get::<_, Option<String>>(16)?
+                        .map(|raw| serde_json::from_str::<PatchAttempt>(&raw))
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                16,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                    let rerunnable_source_handoff =
+                        best_triage.as_ref().and_then(rerunnable_source_handoff);
+                    let mut issue = issue_from_sqlite_row(row)?;
+                    if let Some(handoff) = rerunnable_source_handoff.as_ref() {
+                        attach_rerunnable_source_handoff_to_issue(&mut issue, handoff);
+                    }
+                    let has_foreign_reports = row.get::<_, i64>(17)? != 0;
                     let last_attempt_at = row
-                        .get::<_, Option<String>>(17)?
+                        .get::<_, Option<String>>(18)?
                         .as_deref()
                         .and_then(parse_timestamp);
                     let latest_attempt = row
-                        .get::<_, Option<String>>(18)?
+                        .get::<_, Option<String>>(19)?
                         .and_then(|raw| latest_attempt_from_json_str(&raw).ok());
                     let last_attempt_model = patch_attempt_model(issue.best_patch.as_ref());
                     Ok(WorkerCandidate {
@@ -6398,6 +6414,8 @@ async fn next_issue_for_worker(
                         last_attempt_at,
                         last_attempt_model,
                         latest_attempt,
+                        has_best_triage: best_triage.is_some(),
+                        rerunnable_source_handoff,
                     })
                 },
             )?;
@@ -6416,6 +6434,13 @@ fn candidate_model_differs(candidate: &WorkerCandidate, worker_model: Option<&st
         (Some(wm), Some(lm)) => wm != lm,
         _ => false,
     }
+}
+
+fn candidate_is_available_for_worker(candidate: &WorkerCandidate) -> bool {
+    if candidate.rerunnable_source_handoff.is_some() {
+        return true;
+    }
+    !candidate.has_best_triage && issue_is_available_for_worker(&candidate.issue)
 }
 
 fn select_worker_candidate(
@@ -6443,7 +6468,7 @@ fn select_worker_candidate(
                 .find(|candidate| {
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
                         && candidate.has_foreign_reports
-                        && issue_is_available_for_worker(&candidate.issue)
+                        && candidate_is_available_for_worker(candidate)
                         && candidate_model_differs(candidate, worker_model)
                 })
                 .map(|candidate| candidate.issue.clone())
@@ -6463,7 +6488,7 @@ fn select_worker_candidate(
                 .iter()
                 .find(|candidate| {
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
-                        && issue_is_available_for_worker(&candidate.issue)
+                        && candidate_is_available_for_worker(candidate)
                         && candidate_model_differs(candidate, worker_model)
                 })
                 .map(|candidate| candidate.issue.clone())
@@ -6485,7 +6510,7 @@ fn select_worker_candidate(
                 .find(|candidate| {
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
                         && candidate.has_foreign_reports
-                        && issue_is_available_for_worker(&candidate.issue)
+                        && candidate_is_available_for_worker(candidate)
                 })
                 .map(|candidate| candidate.issue.clone())
         })
@@ -6503,7 +6528,7 @@ fn select_worker_candidate(
                 .iter()
                 .find(|candidate| {
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
-                        && issue_is_available_for_worker(&candidate.issue)
+                        && candidate_is_available_for_worker(candidate)
                 })
                 .map(|candidate| candidate.issue.clone())
         })
@@ -6520,7 +6545,7 @@ fn select_worker_candidate(
             sorted_candidates
                 .iter()
                 .filter(|candidate| {
-                    candidate.has_foreign_reports && issue_is_available_for_worker(&candidate.issue)
+                    candidate.has_foreign_reports && candidate_is_available_for_worker(candidate)
                 })
                 .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
                 .map(|candidate| candidate.issue.clone())
@@ -6535,7 +6560,7 @@ fn select_worker_candidate(
         .or_else(|| {
             sorted_candidates
                 .iter()
-                .filter(|candidate| issue_is_available_for_worker(&candidate.issue))
+                .filter(|candidate| candidate_is_available_for_worker(candidate))
                 .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
                 .map(|candidate| candidate.issue.clone())
         })
@@ -6810,13 +6835,21 @@ fn issue_from_row(row: Row) -> Result<IssueCluster> {
 }
 
 fn worker_candidate_from_row(row: Row) -> Result<WorkerCandidate> {
-    let has_foreign_reports: bool = row.get(16);
-    let last_attempt_at: Option<DateTime<Utc>> = row.get(17);
+    let best_triage = row
+        .get::<_, Option<Value>>(16)
+        .map(serde_json::from_value::<PatchAttempt>)
+        .transpose()?;
+    let rerunnable_source_handoff = best_triage.as_ref().and_then(rerunnable_source_handoff);
+    let has_foreign_reports: bool = row.get(17);
+    let last_attempt_at: Option<DateTime<Utc>> = row.get(18);
     let latest_attempt = row
-        .get::<_, Option<Value>>(18)
+        .get::<_, Option<Value>>(19)
         .map(latest_attempt_from_json_value)
         .transpose()?;
-    let issue = issue_from_row(row)?;
+    let mut issue = issue_from_row(row)?;
+    if let Some(handoff) = rerunnable_source_handoff.as_ref() {
+        attach_rerunnable_source_handoff_to_issue(&mut issue, handoff);
+    }
     let last_attempt_model = patch_attempt_model(latest_attempt.as_ref())
         .or_else(|| patch_attempt_model(issue.best_patch.as_ref()));
     Ok(WorkerCandidate {
@@ -6825,7 +6858,48 @@ fn worker_candidate_from_row(row: Row) -> Result<WorkerCandidate> {
         last_attempt_at,
         last_attempt_model,
         latest_attempt,
+        has_best_triage: best_triage.is_some(),
+        rerunnable_source_handoff,
     })
+}
+
+fn rerunnable_source_handoff(attempt: &PatchAttempt) -> Option<PublicTriageHandoff> {
+    let handoff = public_triage_handoff_from_attempt(attempt, None)?;
+    let classification = handoff.classification.as_deref()?;
+    if !matches!(
+        classification,
+        "external-local-executable" | "interpreter-workload"
+    ) {
+        return None;
+    }
+    handoff
+        .report_url
+        .as_deref()
+        .filter(|url| public_source_repo_url_for_handoff_inheritance(url))?;
+    Some(handoff)
+}
+
+fn attach_rerunnable_source_handoff_to_issue(
+    issue: &mut IssueCluster,
+    handoff: &PublicTriageHandoff,
+) {
+    let handoff_value = serde_json::to_value(handoff).expect("public handoff serializes");
+    let details = &mut issue.representative.finding.details;
+    if !details.is_object() {
+        *details = json!({
+            "original_details": details.clone()
+        });
+    }
+    if let Some(details) = details.as_object_mut() {
+        details.insert("handoff".to_string(), handoff_value);
+        details.insert(
+            "rerun_reason".to_string(),
+            json!("rerunnable-source-handoff"),
+        );
+        if let Some(report_url) = handoff.report_url.as_deref() {
+            details.insert("source_repo_url".to_string(), json!(report_url));
+        }
+    }
 }
 
 fn latest_attempt_from_json_value(raw: Value) -> Result<PatchAttempt> {
@@ -7167,6 +7241,22 @@ async fn load_public_issue_detail(
         .into_iter()
         .take(displayed_attempt_count)
         .collect();
+    let mut best_triage_handoff = best_triage
+        .as_ref()
+        .and_then(|attempt| attempt.handoff.clone());
+    if best_triage_handoff
+        .as_ref()
+        .is_some_and(|handoff| handoff.report_url.is_none())
+    {
+        if let Some(handoff) = load_public_triage(db, 100)
+            .await?
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.handoff)
+        {
+            best_triage_handoff = Some(handoff);
+        }
+    }
     Ok(PublicIssueDetail {
         id: issue.id,
         kind: issue.kind,
@@ -7183,9 +7273,7 @@ async fn load_public_issue_detail(
         best_patch_diff_url,
         best_patch_harvest,
         best_patch,
-        best_triage_handoff: best_triage
-            .as_ref()
-            .and_then(|attempt| attempt.handoff.clone()),
+        best_triage_handoff,
         best_triage,
         last_seen: issue.last_seen,
         technical_snapshot,
@@ -20381,6 +20469,132 @@ mod tests {
             .unwrap();
 
         assert_eq!(issue.id, "issue-runaway");
+    }
+
+    #[test]
+    fn worker_queue_reopens_cloneable_local_executable_handoff_for_source_rerun() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let mut ollama = sample_runaway_investigation("ollama", None);
+        ollama.finding.details["native_executable_provenance"] = json!({
+            "executable_name": "ollama",
+            "executable_path": "/usr/local/bin/ollama",
+            "source_kind": "go-module",
+            "source_name": "github.com/ollama/ollama"
+        });
+        insert_test_issue(
+            &connection,
+            "issue-ollama",
+            "cluster-ollama",
+            210,
+            "2026-03-30T10:00:00Z",
+            &ollama,
+            &["other-install"],
+        );
+        let triage = PatchAttempt {
+            cluster_id: "issue-ollama".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "triage".to_string(),
+            state: "ready".to_string(),
+            summary: "A diagnosis and external handoff were created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "report_only_reason": "workspace-acquisition",
+                "handoff": {
+                    "classification": "external-local-executable",
+                    "target": "local executable ollama",
+                    "report_url": "https://github.com/ollama/ollama.git"
+                }
+            }),
+            created_at: "2026-03-30T10:05:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_triage_json = ?2 WHERE id = ?1",
+                rusqlite::params!["issue-ollama", serde_json::to_string(&triage).unwrap()],
+            )
+            .unwrap();
+        insert_test_attempt(
+            &connection,
+            "attempt-ollama-triage",
+            "lease-ollama-triage",
+            &triage,
+            "2026-03-30T10:05:00Z",
+        );
+
+        let issue = test_runtime()
+            .block_on(next_issue_for_worker(&db, "new-worker-install", 0, None))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(issue.id, "issue-ollama");
+        assert_eq!(
+            issue.representative.finding.details["handoff"]["report_url"].as_str(),
+            Some("https://github.com/ollama/ollama.git")
+        );
+        assert_eq!(
+            issue.representative.finding.details["rerun_reason"].as_str(),
+            Some("rerunnable-source-handoff")
+        );
+    }
+
+    #[test]
+    fn worker_queue_does_not_reopen_terminal_triage_handoff() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let terminal = sample_runaway_investigation("opaque-worker", None);
+        let alternate = sample_runaway_investigation("qbittorrent", Some("qbittorrent"));
+        insert_test_issue(
+            &connection,
+            "issue-terminal",
+            "cluster-terminal",
+            220,
+            "2026-03-30T10:00:00Z",
+            &terminal,
+            &["other-install-a"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-alternate",
+            "cluster-alternate",
+            100,
+            "2026-03-30T10:00:00Z",
+            &alternate,
+            &["other-install-b"],
+        );
+        let triage = PatchAttempt {
+            cluster_id: "issue-terminal".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "triage".to_string(),
+            state: "ready".to_string(),
+            summary: "A diagnosis and external handoff were created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "report_only_reason": "workspace-acquisition",
+                "handoff": {
+                    "classification": "external-local-executable",
+                    "target": "local executable opaque-worker"
+                }
+            }),
+            created_at: "2026-03-30T10:05:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_triage_json = ?2 WHERE id = ?1",
+                rusqlite::params!["issue-terminal", serde_json::to_string(&triage).unwrap()],
+            )
+            .unwrap();
+
+        let issue = test_runtime()
+            .block_on(next_issue_for_worker(&db, "new-worker-install", 0, None))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(issue.id, "issue-alternate");
     }
 
     #[test]
