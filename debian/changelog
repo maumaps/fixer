@@ -1,3 +1,11 @@
+fixer (0.211.0-1) unstable; urgency=medium
+
+  * Show manual patch dispositions on public issue detail pages.
+  * Keep retained semantic-risk diffs visibly actionable instead of falling
+    back to generic missing-metadata harvest blockers.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 14:24:20 +0400
+
 fixer (0.210.0-1) unstable; urgency=medium
 
   * Add manual public patch dispositions for retained do-not-send artifacts.

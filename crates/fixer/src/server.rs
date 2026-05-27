@@ -900,6 +900,8 @@ struct PublicIssueDetail {
     best_patch_diff_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     best_patch_harvest: Option<PublicPatchHarvestReview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_patch_manual_disposition: Option<PublicPatchDisposition>,
     best_patch: Option<PublicAttempt>,
     best_triage: Option<PublicAttempt>,
     best_triage_handoff: Option<PublicTriageHandoff>,
@@ -7334,6 +7336,12 @@ async fn load_public_issue_detail(
             attempt,
         )
     });
+    let best_patch_manual_disposition = if best_patch.is_some() {
+        let mut dispositions = load_public_patch_manual_dispositions(db).await?;
+        dispositions.remove(&id)
+    } else {
+        None
+    };
     let best_patch_diff_url = public_best_patch_diff_url(&id, best_patch.as_ref());
     let possible_duplicates = load_possible_duplicates(db, &id, &issue, 6).await?;
     let all_attempts = load_public_attempts(db, &id, 1024).await?;
@@ -7375,6 +7383,7 @@ async fn load_public_issue_detail(
         best_triage_available: best_triage.is_some(),
         best_patch_diff_url,
         best_patch_harvest,
+        best_patch_manual_disposition,
         best_patch,
         best_triage_handoff,
         best_triage,
@@ -14554,6 +14563,30 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
     let technical_snapshot_markup = render_technical_snapshot_section(issue);
     let duplicates_markup = render_possible_duplicates_section(issue);
     let attempt_summary_markup = render_attempt_summary_section(issue);
+    let best_patch_needs_review = issue.best_patch_manual_disposition.is_none()
+        && issue
+            .best_patch_harvest
+            .as_ref()
+            .is_some_and(|review| review.status != "ready" || !review.blockers.is_empty());
+    let mut issue_tags = render_issue_tags(
+        issue.kind.as_str(),
+        issue.package_name.as_deref(),
+        issue.source_package.as_deref(),
+        issue.ecosystem.as_deref(),
+        issue.severity.as_deref(),
+        issue.score,
+        issue.corroboration_count,
+        issue.best_patch_available,
+        best_patch_needs_review,
+        issue.best_triage_available,
+    );
+    if let Some(disposition) = issue.best_patch_manual_disposition.as_ref() {
+        let _ = write!(
+            issue_tags,
+            "<span class=\"tag\">manual: {}</span>",
+            html_escape(&disposition.disposition.replace('_', " "))
+        );
+    }
     let attempts_markup = if issue.attempts.is_empty() {
         "<p class=\"fine-print\">No public attempts have been published for this issue yet.</p>"
             .to_string()
@@ -14587,21 +14620,7 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
         "#,
         html_escape(&issue.title),
         html_escape(&issue.summary),
-        render_issue_tags(
-            issue.kind.as_str(),
-            issue.package_name.as_deref(),
-            issue.source_package.as_deref(),
-            issue.ecosystem.as_deref(),
-            issue.severity.as_deref(),
-            issue.score,
-            issue.corroboration_count,
-            issue.best_patch_available,
-            issue
-                .best_patch_harvest
-                .as_ref()
-                .is_some_and(|review| { review.status != "ready" || !review.blockers.is_empty() }),
-            issue.best_triage_available,
-        ),
+        issue_tags,
         html_escape(&format_timestamp(&issue.last_seen)),
         issue.id,
         issue.id,
@@ -14837,38 +14856,98 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
         })
         .unwrap_or_default();
     let harvest_review = issue.best_patch_harvest.as_ref();
-    let needs_harvest_review = harvest_review
-        .is_some_and(|review| review.status != "ready" || !review.blockers.is_empty());
-    let heading = if needs_harvest_review {
+    let manual_disposition = issue.best_patch_manual_disposition.as_ref();
+    let manual_disposition_summary =
+        manual_disposition.map(public_patch_manual_disposition_bucket_and_reason);
+    let needs_harvest_review = manual_disposition.is_none()
+        && harvest_review
+            .is_some_and(|review| review.status != "ready" || !review.blockers.is_empty());
+    let heading = if let Some((bucket, _)) = manual_disposition_summary.as_ref() {
+        match bucket.as_str() {
+            "semantic-risk" => "Patch retained for semantic-risk review",
+            "fixer-defect" => "Patch retained for Fixer repair",
+            "do-not-send" => "Patch retained as do-not-send evidence",
+            _ => "Patch retained for manual disposition",
+        }
+    } else if needs_harvest_review {
         "Patch needs harvest review"
     } else {
         "Pull-request-ready diff"
     };
-    let intro = if needs_harvest_review {
+    let intro = if manual_disposition.is_some() {
+        "This diff is preserved as useful evidence, but a manual disposition supersedes the original harvest blockers. Use the patch to understand the failure mode; do not send it upstream unchanged."
+    } else if needs_harvest_review {
         "This is the current best preserved diff for the issue, but Fixer should not treat it as upstream-ready until the proof blockers below are cleared. The downloadable `.patch` is useful for review and repair; do not send it upstream unchanged."
     } else {
         "This is the current best public patch attempt for the issue. The downloadable `.patch` now includes a short cover letter so it reads like something you could send upstream with `git am`. If you only want the raw diff, grab the `.diff` instead."
     };
-    let harvest_tags = harvest_review
-        .filter(|review| review.status != "ready" || !review.blockers.is_empty())
-        .map(|review| {
-            let mut tags = format!(
+    let mut harvest_tags = manual_disposition
+        .map(|disposition| {
+            format!(
+                "<span class=\"tag\">manual: {}</span>",
+                html_escape(&disposition.disposition.replace('_', " "))
+            )
+        })
+        .unwrap_or_default();
+    if manual_disposition.is_none() {
+        if let Some(review) =
+            harvest_review.filter(|review| review.status != "ready" || !review.blockers.is_empty())
+        {
+            harvest_tags = format!(
                 "<span class=\"tag\">harvest: {}</span>",
                 html_escape(&review.status.replace('_', " "))
             );
             for blocker in &review.blockers {
                 let _ = write!(
-                    tags,
+                    harvest_tags,
                     "<span class=\"tag\">{}</span>",
                     html_escape(&blocker.replace('_', " "))
                 );
             }
-            tags
-        })
-        .unwrap_or_default();
-    let harvest_warning = harvest_review
-        .filter(|review| !review.blockers.is_empty() || !review.next_actions.is_empty())
-        .map(|review| {
+        }
+    }
+    let harvest_warning = if let Some(disposition) = manual_disposition {
+        let (_, reason) = manual_disposition_summary
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| public_patch_manual_disposition_bucket_and_reason(disposition));
+        let manual_actions = public_patch_manual_disposition_next_actions(disposition)
+            .into_iter()
+            .map(|action| format!("<li>{}</li>", html_escape(&action)))
+            .collect::<Vec<_>>()
+            .join("");
+        let action_section = if manual_actions.is_empty() {
+            String::new()
+        } else {
+            format!("<h4>Next proof/action</h4><ul class=\"attempt-list\">{manual_actions}</ul>")
+        };
+        let original_blockers = harvest_review
+            .filter(|review| !review.blockers.is_empty())
+            .map(|review| {
+                let blockers = review
+                    .blockers
+                    .iter()
+                    .map(|blocker| {
+                        format!("<li>{}</li>", html_escape(&blocker.replace('_', " ")))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                format!(
+                    "<h4>Original harvest blockers</h4><p class=\"issue-summary\">These blockers remain on the preserved local diff, but the manual disposition above is the current handoff.</p><ul class=\"attempt-list\">{}</ul>",
+                    blockers
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "<section class=\"patch-summary\"><h4>Manual disposition</h4><p class=\"issue-summary\">{}</p>{}{}</section>",
+            html_escape(&reason),
+            action_section,
+            original_blockers
+        )
+    } else {
+        harvest_review
+            .filter(|review| !review.blockers.is_empty() || !review.next_actions.is_empty())
+            .map(|review| {
             let blockers = review
                 .blockers
                 .iter()
@@ -14895,8 +14974,9 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
                 format!("<h4>Next proof/action</h4><ul class=\"attempt-list\">{actions}</ul>")
             };
             format!("<section class=\"patch-summary\">{blocker_section}{action_section}</section>")
-        })
-        .unwrap_or_default();
+            })
+            .unwrap_or_default()
+    };
     let changed_files = if cover.changed_files.is_empty() {
         String::new()
     } else {
@@ -17700,6 +17780,7 @@ mod tests {
                 "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch".to_string(),
             ),
             best_patch_harvest: None,
+            best_patch_manual_disposition: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -17770,6 +17851,7 @@ mod tests {
                     "missing_patch_metadata".to_string(),
                 ]),
             }),
+            best_patch_manual_disposition: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -17818,6 +17900,85 @@ mod tests {
     }
 
     #[test]
+    fn render_issue_detail_page_prefers_manual_disposition_over_harvest_blockers() {
+        let issue = PublicIssueDetail {
+            id: "019d3a17-b958-7a60-86fd-5304e697f42c".to_string(),
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for postgres".to_string(),
+            summary: "postgres is stuck in a file-not-found retry loop.".to_string(),
+            package_name: Some("postgresql-18".to_string()),
+            source_package: Some("postgresql-18".to_string()),
+            ecosystem: Some("debian".to_string()),
+            severity: Some("high".to_string()),
+            score: 106,
+            corroboration_count: 2,
+            best_patch_available: true,
+            best_triage_available: false,
+            best_patch_diff_url: Some(
+                "/issues/019d3a17-b958-7a60-86fd-5304e697f42c/best.patch".to_string(),
+            ),
+            best_patch_harvest: Some(PublicPatchHarvestReview {
+                status: "needs_review".to_string(),
+                blockers: vec!["missing_patch_metadata".to_string()],
+                next_actions: public_patch_harvest_next_actions_for_blockers(&[
+                    "missing_patch_metadata".to_string(),
+                ]),
+            }),
+            best_patch_manual_disposition: Some(PublicPatchDisposition {
+                disposition: "semantic_risk".to_string(),
+                reason: "changes visible $libdir/foo lookup precedence".to_string(),
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+            }),
+            best_patch: Some(PublicAttempt {
+                outcome: "patch".to_string(),
+                state: "ready".to_string(),
+                summary: "Patch proposal created locally.".to_string(),
+                validation_status: Some("ready".to_string()),
+                created_at: "2026-03-29T00:00:00Z".to_string(),
+                published_session: Some(PublishedAttemptSession {
+                    prompt: "Read ./evidence.json".to_string(),
+                    response: Some("Patched ./workspace/src/file.c".to_string()),
+                    diff: Some(
+                        "--- a/src/backend/utils/fmgr/dfmgr.c\n+++ b/src/backend/utils/fmgr/dfmgr.c\n@@\n+/* Avoid the retry loop on missing files. */\n"
+                            .to_string(),
+                    ),
+                    model: Some("gpt-5.4".to_string()),
+                    models_used: vec!["gpt-5.4".to_string()],
+                    rate_limit_fallback_used: false,
+                }),
+                handoff: None,
+                blocker_reason: None,
+                failure_diagnostics: None,
+                failure_context: None,
+            }),
+            best_triage: None,
+            best_triage_handoff: None,
+            last_seen: "2026-03-29T00:00:00Z".to_string(),
+            technical_snapshot: None,
+            possible_duplicates: Vec::new(),
+            attempt_summary: PublicAttemptSummary::default(),
+            attempts_omitted_count: 0,
+            attempts: Vec::new(),
+            showing_all_attempts: false,
+        };
+
+        let markup = render_issue_detail_page(&issue);
+
+        assert!(markup.contains("Patch retained for semantic-risk review"));
+        assert!(markup.contains("manual: semantic risk"));
+        assert!(
+            markup.contains("manual semantic risk: changes visible $libdir/foo lookup precedence")
+        );
+        assert!(markup.contains("Original harvest blockers"));
+        assert!(markup.contains("manual disposition above is the current handoff"));
+        assert!(markup.contains("design a semantics-preserving replacement"));
+        assert!(!markup.contains("Patch needs harvest review"));
+        assert!(!markup.contains("patch needs review"));
+        assert!(!markup.contains("Harvest review needed"));
+        assert!(!markup.contains("Backfill proposal metadata"));
+    }
+
+    #[test]
     fn render_attempt_summary_section_collapses_zero_outcomes() {
         let issue = PublicIssueDetail {
             id: "0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8".to_string(),
@@ -17834,6 +17995,7 @@ mod tests {
             best_triage_available: false,
             best_patch_diff_url: None,
             best_patch_harvest: None,
+            best_patch_manual_disposition: None,
             best_patch: None,
             best_triage: None,
             best_triage_handoff: None,
@@ -17879,6 +18041,7 @@ mod tests {
                 "/issues/0195e5cc-c1ef-7c4e-a4f9-3bb0b44df5f8/best.patch".to_string(),
             ),
             best_patch_harvest: None,
+            best_patch_manual_disposition: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -17978,6 +18141,7 @@ mod tests {
             best_triage_available: true,
             best_patch_diff_url: None,
             best_patch_harvest: None,
+            best_patch_manual_disposition: None,
             best_patch: None,
             best_triage: Some(PublicAttempt {
                 outcome: "triage".to_string(),
@@ -18055,6 +18219,7 @@ mod tests {
             best_triage_available: false,
             best_patch_diff_url: None,
             best_patch_harvest: None,
+            best_patch_manual_disposition: None,
             best_patch: None,
             best_triage: None,
             best_triage_handoff: None,
@@ -18111,6 +18276,7 @@ mod tests {
             best_triage_available: false,
             best_patch_diff_url: None,
             best_patch_harvest: None,
+            best_patch_manual_disposition: None,
             best_patch: None,
             best_triage: None,
             best_triage_handoff: None,
@@ -18164,6 +18330,7 @@ mod tests {
             best_triage_available: false,
             best_patch_diff_url: None,
             best_patch_harvest: None,
+            best_patch_manual_disposition: None,
             best_patch: None,
             best_triage: None,
             best_triage_handoff: None,
@@ -18217,6 +18384,7 @@ mod tests {
                     "missing_patch_metadata".to_string(),
                 ]),
             }),
+            best_patch_manual_disposition: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -18302,6 +18470,7 @@ mod tests {
                 "/issues/019d5954-5300-75b1-b0a0-16d9cf5259e1/best.patch".to_string(),
             ),
             best_patch_harvest: None,
+            best_patch_manual_disposition: None,
             best_patch: Some(PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
