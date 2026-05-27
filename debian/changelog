@@ -1,3 +1,9 @@
+fixer (0.198.0-1) unstable; urgency=medium
+
+  * Backfill source provenance for old local executable investigations.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 09:06:23 +0400
+
 fixer (0.197.0-1) unstable; urgency=medium
 
   * Preserve local executable source provenance without richer evidence.

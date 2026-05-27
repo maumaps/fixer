@@ -1,6 +1,7 @@
 use crate::adapters::inspect_repo;
 use crate::config::FixerConfig;
 use crate::models::{InstalledPackageMetadata, OpportunityRecord, PreparedWorkspace};
+use crate::native_provenance::native_executable_source_hint;
 use crate::util::{
     command_exists, command_output_in_dir_with_timeout, command_output_os_with_timeout,
     command_output_with_timeout, command_status_in_dir_with_timeout, command_status_with_timeout,
@@ -443,30 +444,27 @@ fn upstream_source_alias(source_package: &str) -> Option<WorkspaceSourceTarget> 
 fn native_executable_source_target(
     opportunity: &OpportunityRecord,
 ) -> Option<WorkspaceSourceTarget> {
-    let provenance = opportunity
+    let details = opportunity.evidence.get("details")?;
+    let artifact_path = opportunity
         .evidence
-        .get("details")?
-        .get("native_executable_provenance")?;
-    let repo_url = provenance
-        .get("source_repo_url")
-        .and_then(Value::as_str)
+        .get("artifact_path")
+        .and_then(Value::as_str);
+    let source_hint = native_executable_source_hint(details, artifact_path)?;
+    let repo_url = source_hint
+        .source_repo_url
+        .as_deref()
         .filter(|value| is_cloneable_repo_url(value))?;
-    let source_name = provenance
-        .get("source_name")
-        .and_then(Value::as_str)
-        .or_else(|| provenance.get("executable_name").and_then(Value::as_str))
+    let source_name = source_hint
+        .source_name
+        .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("local-executable-source");
-    let executable_name = provenance
-        .get("executable_name")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(source_name);
     Some(WorkspaceSourceTarget {
         source_package: sanitize_dir_name(source_name),
         upstream_url: Some(repo_url.to_string()),
         acquisition_note: Some(format!(
-            "Cloned {repo_url} from local executable build metadata for {executable_name}; rerun Fixer against upstream HEAD instead of discarding the retained local-executable evidence."
+            "Cloned {repo_url} from local executable build metadata for {}; rerun Fixer against upstream HEAD instead of discarding the retained local-executable evidence.",
+            source_hint.executable_name
         )),
     })
 }

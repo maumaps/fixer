@@ -3,6 +3,7 @@ use crate::models::{
     ClientHello, IssueCluster, PatchAttempt, ServerHello, SharedOpportunity, SubmissionEnvelope,
     SubmissionReceipt, WorkLease, WorkOffer, WorkPullRequest, WorkerResultEnvelope,
 };
+use crate::native_provenance::enrich_runaway_native_executable_provenance;
 use crate::network::verify_worker_pull_pow;
 use crate::pow::verify_pow;
 use crate::privacy::PRIVACY_WARNING;
@@ -11763,9 +11764,12 @@ fn public_triage_handoff_from_attempt(
     attempt: &PatchAttempt,
     published_session: Option<&PublishedAttemptSession>,
 ) -> Option<PublicTriageHandoff> {
+    let mut details = attempt.details.clone();
+    if let Some(diagnosis) = details.get_mut("diagnosis") {
+        enrich_runaway_native_executable_provenance(diagnosis, None, false);
+    }
     let reason = inferred_triage_reason(attempt)?;
-    let raw_target = attempt
-        .details
+    let raw_target = details
         .get("handoff")
         .and_then(|value| value.get("target"))
         .and_then(Value::as_str)
@@ -11774,22 +11778,20 @@ fn public_triage_handoff_from_attempt(
         .unwrap_or_else(|| {
             "external dependency or workload outside the current source tree".to_string()
         });
-    let mut classification = attempt
-        .details
+    let mut classification = details
         .get("handoff")
         .and_then(|value| value.get("classification"))
         .and_then(Value::as_str)
         .or_else(|| {
-            attempt
-                .details
+            details
                 .get("workspace_classification")
                 .and_then(Value::as_str)
         })
         .map(sanitize_public_text)
         .filter(|value| !value.trim().is_empty())
         .or_else(|| triage_reason_classification(&reason).map(ToString::to_string));
-    let local_executable = legacy_local_executable_handoff_target(&attempt.details);
-    let interpreter_workload = interpreter_workload_handoff_target(&attempt.details);
+    let local_executable = legacy_local_executable_handoff_target(&details);
+    let interpreter_workload = interpreter_workload_handoff_target(&details);
     let target = if classification.as_deref() == Some("workspace-unavailable") {
         if let Some(target) = local_executable.as_ref() {
             classification = Some("external-local-executable".to_string());
@@ -11803,22 +11805,19 @@ fn public_triage_handoff_from_attempt(
     } else {
         raw_target
     };
-    let report_url = attempt
-        .details
+    let report_url = details
         .get("handoff")
         .and_then(|value| value.get("report_url"))
         .and_then(Value::as_str)
         .or_else(|| {
-            attempt
-                .details
+            details
                 .get("diagnosis")
                 .and_then(|value| value.get("native_executable_provenance"))
                 .and_then(|value| value.get("source_repo_url"))
                 .and_then(Value::as_str)
         })
         .or_else(|| {
-            attempt
-                .details
+            details
                 .get("diagnosis")
                 .and_then(|value| value.get("interpreter_process"))
                 .and_then(|value| value.get("source_repo_url"))
@@ -11826,8 +11825,7 @@ fn public_triage_handoff_from_attempt(
         })
         .map(ToString::to_string)
         .filter(|value| !value.trim().is_empty());
-    let next_steps = attempt
-        .details
+    let next_steps = details
         .get("handoff")
         .and_then(|value| value.get("next_steps"))
         .and_then(Value::as_array)

@@ -4,6 +4,7 @@ use crate::models::{
     OpportunityRecord, PatchAttempt, PatchDriver, PreparedWorkspace, ProposalRecord,
     SharedOpportunity,
 };
+use crate::native_provenance::enrich_runaway_native_executable_provenance;
 use crate::storage::Store;
 use crate::util::{
     command_exists, command_output_with_timeout, command_run_in_dir_with_timeout,
@@ -4443,11 +4444,16 @@ fn render_external_bug_report(
     if opportunity.kind != "crash" {
         return render_external_issue_report(opportunity, package, system, evidence_path);
     }
-    let details = opportunity
+    let mut details = opportunity
         .evidence
         .get("details")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let artifact_path = opportunity
+        .evidence
+        .get("artifact_path")
+        .and_then(Value::as_str);
+    enrich_runaway_native_executable_provenance(&mut details, artifact_path, false);
     let signal_name = details
         .get("signal_name")
         .and_then(Value::as_str)
@@ -4622,11 +4628,16 @@ fn render_external_issue_report(
     system: &Value,
     evidence_path: &std::path::Path,
 ) -> String {
-    let details = opportunity
+    let mut details = opportunity
         .evidence
         .get("details")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let artifact_path = opportunity
+        .evidence
+        .get("artifact_path")
+        .and_then(Value::as_str);
+    enrich_runaway_native_executable_provenance(&mut details, artifact_path, false);
     let subsystem = details
         .get("subsystem")
         .and_then(Value::as_str)
@@ -4780,11 +4791,16 @@ fn render_process_investigation_report(
     evidence_path: &std::path::Path,
     acquisition_error: Option<&str>,
 ) -> String {
-    let details = opportunity
+    let mut details = opportunity
         .evidence
         .get("details")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let artifact_path = opportunity
+        .evidence
+        .get("artifact_path")
+        .and_then(Value::as_str);
+    enrich_runaway_native_executable_provenance(&mut details, artifact_path, false);
     let subsystem = details
         .get("subsystem")
         .and_then(Value::as_str)
@@ -5048,6 +5064,33 @@ fn render_process_investigation_report(
             body.push_str(&format!(
                 "- Suggested report URL: `{report_url}`\n- Report URL source: `{source}`\n"
             ));
+        }
+    }
+    if let Some(provenance) = details
+        .get("native_executable_provenance")
+        .filter(|value| !value.is_null())
+    {
+        body.push_str("\n## Native Executable Source\n\n");
+        if let Some(name) = provenance.get("executable_name").and_then(Value::as_str) {
+            body.push_str(&format!("- Executable: `{name}`\n"));
+        }
+        if let Some(source_name) = provenance.get("source_name").and_then(Value::as_str) {
+            body.push_str(&format!("- Source identity: `{source_name}`\n"));
+        }
+        if let Some(repo_url) = provenance.get("source_repo_url").and_then(Value::as_str) {
+            body.push_str(&format!("- Source repository: `{repo_url}`\n"));
+        }
+        body.push_str(&format!(
+            "- Evidence gap: {}\n",
+            native_executable_public_evidence_gap(provenance)
+        ));
+        if let Some(steps) = provenance
+            .get("recommended_next_steps")
+            .and_then(Value::as_array)
+        {
+            for step in steps.iter().filter_map(Value::as_str) {
+                body.push_str(&format!("- Next: {step}\n"));
+            }
         }
     }
 
@@ -5795,6 +5838,17 @@ fn render_process_investigation_report(
         evidence_path.display()
     ));
     body
+}
+
+fn native_executable_public_evidence_gap(provenance: &Value) -> String {
+    let executable_name = provenance
+        .get("executable_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("the executable");
+    format!(
+        "Fixer captured native userspace executable {executable_name}, but no Debian package or source package owns that executable."
+    )
 }
 
 pub fn annotate_process_investigation_report_blocker(
@@ -7363,6 +7417,106 @@ mod tests {
         assert!(rendered.contains("recvmsg x122"));
         assert!(rendered.contains("Validation Steps"));
         assert!(rendered.contains("workspace"));
+    }
+
+    #[test]
+    fn runaway_investigation_reports_backfill_local_executable_source_context() {
+        let opportunity = OpportunityRecord {
+            id: 79,
+            finding_id: 79,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for synthetic-runner".to_string(),
+            score: 95,
+            state: "open".to_string(),
+            summary: "synthetic-runner is stuck in a likely unknown userspace loop.".to_string(),
+            evidence: json!({
+                "artifact_path": "/usr/local/bin/synthetic-runner",
+                "details": {
+                    "subsystem": "runaway-process",
+                    "profile_target": {
+                        "name": "synthetic-runner",
+                        "path": "/usr/local/bin/synthetic-runner",
+                        "package_name": null
+                    },
+                    "sampled_pid": 4243,
+                    "loop_classification": "unknown-userspace-loop",
+                    "loop_confidence": 0.42
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+            updated_at: "2026-05-27T00:00:00Z".to_string(),
+        };
+        let system = json!({
+            "os_pretty_name": "Debian GNU/Linux forky/sid",
+            "kernel": "Linux 7.1-amd64"
+        });
+
+        let rendered = render_process_investigation_report(
+            &opportunity,
+            None,
+            &system,
+            Path::new("/tmp/evidence.json"),
+            Some("could not acquire source package automatically"),
+        );
+
+        assert!(rendered.contains("Native Executable Source"));
+        assert!(rendered.contains("Executable: `synthetic-runner`"));
+        assert!(rendered.contains("Fixer captured native userspace executable synthetic-runner"));
+        assert!(rendered.contains("Find the upstream project or local checkout"));
+    }
+
+    #[test]
+    fn runaway_investigation_reports_redact_native_executable_gap_paths() {
+        let opportunity = OpportunityRecord {
+            id: 80,
+            finding_id: 80,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for aurora-agent".to_string(),
+            score: 95,
+            state: "open".to_string(),
+            summary: "aurora-agent is stuck in a likely unknown userspace loop.".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "runaway-process",
+                    "profile_target": {
+                        "name": "aurora-agent",
+                        "path": "/home/user/private/bin/aurora-agent",
+                        "package_name": null
+                    },
+                    "native_executable_provenance": {
+                        "executable_name": "aurora-agent",
+                        "executable_path": "/home/user/private/bin/aurora-agent",
+                        "evidence_gap": "Fixer captured a native userspace process at /home/user/private/bin/aurora-agent, but no Debian package or source package owns that executable.",
+                        "recommended_next_steps": [
+                            "Find the upstream project or local checkout that installed aurora-agent before asking Fixer for a source patch."
+                        ]
+                    }
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+            updated_at: "2026-05-27T00:00:00Z".to_string(),
+        };
+        let system = json!({
+            "os_pretty_name": "Debian GNU/Linux forky/sid",
+            "kernel": "Linux 7.1-amd64"
+        });
+
+        let rendered = render_process_investigation_report(
+            &opportunity,
+            None,
+            &system,
+            Path::new("/tmp/evidence.json"),
+            Some("could not acquire source package automatically"),
+        );
+
+        assert!(rendered.contains("Native Executable Source"));
+        assert!(rendered.contains("Executable: `aurora-agent`"));
+        assert!(rendered.contains("Fixer captured native userspace executable aurora-agent"));
+        assert!(!rendered.contains("/home/user/private"));
     }
 
     #[test]

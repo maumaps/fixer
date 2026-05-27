@@ -7,6 +7,7 @@ use crate::models::{
     SubmissionEnvelope, SubmissionReceipt, SubmittedProposal, WorkOffer, WorkPullRequest,
     WorkerResultEnvelope,
 };
+use crate::native_provenance::enrich_runaway_native_executable_provenance;
 use crate::pow::{mine_pow, verify_pow};
 use crate::privacy::{consent_policy_digest, consent_policy_text, redact_string, redact_value};
 use crate::proposal;
@@ -2636,11 +2637,17 @@ fn investigation_classification_phrase(classification: &str, fallback_kind: &str
 }
 
 fn process_investigation_worker_diagnosis(opportunity: &crate::models::OpportunityRecord) -> Value {
-    opportunity
+    let mut diagnosis = opportunity
         .evidence
         .get("details")
         .cloned()
-        .unwrap_or_else(|| json!({}))
+        .unwrap_or_else(|| json!({}));
+    let artifact_path = opportunity
+        .evidence
+        .get("artifact_path")
+        .and_then(Value::as_str);
+    enrich_runaway_native_executable_provenance(&mut diagnosis, artifact_path, false);
+    diagnosis
 }
 
 fn process_investigation_prefers_report_only(
