@@ -1,3 +1,17 @@
+fixer (0.186.0-1) unstable; urgency=medium
+
+  * Keep closed source-path-family reviews in needs-review instead of
+    promoting distinct sensitive diffs as fresh harvest candidates.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 18:55:00 +0400
+
+fixer (0.185.0-1) unstable; urgency=medium
+
+  * Keep source-path-family upstream reviews as advisory metadata so distinct
+    ready diffs are not hidden from harvest as already-covered patches.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 18:35:00 +0400
+
 fixer (0.184.0-1) unstable; urgency=medium
 
   * Preserve public triage handoff classifications so local executable and

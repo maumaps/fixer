@@ -7832,6 +7832,18 @@ fn public_patch_harvest_bucket_and_reason(patch: &PublicPatchEntry) -> (String, 
         );
     }
     if let Some(review) = patch.related_upstream_review.as_ref() {
+        if review.relation == "source_path_family" {
+            if public_upstream_review_state_is_closed(&review.state) {
+                return (
+                    "needs-review".to_string(),
+                    format!(
+                        "related source-path family review {} needs distinct-issue review",
+                        review.state.replace('_', "-")
+                    ),
+                );
+            }
+            return public_patch_harvest_bucket_without_related_review(patch);
+        }
         if review.state == "merged" {
             return (
                 "merged".to_string(),
@@ -7853,6 +7865,12 @@ fn public_patch_harvest_bucket_and_reason(patch: &PublicPatchEntry) -> (String, 
             format!("related upstream review {}", review.relation),
         );
     }
+    public_patch_harvest_bucket_without_related_review(patch)
+}
+
+fn public_patch_harvest_bucket_without_related_review(
+    patch: &PublicPatchEntry,
+) -> (String, String) {
     if let Some(duplicate) = patch.duplicate_patch.as_ref() {
         if patch.harvest_status == "ready" && patch.harvest_blockers.is_empty() {
             return (
@@ -18344,7 +18362,7 @@ mod tests {
             details: json!({
                 "published_session": {
                     "prompt": "patch prompt",
-                    "response": "Subject: supervisord: skip idle reaping\n\n## Git Add Paths\nsupervisor/supervisord.py\nsupervisor/tests/test_supervisord.py\n",
+                    "response": "Subject: supervisord: skip idle reaping\n\n## Evidence Confidence\nreproduced\n\n## Git Add Paths\nsupervisor/supervisord.py\nsupervisor/tests/test_supervisord.py\n\n## Validation\npytest passed\n",
                     "diff": "--- a/supervisor/supervisord.py\n+++ b/supervisor/supervisord.py\n@@ -1 +1 @@\n-old\n+new\n",
                 }
             }),
@@ -18362,7 +18380,7 @@ mod tests {
             details: json!({
                 "published_session": {
                     "prompt": "patch prompt",
-                    "response": "Subject: supervisord: avoid idle waitpid polling\n\n## Git Add Paths\nsupervisor/supervisord.py\nsupervisor/tests/base.py\nsupervisor/tests/test_supervisord.py\n",
+                    "response": "Subject: supervisord: avoid idle waitpid polling\n\n## Evidence Confidence\nreproduced\n\n## Git Add Paths\nsupervisor/supervisord.py\nsupervisor/tests/base.py\nsupervisor/tests/test_supervisord.py\n\n## Validation\npytest passed\n",
                     "diff": "--- a/supervisor/supervisord.py\n+++ b/supervisor/supervisord.py\n@@ -1 +1 @@\n-old\n+newer\n",
                 }
             }),
@@ -18425,6 +18443,11 @@ mod tests {
         );
         assert_eq!(family.state, "closed_unmerged");
         assert_eq!(family.family_count, 2);
+        assert_eq!(related.harvest_bucket, "needs-review");
+        assert_eq!(
+            related.harvest_reason,
+            "related source-path family review closed-unmerged needs distinct-issue review"
+        );
     }
 
     #[test]
@@ -18466,7 +18489,7 @@ mod tests {
             details: json!({
                 "published_session": {
                     "prompt": "patch prompt",
-                    "response": "Subject: libcontainerd: throttle event stream restarts\n\n## Git Add Paths\nengine/libcontainerd/remote/client.go\nengine/libcontainerd/remote/client_test.go\n",
+                    "response": "Subject: libcontainerd: throttle event stream restarts\n\n## Evidence Confidence\nreproduced\n\n## Git Add Paths\nengine/libcontainerd/remote/client.go\nengine/libcontainerd/remote/client_test.go\n\n## Validation\ngo test passed\n",
                     "diff": "--- a/engine/libcontainerd/remote/client.go\n+++ b/engine/libcontainerd/remote/client.go\n@@ -1 +1 @@\n-old\n+new\n",
                 }
             }),
@@ -18484,7 +18507,7 @@ mod tests {
             details: json!({
                 "published_session": {
                     "prompt": "patch prompt",
-                    "response": "Subject: libcontainerd: handle closed event stream channel\n\n## Git Add Paths\nengine/libcontainerd/remote/client.go\n",
+                    "response": "Subject: libcontainerd: handle closed event stream channel\n\n## Evidence Confidence\nreproduced\n\n## Git Add Paths\nengine/libcontainerd/remote/client.go\n\n## Validation\ngo test passed\n",
                     "diff": "--- a/engine/libcontainerd/remote/client.go\n+++ b/engine/libcontainerd/remote/client.go\n@@ -1 +1 @@\n-old\n+newer\n",
                 }
             }),
@@ -18544,6 +18567,8 @@ mod tests {
         assert_eq!(family.pr_url, "https://github.com/moby/moby/pull/52643");
         assert_eq!(family.state, "review");
         assert_eq!(family.family_count, 2);
+        assert_eq!(related.harvest_bucket, "realish");
+        assert_eq!(related.harvest_reason, "candidate source diff");
     }
 
     #[test]
