@@ -3492,6 +3492,15 @@ fn published_session_publication_blocker(
         );
     }
 
+    if published_session_touches_openssh_preauth_timing(opportunity, diff)
+        && published_response_evidence_confidence(response) != Some("reproduced")
+    {
+        return Some(
+            "OpenSSH pre-authentication/authentication timing patch changes security-sensitive behavior without reproduced evidence and explicit security-impact analysis; publish a diagnosis or gather a failing/passing proof first."
+                .to_string(),
+        );
+    }
+
     if opportunity
         .evidence
         .get("details")
@@ -3541,6 +3550,28 @@ fn postgresql_core_patch_path(path: &str) -> bool {
         || path.starts_with("src/include/")
         || path.starts_with("src/bin/pg_upgrade/")
         || path.starts_with("contrib/")
+}
+
+fn published_session_touches_openssh_preauth_timing(
+    opportunity: &OpportunityRecord,
+    diff: &str,
+) -> bool {
+    let package_matches = opportunity
+        .evidence
+        .get("source_package")
+        .or_else(|| opportunity.evidence.get("package_name"))
+        .and_then(Value::as_str)
+        .is_some_and(|package| package == "openssh" || package.starts_with("openssh-"));
+    if !package_matches {
+        return false;
+    }
+    published_diff_changed_paths(diff)
+        .iter()
+        .any(|path| openssh_preauth_timing_patch_path(path))
+}
+
+fn openssh_preauth_timing_patch_path(path: &str) -> bool {
+    matches!(path, "auth2.c" | "sshd-auth.c")
 }
 
 fn published_diff_changed_paths(diff: &str) -> Vec<String> {
@@ -3953,6 +3984,26 @@ mod tests {
         }
     }
 
+    fn sample_openssh_opportunity() -> OpportunityRecord {
+        OpportunityRecord {
+            id: 2,
+            finding_id: 2,
+            kind: "investigation".to_string(),
+            title: "OpenSSH pre-authentication delay".to_string(),
+            score: 104,
+            state: "open".to_string(),
+            summary: "sshd-auth remains around during pre-authentication.".to_string(),
+            evidence: json!({
+                "package_name": "openssh-server",
+                "source_package": "openssh"
+            }),
+            repo_root: None,
+            ecosystem: Some("debian".to_string()),
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+            updated_at: "2026-05-27T00:00:00Z".to_string(),
+        }
+    }
+
     #[test]
     fn postgres_core_publication_guard_blocks_observed_semantic_patch() {
         let opportunity = sample_postgresql_opportunity();
@@ -3973,6 +4024,31 @@ mod tests {
         let session = json!({
             "response": "Subject: postgresql-18: preserve extension lookup semantics\n\n## Evidence Confidence\nreproduced\n\n## Validation\nA pg_upgrade TAP proof passed on current PostgreSQL master.\n",
             "diff": "diff --git a/src/backend/utils/fmgr/dfmgr.c b/src/backend/utils/fmgr/dfmgr.c\n--- a/src/backend/utils/fmgr/dfmgr.c\n+++ b/src/backend/utils/fmgr/dfmgr.c\n@@ -1 +1 @@\n-old\n+new\n",
+        });
+
+        assert!(published_session_publication_blocker(&opportunity, Some(&session)).is_none());
+    }
+
+    #[test]
+    fn openssh_preauth_timing_guard_blocks_observed_patch() {
+        let opportunity = sample_openssh_opportunity();
+        let session = json!({
+            "response": "Subject: sshd-auth: enforce LoginGraceTime during pre-authentication\n\n## Evidence Confidence\nobserved\n\n## Issue Connection\nFixer observed a pre-authentication process lifetime signal.\n",
+            "diff": "diff --git a/sshd-auth.c b/sshd-auth.c\n--- a/sshd-auth.c\n+++ b/sshd-auth.c\n@@ -1 +1 @@\n-old\n+new\n",
+        });
+
+        let blocker = published_session_publication_blocker(&opportunity, Some(&session)).unwrap();
+
+        assert!(blocker.contains("OpenSSH pre-authentication"));
+        assert!(blocker.contains("security-sensitive behavior"));
+    }
+
+    #[test]
+    fn openssh_preauth_timing_guard_allows_reproduced_patch() {
+        let opportunity = sample_openssh_opportunity();
+        let session = json!({
+            "response": "Subject: auth2: test pre-authentication timing behavior\n\n## Evidence Confidence\nreproduced\n\n## Validation\nA focused regress test reproduced and verified the pre-authentication timing behavior.\n",
+            "diff": "diff --git a/auth2.c b/auth2.c\n--- a/auth2.c\n+++ b/auth2.c\n@@ -1 +1 @@\n-old\n+new\n",
         });
 
         assert!(published_session_publication_blocker(&opportunity, Some(&session)).is_none());
