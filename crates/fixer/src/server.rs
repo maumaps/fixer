@@ -1081,6 +1081,7 @@ struct PublicPatchUpstreamReview {
     pr_url: String,
     state: String,
     merged_at: Option<String>,
+    fixer_credit: bool,
     tags: Vec<String>,
 }
 
@@ -1089,6 +1090,7 @@ struct PublicPatchRelatedReview {
     issue_id: String,
     pr_url: String,
     state: String,
+    fixer_credit: bool,
     relation: String,
     family_count: i64,
 }
@@ -1145,14 +1147,14 @@ struct DashboardSnapshot {
     explained_impossible_count: i64,
     corroborated_public_issue_count: i64,
     largest_public_cluster_size: i64,
-    unlinked_upstream_win_count: i64,
+    unlinked_upstream_review_count: i64,
     last_submission_at: Option<String>,
     top_issues: Vec<PublicIssueCandidate>,
-    upstream_wins: Vec<UpstreamPatchWin>,
+    fixer_upstream_wins: Vec<UpstreamReview>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct UpstreamPatchWin {
+struct UpstreamReview {
     id: String,
     project: String,
     title: String,
@@ -1848,6 +1850,7 @@ async fn init_db(db: &ServerDb, config: &FixerConfig) -> Result<()> {
     if needs_schema_migration(db).await? {
         migrate_legacy_schema(db, config).await?;
     }
+    rename_legacy_upstream_reviews_table(db).await?;
     ensure_current_schema(db).await
 }
 
@@ -1949,7 +1952,7 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             created_at TIMESTAMPTZ NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS upstream_patch_wins (
+        CREATE TABLE IF NOT EXISTS upstream_reviews (
             id TEXT PRIMARY KEY,
             project TEXT NOT NULL,
             title TEXT NOT NULL,
@@ -1957,6 +1960,7 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             pr_url TEXT NOT NULL,
             state TEXT NOT NULL DEFAULT 'review',
             merged_at TIMESTAMPTZ,
+            fixer_credit BOOLEAN NOT NULL DEFAULT FALSE,
             tags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
             patch_issue_id TEXT REFERENCES issue_clusters(id) ON DELETE SET NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -1965,7 +1969,7 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
         CREATE TABLE IF NOT EXISTS upstream_patch_relations (
             id TEXT PRIMARY KEY,
             issue_id TEXT NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
-            upstream_patch_win_id TEXT NOT NULL REFERENCES upstream_patch_wins(id) ON DELETE CASCADE,
+            upstream_patch_win_id TEXT NOT NULL REFERENCES upstream_reviews(id) ON DELETE CASCADE,
             relation TEXT NOT NULL DEFAULT 'related',
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
@@ -2086,7 +2090,7 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             created_at TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS upstream_patch_wins (
+        CREATE TABLE IF NOT EXISTS upstream_reviews (
             id TEXT PRIMARY KEY,
             project TEXT NOT NULL,
             title TEXT NOT NULL,
@@ -2094,6 +2098,7 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             pr_url TEXT NOT NULL,
             state TEXT NOT NULL DEFAULT 'review',
             merged_at TEXT,
+            fixer_credit INTEGER NOT NULL DEFAULT 0,
             tags_json TEXT NOT NULL DEFAULT '[]',
             patch_issue_id TEXT REFERENCES issue_clusters(id) ON DELETE SET NULL,
             created_at TEXT NOT NULL
@@ -2102,7 +2107,7 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
         CREATE TABLE IF NOT EXISTS upstream_patch_relations (
             id TEXT PRIMARY KEY,
             issue_id TEXT NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
-            upstream_patch_win_id TEXT NOT NULL REFERENCES upstream_patch_wins(id) ON DELETE CASCADE,
+            upstream_patch_win_id TEXT NOT NULL REFERENCES upstream_reviews(id) ON DELETE CASCADE,
             relation TEXT NOT NULL DEFAULT 'related',
             created_at TEXT NOT NULL
         );
@@ -2137,7 +2142,7 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
     }
     ensure_forward_issue_cluster_schema(db).await?;
     ensure_forward_installs_schema(db).await?;
-    ensure_forward_upstream_patch_wins_schema(db).await?;
+    ensure_forward_upstream_reviews_schema(db).await?;
     ensure_forward_upstream_patch_relations_schema(db).await?;
     ensure_forward_patch_issue_dispositions_schema(db).await?;
     Ok(())
@@ -2183,7 +2188,7 @@ async fn ensure_forward_upstream_patch_relations_schema(db: &ServerDb) -> Result
             CREATE TABLE IF NOT EXISTS upstream_patch_relations (
                 id TEXT PRIMARY KEY,
                 issue_id TEXT NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
-                upstream_patch_win_id TEXT NOT NULL REFERENCES upstream_patch_wins(id) ON DELETE CASCADE,
+                upstream_patch_win_id TEXT NOT NULL REFERENCES upstream_reviews(id) ON DELETE CASCADE,
                 relation TEXT NOT NULL DEFAULT 'related',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
@@ -2198,7 +2203,7 @@ async fn ensure_forward_upstream_patch_relations_schema(db: &ServerDb) -> Result
             CREATE TABLE IF NOT EXISTS upstream_patch_relations (
                 id TEXT PRIMARY KEY,
                 issue_id TEXT NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
-                upstream_patch_win_id TEXT NOT NULL REFERENCES upstream_patch_wins(id) ON DELETE CASCADE,
+                upstream_patch_win_id TEXT NOT NULL REFERENCES upstream_reviews(id) ON DELETE CASCADE,
                 relation TEXT NOT NULL DEFAULT 'related',
                 created_at TEXT NOT NULL
             )
@@ -2209,26 +2214,98 @@ async fn ensure_forward_upstream_patch_relations_schema(db: &ServerDb) -> Result
     Ok(())
 }
 
-async fn ensure_forward_upstream_patch_wins_schema(db: &ServerDb) -> Result<()> {
+async fn rename_legacy_upstream_reviews_table(db: &ServerDb) -> Result<()> {
     match db {
         ServerDb::Postgres(db) => {
             db.batch_execute(
                 "
-            ALTER TABLE upstream_patch_wins
-            ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'review'
+            DO $$
+            BEGIN
+                IF to_regclass('public.upstream_reviews') IS NULL
+                   AND to_regclass('public.upstream_patch_wins') IS NOT NULL THEN
+                    ALTER TABLE upstream_patch_wins RENAME TO upstream_reviews;
+                END IF;
+            END
+            $$;
             ",
             )
             .await?;
         }
         ServerDb::Sqlite(path) => {
             let connection = sqlite_connection(path)?;
-            let mut stmt = connection.prepare("PRAGMA table_info(upstream_patch_wins)")?;
+            let legacy_exists: Option<i64> = connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'upstream_patch_wins'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let current_exists: Option<i64> = connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'upstream_reviews'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if legacy_exists.is_some() && current_exists.is_none() {
+                connection.execute(
+                    "ALTER TABLE upstream_patch_wins RENAME TO upstream_reviews",
+                    [],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_forward_upstream_reviews_schema(db: &ServerDb) -> Result<()> {
+    match db {
+        ServerDb::Postgres(db) => {
+            db.batch_execute(
+                "
+            ALTER TABLE upstream_reviews
+            ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'review';
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'upstream_reviews'
+                      AND column_name = 'fixer_credit'
+                ) THEN
+                    ALTER TABLE upstream_reviews
+                    ADD COLUMN fixer_credit BOOLEAN NOT NULL DEFAULT FALSE;
+
+                    UPDATE upstream_reviews
+                    SET fixer_credit = TRUE
+                    WHERE id <> 'cpython-subprocess-pidfd-wait';
+                END IF;
+            END
+            $$;
+            ",
+            )
+            .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let mut stmt = connection.prepare("PRAGMA table_info(upstream_reviews)")?;
             let columns = stmt
                 .query_map([], |row| row.get::<_, String>(1))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             if !columns.iter().any(|name| name == "state") {
                 connection.execute(
-                    "ALTER TABLE upstream_patch_wins ADD COLUMN state TEXT NOT NULL DEFAULT 'review'",
+                    "ALTER TABLE upstream_reviews ADD COLUMN state TEXT NOT NULL DEFAULT 'review'",
+                    [],
+                )?;
+            }
+            if !columns.iter().any(|name| name == "fixer_credit") {
+                connection.execute(
+                    "ALTER TABLE upstream_reviews ADD COLUMN fixer_credit INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+                connection.execute(
+                    "UPDATE upstream_reviews SET fixer_credit = 1 WHERE id <> 'cpython-subprocess-pidfd-wait'",
                     [],
                 )?;
             }
@@ -7123,7 +7200,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 (SELECT COUNT(*) FROM issue_clusters WHERE best_patch_json IS NULL AND best_triage_json IS NOT NULL),
                 (SELECT COUNT(*) FROM issue_clusters WHERE promoted = TRUE AND public_visible = TRUE AND corroboration_count >= 2),
                 (SELECT COALESCE(MAX(corroboration_count), 0) FROM issue_clusters WHERE promoted = TRUE AND public_visible = TRUE),
-                (SELECT COUNT(*) FROM upstream_patch_wins WHERE patch_issue_id IS NULL),
+                (SELECT COUNT(*) FROM upstream_reviews WHERE patch_issue_id IS NULL),
                 (SELECT MAX(received_at) FROM submissions)
             ",
                     &[],
@@ -7147,10 +7224,11 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 explained_impossible_count,
                 corroborated_public_issue_count: row.get(6),
                 largest_public_cluster_size: row.get(7),
-                unlinked_upstream_win_count: row.get(8),
+                unlinked_upstream_review_count: row.get(8),
                 last_submission_at,
                 top_issues: load_public_issue_candidates(db, 8).await?,
-                upstream_wins: load_upstream_patch_wins(db, LANDING_UPSTREAM_REVIEW_LIMIT).await?,
+                fixer_upstream_wins: load_fixer_upstream_wins(db, LANDING_UPSTREAM_REVIEW_LIMIT)
+                    .await?,
             })
         }
         ServerDb::Sqlite(path) => {
@@ -7205,9 +7283,9 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                     |row| row.get(0),
                 )
                 .map_err(ApiError::internal)?;
-            let unlinked_upstream_win_count: i64 = connection
+            let unlinked_upstream_review_count: i64 = connection
                 .query_row(
-                    "SELECT COUNT(*) FROM upstream_patch_wins WHERE patch_issue_id IS NULL",
+                    "SELECT COUNT(*) FROM upstream_reviews WHERE patch_issue_id IS NULL",
                     [],
                     |row| row.get(0),
                 )
@@ -7231,27 +7309,28 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 explained_impossible_count,
                 corroborated_public_issue_count,
                 largest_public_cluster_size,
-                unlinked_upstream_win_count,
+                unlinked_upstream_review_count,
                 last_submission_at,
                 top_issues: load_public_issue_candidates(db, 8).await?,
-                upstream_wins: load_upstream_patch_wins(db, LANDING_UPSTREAM_REVIEW_LIMIT).await?,
+                fixer_upstream_wins: load_fixer_upstream_wins(db, LANDING_UPSTREAM_REVIEW_LIMIT)
+                    .await?,
             })
         }
     }
 }
 
-async fn load_upstream_patch_wins(
+async fn load_fixer_upstream_wins(
     db: &ServerDb,
     limit: i64,
-) -> Result<Vec<UpstreamPatchWin>, ApiError> {
+) -> Result<Vec<UpstreamReview>, ApiError> {
     match db {
         ServerDb::Postgres(client) => {
             let rows = client
                 .query(
                     "
             SELECT id, project, title, summary, pr_url, merged_at, tags_json
-            FROM upstream_patch_wins
-            WHERE state = 'merged' AND merged_at IS NOT NULL
+            FROM upstream_reviews
+            WHERE state = 'merged' AND merged_at IS NOT NULL AND fixer_credit = TRUE
             ORDER BY COALESCE(merged_at, created_at) DESC, created_at DESC
             LIMIT $1
             ",
@@ -7260,7 +7339,7 @@ async fn load_upstream_patch_wins(
                 .await
                 .map_err(ApiError::internal)?;
             rows.into_iter()
-                .map(upstream_patch_win_from_row)
+                .map(upstream_review_from_row)
                 .collect::<Result<Vec<_>, _>>()
         }
         ServerDb::Sqlite(path) => {
@@ -7269,15 +7348,15 @@ async fn load_upstream_patch_wins(
                 .prepare(
                     "
             SELECT id, project, title, summary, pr_url, merged_at, tags_json
-            FROM upstream_patch_wins
-            WHERE state = 'merged' AND merged_at IS NOT NULL
+            FROM upstream_reviews
+            WHERE state = 'merged' AND merged_at IS NOT NULL AND fixer_credit = 1
             ORDER BY COALESCE(merged_at, created_at) DESC, created_at DESC
             LIMIT ?1
             ",
                 )
                 .map_err(ApiError::internal)?;
             let rows = stmt
-                .query_map([limit], upstream_patch_win_from_sqlite_row)
+                .query_map([limit], upstream_review_from_sqlite_row)
                 .map_err(ApiError::internal)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(ApiError::internal)
@@ -7728,47 +7807,53 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
             SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
                    severity, score, corroboration_count, best_patch_json, last_seen,
                    (
-                       SELECT upw.id FROM upstream_patch_wins upw
+                       SELECT upw.id FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
                    ) AS upstream_review_id,
                    (
-                       SELECT upw.project FROM upstream_patch_wins upw
+                       SELECT upw.project FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
                    ) AS upstream_review_project,
                    (
-                       SELECT upw.title FROM upstream_patch_wins upw
+                       SELECT upw.title FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
                    ) AS upstream_review_title,
                    (
-                       SELECT upw.pr_url FROM upstream_patch_wins upw
+                       SELECT upw.pr_url FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
                    ) AS upstream_review_pr_url,
                    (
-                       SELECT upw.merged_at FROM upstream_patch_wins upw
+                       SELECT upw.merged_at FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
                    ) AS upstream_review_merged_at,
                    (
-                       SELECT upw.tags_json FROM upstream_patch_wins upw
+                       SELECT upw.tags_json FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
                    ) AS upstream_review_tags_json,
                    (
-                       SELECT upw.state FROM upstream_patch_wins upw
+                       SELECT upw.state FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
-                   ) AS upstream_review_state
+                   ) AS upstream_review_state,
+                   (
+                       SELECT upw.fixer_credit FROM upstream_reviews upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_fixer_credit
             FROM issue_clusters
             WHERE promoted = TRUE
               AND public_visible = TRUE
@@ -7796,47 +7881,53 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
             SELECT id, kind, public_title, public_summary, package_name, source_package, ecosystem,
                    severity, score, corroboration_count, best_patch_json, last_seen,
                    (
-                       SELECT upw.id FROM upstream_patch_wins upw
+                       SELECT upw.id FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
                    ) AS upstream_review_id,
                    (
-                       SELECT upw.project FROM upstream_patch_wins upw
+                       SELECT upw.project FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
                    ) AS upstream_review_project,
                    (
-                       SELECT upw.title FROM upstream_patch_wins upw
+                       SELECT upw.title FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
                    ) AS upstream_review_title,
                    (
-                       SELECT upw.pr_url FROM upstream_patch_wins upw
+                       SELECT upw.pr_url FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
                    ) AS upstream_review_pr_url,
                    (
-                       SELECT upw.merged_at FROM upstream_patch_wins upw
+                       SELECT upw.merged_at FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
                    ) AS upstream_review_merged_at,
                    (
-                       SELECT upw.tags_json FROM upstream_patch_wins upw
+                       SELECT upw.tags_json FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
                    ) AS upstream_review_tags_json,
                    (
-                       SELECT upw.state FROM upstream_patch_wins upw
+                       SELECT upw.state FROM upstream_reviews upw
                        WHERE upw.patch_issue_id = issue_clusters.id
                        ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
                        LIMIT 1
-                   ) AS upstream_review_state
+                   ) AS upstream_review_state,
+                   (
+                       SELECT upw.fixer_credit FROM upstream_reviews upw
+                       WHERE upw.patch_issue_id = issue_clusters.id
+                       ORDER BY COALESCE(upw.merged_at, upw.created_at) DESC, upw.created_at DESC
+                       LIMIT 1
+                   ) AS upstream_review_fixer_credit
             FROM issue_clusters
             WHERE promoted = 1
               AND public_visible = 1
@@ -7949,9 +8040,10 @@ async fn load_public_patch_manual_related_reviews(
                    upw.pr_url,
                    upw.state,
                    upw.merged_at,
+                   upw.fixer_credit,
                    rel.relation
             FROM upstream_patch_relations rel
-            JOIN upstream_patch_wins upw ON upw.id = rel.upstream_patch_win_id
+            JOIN upstream_reviews upw ON upw.id = rel.upstream_patch_win_id
             ORDER BY rel.created_at DESC
             ",
                     &[],
@@ -7966,7 +8058,8 @@ async fn load_public_patch_manual_related_reviews(
                 let merged_at = row
                     .get::<_, Option<DateTime<Utc>>>(4)
                     .map(|value| value.to_rfc3339());
-                let relation: String = row.get(5);
+                let fixer_credit: bool = row.get(5);
+                let relation: String = row.get(6);
                 relations
                     .entry(issue_id)
                     .or_insert(PublicPatchRelatedReview {
@@ -7976,6 +8069,7 @@ async fn load_public_patch_manual_related_reviews(
                             raw_state.as_deref(),
                             merged_at.as_deref(),
                         ),
+                        fixer_credit,
                         relation,
                         family_count: 1,
                     });
@@ -7991,9 +8085,10 @@ async fn load_public_patch_manual_related_reviews(
                    upw.pr_url,
                    upw.state,
                    upw.merged_at,
+                   upw.fixer_credit,
                    rel.relation
             FROM upstream_patch_relations rel
-            JOIN upstream_patch_wins upw ON upw.id = rel.upstream_patch_win_id
+            JOIN upstream_reviews upw ON upw.id = rel.upstream_patch_win_id
             ORDER BY rel.created_at DESC
             ",
                 )
@@ -8005,7 +8100,8 @@ async fn load_public_patch_manual_related_reviews(
                     let pr_url: String = row.get(2)?;
                     let raw_state: Option<String> = row.get(3)?;
                     let merged_at: Option<String> = row.get(4)?;
-                    let relation: String = row.get(5)?;
+                    let fixer_credit: bool = row.get(5)?;
+                    let relation: String = row.get(6)?;
                     Ok((
                         issue_id,
                         PublicPatchRelatedReview {
@@ -8015,6 +8111,7 @@ async fn load_public_patch_manual_related_reviews(
                                 raw_state.as_deref(),
                                 merged_at.as_deref(),
                             ),
+                            fixer_credit,
                             relation,
                             family_count: 1,
                         },
@@ -8153,6 +8250,7 @@ fn annotate_public_patch_related_reviews(patches: &mut [PublicPatchEntry]) {
                 issue_id: patches[review_index].id.clone(),
                 pr_url: review.pr_url.clone(),
                 state: review.state.clone(),
+                fixer_credit: review.fixer_credit,
                 relation: "source_path_family".to_string(),
                 family_count: indexes.len() as i64,
             });
@@ -8172,6 +8270,12 @@ fn annotate_public_patch_harvest_buckets(patches: &mut [PublicPatchEntry]) {
 fn public_patch_harvest_bucket_and_reason(patch: &PublicPatchEntry) -> (String, String) {
     if let Some(review) = patch.upstream_review.as_ref() {
         if review.state == "merged" {
+            if !review.fixer_credit {
+                return (
+                    "covered-upstream".to_string(),
+                    "covered by independent upstream fix".to_string(),
+                );
+            }
             return ("merged".to_string(), "merged upstream".to_string());
         }
         if public_upstream_review_state_is_closed(&review.state) {
@@ -8190,6 +8294,12 @@ fn public_patch_harvest_bucket_and_reason(patch: &PublicPatchEntry) -> (String, 
     }
     if let Some(review) = patch.related_upstream_review.as_ref() {
         if review.state == "merged" {
+            if !review.fixer_credit {
+                return (
+                    "covered-upstream".to_string(),
+                    format!("related independent upstream fix {}", review.relation),
+                );
+            }
             return (
                 "merged".to_string(),
                 format!("related upstream review {} merged", review.relation),
@@ -8957,6 +9067,7 @@ fn public_patch_upstream_review_from_row(row: &Row) -> Option<PublicPatchUpstrea
         .get::<_, Option<DateTime<Utc>>>(16)
         .map(|value| value.to_rfc3339());
     let raw_state: Option<String> = row.get(18);
+    let fixer_credit: Option<bool> = row.get(19);
     Some(PublicPatchUpstreamReview {
         id: id?,
         project: row.get(13),
@@ -8964,6 +9075,7 @@ fn public_patch_upstream_review_from_row(row: &Row) -> Option<PublicPatchUpstrea
         pr_url: row.get(15),
         state: effective_upstream_review_state(raw_state.as_deref(), merged_at.as_deref()),
         merged_at,
+        fixer_credit: fixer_credit.unwrap_or(false),
         tags: tags_json
             .as_ref()
             .map(string_array_from_value)
@@ -8971,12 +9083,12 @@ fn public_patch_upstream_review_from_row(row: &Row) -> Option<PublicPatchUpstrea
     })
 }
 
-fn upstream_patch_win_from_row(row: Row) -> Result<UpstreamPatchWin, ApiError> {
+fn upstream_review_from_row(row: Row) -> Result<UpstreamReview, ApiError> {
     let merged_at = row
         .get::<_, Option<DateTime<Utc>>>(5)
         .map(|value| value.to_rfc3339());
     let tags_json: Value = row.get(6);
-    Ok(UpstreamPatchWin {
+    Ok(UpstreamReview {
         id: row.get(0),
         project: row.get(1),
         title: row.get(2),
@@ -10461,6 +10573,7 @@ fn public_patch_upstream_review_from_sqlite_row(
     let tags_raw: Option<String> = row.get(17)?;
     let merged_at: Option<String> = row.get(16)?;
     let raw_state: Option<String> = row.get(18)?;
+    let fixer_credit: Option<bool> = row.get(19)?;
     let tags = tags_raw
         .as_deref()
         .map(|raw| {
@@ -10483,6 +10596,7 @@ fn public_patch_upstream_review_from_sqlite_row(
         pr_url: row.get(15)?,
         state: effective_upstream_review_state(raw_state.as_deref(), merged_at.as_deref()),
         merged_at,
+        fixer_credit: fixer_credit.unwrap_or(false),
         tags,
     }))
 }
@@ -10526,7 +10640,8 @@ fn public_upstream_review_relation_label(relation: &str) -> String {
 fn public_patch_headline_label(entry: &PublicPatchEntry) -> String {
     if let Some(review) = entry.upstream_review.as_ref() {
         return match review.state.as_str() {
-            "merged" => "merged upstream".to_string(),
+            "merged" if review.fixer_credit => "merged upstream".to_string(),
+            "merged" => "covered by upstream fix".to_string(),
             "review" => "submitted upstream".to_string(),
             "reviewer_reduced" => "reviewer-reduced upstream".to_string(),
             "closed" | "closed_unmerged" | "rejected" => "closed upstream".to_string(),
@@ -10537,6 +10652,10 @@ fn public_patch_headline_label(entry: &PublicPatchEntry) -> String {
 
     if entry.harvest_bucket == "evidence-upgrade" {
         return "needs evidence upgrade".to_string();
+    }
+
+    if entry.harvest_bucket == "covered-upstream" {
+        return "covered by upstream fix".to_string();
     }
 
     if matches!(
@@ -10553,14 +10672,12 @@ fn public_patch_headline_label(entry: &PublicPatchEntry) -> String {
     }
 }
 
-fn upstream_patch_win_from_sqlite_row(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<UpstreamPatchWin> {
+fn upstream_review_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpstreamReview> {
     let tags_raw: String = row.get(6)?;
     let tags_json = serde_json::from_str::<Value>(&tags_raw).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
     })?;
-    Ok(UpstreamPatchWin {
+    Ok(UpstreamReview {
         id: row.get(0)?,
         project: row.get(1)?,
         title: row.get(2)?,
@@ -14137,20 +14254,20 @@ fn validate_uuid_param(raw: &str, label: &str) -> Result<(), ApiError> {
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid {label}")))
 }
 
-fn render_upstream_wins_section(wins: &[UpstreamPatchWin]) -> String {
+fn render_fixer_upstream_wins_section(wins: &[UpstreamReview]) -> String {
     if wins.is_empty() {
         return String::new();
     }
     let cards = wins
         .iter()
-        .map(render_upstream_win_card)
+        .map(render_fixer_upstream_win_card)
         .collect::<Vec<_>>()
         .join("");
     r#"
         <section class="panel upstream-proof section">
             <div class="upstream-proof-copy">
                 <div>
-                    <p class="eyebrow">Upstream review</p>
+                    <p class="eyebrow">Merged Fixer upstream wins</p>
                     <h2>Fixer patches can move back to projects people already trust.</h2>
                     <p class="section-intro">The goal is not to generate local workarounds forever. When the evidence is strong and the patch is maintainable, Fixer should help move the fix back to the project that owns the code.</p>
                 </div>
@@ -14168,7 +14285,7 @@ fn render_upstream_wins_section(wins: &[UpstreamPatchWin]) -> String {
 "#
 }
 
-fn render_upstream_win_card(win: &UpstreamPatchWin) -> String {
+fn render_fixer_upstream_win_card(win: &UpstreamReview) -> String {
     let tags = win
         .tags
         .iter()
@@ -14241,7 +14358,8 @@ sudo apt install fixer"
             .collect::<Vec<_>>()
             .join("")
     };
-    let upstream_wins_markup = render_upstream_wins_section(&snapshot.upstream_wins);
+    let fixer_upstream_wins_markup =
+        render_fixer_upstream_wins_section(&snapshot.fixer_upstream_wins);
 
     let body = format!(
         r#"
@@ -14323,7 +14441,7 @@ sudo apt install fixer"
             </article>
         </section>
 
-        {upstream_wins_markup}
+        {fixer_upstream_wins_markup}
 
         <section class="grid columns section">
             <article class="panel">
@@ -14413,7 +14531,7 @@ sudo apt install fixer"
         snapshot.ready_report_count,
         snapshot.failed_patch_attempt_count,
         snapshot.explained_impossible_count,
-        snapshot.unlinked_upstream_win_count,
+        snapshot.unlinked_upstream_review_count,
         snapshot.quarantined_issue_count,
         html_escape(&apt_snippet),
         html_escape(PRIVACY_WARNING),
@@ -14580,8 +14698,8 @@ fn render_patches_page(patches: &[PublicPatchEntry]) -> String {
         r#"
         <section class="hero">
             <p class="tag">Public patch board</p>
-            <h1>Successful patches</h1>
-            <p class="lede">These are the promoted issues with a ready public patch attempt. Each card points back to the issue detail page so you can inspect the full published session, prompt, and sanitized artifacts.</p>
+            <h1>Patch handoffs</h1>
+            <p class="lede">These are promoted issues with retained patch attempts, upstream reviews, manual dispositions, or related upstream coverage. Each card points back to the issue detail page so you can inspect the full published session, prompt, and sanitized artifacts.</p>
             <p class="fine-print">Public JSON: <a href="/v1/patches">/v1/patches</a></p>
         </section>
 
@@ -14593,7 +14711,7 @@ fn render_patches_page(patches: &[PublicPatchEntry]) -> String {
     );
     render_page(
         "Fixer Patches",
-        "Ready public Fixer patch attempts",
+        "Public Fixer patch handoffs",
         NavPage::Patches,
         body,
         0,
@@ -14633,10 +14751,18 @@ fn render_issue_detail_page(issue: &PublicIssueDetail) -> String {
         );
     }
     if let Some(review) = issue.best_patch_upstream_review.as_ref() {
+        let label = if review.state == "merged" && !review.fixer_credit {
+            format!(
+                "coverage: {}",
+                public_upstream_review_state_label(&review.state)
+            )
+        } else {
+            public_upstream_review_state_label(&review.state)
+        };
         let _ = write!(
             issue_tags,
             "<span class=\"tag\">upstream: {}</span>",
-            html_escape(&public_upstream_review_state_label(&review.state))
+            html_escape(&label)
         );
     } else if let Some(review) = issue.best_patch_related_upstream_review.as_ref() {
         let relation_label = public_upstream_review_relation_label(&review.relation);
@@ -14934,24 +15060,39 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
         && related_upstream_review.is_none()
         && harvest_review
             .is_some_and(|review| review.status != "ready" || !review.blockers.is_empty());
-    let heading = if upstream_review.is_some() {
-        "Patch tracked upstream"
-    } else if related_upstream_review.is_some() {
-        "Patch related to upstream review"
-    } else if let Some((bucket, _)) = manual_disposition_summary.as_ref() {
-        match bucket.as_str() {
-            "semantic-risk" => "Patch retained for semantic-risk review",
-            "fixer-defect" => "Patch retained for Fixer repair",
-            "do-not-send" => "Patch retained as do-not-send evidence",
-            _ => "Patch retained for manual disposition",
-        }
-    } else if needs_harvest_review {
-        "Patch needs harvest review"
-    } else {
-        "Pull-request-ready diff"
-    };
-    let intro = if upstream_review.is_some() {
+    let heading =
+        if upstream_review.is_some_and(|review| review.state == "merged" && !review.fixer_credit) {
+            "Covered by upstream fix"
+        } else if upstream_review.is_some() {
+            "Patch tracked upstream"
+        } else if related_upstream_review
+            .is_some_and(|review| review.state == "merged" && !review.fixer_credit)
+        {
+            "Patch covered by related upstream fix"
+        } else if related_upstream_review.is_some() {
+            "Patch related to upstream review"
+        } else if let Some((bucket, _)) = manual_disposition_summary.as_ref() {
+            match bucket.as_str() {
+                "semantic-risk" => "Patch retained for semantic-risk review",
+                "fixer-defect" => "Patch retained for Fixer repair",
+                "do-not-send" => "Patch retained as do-not-send evidence",
+                _ => "Patch retained for manual disposition",
+            }
+        } else if needs_harvest_review {
+            "Patch needs harvest review"
+        } else {
+            "Pull-request-ready diff"
+        };
+    let intro = if upstream_review
+        .is_some_and(|review| review.state == "merged" && !review.fixer_credit)
+    {
+        "This diff is preserved for inspection, but the current resolution is an independent upstream fix. Use this row as coverage evidence, not as a Fixer-authored upstream win."
+    } else if upstream_review.is_some() {
         "This diff is preserved for inspection, but the current handoff is the upstream review linked below. The original harvest blockers remain visible as historical context for the retained local artifact."
+    } else if related_upstream_review
+        .is_some_and(|review| review.state == "merged" && !review.fixer_credit)
+    {
+        "This diff is preserved for inspection, but a related issue family is already covered by an independent upstream fix. Use the retained patch as evidence only; do not claim it as a Fixer win."
     } else if related_upstream_review.is_some() {
         "This diff is preserved for inspection, but a related source-family upstream review is the current handoff. Use the retained patch as evidence only; do not open a duplicate review from this artifact."
     } else if manual_disposition.is_some() {
@@ -15008,8 +15149,16 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
     }
     let upstream_review_summary = upstream_review
         .map(|review| {
+            let text = if review.state == "merged" && !review.fixer_credit {
+                "This issue is covered by an independent upstream fix"
+            } else if review.state == "merged" {
+                "This Fixer patch was merged upstream as"
+            } else {
+                "This patch is tracked upstream as"
+            };
             format!(
-                "<section class=\"patch-summary\"><h4>Upstream review</h4><p class=\"issue-summary\">This patch is already tracked upstream as <a href=\"{}\">{}: {}</a> ({}).</p></section>",
+                "<section class=\"patch-summary\"><h4>Upstream review</h4><p class=\"issue-summary\">{} <a href=\"{}\">{}: {}</a> ({}).</p></section>",
+                text,
                 html_escape(&review.pr_url),
                 html_escape(&review.project),
                 html_escape(&review.title),
@@ -15026,8 +15175,14 @@ fn render_best_patch_panel(issue: &PublicIssueDetail) -> Option<String> {
             } else {
                 format!("{relation_label} {state_label}")
             };
+            let text = if review.state == "merged" && !review.fixer_credit {
+                "This retained diff belongs to an issue family covered by an independent upstream fix"
+            } else {
+                "This retained diff belongs to an issue family already tracked upstream as"
+            };
             format!(
-                "<section class=\"patch-summary\"><h4>Related upstream review</h4><p class=\"issue-summary\">This retained diff belongs to an issue family already tracked upstream as <a href=\"{}\">{}</a> ({}; {} related row{}).</p></section>",
+                "<section class=\"patch-summary\"><h4>Related upstream review</h4><p class=\"issue-summary\">{} <a href=\"{}\">{}</a> ({}; {} related row{}).</p></section>",
+                text,
                 html_escape(&review.pr_url),
                 html_escape(&review.pr_url),
                 html_escape(&related_label),
@@ -15854,10 +16009,18 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
         }
     }
     if let Some(review) = entry.upstream_review.as_ref() {
+        let label = if review.state == "merged" && !review.fixer_credit {
+            format!(
+                "coverage: {}",
+                public_upstream_review_state_label(&review.state)
+            )
+        } else {
+            public_upstream_review_state_label(&review.state)
+        };
         let _ = write!(
             patch_tags,
             "<span class=\"tag\">upstream: {}</span>",
-            html_escape(&public_upstream_review_state_label(&review.state))
+            html_escape(&label)
         );
     } else if let Some(review) = entry.related_upstream_review.as_ref() {
         let relation_label = public_upstream_review_relation_label(&review.relation);
@@ -15894,8 +16057,16 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
         .upstream_review
         .as_ref()
         .map(|review| {
+            let text = if review.state == "merged" && !review.fixer_credit {
+                "This issue is covered by an independent upstream fix"
+            } else if review.state == "merged" {
+                "This Fixer patch was merged upstream as"
+            } else {
+                "This patch is tracked upstream as"
+            };
             format!(
-                "<section class=\"patch-summary\"><h4>Upstream review</h4><p class=\"issue-summary\">This patch is already tracked upstream as <a href=\"{}\">{}: {}</a> ({}).</p></section>",
+                "<section class=\"patch-summary\"><h4>Upstream review</h4><p class=\"issue-summary\">{} <a href=\"{}\">{}: {}</a> ({}).</p></section>",
+                text,
                 html_escape(&review.pr_url),
                 html_escape(&review.project),
                 html_escape(&review.title),
@@ -17343,7 +17514,7 @@ mod tests {
     fn render_page_marks_patches_nav_active() {
         let markup = render_page(
             "Fixer Patches",
-            "Ready public Fixer patch attempts",
+            "Public Fixer patch handoffs",
             NavPage::Patches,
             "<section>body</section>".to_string(),
             0,
@@ -17456,10 +17627,10 @@ mod tests {
             explained_impossible_count: 2,
             corroborated_public_issue_count: 4,
             largest_public_cluster_size: 6,
-            unlinked_upstream_win_count: 1,
+            unlinked_upstream_review_count: 1,
             last_submission_at: Some("2026-03-30T00:00:00Z".to_string()),
             top_issues: Vec::new(),
-            upstream_wins: vec![UpstreamPatchWin {
+            fixer_upstream_wins: vec![UpstreamReview {
                 id: "htop-zram".to_string(),
                 project: "htop".to_string(),
                 title: "Stopped repeated zram ENOENT probes in htop.".to_string(),
@@ -17479,7 +17650,7 @@ mod tests {
         assert!(markup.contains("Install first, opt in later"));
         assert!(markup.contains("Shared queue, not private guessing"));
         assert!(markup.contains("sanitized issue families, not raw host evidence"));
-        assert!(markup.contains("Upstream review"));
+        assert!(markup.contains("Merged Fixer upstream wins"));
         assert!(markup.contains("htop"));
         assert!(markup.contains("https://github.com/htop-dev/htop/pull/1977"));
         assert!(markup.contains("Compat_readfileat"));
@@ -17495,7 +17666,7 @@ mod tests {
         let connection = sqlite_test_connection(&db);
         connection
             .execute(
-                "INSERT INTO upstream_patch_wins
+                "INSERT INTO upstream_reviews
                  (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, NULL, ?8)",
                 rusqlite::params![
@@ -17516,19 +17687,84 @@ mod tests {
             Err(error) => panic!("dashboard snapshot failed: {}", error.message),
         };
 
-        assert_eq!(snapshot.unlinked_upstream_win_count, 1);
+        assert_eq!(snapshot.unlinked_upstream_review_count, 1);
     }
 
     #[test]
-    fn landing_upstream_wins_loader_only_returns_merged_reviews() {
+    fn schema_migration_renames_upstream_wins_and_backfills_credit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("server.sqlite");
+        let db = ServerDb::Sqlite(path.clone());
+        let connection = sqlite_connection(&path).expect("sqlite");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE upstream_patch_wins (
+                    id TEXT PRIMARY KEY,
+                    project TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    pr_url TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'review',
+                    merged_at TEXT,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    patch_issue_id TEXT,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO upstream_patch_wins
+                    (id, project, title, summary, pr_url, state, merged_at, tags_json, created_at)
+                VALUES
+                    ('cpython-subprocess-pidfd-wait', 'CPython', 'external', 'external fix', 'https://example.test/cpython', 'merged', '2026-01-28T14:04:40Z', '[]', '2026-05-26T00:00:00Z'),
+                    ('htop-zram-enoent-probes', 'htop', 'fixer win', 'fixer fix', 'https://example.test/htop', 'merged', '2026-05-01T14:42:20Z', '[]', '2026-05-01T00:00:00Z');
+                ",
+            )
+            .expect("legacy table");
+        drop(connection);
+
+        test_runtime()
+            .block_on(init_db(&db, &FixerConfig::default()))
+            .expect("schema init");
+
+        let connection = sqlite_connection(&path).expect("sqlite");
+        let legacy_exists: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'upstream_patch_wins'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("legacy lookup");
+        let cpython_credit: bool = connection
+            .query_row(
+                "SELECT fixer_credit FROM upstream_reviews WHERE id = 'cpython-subprocess-pidfd-wait'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("cpython row");
+        let htop_credit: bool = connection
+            .query_row(
+                "SELECT fixer_credit FROM upstream_reviews WHERE id = 'htop-zram-enoent-probes'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("htop row");
+
+        assert!(legacy_exists.is_none());
+        assert!(!cpython_credit);
+        assert!(htop_credit);
+    }
+
+    #[test]
+    fn landing_upstream_reviews_loader_only_returns_credited_merged_reviews() {
         let (_dir, db) = init_test_server_db();
         let connection = sqlite_test_connection(&db);
-        for (id, project, state, merged_at, created_at) in [
+        for (id, project, state, merged_at, fixer_credit, created_at) in [
             (
                 "active-review",
                 "Moby",
                 "review",
                 None,
+                false,
                 "2026-05-27T00:00:00Z",
             ),
             (
@@ -17536,21 +17772,31 @@ mod tests {
                 "OpenSSH",
                 "closed_unmerged",
                 None,
+                false,
                 "2026-05-26T00:00:00Z",
+            ),
+            (
+                "external-merged-review",
+                "CPython",
+                "merged",
+                Some("2026-05-02T14:42:20Z"),
+                false,
+                "2026-05-02T00:00:00Z",
             ),
             (
                 "accepted-review",
                 "htop",
                 "merged",
                 Some("2026-05-01T14:42:20Z"),
+                true,
                 "2026-05-01T00:00:00Z",
             ),
         ] {
             connection
                 .execute(
-                    "INSERT INTO upstream_patch_wins
-                     (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
+                    "INSERT INTO upstream_reviews
+                     (id, project, title, summary, pr_url, state, merged_at, fixer_credit, tags_json, patch_issue_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
                     rusqlite::params![
                         id,
                         project,
@@ -17559,6 +17805,7 @@ mod tests {
                         "https://example.test/review",
                         state,
                         merged_at,
+                        fixer_credit,
                         serde_json::to_string(&json!(["upstream review"])).unwrap(),
                         created_at,
                     ],
@@ -17566,7 +17813,7 @@ mod tests {
                 .unwrap();
         }
 
-        let wins = match test_runtime().block_on(load_upstream_patch_wins(&db, 10)) {
+        let wins = match test_runtime().block_on(load_fixer_upstream_wins(&db, 10)) {
             Ok(value) => value,
             Err(error) => panic!("upstream wins load failed: {}", error.message),
         };
@@ -18231,6 +18478,7 @@ mod tests {
                 pr_url: "https://github.com/htop-dev/htop/pull/2011".to_string(),
                 state: "review".to_string(),
                 merged_at: None,
+                fixer_credit: true,
                 tags: vec!["upstream review".to_string()],
             }),
             best_patch_related_upstream_review: None,
@@ -20072,7 +20320,7 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO upstream_patch_wins
+                "INSERT INTO upstream_reviews
                  (id, project, title, summary, pr_url, merged_at, tags_json, patch_issue_id, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)",
                 rusqlite::params![
@@ -20173,7 +20421,7 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO upstream_patch_wins
+                "INSERT INTO upstream_reviews
                  (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)",
                 rusqlite::params![
@@ -20289,7 +20537,7 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO upstream_patch_wins
+                "INSERT INTO upstream_reviews
                  (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)",
                 rusqlite::params![
@@ -20344,7 +20592,7 @@ mod tests {
     }
 
     #[test]
-    fn public_patch_related_review_family_merged_wins_before_active_bucket() {
+    fn public_patch_related_review_family_merged_without_credit_is_coverage() {
         let (_dir, db) = init_test_server_db();
         let connection = sqlite_test_connection(&db);
         let representative = sample_crash(
@@ -20426,7 +20674,7 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO upstream_patch_wins
+                "INSERT INTO upstream_reviews
                  (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
@@ -20463,11 +20711,12 @@ mod tests {
             "https://github.com/python/cpython/pull/144047"
         );
         assert_eq!(family.state, "merged");
+        assert!(!family.fixer_credit);
         assert_eq!(family.family_count, 2);
-        assert_eq!(related.harvest_bucket, "merged");
+        assert_eq!(related.harvest_bucket, "covered-upstream");
         assert_eq!(
             related.harvest_reason,
-            "related upstream review source_path_family merged"
+            "related independent upstream fix source_path_family"
         );
     }
 
@@ -20554,7 +20803,7 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO upstream_patch_wins
+                "INSERT INTO upstream_reviews
                  (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)",
                 rusqlite::params![
@@ -20678,7 +20927,7 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO upstream_patch_wins
+                "INSERT INTO upstream_reviews
                  (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)",
                 rusqlite::params![

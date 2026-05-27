@@ -1,3 +1,12 @@
+fixer (0.215.0-1) unstable; urgency=medium
+
+  * Rename upstream review storage away from wins and require explicit Fixer
+    credit before showing merged upstream rows on the landing page.
+  * Keep independent upstream coverage linked without claiming it as a Fixer
+    win.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 28 May 2026 00:00:00 +0400
+
 fixer (0.214.0-1) unstable; urgency=medium
 
   * Keep the landing-page upstream wins section limited to merged reviews.
