@@ -1,3 +1,12 @@
+fixer (0.207.0-1) unstable; urgency=medium
+
+  * Preserve retained patch file paths from published diffs when proposal
+    metadata is missing.
+  * Reuse external-local-executable handoff source URLs for workspace
+    acquisition.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 11:44:26 +0400
+
 fixer (0.206.0-1) unstable; urgency=medium
 
   * Propagate public source repo handoffs across matching triage rows.

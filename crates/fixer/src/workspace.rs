@@ -457,20 +457,83 @@ fn native_executable_source_target(
     let repo_url = source_hint
         .source_repo_url
         .as_deref()
-        .filter(|value| is_cloneable_repo_url(value))?;
+        .filter(|value| is_cloneable_repo_url(value))
+        .map(ToString::to_string)
+        .or_else(|| native_executable_handoff_source_repo_url(opportunity, &source_hint))?;
     let source_name = source_hint
         .source_name
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("local-executable-source");
+        .map(ToString::to_string)
+        .or_else(|| source_name_from_repo_url(&repo_url))
+        .unwrap_or_else(|| "local-executable-source".to_string());
     Some(WorkspaceSourceTarget {
-        source_package: sanitize_dir_name(source_name),
-        upstream_url: Some(repo_url.to_string()),
+        source_package: sanitize_dir_name(&source_name),
+        upstream_url: Some(repo_url.clone()),
         acquisition_note: Some(format!(
             "Cloned {repo_url} from local executable build metadata for {}; rerun Fixer against upstream HEAD instead of discarding the retained local-executable evidence.",
             source_hint.executable_name
         )),
     })
+}
+
+fn native_executable_handoff_source_repo_url(
+    opportunity: &OpportunityRecord,
+    source_hint: &crate::native_provenance::NativeExecutableSourceHint,
+) -> Option<String> {
+    [
+        opportunity.evidence.get("details")?.get("handoff"),
+        opportunity.evidence.get("handoff"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|handoff| {
+        handoff
+            .get("classification")
+            .and_then(Value::as_str)
+            .filter(|classification| *classification == "external-local-executable")?;
+        let target = handoff.get("target").and_then(Value::as_str)?;
+        if !native_executable_handoff_target_matches(target, source_hint) {
+            return None;
+        }
+        handoff
+            .get("report_url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| is_cloneable_repo_url(value))
+            .map(ToString::to_string)
+    })
+}
+
+fn native_executable_handoff_target_matches(
+    target: &str,
+    source_hint: &crate::native_provenance::NativeExecutableSourceHint,
+) -> bool {
+    let normalized = target
+        .trim()
+        .strip_prefix("local executable ")
+        .unwrap_or_else(|| target.trim())
+        .trim()
+        .to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    if normalized == source_hint.executable_name.to_ascii_lowercase() {
+        return true;
+    }
+    source_hint
+        .source_name
+        .as_deref()
+        .and_then(|source_name| source_name.rsplit('/').next())
+        .is_some_and(|name| normalized == name.to_ascii_lowercase())
+}
+
+fn source_name_from_repo_url(repo_url: &str) -> Option<String> {
+    let parsed = Url::parse(repo_url).ok()?;
+    let mut segments = parsed.path_segments()?;
+    let owner = segments.next()?.trim_matches('/');
+    let repo = segments.next()?.trim_matches('/').trim_end_matches(".git");
+    (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
 }
 
 fn interpreter_source_target(opportunity: &OpportunityRecord) -> Option<WorkspaceSourceTarget> {
@@ -1435,6 +1498,83 @@ zoom:\n\
                 .as_deref()
                 .is_some_and(|note| note.contains("local executable build metadata"))
         );
+    }
+
+    #[test]
+    fn maps_local_executable_handoff_report_url_to_upstream_source() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "ollama spins CPU".to_string(),
+            score: 100,
+            state: "open".to_string(),
+            summary: "ollama spins".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "runaway-process",
+                    "native_executable_provenance": {
+                        "executable_name": "ollama",
+                        "executable_path": "/usr/local/bin/ollama",
+                        "source_kind": "go-module",
+                        "source_name": "github.com/ollama/ollama"
+                    },
+                    "handoff": {
+                        "classification": "external-local-executable",
+                        "target": "local executable ollama",
+                        "report_url": "https://github.com/ollama/ollama.git"
+                    }
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+            updated_at: "2026-05-27T00:00:00Z".to_string(),
+        };
+
+        let target = native_executable_source_target(&opportunity)
+            .expect("handoff source URL should map to an upstream source");
+
+        assert_eq!(target.source_package, "github.com_ollama_ollama");
+        assert_eq!(
+            target.upstream_url.as_deref(),
+            Some("https://github.com/ollama/ollama.git")
+        );
+    }
+
+    #[test]
+    fn ignores_local_executable_handoff_url_for_mismatched_target() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "ollama spins CPU".to_string(),
+            score: 100,
+            state: "open".to_string(),
+            summary: "ollama spins".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "runaway-process",
+                    "native_executable_provenance": {
+                        "executable_name": "ollama",
+                        "executable_path": "/usr/local/bin/ollama",
+                        "source_kind": "go-module",
+                        "source_name": "github.com/ollama/ollama"
+                    },
+                    "handoff": {
+                        "classification": "external-local-executable",
+                        "target": "local executable synthetic-runner",
+                        "report_url": "https://github.com/ollama/ollama.git"
+                    }
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+            updated_at: "2026-05-27T00:00:00Z".to_string(),
+        };
+
+        assert!(native_executable_source_target(&opportunity).is_none());
     }
 
     #[test]

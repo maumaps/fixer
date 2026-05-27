@@ -7982,6 +7982,17 @@ fn public_patch_harvest_next_actions_for_blockers(blockers: &[String]) -> Vec<St
     actions
 }
 
+fn public_patch_display_git_add_paths(
+    response_metadata: &PatchResponseMetadata,
+    changed_files: &[String],
+) -> Vec<String> {
+    if response_metadata.git_add_paths.is_empty() {
+        changed_files.to_vec()
+    } else {
+        response_metadata.git_add_paths.clone()
+    }
+}
+
 fn public_patch_primary_source_paths(patch: &PublicPatchEntry) -> Vec<String> {
     let paths = if patch.git_add_paths.is_empty() {
         &patch.changed_files
@@ -8530,6 +8541,7 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
         &validation_notes,
     );
     let harvest_status = public_patch_harvest_status(&harvest_blockers);
+    let git_add_paths = public_patch_display_git_add_paths(&response_metadata, &changed_files);
     Ok(Some(PublicPatchEntry {
         id: id.clone(),
         kind: row.get(1),
@@ -8547,7 +8559,7 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
         patch_diff_hash: public_patch_diff_hash(Some(&best_patch)),
         patch_subject: cover.as_ref().map(|cover| cover.subject.clone()),
         evidence_confidence: response_metadata.evidence_confidence,
-        git_add_paths: response_metadata.git_add_paths,
+        git_add_paths,
         changed_files,
         validation_notes,
         harvest_status,
@@ -10030,6 +10042,7 @@ fn public_patch_from_sqlite_row(
         &validation_notes,
     );
     let harvest_status = public_patch_harvest_status(&harvest_blockers);
+    let git_add_paths = public_patch_display_git_add_paths(&response_metadata, &changed_files);
     Ok(Some(PublicPatchEntry {
         id: id.clone(),
         kind: row.get(1)?,
@@ -10047,7 +10060,7 @@ fn public_patch_from_sqlite_row(
         patch_diff_hash: public_patch_diff_hash(Some(&best_patch)),
         patch_subject: cover.as_ref().map(|cover| cover.subject.clone()),
         evidence_confidence: response_metadata.evidence_confidence,
-        git_add_paths: response_metadata.git_add_paths,
+        git_add_paths,
         changed_files,
         validation_notes,
         harvest_status,
@@ -19058,6 +19071,7 @@ mod tests {
                 "linux/LinuxProcessTable.c".to_string(),
             ]
         );
+        assert_eq!(patch.git_add_paths, patch.changed_files);
         assert_eq!(patch.harvest_status, "needs_review");
         assert_eq!(patch.harvest_blockers, vec!["missing_patch_metadata"]);
         assert_eq!(
