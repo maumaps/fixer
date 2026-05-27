@@ -1,3 +1,10 @@
+fixer (0.209.0-1) unstable; urgency=medium
+
+  * Prioritize rerunnable source handoffs ahead of stale patch refresh work.
+  * Keep triage-backed rows in the worker candidate window.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 12:30:00 +0400
+
 fixer (0.208.0-1) unstable; urgency=medium
 
   * Requeue cloneable local-executable triage handoffs as source reruns.

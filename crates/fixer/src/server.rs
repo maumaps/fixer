@@ -6286,7 +6286,7 @@ async fn next_issue_for_worker(
     worker_attempt_cooldown_seconds: u64,
     worker_model: Option<String>,
 ) -> Result<Option<IssueCluster>> {
-    let candidate_limit: i64 = 256;
+    let candidate_limit: i64 = 1024;
     match db {
         ServerDb::Postgres(db) => {
             let rows = db
@@ -6323,7 +6323,8 @@ async fn next_issue_for_worker(
                   AND lease.state = 'leased'
                   AND lease.expires_at > NOW()
           )
-        ORDER BY score DESC, last_seen DESC
+        ORDER BY CASE WHEN best_triage_json IS NOT NULL THEN 0 ELSE 1 END,
+                 score DESC, last_seen DESC
         LIMIT $2
         ",
                     &[&worker_install_id, &candidate_limit],
@@ -6375,7 +6376,8 @@ async fn next_issue_for_worker(
                   AND lease.state = 'leased'
                   AND lease.expires_at > ?2
           )
-        ORDER BY score DESC, last_seen DESC
+        ORDER BY CASE WHEN best_triage_json IS NOT NULL THEN 0 ELSE 1 END,
+                 score DESC, last_seen DESC
         LIMIT ?3
         ",
             )?;
@@ -6437,10 +6439,14 @@ fn candidate_model_differs(candidate: &WorkerCandidate, worker_model: Option<&st
 }
 
 fn candidate_is_available_for_worker(candidate: &WorkerCandidate) -> bool {
-    if candidate.rerunnable_source_handoff.is_some() {
+    if candidate_has_rerunnable_source_handoff(candidate) {
         return true;
     }
     !candidate.has_best_triage && issue_is_available_for_worker(&candidate.issue)
+}
+
+fn candidate_has_rerunnable_source_handoff(candidate: &WorkerCandidate) -> bool {
+    candidate.rerunnable_source_handoff.is_some()
 }
 
 fn select_worker_candidate(
@@ -6452,16 +6458,58 @@ fn select_worker_candidate(
         .then(|| Utc::now() - Duration::seconds(worker_attempt_cooldown_seconds as i64));
     let mut sorted_candidates = candidates.iter().collect::<Vec<_>>();
     sorted_candidates.sort_by(compare_worker_candidate_priority);
-    // Model-rotation tiers: prefer issues whose last attempt used a different model
+    // Source-backed triage handoffs have already reached "bring me the real
+    // upstream checkout" and should not sit behind stale retained patch refresh.
     sorted_candidates
         .iter()
         .find(|candidate| {
             !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
                 && candidate.has_foreign_reports
-                && candidate_needs_patch_refresh(candidate)
+                && candidate_has_rerunnable_source_handoff(candidate)
                 && candidate_model_differs(candidate, worker_model)
         })
         .map(|candidate| candidate.issue.clone())
+        .or_else(|| {
+            sorted_candidates
+                .iter()
+                .find(|candidate| {
+                    !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
+                        && candidate_has_rerunnable_source_handoff(candidate)
+                        && candidate_model_differs(candidate, worker_model)
+                })
+                .map(|candidate| candidate.issue.clone())
+        })
+        .or_else(|| {
+            sorted_candidates
+                .iter()
+                .find(|candidate| {
+                    !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
+                        && candidate.has_foreign_reports
+                        && candidate_has_rerunnable_source_handoff(candidate)
+                })
+                .map(|candidate| candidate.issue.clone())
+        })
+        .or_else(|| {
+            sorted_candidates
+                .iter()
+                .find(|candidate| {
+                    !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
+                        && candidate_has_rerunnable_source_handoff(candidate)
+                })
+                .map(|candidate| candidate.issue.clone())
+        })
+        // Model-rotation tiers: prefer issues whose last attempt used a different model.
+        .or_else(|| {
+            sorted_candidates
+                .iter()
+                .find(|candidate| {
+                    !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
+                        && candidate.has_foreign_reports
+                        && candidate_needs_patch_refresh(candidate)
+                        && candidate_model_differs(candidate, worker_model)
+                })
+                .map(|candidate| candidate.issue.clone())
+        })
         .or_else(|| {
             sorted_candidates
                 .iter()
@@ -20493,7 +20541,7 @@ mod tests {
         );
         let triage = PatchAttempt {
             cluster_id: "issue-ollama".to_string(),
-            install_id: "worker-install".to_string(),
+            install_id: "worker-install-b".to_string(),
             outcome: "triage".to_string(),
             state: "ready".to_string(),
             summary: "A diagnosis and external handoff were created locally.".to_string(),
@@ -20534,6 +20582,119 @@ mod tests {
             issue.representative.finding.details["handoff"]["report_url"].as_str(),
             Some("https://github.com/ollama/ollama.git")
         );
+        assert_eq!(
+            issue.representative.finding.details["rerun_reason"].as_str(),
+            Some("rerunnable-source-handoff")
+        );
+    }
+
+    #[test]
+    fn worker_queue_prefers_source_handoff_over_stale_patch_refresh() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let stale_patch_issue = sample_crash(
+            "docker",
+            "Top frame: stale_patch_frame [dockerd]",
+            &["stale_patch_frame [dockerd]"],
+        );
+        let mut ollama = sample_runaway_investigation("ollama", None);
+        ollama.finding.details["native_executable_provenance"] = json!({
+            "executable_name": "ollama",
+            "executable_path": "/usr/local/bin/ollama",
+            "source_kind": "go-module",
+            "source_name": "github.com/ollama/ollama"
+        });
+        insert_test_issue(
+            &connection,
+            "issue-stale-patch",
+            "cluster-stale-patch",
+            300,
+            "2026-03-30T10:00:00Z",
+            &stale_patch_issue,
+            &["other-install-a"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-ollama",
+            "cluster-ollama",
+            106,
+            "2026-03-30T10:00:00Z",
+            &ollama,
+            &["other-install-b"],
+        );
+        let stale_patch = PatchAttempt {
+            cluster_id: "issue-stale-patch".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Patch proposal created from an old no-git workspace.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: stale no-git patch\n\n## Git Add Paths\nNone\n\n## Validation\nnot run\n",
+                    "diff": "--- a/daemon/daemon.go\n+++ b/daemon/daemon.go\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-30T10:01:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-stale-patch",
+                    serde_json::to_string(&stale_patch).unwrap()
+                ],
+            )
+            .unwrap();
+        insert_test_attempt(
+            &connection,
+            "attempt-stale-patch",
+            "lease-stale-patch",
+            &stale_patch,
+            "2026-03-30T10:01:00Z",
+        );
+        let triage = PatchAttempt {
+            cluster_id: "issue-ollama".to_string(),
+            install_id: "worker-install-b".to_string(),
+            outcome: "triage".to_string(),
+            state: "ready".to_string(),
+            summary: "A diagnosis and external handoff were created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "report_only_reason": "workspace-acquisition",
+                "handoff": {
+                    "classification": "external-local-executable",
+                    "target": "local executable ollama",
+                    "report_url": "https://github.com/ollama/ollama.git"
+                }
+            }),
+            created_at: "2026-03-30T10:05:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_triage_json = ?2 WHERE id = ?1",
+                rusqlite::params!["issue-ollama", serde_json::to_string(&triage).unwrap()],
+            )
+            .unwrap();
+        insert_test_attempt(
+            &connection,
+            "attempt-ollama-triage",
+            "lease-ollama-triage",
+            &triage,
+            "2026-03-30T10:05:00Z",
+        );
+
+        let issue = test_runtime()
+            .block_on(next_issue_for_worker(&db, "new-worker-install", 0, None))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(issue.id, "issue-ollama");
         assert_eq!(
             issue.representative.finding.details["rerun_reason"].as_str(),
             Some("rerunnable-source-handoff")
