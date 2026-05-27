@@ -1028,6 +1028,7 @@ struct PublicPatchEntry {
     upstream_review: Option<PublicPatchUpstreamReview>,
     related_upstream_review: Option<PublicPatchRelatedReview>,
     duplicate_patch: Option<PublicPatchDuplicate>,
+    manual_disposition: Option<PublicPatchDisposition>,
     best_patch: PublicAttempt,
 }
 
@@ -1049,6 +1050,13 @@ struct PublicPatchRelatedReview {
     state: String,
     relation: String,
     family_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicPatchDisposition {
+    disposition: String,
+    reason: String,
+    created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1921,6 +1929,13 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
 
+        CREATE TABLE IF NOT EXISTS patch_issue_dispositions (
+            issue_id TEXT PRIMARY KEY REFERENCES issue_clusters(id) ON DELETE CASCADE,
+            disposition TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
         CREATE TABLE IF NOT EXISTS evidence_requests (
             id TEXT PRIMARY KEY,
             issue_id TEXT NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
@@ -2051,6 +2066,13 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
             created_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS patch_issue_dispositions (
+            issue_id TEXT PRIMARY KEY REFERENCES issue_clusters(id) ON DELETE CASCADE,
+            disposition TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS evidence_requests (
             id TEXT PRIMARY KEY,
             issue_id TEXT NOT NULL REFERENCES issue_clusters(id) ON DELETE CASCADE,
@@ -2076,6 +2098,39 @@ async fn ensure_current_schema(db: &ServerDb) -> Result<()> {
     ensure_forward_installs_schema(db).await?;
     ensure_forward_upstream_patch_wins_schema(db).await?;
     ensure_forward_upstream_patch_relations_schema(db).await?;
+    ensure_forward_patch_issue_dispositions_schema(db).await?;
+    Ok(())
+}
+
+async fn ensure_forward_patch_issue_dispositions_schema(db: &ServerDb) -> Result<()> {
+    match db {
+        ServerDb::Postgres(db) => {
+            db.batch_execute(
+                "
+            CREATE TABLE IF NOT EXISTS patch_issue_dispositions (
+                issue_id TEXT PRIMARY KEY REFERENCES issue_clusters(id) ON DELETE CASCADE,
+                disposition TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            ",
+            )
+            .await?;
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            connection.execute_batch(
+                "
+            CREATE TABLE IF NOT EXISTS patch_issue_dispositions (
+                issue_id TEXT PRIMARY KEY REFERENCES issue_clusters(id) ON DELETE CASCADE,
+                disposition TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            ",
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -7742,9 +7797,11 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
         }
     };
     let manual_related_reviews = load_public_patch_manual_related_reviews(db).await?;
+    let manual_dispositions = load_public_patch_manual_dispositions(db).await?;
     annotate_public_patch_manual_related_reviews(&mut patches, manual_related_reviews);
     annotate_public_patch_duplicates(&mut patches);
     annotate_public_patch_related_reviews(&mut patches);
+    annotate_public_patch_manual_dispositions(&mut patches, manual_dispositions);
     annotate_public_patch_harvest_buckets(&mut patches);
     patches.sort_by(|left, right| {
         parse_timestamp(&right.best_patch.created_at)
@@ -7752,6 +7809,68 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
             .then_with(|| right.score.cmp(&left.score))
     });
     Ok(patches)
+}
+
+async fn load_public_patch_manual_dispositions(
+    db: &ServerDb,
+) -> Result<HashMap<String, PublicPatchDisposition>, ApiError> {
+    let mut dispositions = HashMap::new();
+    match db {
+        ServerDb::Postgres(db) => {
+            let rows = db
+                .query(
+                    "
+            SELECT issue_id, disposition, reason, created_at
+            FROM patch_issue_dispositions
+            ORDER BY created_at DESC
+            ",
+                    &[],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            for row in rows {
+                let issue_id: String = row.get(0);
+                let created_at: DateTime<Utc> = row.get(3);
+                dispositions.insert(
+                    issue_id,
+                    PublicPatchDisposition {
+                        disposition: row.get(1),
+                        reason: row.get(2),
+                        created_at: created_at.to_rfc3339(),
+                    },
+                );
+            }
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            let mut stmt = connection
+                .prepare(
+                    "
+            SELECT issue_id, disposition, reason, created_at
+            FROM patch_issue_dispositions
+            ORDER BY created_at DESC
+            ",
+                )
+                .map_err(ApiError::internal)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        PublicPatchDisposition {
+                            disposition: row.get(1)?,
+                            reason: row.get(2)?,
+                            created_at: row.get(3)?,
+                        },
+                    ))
+                })
+                .map_err(ApiError::internal)?;
+            for row in rows {
+                let (issue_id, disposition) = row.map_err(ApiError::internal)?;
+                dispositions.insert(issue_id, disposition);
+            }
+        }
+    }
+    Ok(dispositions)
 }
 
 async fn load_public_patch_manual_related_reviews(
@@ -7859,6 +7978,17 @@ fn annotate_public_patch_manual_related_reviews(
         }
         if let Some(review) = manual_related_reviews.get(&patch.id) {
             patch.related_upstream_review = Some(review.clone());
+        }
+    }
+}
+
+fn annotate_public_patch_manual_dispositions(
+    patches: &mut [PublicPatchEntry],
+    manual_dispositions: HashMap<String, PublicPatchDisposition>,
+) {
+    for patch in patches {
+        if let Some(disposition) = manual_dispositions.get(&patch.id) {
+            patch.manual_disposition = Some(disposition.clone());
         }
     }
 }
@@ -7993,6 +8123,9 @@ fn public_patch_harvest_bucket_and_reason(patch: &PublicPatchEntry) -> (String, 
             "already submitted upstream".to_string(),
         );
     }
+    if let Some(disposition) = patch.manual_disposition.as_ref() {
+        return public_patch_manual_disposition_bucket_and_reason(disposition);
+    }
     if let Some(review) = patch.related_upstream_review.as_ref() {
         if review.state == "merged" {
             return (
@@ -8066,7 +8199,34 @@ fn public_patch_harvest_bucket_without_related_review(
     ("realish".to_string(), "candidate source diff".to_string())
 }
 
+fn public_patch_manual_disposition_bucket_and_reason(
+    disposition: &PublicPatchDisposition,
+) -> (String, String) {
+    let normalized = disposition.disposition.replace('_', "-");
+    match disposition.disposition.as_str() {
+        "fixer_defect" => (
+            "fixer-defect".to_string(),
+            format!("manual fixer defect: {}", disposition.reason),
+        ),
+        "semantic_risk" => (
+            "semantic-risk".to_string(),
+            format!("manual semantic risk: {}", disposition.reason),
+        ),
+        "do_not_send" => (
+            "do-not-send".to_string(),
+            format!("manual do-not-send: {}", disposition.reason),
+        ),
+        other => (
+            normalized,
+            format!("manual {}: {}", other.replace('_', "-"), disposition.reason),
+        ),
+    }
+}
+
 fn public_patch_harvest_next_actions(patch: &PublicPatchEntry) -> Vec<String> {
+    if let Some(disposition) = patch.manual_disposition.as_ref() {
+        return public_patch_manual_disposition_next_actions(disposition);
+    }
     if patch.harvest_bucket != "needs-review" && patch.harvest_bucket != "evidence-upgrade" {
         return Vec::new();
     }
@@ -8091,6 +8251,23 @@ fn public_patch_harvest_next_actions(patch: &PublicPatchEntry) -> Vec<String> {
         );
     }
     actions
+}
+
+fn public_patch_manual_disposition_next_actions(
+    disposition: &PublicPatchDisposition,
+) -> Vec<String> {
+    match disposition.disposition.as_str() {
+        "fixer_defect" => vec![
+            "Do not submit this retained diff; fix the Fixer collector/proposal rule before rerunning this issue family.".to_string(),
+        ],
+        "semantic_risk" => vec![
+            "Do not submit this retained diff; design a semantics-preserving replacement with a failing/passing proof first.".to_string(),
+        ],
+        "do_not_send" => vec![
+            "Do not submit this retained diff; keep the patch artifact only as evidence for a future replacement.".to_string(),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 fn public_patch_harvest_next_actions_for_blockers(blockers: &[String]) -> Vec<String> {
@@ -8706,6 +8883,7 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
         upstream_review: public_patch_upstream_review_from_row(&row),
         related_upstream_review: None,
         duplicate_patch: None,
+        manual_disposition: None,
         best_patch,
     }))
 }
@@ -10207,6 +10385,7 @@ fn public_patch_from_sqlite_row(
         upstream_review: public_patch_upstream_review_from_sqlite_row(row)?,
         related_upstream_review: None,
         duplicate_patch: None,
+        manual_disposition: None,
         best_patch,
     }))
 }
@@ -10296,6 +10475,13 @@ fn public_patch_headline_label(entry: &PublicPatchEntry) -> String {
 
     if entry.harvest_bucket == "evidence-upgrade" {
         return "needs evidence upgrade".to_string();
+    }
+
+    if matches!(
+        entry.harvest_bucket.as_str(),
+        "do-not-send" | "fixer-defect" | "semantic-risk"
+    ) {
+        return entry.harvest_bucket.replace('-', " ");
     }
 
     if entry.harvest_status == "ready" {
@@ -15453,6 +15639,13 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             html_escape(&related_label)
         );
     }
+    if let Some(disposition) = entry.manual_disposition.as_ref() {
+        let _ = write!(
+            patch_tags,
+            "<span class=\"tag\">manual: {}</span>",
+            html_escape(&disposition.disposition.replace('_', " "))
+        );
+    }
     if let Some(duplicate) = entry.duplicate_patch.as_ref() {
         let _ = write!(
             patch_tags,
@@ -15473,6 +15666,17 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             )
         })
         .unwrap_or_default();
+    let manual_disposition_summary = entry
+        .manual_disposition
+        .as_ref()
+        .map(|disposition| {
+            format!(
+                "<section class=\"patch-summary\"><h4>Manual disposition</h4><p class=\"issue-summary\">{}: {}</p></section>",
+                html_escape(&disposition.disposition.replace('_', " ")),
+                html_escape(&disposition.reason)
+            )
+        })
+        .unwrap_or_default();
     let harvest_warning = if entry.harvest_blockers.is_empty() {
         String::new()
     } else {
@@ -15485,6 +15689,11 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
         if entry.upstream_review.is_some() {
             format!(
                 "<section class=\"patch-summary\"><h4>Original harvest blockers</h4><p class=\"issue-summary\">These blockers remain on the preserved local diff, but the upstream review above is the current handoff.</p><ul class=\"attempt-list\">{}</ul></section>",
+                blockers
+            )
+        } else if entry.manual_disposition.is_some() {
+            format!(
+                "<section class=\"patch-summary\"><h4>Original harvest blockers</h4><p class=\"issue-summary\">These blockers remain on the preserved local diff, but the manual disposition above is the current handoff.</p><ul class=\"attempt-list\">{}</ul></section>",
                 blockers
             )
         } else {
@@ -15528,6 +15737,7 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             {}
             {}
             {}
+            {}
             <p class="fine-print">Full published attempt: <a href="/issues/{}">/issues/{}</a>. Issue JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
         </article>"#,
         entry.id,
@@ -15537,6 +15747,7 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
         patch_tags,
         html_escape(&entry.best_patch.summary),
         upstream_review_summary,
+        manual_disposition_summary,
         harvest_warning,
         harvest_next_actions,
         cover
@@ -17372,6 +17583,7 @@ mod tests {
             upstream_review: None,
             related_upstream_review: None,
             duplicate_patch: None,
+            manual_disposition: None,
             best_patch: PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -17440,6 +17652,7 @@ mod tests {
             upstream_review: None,
             related_upstream_review: None,
             duplicate_patch: None,
+            manual_disposition: None,
             best_patch: PublicAttempt {
                 outcome: "patch".to_string(),
                 state: "ready".to_string(),
@@ -20031,6 +20244,168 @@ mod tests {
             alternative.harvest_reason,
             "related upstream review alternative"
         );
+    }
+
+    #[test]
+    fn public_patch_loader_exposes_manual_dispositions() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "openssh-server",
+            "Top frame: grace_alarm [sshd-auth]",
+            &["grace_alarm [sshd-auth]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-fixer-defect",
+            "cluster-fixer-defect",
+            110,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-semantic-risk",
+            "cluster-semantic-risk",
+            109,
+            "2026-03-31T00:00:00Z",
+            &representative,
+            &["install-2"],
+        );
+        let blocked_patch = PatchAttempt {
+            cluster_id: "issue-fixer-defect".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Add a child-side LoginGraceTime timer.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("blocked_validation".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: sshd-auth: enforce LoginGraceTime\n\n## Evidence Confidence\nobserved\n\n## Git Add Paths\nsshd-auth.c\n\n## Validation\nBlocked because /var/empty was not available.\n",
+                    "diff": "--- a/sshd-auth.c\n+++ b/sshd-auth.c\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let risky_patch = PatchAttempt {
+            cluster_id: "issue-semantic-risk".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Prefer suffixed dfmgr library names.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: dfmgr: prefer suffixed library lookup\n\n## Git Add Paths\nsrc/backend/utils/fmgr/dfmgr.c\n",
+                    "diff": "--- a/src/backend/utils/fmgr/dfmgr.c\n+++ b/src/backend/utils/fmgr/dfmgr.c\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-fixer-defect",
+                    serde_json::to_string(&blocked_patch).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-semantic-risk",
+                    serde_json::to_string(&risky_patch).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO patch_issue_dispositions
+                 (issue_id, disposition, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "issue-fixer-defect",
+                    "fixer_defect",
+                    "upstream already owns the parent-side timer",
+                    "2026-04-01T00:00:00Z",
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO patch_issue_dispositions
+                 (issue_id, disposition, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "issue-semantic-risk",
+                    "semantic_risk",
+                    "changes visible $libdir/foo lookup precedence",
+                    "2026-04-01T00:00:00Z",
+                ],
+            )
+            .unwrap();
+
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let fixer_defect = patches
+            .iter()
+            .find(|patch| patch.id == "issue-fixer-defect")
+            .expect("manual fixer-defect patch should be visible");
+        let semantic_risk = patches
+            .iter()
+            .find(|patch| patch.id == "issue-semantic-risk")
+            .expect("manual semantic-risk patch should be visible");
+
+        assert_eq!(fixer_defect.harvest_bucket, "fixer-defect");
+        assert_eq!(
+            fixer_defect.harvest_reason,
+            "manual fixer defect: upstream already owns the parent-side timer"
+        );
+        assert_eq!(fixer_defect.harvest_status, "needs_review");
+        assert_eq!(fixer_defect.harvest_blockers, vec!["blocked_validation"]);
+        assert_eq!(
+            fixer_defect
+                .manual_disposition
+                .as_ref()
+                .map(|disposition| disposition.created_at.as_str()),
+            Some("2026-04-01T00:00:00Z")
+        );
+        assert_eq!(
+            fixer_defect.harvest_next_actions,
+            vec![
+                "Do not submit this retained diff; fix the Fixer collector/proposal rule before rerunning this issue family."
+            ]
+        );
+
+        assert_eq!(semantic_risk.harvest_bucket, "semantic-risk");
+        assert_eq!(
+            semantic_risk.harvest_reason,
+            "manual semantic risk: changes visible $libdir/foo lookup precedence"
+        );
+        assert_eq!(
+            semantic_risk.harvest_next_actions,
+            vec![
+                "Do not submit this retained diff; design a semantics-preserving replacement with a failing/passing proof first."
+            ]
+        );
+
+        let card = render_public_patch_card(fixer_defect);
+        assert!(card.contains("Manual disposition"));
+        assert!(card.contains("fixer defect"));
+        assert!(card.contains("Original harvest blockers"));
+        assert!(!card.contains("Harvest review needed"));
+        assert!(card.contains("manual disposition above is the current handoff"));
     }
 
     #[test]

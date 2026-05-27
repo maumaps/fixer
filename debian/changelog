@@ -1,3 +1,10 @@
+fixer (0.210.0-1) unstable; urgency=medium
+
+  * Add manual public patch dispositions for retained do-not-send artifacts.
+  * Let harvest helpers follow public API buckets instead of stale local guesses.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 12:50:26 +0400
+
 fixer (0.209.0-1) unstable; urgency=medium
 
   * Prioritize rerunnable source handoffs ahead of stale patch refresh work.
