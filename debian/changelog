@@ -1,3 +1,9 @@
+fixer (0.202.0-1) unstable; urgency=medium
+
+  * Acquire versioned PostgreSQL packages from upstream git.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 10:20:40 +0400
+
 fixer (0.201.0-1) unstable; urgency=medium
 
   * Prioritize fresh ready reports when proposal submission slots are capped.

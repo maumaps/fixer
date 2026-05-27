@@ -429,6 +429,10 @@ fn upstream_source_alias(source_package: &str) -> Option<WorkspaceSourceTarget> 
             ("https://github.com/PackageKit/PackageKit.git", "PackageKit")
         }
         "htop" => ("https://github.com/htop-dev/htop.git", "htop"),
+        pkg if pkg == "postgresql" || pkg.starts_with("postgresql-") => (
+            "https://git.postgresql.org/git/postgresql.git",
+            "PostgreSQL",
+        ),
         _ => return None,
     };
 
@@ -1368,6 +1372,24 @@ zoom:\n\
                 .as_deref()
                 .unwrap()
                 .contains("upstream git default branch")
+        );
+    }
+
+    #[test]
+    fn maps_versioned_postgresql_packages_to_upstream_git() {
+        let target =
+            upstream_source_alias("postgresql-18").expect("PostgreSQL should use upstream git");
+        assert_eq!(target.source_package, "postgresql-18");
+        assert_eq!(
+            target.upstream_url.as_deref(),
+            Some("https://git.postgresql.org/git/postgresql.git")
+        );
+        assert!(
+            target
+                .acquisition_note
+                .as_deref()
+                .unwrap()
+                .contains("PostgreSQL upstream git default branch")
         );
     }
 
