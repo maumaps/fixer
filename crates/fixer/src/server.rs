@@ -11690,7 +11690,7 @@ fn public_triage_handoff_from_attempt(
     published_session: Option<&PublishedAttemptSession>,
 ) -> Option<PublicTriageHandoff> {
     let reason = inferred_triage_reason(attempt)?;
-    let target = attempt
+    let raw_target = attempt
         .details
         .get("handoff")
         .and_then(|value| value.get("target"))
@@ -11700,7 +11700,7 @@ fn public_triage_handoff_from_attempt(
         .unwrap_or_else(|| {
             "external dependency or workload outside the current source tree".to_string()
         });
-    let classification = attempt
+    let mut classification = attempt
         .details
         .get("handoff")
         .and_then(|value| value.get("classification"))
@@ -11713,6 +11713,17 @@ fn public_triage_handoff_from_attempt(
         })
         .map(sanitize_public_text)
         .filter(|value| !value.trim().is_empty());
+    let local_executable = legacy_local_executable_handoff_target(&attempt.details);
+    let target = if classification.as_deref() == Some("workspace-unavailable") {
+        if let Some(target) = local_executable.as_ref() {
+            classification = Some("external-local-executable".to_string());
+            target.clone()
+        } else {
+            raw_target
+        }
+    } else {
+        raw_target
+    };
     let report_url = attempt
         .details
         .get("handoff")
@@ -11733,7 +11744,14 @@ fn public_triage_handoff_from_attempt(
                 .collect::<Vec<_>>()
         })
         .filter(|items| !items.is_empty())
-        .unwrap_or_else(|| default_triage_next_steps(&target));
+        .filter(|_| classification.as_deref() != Some("external-local-executable"))
+        .unwrap_or_else(|| {
+            if classification.as_deref() == Some("external-local-executable") {
+                local_executable_triage_next_steps(&target)
+            } else {
+                default_triage_next_steps(&target)
+            }
+        });
     Some(PublicTriageHandoff {
         reason,
         classification,
@@ -11741,6 +11759,83 @@ fn public_triage_handoff_from_attempt(
         report_url,
         next_steps,
     })
+}
+
+fn legacy_local_executable_handoff_target(details: &Value) -> Option<String> {
+    let diagnosis = details.get("diagnosis")?;
+    if !diagnosis_profile_target_has_local_non_dpkg_path(diagnosis)
+        && !diagnosis_command_line_has_local_non_dpkg_path(diagnosis)
+        && diagnosis
+            .get("native_executable_provenance")
+            .is_none_or(Value::is_null)
+    {
+        return None;
+    }
+    let name = diagnosis
+        .get("native_executable_provenance")
+        .and_then(|value| value.get("executable_name"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            diagnosis
+                .get("profile_target")
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(normalize_deleted_file_marker)
+        .or_else(|| {
+            diagnosis
+                .get("native_executable_provenance")
+                .and_then(|value| value.get("executable_path"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    diagnosis
+                        .get("profile_target")
+                        .and_then(|value| value.get("path"))
+                        .and_then(Value::as_str)
+                })
+                .map(normalize_deleted_file_marker)
+                .map(|value| file_name_or_self(&value).to_string())
+        })?;
+    Some(format!("local executable {name}"))
+}
+
+fn diagnosis_profile_target_has_local_non_dpkg_path(diagnosis: &Value) -> bool {
+    diagnosis
+        .get("profile_target")
+        .and_then(|value| value.get("path"))
+        .and_then(Value::as_str)
+        .is_some_and(local_non_dpkg_executable_path)
+}
+
+fn diagnosis_command_line_has_local_non_dpkg_path(diagnosis: &Value) -> bool {
+    diagnosis
+        .get("command_line")
+        .and_then(Value::as_str)
+        .and_then(|command_line| command_line.split_whitespace().next())
+        .is_some_and(local_non_dpkg_executable_path)
+}
+
+fn local_non_dpkg_executable_path(path: &str) -> bool {
+    let normalized = path
+        .trim()
+        .trim_start_matches("(deleted) ")
+        .trim_end_matches(" (deleted)");
+    normalized.starts_with("/usr/local/")
+        || normalized.starts_with("/opt/")
+        || normalized.starts_with("/home/")
+        || normalized.starts_with("/var/lib/flatpak/")
+        || normalized.starts_with("/snap/")
+}
+
+fn local_executable_triage_next_steps(target: &str) -> Vec<String> {
+    vec![
+        format!(
+            "Find the upstream project, local checkout, container image, or manual install source that provided {target}."
+        ),
+        "Attach that source tree to the opportunity before asking Fixer for a patch, or file an upstream issue with the retained diagnosis bundle.".to_string(),
+        "Record the executable distribution channel so future Fixer runs can acquire the right workspace automatically.".to_string(),
+    ]
 }
 
 fn infer_external_target_from_response(response: &str) -> Option<String> {
@@ -17536,6 +17631,57 @@ mod tests {
                 .and_then(|handoff| handoff.classification)
                 .as_deref(),
             Some("external-package")
+        );
+    }
+
+    #[test]
+    fn legacy_local_executable_workspace_handoff_is_canonicalized() {
+        let attempt = PatchAttempt {
+            cluster_id: "issue-1".to_string(),
+            install_id: "install-1".to_string(),
+            outcome: "triage".to_string(),
+            state: "ready".to_string(),
+            summary: "A diagnosis and external handoff were created locally.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "report_only_reason": "workspace-acquisition",
+                "workspace_classification": "workspace-unavailable",
+                "diagnosis": {
+                    "profile_target": {
+                        "name": "synthetic-llm",
+                        "path": "/usr/local/bin/synthetic-llm",
+                        "package_name": null
+                    }
+                },
+                "handoff": {
+                    "classification": "workspace-unavailable",
+                    "target": "the upstream maintainer",
+                    "next_steps": [
+                        "Review the package metadata and attach a source tree or upstream clone if one exists.",
+                        "If no patchable tree is available, file an external bug using the diagnosis bundle."
+                    ]
+                }
+            }),
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+        };
+
+        let public_attempt = public_attempt_from_patch_attempt(attempt);
+        let handoff = public_attempt
+            .handoff
+            .expect("legacy workspace handoff should stay public");
+
+        assert_eq!(
+            handoff.classification.as_deref(),
+            Some("external-local-executable")
+        );
+        assert_eq!(handoff.target, "local executable synthetic-llm");
+        assert!(
+            handoff
+                .next_steps
+                .iter()
+                .any(|step| step.contains("local checkout"))
         );
     }
 
