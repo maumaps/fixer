@@ -7834,6 +7834,12 @@ fn public_patch_harvest_bucket_and_reason(patch: &PublicPatchEntry) -> (String, 
         );
     }
     if let Some(review) = patch.related_upstream_review.as_ref() {
+        if review.state == "merged" {
+            return (
+                "merged".to_string(),
+                format!("related upstream review {} merged", review.relation),
+            );
+        }
         if review.relation == "source_path_family" {
             if public_upstream_review_state_is_closed(&review.state) {
                 return (
@@ -7847,12 +7853,6 @@ fn public_patch_harvest_bucket_and_reason(patch: &PublicPatchEntry) -> (String, 
             return (
                 "source-family-review".to_string(),
                 "related source-path family review is active".to_string(),
-            );
-        }
-        if review.state == "merged" {
-            return (
-                "merged".to_string(),
-                format!("related upstream review {} merged", review.relation),
             );
         }
         if public_upstream_review_state_is_closed(&review.state) {
@@ -18452,6 +18452,134 @@ mod tests {
         assert_eq!(
             related.harvest_reason,
             "related source-path family review closed-unmerged needs distinct-issue review"
+        );
+    }
+
+    #[test]
+    fn public_patch_related_review_family_merged_wins_before_active_bucket() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "python3.13",
+            "Top frame: Popen._wait [python]",
+            &["Popen._wait [python]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-reviewed",
+            "cluster-reviewed",
+            110,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-1"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-related",
+            "cluster-related",
+            109,
+            "2026-03-31T00:00:00Z",
+            &representative,
+            &["install-2"],
+        );
+        let reviewed_patch = PatchAttempt {
+            cluster_id: "issue-reviewed".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Add event-driven subprocess wait.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: subprocess: reduce wakeups in timed POSIX Popen._wait loop\n\n## Evidence Confidence\nreproduced\n\n## Git Add Paths\nLib/subprocess.py\nLib/test/test_subprocess.py\n\n## Validation\npython tests passed\n",
+                    "diff": "--- a/Lib/subprocess.py\n+++ b/Lib/subprocess.py\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-29T00:00:00Z".to_string(),
+        };
+        let related_patch = PatchAttempt {
+            cluster_id: "issue-related".to_string(),
+            install_id: "worker-install".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Reduce timed wait wakeups.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: subprocess: reduce timed wait wakeups\n\n## Evidence Confidence\nreproduced\n\n## Git Add Paths\nLib/subprocess.py\n\n## Validation\npython tests passed\n",
+                    "diff": "--- a/Lib/subprocess.py\n+++ b/Lib/subprocess.py\n@@ -1 +1 @@\n-old\n+newer\n",
+                }
+            }),
+            created_at: "2026-03-31T00:00:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-reviewed",
+                    serde_json::to_string(&reviewed_patch).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-related",
+                    serde_json::to_string(&related_patch).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO upstream_patch_wins
+                 (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    "cpython-subprocess-wait",
+                    "CPython",
+                    "Merged CPython subprocess wait fix.",
+                    "Merged stronger source-path family fix.",
+                    "https://github.com/python/cpython/pull/144047",
+                    "merged",
+                    "2026-01-28T14:04:40Z",
+                    serde_json::to_string(&json!(["upstream review"])).unwrap(),
+                    "issue-reviewed",
+                    "2026-03-31T00:00:00Z",
+                ],
+            )
+            .unwrap();
+
+        let patches = match test_runtime().block_on(load_public_patches(&db, 10)) {
+            Ok(value) => value,
+            Err(error) => panic!("load public patches failed: {}", error.message),
+        };
+        let related = patches
+            .iter()
+            .find(|patch| patch.id == "issue-related")
+            .expect("merged source-path related public patch should be visible");
+        let family = related
+            .related_upstream_review
+            .as_ref()
+            .expect("source-path row should match merged reviewed family");
+
+        assert_eq!(family.issue_id, "issue-reviewed");
+        assert_eq!(
+            family.pr_url,
+            "https://github.com/python/cpython/pull/144047"
+        );
+        assert_eq!(family.state, "merged");
+        assert_eq!(family.family_count, 2);
+        assert_eq!(related.harvest_bucket, "merged");
+        assert_eq!(
+            related.harvest_reason,
+            "related upstream review source_path_family merged"
         );
     }
 

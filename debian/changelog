@@ -1,3 +1,10 @@
+fixer (0.188.0-1) unstable; urgency=medium
+
+  * Classify merged source-path-family reviews as merged instead of active
+    related reviews.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 22:25:00 +0400
+
 fixer (0.187.0-1) unstable; urgency=medium
 
   * Put active source-path-family reviews into their own advisory harvest
