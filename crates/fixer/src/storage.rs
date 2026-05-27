@@ -1712,13 +1712,13 @@ impl Store {
                     SELECT 1
                     FROM proposals p
                     WHERE p.opportunity_id = o.id
-                      AND p.engine = 'codex'
+                      AND p.engine IN ('codex', 'deterministic')
                       AND p.state = 'ready'
                       AND NOT EXISTS (
                             SELECT 1
                             FROM proposals newer
                             WHERE newer.opportunity_id = p.opportunity_id
-                              AND newer.engine = 'codex'
+                              AND newer.engine = p.engine
                               AND newer.state = 'ready'
                               AND (
                                     newer.updated_at > p.updated_at

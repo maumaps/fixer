@@ -4869,6 +4869,21 @@ mod tests {
     fn build_submission_bundle_includes_ready_process_reports_with_source_provenance() {
         let dir = tempdir().unwrap();
         let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+        for index in 0..3 {
+            store
+                .record_finding(&FindingInput {
+                    kind: "investigation".to_string(),
+                    title: format!("Higher score investigation {index}"),
+                    severity: "high".to_string(),
+                    fingerprint: format!("higher-score-investigation-{index}"),
+                    summary: "A higher score investigation without a ready report".to_string(),
+                    details: json!({"subsystem": "runaway-process"}),
+                    artifact: None,
+                    repo_root: None,
+                    ecosystem: None,
+                })
+                .unwrap();
+        }
         let finding_id = store
             .record_finding(&FindingInput {
                 kind: "investigation".to_string(),
@@ -4929,7 +4944,8 @@ mod tests {
             )
             .unwrap();
 
-        let config = FixerConfig::default();
+        let mut config = FixerConfig::default();
+        config.network.max_submission_items = 1;
         let identity = store.ensure_install_identity().unwrap();
         let participation = ParticipationSnapshot {
             identity,
@@ -4943,6 +4959,7 @@ mod tests {
 
         let bundle = build_submission_bundle(&store, &config, &participation).unwrap();
         assert_eq!(bundle.items.len(), 1);
+        assert_eq!(bundle.items[0].local_opportunity_id, opportunity.id);
         assert_eq!(bundle.proposals.len(), 1);
         assert_eq!(bundle.proposals[0].local_proposal_id, proposal.id);
         assert_eq!(bundle.proposals[0].result.attempt.outcome, "triage");

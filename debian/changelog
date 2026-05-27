@@ -1,3 +1,9 @@
+fixer (0.200.0-1) unstable; urgency=medium
+
+  * Prioritize ready deterministic reports in submission candidate windows.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 09:29:42 +0400
+
 fixer (0.199.0-1) unstable; urgency=medium
 
   * Publish deterministic process reports with executable source provenance.
