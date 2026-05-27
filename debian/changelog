@@ -1,3 +1,11 @@
+fixer (0.178.0-1) unstable; urgency=medium
+
+  * Show direct upstream reviews as submitted, merged, or closed handoffs on
+    public patch cards even when the preserved local diff still has original
+    harvest blockers.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 04:12:00 +0400
+
 fixer (0.177.0-1) unstable; urgency=medium
 
   * Mark retained source diffs with missing harvest metadata as needs-review

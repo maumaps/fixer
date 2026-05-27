@@ -9738,6 +9738,25 @@ fn public_upstream_review_relation_label(relation: &str) -> String {
     }
 }
 
+fn public_patch_headline_label(entry: &PublicPatchEntry) -> String {
+    if let Some(review) = entry.upstream_review.as_ref() {
+        return match review.state.as_str() {
+            "merged" => "merged upstream".to_string(),
+            "review" => "submitted upstream".to_string(),
+            "reviewer_reduced" => "reviewer-reduced upstream".to_string(),
+            "closed" | "closed_unmerged" | "rejected" => "closed upstream".to_string(),
+            "superseded" => "superseded upstream".to_string(),
+            state => format!("{} upstream", public_upstream_review_state_label(state)),
+        };
+    }
+
+    if entry.harvest_status == "ready" {
+        "successful patch".to_string()
+    } else {
+        "patch needs review".to_string()
+    }
+}
+
 fn upstream_patch_win_from_sqlite_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<UpstreamPatchWin> {
@@ -14470,7 +14489,7 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             html_escape(status)
         );
     }
-    if entry.harvest_status != "ready" {
+    if entry.upstream_review.is_none() && entry.harvest_status != "ready" {
         let _ = write!(
             patch_tags,
             "<span class=\"tag\">harvest: {}</span>",
@@ -14514,6 +14533,19 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             duplicate.duplicate_count
         );
     }
+    let upstream_review_summary = entry
+        .upstream_review
+        .as_ref()
+        .map(|review| {
+            format!(
+                "<section class=\"patch-summary\"><h4>Upstream review</h4><p class=\"issue-summary\">This patch is already tracked upstream as <a href=\"{}\">{}: {}</a> ({}).</p></section>",
+                html_escape(&review.pr_url),
+                html_escape(&review.project),
+                html_escape(&review.title),
+                html_escape(&public_upstream_review_state_label(&review.state))
+            )
+        })
+        .unwrap_or_default();
     let harvest_warning = if entry.harvest_blockers.is_empty() {
         String::new()
     } else {
@@ -14523,16 +14555,19 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             .map(|blocker| format!("<li>{}</li>", html_escape(&blocker.replace('_', " "))))
             .collect::<Vec<_>>()
             .join("");
-        format!(
-            "<section class=\"patch-summary\"><h4>Harvest review needed</h4><p class=\"issue-summary\">The diff is preserved for inspection, but Fixer should not treat it as upstream-ready until these blockers are cleared.</p><ul class=\"attempt-list\">{}</ul></section>",
-            blockers
-        )
+        if entry.upstream_review.is_some() {
+            format!(
+                "<section class=\"patch-summary\"><h4>Original harvest blockers</h4><p class=\"issue-summary\">These blockers remain on the preserved local diff, but the upstream review above is the current handoff.</p><ul class=\"attempt-list\">{}</ul></section>",
+                blockers
+            )
+        } else {
+            format!(
+                "<section class=\"patch-summary\"><h4>Harvest review needed</h4><p class=\"issue-summary\">The diff is preserved for inspection, but Fixer should not treat it as upstream-ready until these blockers are cleared.</p><ul class=\"attempt-list\">{}</ul></section>",
+                blockers
+            )
+        }
     };
-    let headline_label = if entry.harvest_status == "ready" {
-        "successful patch"
-    } else {
-        "patch needs review"
-    };
+    let headline_label = public_patch_headline_label(entry);
 
     format!(
         r#"<article class="issue-card patch-card">
@@ -14550,14 +14585,16 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             {}
             {}
             {}
+            {}
             <p class="fine-print">Full published attempt: <a href="/issues/{}">/issues/{}</a>. Issue JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
         </article>"#,
         entry.id,
         html_escape(&entry.title),
-        html_escape(headline_label),
+        html_escape(&headline_label),
         html_escape(&entry.summary),
         patch_tags,
         html_escape(&entry.best_patch.summary),
+        upstream_review_summary,
         harvest_warning,
         cover
             .as_ref()
@@ -17883,11 +17920,11 @@ mod tests {
             summary: "smtpd keeps draining an overlong command.".to_string(),
             bundle_path: None,
             output_path: None,
-            validation_status: Some("ready".to_string()),
+            validation_status: Some("blocked_validation".to_string()),
             details: json!({
                 "published_session": {
                     "prompt": "patch prompt",
-                    "response": "Subject: smtpd: disconnect after overlong commands\n\n## Evidence Confidence\nreproduced\n\n## Git Add Paths\nsrc/smtpd/smtpd.c\n\n## Validation\nmake -j32 passed\n",
+                    "response": "Subject: smtpd: disconnect after overlong commands\n\n## Evidence Confidence\nreproduced\n\n## Git Add Paths\nsrc/smtpd/smtpd.c\n\n## Validation\nBlocked because the upstream test environment was not available.\n",
                     "diff": "--- a/src/smtpd/smtpd.c\n+++ b/src/smtpd/smtpd.c\n@@ -1 +1 @@\n-old\n+new\n",
                 }
             }),
@@ -17941,6 +17978,19 @@ mod tests {
                 "resource hardening".to_string()
             ]
         );
+        let patch = patches.first().expect("patch should be visible");
+        assert_eq!(patch.harvest_status, "needs_review");
+        assert_eq!(patch.harvest_blockers, vec!["blocked_validation"]);
+
+        let card = render_public_patch_card(patch);
+        assert!(card.contains("submitted upstream"));
+        assert!(card.contains("Upstream review"));
+        assert!(card.contains("https://github.com/vdukhovni/postfix/pull/22"));
+        assert!(card.contains("Original harvest blockers"));
+        assert!(card.contains("blocked validation"));
+        assert!(!card.contains("patch needs review"));
+        assert!(!card.contains("Harvest review needed"));
+        assert!(!card.contains("harvest: needs review"));
     }
 
     #[test]
