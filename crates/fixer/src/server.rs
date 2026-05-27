@@ -49,7 +49,7 @@ const APP_CSS: &str = r#"
     --warm: #b14c22;
     --good: #245c2d;
     --shadow: 0 18px 40px rgba(66, 45, 15, 0.12);
-    --radius: 22px;
+    --radius: 14px;
     --mono: "Iosevka Term", "JetBrains Mono", "SFMono-Regular", monospace;
     --sans: "IBM Plex Sans", "Segoe UI", sans-serif;
 }
@@ -62,10 +62,7 @@ html, body {
     margin: 0;
     padding: 0;
     font-family: var(--sans);
-    background:
-        radial-gradient(circle at top left, rgba(11, 122, 117, 0.18), transparent 32%),
-        radial-gradient(circle at top right, rgba(177, 76, 34, 0.14), transparent 24%),
-        linear-gradient(180deg, #f8f3ea 0%, var(--bg) 100%);
+    background: linear-gradient(180deg, #f8f3ea 0%, var(--bg) 100%);
     color: var(--text);
 }
 
@@ -140,26 +137,16 @@ code, pre {
 }
 
 .hero {
-    padding: clamp(1.5rem, 4vw, 3rem);
+    padding: clamp(1.35rem, 3vw, 2.35rem);
     overflow: hidden;
     position: relative;
 }
 
-.hero::after {
-    content: "";
-    position: absolute;
-    inset: auto -6rem -6rem auto;
-    width: 18rem;
-    height: 18rem;
-    border-radius: 50%;
-    background: radial-gradient(circle, rgba(11, 122, 117, 0.18), transparent 68%);
-}
-
 .hero h1 {
-    font-size: clamp(2rem, 4vw, 4rem);
-    line-height: 1;
+    font-size: clamp(2rem, 3.2vw, 3.3rem);
+    line-height: 1.04;
     margin: 0 0 1rem;
-    max-width: 12ch;
+    max-width: 18ch;
 }
 
 .hero p {
@@ -178,27 +165,15 @@ code, pre {
 
 .hero-grid {
     display: grid;
-    grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.9fr);
+    grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr);
     gap: 1.2rem;
-    align-items: stretch;
+    align-items: start;
 }
 
 .home-hero {
     background:
         radial-gradient(circle at top right, rgba(255, 255, 255, 0.62), transparent 36%),
         linear-gradient(135deg, rgba(255, 250, 242, 0.92), rgba(241, 250, 248, 0.92));
-}
-
-.home-hero::before {
-    content: "";
-    position: absolute;
-    inset: 1rem auto auto 52%;
-    width: 12rem;
-    height: 12rem;
-    border-radius: 2.4rem;
-    border: 1px solid rgba(11, 122, 117, 0.1);
-    background: linear-gradient(180deg, rgba(11, 122, 117, 0.06), rgba(11, 122, 117, 0));
-    transform: rotate(18deg);
 }
 
 .hero-copy,
@@ -208,7 +183,7 @@ code, pre {
 }
 
 .hero-copy h1 {
-    max-width: 9.5ch;
+    max-width: 16ch;
 }
 
 .hero-copy .lede {
@@ -240,8 +215,8 @@ code, pre {
 }
 
 .live-board {
-    padding: 1.15rem;
-    border-radius: 20px;
+    padding: 1rem;
+    border-radius: var(--radius);
     border: 1px solid rgba(94, 70, 34, 0.12);
     background:
         linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(245, 250, 249, 0.84));
@@ -274,8 +249,8 @@ code, pre {
 }
 
 .snapshot-stat {
-    padding: 0.95rem;
-    border-radius: 16px;
+    padding: 0.85rem;
+    border-radius: 10px;
     border: 1px solid rgba(94, 70, 34, 0.12);
     background: rgba(255, 255, 255, 0.78);
 }
@@ -290,6 +265,35 @@ code, pre {
 .snapshot-stat span {
     color: var(--muted);
     font-size: 0.94rem;
+}
+
+.live-board .snapshot-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.65rem;
+}
+
+.live-board .snapshot-stat {
+    min-height: 4.8rem;
+}
+
+.compact-metrics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem 0.75rem;
+    margin-top: 0.8rem;
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+.compact-metrics span {
+    padding: 0.35rem 0.55rem;
+    border: 1px solid rgba(94, 70, 34, 0.12);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.58);
+}
+
+.compact-metrics strong {
+    color: var(--text);
 }
 
 .outcome-zero-summary {
@@ -683,12 +687,43 @@ code, pre {
         grid-template-columns: 1fr;
     }
 
+    .hero-copy h1 {
+        max-width: 13ch;
+    }
+
     .snapshot-grid {
+        grid-template-columns: 1fr 1fr;
+    }
+
+    .live-board .snapshot-grid {
         grid-template-columns: 1fr 1fr;
     }
 
     .upstream-proof {
         grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 420px) {
+    .shell {
+        width: min(100% - 1.25rem, 1180px);
+    }
+
+    .hero {
+        padding: 1.25rem;
+    }
+
+    .hero-copy h1 {
+        font-size: 2.1rem;
+        max-width: 12ch;
+    }
+
+    .hero-actions .button {
+        width: 100%;
+    }
+
+    .mini-badge {
+        width: 100%;
     }
 }
 "#;
@@ -14256,22 +14291,12 @@ sudo apt install fixer"
                             <strong><a href="/attempts?kind=reports">{}</a></strong>
                             <span>diagnosis-only reports</span>
                         </div>
-                        <div class="snapshot-stat">
-                            <strong><a href="/attempts?kind=failures">{}</a></strong>
-                            <span>failed patch attempts</span>
-                        </div>
-                        <div class="snapshot-stat">
-                            <strong><a href="/attempts?kind=impossible">{}</a></strong>
-                            <span>explained impossible attempts</span>
-                        </div>
-                        <div class="snapshot-stat">
-                            <strong>{}</strong>
-                            <span>upstream reviews missing issue links</span>
-                        </div>
-                        <div class="snapshot-stat">
-                            <strong>{}</strong>
-                            <span>still quarantined against spam</span>
-                        </div>
+                    </div>
+                    <div class="compact-metrics" aria-label="Secondary network counters">
+                        <span><strong><a href="/attempts?kind=failures">{}</a></strong> failed patch attempts</span>
+                        <span><strong><a href="/attempts?kind=impossible">{}</a></strong> explained impossible attempts</span>
+                        <span><strong>{}</strong> upstream reviews missing issue links</span>
+                        <span><strong>{}</strong> still quarantined against spam</span>
                     </div>
                     <div class="snapshot-foot">
                         <p><strong>Last submission:</strong> {last_submission}</p>

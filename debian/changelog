@@ -1,3 +1,9 @@
+fixer (0.213.0-1) unstable; urgency=medium
+
+  * Tighten the public landing page hero and live snapshot layout.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 14:50:29 +0400
+
 fixer (0.212.0-1) unstable; urgency=medium
 
   * Show upstream review handoffs on public issue detail pages.
