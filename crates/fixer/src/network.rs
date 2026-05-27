@@ -3469,15 +3469,6 @@ fn published_session_publication_blocker(
     opportunity: &OpportunityRecord,
     session: Option<&Value>,
 ) -> Option<String> {
-    if opportunity
-        .evidence
-        .get("details")
-        .and_then(|details| details.get("subsystem"))
-        .and_then(Value::as_str)
-        != Some("apparmor")
-    {
-        return None;
-    }
     let session = session?;
     let diff = session
         .get("diff")
@@ -3491,6 +3482,25 @@ fn published_session_publication_blocker(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let response_lower = response.to_ascii_lowercase();
+
+    if published_session_touches_postgresql_core(opportunity, diff)
+        && published_response_evidence_confidence(response) != Some("reproduced")
+    {
+        return Some(
+            "PostgreSQL core patch changes database semantics without reproduced evidence and PostgreSQL upstream validation; publish a diagnosis or gather a failing/passing proof first."
+                .to_string(),
+        );
+    }
+
+    if opportunity
+        .evidence
+        .get("details")
+        .and_then(|details| details.get("subsystem"))
+        .and_then(Value::as_str)
+        != Some("apparmor")
+    {
+        return None;
+    }
 
     if diff_adds_apparmor_root_read(diff)
         && published_response_evidence_confidence(response) != Some("reproduced")
@@ -3509,6 +3519,52 @@ fn published_session_publication_blocker(
         );
     }
     None
+}
+
+fn published_session_touches_postgresql_core(opportunity: &OpportunityRecord, diff: &str) -> bool {
+    let package_matches = opportunity
+        .evidence
+        .get("source_package")
+        .or_else(|| opportunity.evidence.get("package_name"))
+        .and_then(Value::as_str)
+        .is_some_and(|package| package == "postgresql" || package.starts_with("postgresql-"));
+    if !package_matches {
+        return false;
+    }
+    published_diff_changed_paths(diff)
+        .iter()
+        .any(|path| postgresql_core_patch_path(path))
+}
+
+fn postgresql_core_patch_path(path: &str) -> bool {
+    path.starts_with("src/backend/")
+        || path.starts_with("src/include/")
+        || path.starts_with("src/bin/pg_upgrade/")
+        || path.starts_with("contrib/")
+}
+
+fn published_diff_changed_paths(diff: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            for token in rest.split_whitespace().take(2) {
+                let path = token
+                    .strip_prefix("a/")
+                    .or_else(|| token.strip_prefix("b/"))
+                    .unwrap_or(token);
+                if path != "/dev/null" && !path.is_empty() {
+                    paths.push(path.to_string());
+                }
+            }
+        } else if let Some(path) = line.strip_prefix("+++ b/") {
+            if path != "/dev/null" && !path.is_empty() {
+                paths.push(path.to_string());
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn published_response_evidence_confidence(response: &str) -> Option<&'static str> {
@@ -3872,6 +3928,51 @@ mod tests {
         let session = json!({
             "response": "Subject: profiles: import lsusb profile\n\n## Evidence Confidence\nreproduced\n\n## Issue Connection\nI reproduced the confined command. The profile is copied from the existing upstream profile, preserving the existing header.\n",
             "diff": "diff --git a/profiles/apparmor.d/lsusb b/profiles/apparmor.d/lsusb\nnew file mode 100644\n--- /dev/null\n+++ b/profiles/apparmor.d/lsusb\n@@ -0,0 +1,5 @@\n+#    Author: Existing Maintainer <maintainer@example.com>\n+profile lsusb /usr/bin/lsusb {\n+  / r,\n+}\n",
+        });
+
+        assert!(published_session_publication_blocker(&opportunity, Some(&session)).is_none());
+    }
+
+    fn sample_postgresql_opportunity() -> OpportunityRecord {
+        OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "PostgreSQL dynamic library lookup churn".to_string(),
+            score: 106,
+            state: "open".to_string(),
+            summary: "postgres repeatedly probes for an extension library.".to_string(),
+            evidence: json!({
+                "package_name": "postgresql-18",
+                "source_package": "postgresql-18"
+            }),
+            repo_root: None,
+            ecosystem: Some("debian".to_string()),
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+            updated_at: "2026-05-27T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn postgres_core_publication_guard_blocks_observed_semantic_patch() {
+        let opportunity = sample_postgresql_opportunity();
+        let session = json!({
+            "response": "Subject: postgresql-18: prefer suffixed dynamic libraries\n\n## Evidence Confidence\nobserved\n\n## Issue Connection\nFixer observed repeated file-not-found probes.\n",
+            "diff": "diff --git a/src/backend/utils/fmgr/dfmgr.c b/src/backend/utils/fmgr/dfmgr.c\n--- a/src/backend/utils/fmgr/dfmgr.c\n+++ b/src/backend/utils/fmgr/dfmgr.c\n@@ -1 +1 @@\n-old\n+new\n",
+        });
+
+        let blocker = published_session_publication_blocker(&opportunity, Some(&session)).unwrap();
+
+        assert!(blocker.contains("PostgreSQL core patch"));
+        assert!(blocker.contains("reproduced evidence"));
+    }
+
+    #[test]
+    fn postgres_core_publication_guard_allows_reproduced_patch() {
+        let opportunity = sample_postgresql_opportunity();
+        let session = json!({
+            "response": "Subject: postgresql-18: preserve extension lookup semantics\n\n## Evidence Confidence\nreproduced\n\n## Validation\nA pg_upgrade TAP proof passed on current PostgreSQL master.\n",
+            "diff": "diff --git a/src/backend/utils/fmgr/dfmgr.c b/src/backend/utils/fmgr/dfmgr.c\n--- a/src/backend/utils/fmgr/dfmgr.c\n+++ b/src/backend/utils/fmgr/dfmgr.c\n@@ -1 +1 @@\n-old\n+new\n",
         });
 
         assert!(published_session_publication_blocker(&opportunity, Some(&session)).is_none());

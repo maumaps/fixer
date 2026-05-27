@@ -1,3 +1,9 @@
+fixer (0.203.0-1) unstable; urgency=medium
+
+  * Block observed-only PostgreSQL core semantic patches from ready publication.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 10:45:00 +0400
+
 fixer (0.202.0-1) unstable; urgency=medium
 
   * Acquire versioned PostgreSQL packages from upstream git.
