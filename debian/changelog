@@ -1,3 +1,9 @@
+fixer (0.196.0-1) unstable; urgency=medium
+
+  * Read Go build metadata without requiring the Go tool.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 08:15:31 +0400
+
 fixer (0.195.0-1) unstable; urgency=medium
 
   * Acquire Python module sources for interpreter workload investigations.

@@ -31,6 +31,7 @@ const COREDUMP_FETCH_MIN: usize = 50;
 const COREDUMP_FETCH_MAX: usize = 200;
 const COREDUMP_FETCH_MULTIPLIER: usize = 8;
 const BASIC_COMMAND_TIMEOUT_SECONDS: u64 = 2;
+const GO_BUILDINFO_MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const COREDUMP_COMMAND_TIMEOUT_SECONDS: u64 = 10;
 const COREDUMP_DEBUG_TIMEOUT_SECONDS: u64 = 45;
 const COREDUMP_DEBUG_CHAR_LIMIT: usize = 128 * 1024;
@@ -6421,35 +6422,109 @@ struct GoBinarySourceHint {
 }
 
 fn go_binary_source_hint(path: &str) -> Option<GoBinarySourceHint> {
-    if !command_exists("go") {
+    if command_exists("go") {
+        if let Some(hint) = command_output_os_with_timeout(
+            "go",
+            &[OsStr::new("version"), OsStr::new("-m"), OsStr::new(path)],
+            StdDuration::from_secs(BASIC_COMMAND_TIMEOUT_SECONDS),
+        )
+        .ok()
+        .and_then(|output| parse_go_binary_source_hint(&output))
+        {
+            return Some(hint);
+        }
+    }
+    go_binary_source_hint_from_file(path)
+}
+
+fn go_binary_source_hint_from_file(path: &str) -> Option<GoBinarySourceHint> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.len() > GO_BUILDINFO_MAX_BINARY_BYTES {
         return None;
     }
-    let output = command_output_os_with_timeout(
-        "go",
-        &[OsStr::new("version"), OsStr::new("-m"), OsStr::new(path)],
-        StdDuration::from_secs(BASIC_COMMAND_TIMEOUT_SECONDS),
-    )
-    .ok()?;
-    parse_go_binary_source_hint(&output)
+    let data = fs::read(path).ok()?;
+    parse_go_binary_source_hint_from_bytes(&data)
+}
+
+fn parse_go_binary_source_hint_from_bytes(data: &[u8]) -> Option<GoBinarySourceHint> {
+    let magic = b"\xff Go buildinf:";
+    let start = data
+        .windows(magic.len())
+        .position(|window| window == magic)?;
+    let header = data.get(start..start + 32)?;
+    let flags = header[15];
+    if flags & 0x2 == 0 {
+        return None;
+    }
+    let mut offset = start + 32;
+    let (version_len, version_len_len) = decode_uvarint(data.get(offset..)?)?;
+    offset += version_len_len;
+    offset = offset.checked_add(version_len as usize)?;
+    let (mod_len, mod_len_len) = decode_uvarint(data.get(offset..)?)?;
+    offset += mod_len_len;
+    let module_info = data.get(offset..offset.checked_add(mod_len as usize)?)?;
+    let module_info = std::str::from_utf8(module_info).ok()?;
+    let module_info = strip_go_module_info_framing(module_info);
+    parse_go_binary_source_hint(module_info)
+}
+
+fn decode_uvarint(data: &[u8]) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    for (index, byte) in data.iter().copied().take(10).enumerate() {
+        if byte < 0x80 {
+            if index == 9 && byte > 1 {
+                return None;
+            }
+            return Some((value | ((byte as u64) << (7 * index)), index + 1));
+        }
+        value |= ((byte & 0x7f) as u64) << (7 * index);
+    }
+    None
+}
+
+fn strip_go_module_info_framing(module_info: &str) -> &str {
+    if module_info.len() >= 33 && module_info.as_bytes()[module_info.len() - 17] == b'\n' {
+        &module_info[16..module_info.len() - 16]
+    } else {
+        module_info
+    }
 }
 
 fn parse_go_binary_source_hint(output: &str) -> Option<GoBinarySourceHint> {
-    let module_path = output.lines().find_map(|line| {
-        let line = line.trim();
-        line.strip_prefix("path\t")
-            .or_else(|| {
-                line.strip_prefix("mod\t")
-                    .and_then(|rest| rest.split('\t').next())
+    let module_path = output
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("mod\t")
+                .and_then(|rest| rest.split('\t').next())
+                .map(str::trim)
+                .filter(|value| plausible_go_main_module_path(value))
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            output.lines().find_map(|line| {
+                let line = line.trim();
+                line.strip_prefix("path\t")
+                    .map(str::trim)
+                    .filter(|value| plausible_go_main_module_path(value))
+                    .map(ToString::to_string)
             })
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && value.contains('/'))
-            .map(ToString::to_string)
-    })?;
+        })?;
     let repo_url = go_module_repo_url(&module_path);
     Some(GoBinarySourceHint {
         module_path,
         repo_url,
     })
+}
+
+fn plausible_go_main_module_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.contains('/')
+        && value != "command-line-arguments"
+        && !value.starts_with("_/")
+        && !value.starts_with("./")
+        && !value.starts_with("../")
+        && !value.starts_with('/')
 }
 
 fn go_module_repo_url(module_path: &str) -> Option<String> {
@@ -8213,9 +8288,10 @@ mod tests {
         normalize_stuck_process_target_name, oom_cgroup_package_candidates, package_lookup_path,
         package_lookup_path_is_dpkg_candidate, parse_apparmor_denial, parse_coredump_info,
         parse_desktop_graphics_session_failure, parse_dkms_status_line,
-        parse_go_binary_source_hint, parse_ini_sections, parse_interpreter_command_hints,
-        parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
-        parse_network_driver_hang_events, parse_perf_hot_paths, parse_perl_command_line_hints,
+        parse_go_binary_source_hint, parse_go_binary_source_hint_from_bytes, parse_ini_sections,
+        parse_interpreter_command_hints, parse_kernel_oom_kill_events,
+        parse_latest_desktop_resume_failure, parse_network_driver_hang_events,
+        parse_perf_hot_paths, parse_perl_command_line_hints,
         parse_postgres_collation_mismatch_rows, parse_python_module_source_hint,
         parse_strace_syscall_name, prioritize_coredump_events, process_runtime_seconds,
         process_state_is_uninterruptible, richer_evidence_enabled, safe_perf_name,
@@ -9456,6 +9532,67 @@ Description: user-space parser utility for AppArmor
             hint.repo_url.as_deref(),
             Some("https://github.com/ollama/ollama.git")
         );
+    }
+
+    #[test]
+    fn go_build_metadata_prefers_module_root_over_command_path() {
+        let hint = parse_go_binary_source_hint(
+            "/tmp/tool: go1.26.0\n\
+             \tpath\tgithub.com/example/project/cmd/tool\n\
+             \tmod\tgithub.com/example/project\tv1.2.3\th1:abc\n\
+             \tdep\tgithub.com/other/library\tv0.1.0\th1:def\n",
+        )
+        .expect("Go module metadata should identify the repository root");
+
+        assert_eq!(hint.module_path, "github.com/example/project");
+        assert_eq!(
+            hint.repo_url.as_deref(),
+            Some("https://github.com/example/project.git")
+        );
+    }
+
+    #[test]
+    fn go_build_metadata_rejects_local_or_stdlib_main_paths() {
+        assert!(
+            parse_go_binary_source_hint(
+                "/tmp/local: go1.26.0\n\
+                 \tpath\tcommand-line-arguments\n\
+                 \tmod\t_/home/kom/private/tool\t(devel)\t\n",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn inline_go_buildinfo_maps_binary_to_upstream_without_go_tool() {
+        let mut blob = vec![0u8; 16];
+        blob.extend_from_slice(b"\xff Go buildinf:");
+        blob.push(8);
+        blob.push(2);
+        blob.extend_from_slice(&[0u8; 16]);
+        push_uvarint(&mut blob, "go1.26.0".len() as u64);
+        blob.extend_from_slice(b"go1.26.0");
+        let module_info =
+            "path\tgithub.com/ollama/ollama\nmod\tgithub.com/ollama/ollama\t(devel)\t\n";
+        push_uvarint(&mut blob, module_info.len() as u64);
+        blob.extend_from_slice(module_info.as_bytes());
+
+        let hint = parse_go_binary_source_hint_from_bytes(&blob)
+            .expect("inline Go build info should identify module source");
+
+        assert_eq!(hint.module_path, "github.com/ollama/ollama");
+        assert_eq!(
+            hint.repo_url.as_deref(),
+            Some("https://github.com/ollama/ollama.git")
+        );
+    }
+
+    fn push_uvarint(output: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            output.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+        output.push(value as u8);
     }
 
     #[test]
