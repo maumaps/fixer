@@ -3030,6 +3030,7 @@ fn workspace_blocked_handoff(opportunity: &crate::models::OpportunityRecord, err
         ],
     };
     json!({
+        "classification": classification,
         "target": target,
         "report_url": report_url,
         "next_steps": next_steps,
@@ -3902,6 +3903,10 @@ mod tests {
         assert_eq!(
             handoff.get("target").and_then(Value::as_str),
             Some("local executable synthetic-llm")
+        );
+        assert_eq!(
+            handoff.get("classification").and_then(Value::as_str),
+            Some("external-local-executable")
         );
         assert!(
             handoff

@@ -1,3 +1,11 @@
+fixer (0.183.0-1) unstable; urgency=medium
+
+  * Preserve public triage handoff classifications so local executable and
+    external-package workspace blockers remain machine-routable in harvest
+    views and API responses.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 17:40:00 +0400
+
 fixer (0.182.0-1) unstable; urgency=medium
 
   * Expose public harvest buckets on patch rows and show unlinked upstream

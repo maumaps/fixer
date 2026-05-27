@@ -868,6 +868,8 @@ struct PublicAttemptBlocker {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PublicTriageHandoff {
     reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classification: Option<String>,
     target: String,
     report_url: Option<String>,
     next_steps: Vec<String>,
@@ -11624,6 +11626,13 @@ fn public_triage_handoff_from_attempt(
         .unwrap_or_else(|| {
             "external dependency or workload outside the current source tree".to_string()
         });
+    let classification = attempt
+        .details
+        .get("handoff")
+        .and_then(|value| value.get("classification"))
+        .and_then(Value::as_str)
+        .map(sanitize_public_text)
+        .filter(|value| !value.trim().is_empty());
     let report_url = attempt
         .details
         .get("handoff")
@@ -11647,6 +11656,7 @@ fn public_triage_handoff_from_attempt(
         .unwrap_or_else(|| default_triage_next_steps(&target));
     Some(PublicTriageHandoff {
         reason,
+        classification,
         target,
         report_url,
         next_steps,
@@ -16837,6 +16847,7 @@ mod tests {
                 published_session: None,
                 handoff: Some(PublicTriageHandoff {
                     reason: "workspace-acquisition".to_string(),
+                    classification: Some("external-package".to_string()),
                     target: "htop".to_string(),
                     report_url: Some("https://htop.dev/".to_string()),
                     next_steps: vec!["File an upstream issue.".to_string()],
@@ -16847,6 +16858,7 @@ mod tests {
             }),
             best_triage_handoff: Some(PublicTriageHandoff {
                 reason: "workspace-acquisition".to_string(),
+                classification: Some("external-package".to_string()),
                 target: "htop".to_string(),
                 report_url: Some("https://htop.dev/".to_string()),
                 next_steps: vec!["File an upstream issue.".to_string()],
@@ -16911,6 +16923,7 @@ mod tests {
                 published_session: None,
                 handoff: Some(PublicTriageHandoff {
                     reason: "likely-external-root-cause".to_string(),
+                    classification: None,
                     target: "module `h3_postgis.so` or the workload driving it".to_string(),
                     report_url: None,
                     next_steps: vec!["Capture a fresh backend sample.".to_string()],
@@ -16921,6 +16934,7 @@ mod tests {
             }),
             best_triage_handoff: Some(PublicTriageHandoff {
                 reason: "likely-external-root-cause".to_string(),
+                classification: None,
                 target: "module `h3_postgis.so` or the workload driving it".to_string(),
                 report_url: None,
                 next_steps: vec!["Capture a fresh backend sample.".to_string()],
@@ -17393,6 +17407,7 @@ mod tests {
                 "report_only_reason": "workspace-acquisition",
                 "workspace_classification": "external-package",
                 "handoff": {
+                    "classification": "external-package",
                     "target": "google-chrome-stable",
                     "report_url": "https://bugs.example.test/chrome",
                     "next_steps": ["File upstream issue"]
@@ -17416,6 +17431,14 @@ mod tests {
             Some("workspace-acquisition")
         );
         assert!(best_triage.summary.contains("external handoff"));
+        let public_attempt = public_attempt_from_patch_attempt(best_triage);
+        assert_eq!(
+            public_attempt
+                .handoff
+                .and_then(|handoff| handoff.classification)
+                .as_deref(),
+            Some("external-package")
+        );
     }
 
     #[test]
