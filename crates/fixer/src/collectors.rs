@@ -4,8 +4,8 @@ use crate::config::FixerConfig;
 use crate::models::{FindingInput, ObservedArtifact, PopularBinaryProfile};
 use crate::storage::Store;
 use crate::util::{
-    command_exists, command_output_os_with_timeout, command_output_with_timeout,
-    find_postgres_binary, hash_text, maybe_canonicalize, now_rfc3339,
+    command_exists, command_output_in_dir_with_timeout, command_output_os_with_timeout,
+    command_output_with_timeout, find_postgres_binary, hash_text, maybe_canonicalize, now_rfc3339,
 };
 use crate::workspace::resolve_installed_package_metadata;
 use anyhow::Result;
@@ -4322,6 +4322,9 @@ struct InterpreterRunawayProcessEvidence {
     interpreter_executable: Option<String>,
     entrypoint_kind: String,
     suspected_entrypoint: Option<String>,
+    source_kind: Option<String>,
+    source_name: Option<String>,
+    source_repo_url: Option<String>,
     entrypoint_package_name: Option<String>,
     entrypoint_package_metadata: Option<RunawayPackageMetadata>,
     runtime_package_name: Option<String>,
@@ -6084,6 +6087,7 @@ fn collect_interpreter_runaway_process_evidence(
     command_line: Option<&str>,
     command_argv: &[String],
     executable: Option<&str>,
+    cwd: Option<&str>,
     profile: &PerfProfileCapture,
     top_hot_symbols: &[String],
     backtrace_capture: Option<&GdbBacktraceCapture>,
@@ -6150,6 +6154,29 @@ fn collect_interpreter_runaway_process_evidence(
     let runtime_package_metadata = runtime_package_name
         .as_deref()
         .and_then(resolve_installed_package_metadata_for_investigation);
+    let python_module_source = (parsed.interpreter == "python"
+        && parsed.entrypoint_kind == "module")
+        .then(|| {
+            parsed.suspected_entrypoint.as_deref().and_then(|module| {
+                python_module_source_hint(parsed.interpreter_executable.as_deref(), cwd, module)
+            })
+        })
+        .flatten();
+    if let Some(source) = python_module_source.as_ref() {
+        detection_signals.insert(format!(
+            "Python distribution metadata identifies module source {}",
+            source.distribution_name
+        ));
+    }
+    let source_kind = python_module_source
+        .as_ref()
+        .map(|_| "python-distribution".to_string());
+    let source_name = python_module_source
+        .as_ref()
+        .map(|source| source.distribution_name.clone());
+    let source_repo_url = python_module_source
+        .as_ref()
+        .and_then(|source| source.repo_url.clone());
 
     let evidence_gap = match parsed.entrypoint_kind.as_str() {
         "script" => format!(
@@ -6169,15 +6196,19 @@ fn collect_interpreter_runaway_process_evidence(
             parsed.interpreter
         ),
     };
-    let recommended_next_steps = vec![
-        "ps -p <pid> -o pid,stat,pcpu,etime,wchan,args".to_string(),
-        format!(
-            "Inspect the {} script or module entrypoint first; only patch the interpreter/runtime after proving it mishandles the workload.",
-            parsed.interpreter
-        ),
-        "Capture a language-level stack, trace, or minimal reproducer that ties the hot loop to the entrypoint before proposing runtime changes.".to_string(),
-        "Keep runtime performance fixes in scope only when they also make bad script code run more predictably or cheaply without changing language semantics.".to_string(),
-    ];
+    let mut recommended_next_steps =
+        vec!["ps -p <pid> -o pid,stat,pcpu,etime,wchan,args".to_string()];
+    if let Some(repo_url) = source_repo_url.as_ref() {
+        recommended_next_steps.push(format!(
+            "Acquire the module source from {repo_url} and rerun Fixer against that repository before proposing a patch."
+        ));
+    }
+    recommended_next_steps.push(format!(
+        "Inspect the {} script or module entrypoint first; only patch the interpreter/runtime after proving it mishandles the workload.",
+        parsed.interpreter
+    ));
+    recommended_next_steps.push("Capture a language-level stack, trace, or minimal reproducer that ties the hot loop to the entrypoint before proposing runtime changes.".to_string());
+    recommended_next_steps.push("Keep runtime performance fixes in scope only when they also make bad script code run more predictably or cheaply without changing language semantics.".to_string());
 
     Some(InterpreterRunawayProcessEvidence {
         detection_signals: detection_signals.into_iter().collect(),
@@ -6185,6 +6216,9 @@ fn collect_interpreter_runaway_process_evidence(
         interpreter_executable: parsed.interpreter_executable,
         entrypoint_kind: parsed.entrypoint_kind,
         suspected_entrypoint: parsed.suspected_entrypoint,
+        source_kind,
+        source_name,
+        source_repo_url,
         entrypoint_package_name,
         entrypoint_package_metadata,
         runtime_package_name,
@@ -6195,6 +6229,113 @@ fn collect_interpreter_runaway_process_evidence(
         evidence_gap,
         recommended_next_steps,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PythonModuleSourceHint {
+    distribution_name: String,
+    repo_url: Option<String>,
+}
+
+fn python_module_source_hint(
+    interpreter_executable: Option<&str>,
+    cwd: Option<&str>,
+    module: &str,
+) -> Option<PythonModuleSourceHint> {
+    let interpreter = interpreter_executable?;
+    let script = r#"
+import importlib.metadata as metadata
+import sys
+
+module = sys.argv[1].split(".", 1)[0].replace("-", "_")
+packages = metadata.packages_distributions().get(module, [])
+for distribution_name in packages:
+    dist = metadata.distribution(distribution_name)
+    meta = dist.metadata
+    print("name\t" + distribution_name)
+    homepage = meta.get("Home-page")
+    if homepage:
+        print("url\tHome-page\t" + homepage)
+    for item in meta.get_all("Project-URL") or []:
+        label, sep, url = item.partition(",")
+        if sep:
+            print("url\t" + label.strip() + "\t" + url.strip())
+    break
+"#;
+    let args = ["-c", script, module];
+    let output = if Path::new(interpreter).is_absolute() || cwd.is_none() {
+        command_output_with_timeout(
+            interpreter,
+            &args,
+            StdDuration::from_secs(BASIC_COMMAND_TIMEOUT_SECONDS),
+        )
+    } else {
+        command_output_in_dir_with_timeout(
+            interpreter,
+            &args,
+            Path::new(cwd?),
+            StdDuration::from_secs(BASIC_COMMAND_TIMEOUT_SECONDS),
+        )
+    }
+    .ok()?;
+    parse_python_module_source_hint(&output)
+}
+
+fn parse_python_module_source_hint(output: &str) -> Option<PythonModuleSourceHint> {
+    let mut distribution_name = None;
+    let mut repo_url = None;
+    for line in output.lines() {
+        let mut fields = line.splitn(3, '\t');
+        match fields.next()? {
+            "name" => {
+                distribution_name = fields
+                    .next()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string);
+            }
+            "url" => {
+                let _label = fields.next();
+                if repo_url.is_none() {
+                    repo_url = fields
+                        .next()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .and_then(source_repo_url_from_project_url);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(PythonModuleSourceHint {
+        distribution_name: distribution_name?,
+        repo_url,
+    })
+}
+
+fn source_repo_url_from_project_url(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches('/');
+    let https = trimmed
+        .strip_prefix("git+")
+        .unwrap_or(trimmed)
+        .trim_end_matches(".git");
+    let mut parts = https.split('/');
+    let scheme = parts.next()?;
+    if scheme != "https:" && scheme != "http:" {
+        return None;
+    }
+    if parts.next()? != "" {
+        return None;
+    }
+    let host = parts.next()?;
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    match host {
+        "github.com" | "gitlab.com" | "bitbucket.org" => {
+            Some(format!("https://{host}/{owner}/{repo}.git"))
+        }
+        _ => None,
+    }
 }
 
 fn collect_native_executable_provenance(
@@ -6716,6 +6857,7 @@ fn build_runaway_investigation_summary(
             proc_snapshot.command_line.as_deref(),
             &proc_snapshot.command_argv,
             proc_snapshot.executable.as_deref(),
+            proc_snapshot.cwd.as_deref(),
             profile,
             top_hot_symbols,
             backtrace_capture,
@@ -8074,12 +8216,12 @@ mod tests {
         parse_go_binary_source_hint, parse_ini_sections, parse_interpreter_command_hints,
         parse_kernel_oom_kill_events, parse_latest_desktop_resume_failure,
         parse_network_driver_hang_events, parse_perf_hot_paths, parse_perl_command_line_hints,
-        parse_postgres_collation_mismatch_rows, parse_strace_syscall_name,
-        prioritize_coredump_events, process_runtime_seconds, process_state_is_uninterruptible,
-        richer_evidence_enabled, safe_perf_name, shell_assignment_csv_value,
-        stable_apparmor_denial_name, stuck_process_investigation_fingerprint,
-        stuck_process_source_fingerprint, summarize_top_syscalls, system_uptime_seconds,
-        truncate_for_json_field,
+        parse_postgres_collation_mismatch_rows, parse_python_module_source_hint,
+        parse_strace_syscall_name, prioritize_coredump_events, process_runtime_seconds,
+        process_state_is_uninterruptible, richer_evidence_enabled, safe_perf_name,
+        shell_assignment_csv_value, stable_apparmor_denial_name,
+        stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
+        summarize_top_syscalls, system_uptime_seconds, truncate_for_json_field,
     };
     use crate::config::FixerConfig;
     use crate::models::{ParticipationMode, ParticipationState, PopularBinaryProfile};
@@ -9233,6 +9375,7 @@ Description: user-space parser utility for AppArmor
                 "/opt/app/worker.py".to_string(),
             ],
             Some("python3"),
+            None,
             &profile,
             &["PyEval_EvalFrameDefault (90.00% in python3.13)".to_string()],
             None,
@@ -9253,6 +9396,21 @@ Description: user-space parser utility for AppArmor
             evidence
                 .evidence_gap
                 .contains("script/application logic or from the runtime")
+        );
+    }
+
+    #[test]
+    fn python_module_metadata_maps_module_to_upstream_source() {
+        let hint = parse_python_module_source_hint(
+            "name\twyoming-faster-whisper\n\
+             url\tHomepage\thttps://github.com/rhasspy/wyoming-faster-whisper\n",
+        )
+        .expect("distribution metadata should name the source distribution");
+
+        assert_eq!(hint.distribution_name, "wyoming-faster-whisper");
+        assert_eq!(
+            hint.repo_url.as_deref(),
+            Some("https://github.com/rhasspy/wyoming-faster-whisper.git")
         );
     }
 

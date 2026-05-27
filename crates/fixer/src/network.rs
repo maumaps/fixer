@@ -3021,6 +3021,12 @@ fn workspace_blocked_handoff(opportunity: &crate::models::OpportunityRecord, err
             local_native_executable_provenance(&diagnosis)
                 .and_then(|value| value.get("source_repo_url"))
                 .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            diagnosis
+                .get("interpreter_process")
+                .and_then(|value| value.get("source_repo_url"))
+                .and_then(Value::as_str)
         });
     let next_steps = match classification.as_str() {
         "kernel-source-unavailable" => vec![
@@ -3041,7 +3047,11 @@ fn workspace_blocked_handoff(opportunity: &crate::models::OpportunityRecord, err
             "Record the executable distribution channel so future Fixer runs can acquire the right workspace automatically.".to_string(),
         ],
         "interpreter-workload" => vec![
-            "Find the application, module repository, Home Assistant add-on, container image, or local checkout that provides this interpreter workload.".to_string(),
+            if report_url.is_some() {
+                "Use the source repository identified from the interpreter module metadata before asking Fixer for a patch.".to_string()
+            } else {
+                "Find the application, module repository, Home Assistant add-on, container image, or local checkout that provides this interpreter workload.".to_string()
+            },
             "Attach that source tree before asking Fixer for a patch; only patch the interpreter/runtime after a language-level stack or minimal reproducer proves the runtime is at fault.".to_string(),
             "Capture a fresh process sample with the module entrypoint, language stack or native extension frames, and container/image provenance so the next run can acquire the right workspace.".to_string(),
         ],
@@ -4062,6 +4072,12 @@ mod tests {
                 "details": {
                     "subsystem": "runaway-process",
                     "command_line": ".venv/bin/python3 -m synthetic_worker --serve",
+                    "interpreter_process": {
+                        "interpreter": "python",
+                        "entrypoint_kind": "module",
+                        "suspected_entrypoint": "synthetic_worker",
+                        "source_repo_url": "https://github.com/example/synthetic-worker.git"
+                    },
                     "profile_target": {
                         "name": "python3.11",
                         "path": "/usr/bin/python3.11"
@@ -4094,6 +4110,10 @@ mod tests {
             handoff.get("classification").and_then(Value::as_str),
             Some("interpreter-workload")
         );
+        assert_eq!(
+            handoff.get("report_url").and_then(Value::as_str),
+            Some("https://github.com/example/synthetic-worker.git")
+        );
         assert!(
             handoff
                 .get("next_steps")
@@ -4101,7 +4121,7 @@ mod tests {
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str)
-                .any(|step| step.contains("language-level stack"))
+                .any(|step| step.contains("source repository identified"))
         );
     }
 

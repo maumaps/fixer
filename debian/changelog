@@ -1,3 +1,9 @@
+fixer (0.195.0-1) unstable; urgency=medium
+
+  * Acquire Python module sources for interpreter workload investigations.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 08:08:12 +0400
+
 fixer (0.194.0-1) unstable; urgency=medium
 
   * Acquire Go module sources for local executable investigations.

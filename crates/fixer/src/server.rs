@@ -11816,6 +11816,14 @@ fn public_triage_handoff_from_attempt(
                 .and_then(|value| value.get("source_repo_url"))
                 .and_then(Value::as_str)
         })
+        .or_else(|| {
+            attempt
+                .details
+                .get("diagnosis")
+                .and_then(|value| value.get("interpreter_process"))
+                .and_then(|value| value.get("source_repo_url"))
+                .and_then(Value::as_str)
+        })
         .map(ToString::to_string)
         .filter(|value| !value.trim().is_empty());
     let next_steps = attempt
@@ -11837,7 +11845,7 @@ fn public_triage_handoff_from_attempt(
             if classification.as_deref() == Some("external-local-executable") {
                 local_executable_triage_next_steps(&target)
             } else if classification.as_deref() == Some("interpreter-workload") {
-                interpreter_workload_triage_next_steps(&target)
+                interpreter_workload_triage_next_steps(&target, report_url.as_deref())
             } else {
                 default_triage_next_steps(&target)
             }
@@ -12028,11 +12036,18 @@ fn local_executable_triage_next_steps(target: &str) -> Vec<String> {
     ]
 }
 
-fn interpreter_workload_triage_next_steps(target: &str) -> Vec<String> {
-    vec![
+fn interpreter_workload_triage_next_steps(target: &str, report_url: Option<&str>) -> Vec<String> {
+    let first_step = if let Some(report_url) = report_url {
+        format!(
+            "Use the source repository identified from the interpreter module metadata ({report_url}) before asking Fixer for a patch."
+        )
+    } else {
         format!(
             "Find the application, module repository, Home Assistant add-on, container image, or local checkout that provides {target}."
-        ),
+        )
+    };
+    vec![
+        first_step,
         "Attach that source tree before asking Fixer for a patch; only patch the interpreter/runtime after a language-level stack or minimal reproducer proves the runtime is at fault.".to_string(),
         "Capture a fresh process sample with the module entrypoint, Python stack or native extension frames, and container/image provenance so the next run can acquire the right workspace.".to_string(),
     ]
@@ -18078,6 +18093,12 @@ mod tests {
                 "workspace_classification": "workspace-unavailable",
                 "diagnosis": {
                     "command_line": ".venv/bin/python3 -m synthetic_worker --serve",
+                    "interpreter_process": {
+                        "interpreter": "python",
+                        "entrypoint_kind": "module",
+                        "suspected_entrypoint": "synthetic_worker",
+                        "source_repo_url": "https://github.com/example/synthetic-worker.git"
+                    },
                     "profile_target": {
                         "name": "python3.11",
                         "path": "/usr/bin/python3.11",
@@ -18106,11 +18127,15 @@ mod tests {
             Some("interpreter-workload")
         );
         assert_eq!(handoff.target, "python module synthetic_worker");
+        assert_eq!(
+            handoff.report_url.as_deref(),
+            Some("https://github.com/example/synthetic-worker.git")
+        );
         assert!(
             handoff
                 .next_steps
                 .iter()
-                .any(|step| step.contains("language-level stack"))
+                .any(|step| step.contains("source repository identified"))
         );
     }
 

@@ -65,6 +65,30 @@ pub fn ensure_workspace_for_opportunity(
         });
     }
 
+    if let Some(workspace_target) = interpreter_source_target(opportunity) {
+        let repo_root = ensure_upstream_clone(
+            config,
+            &workspace_target.source_package,
+            workspace_target
+                .upstream_url
+                .as_deref()
+                .expect("interpreter source target requires an upstream URL"),
+        )?;
+        let repo_root = maybe_canonicalize(&repo_root);
+        let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
+        return Ok(PreparedWorkspace {
+            repo_root,
+            ecosystem,
+            source_kind: "interpreter-upstream-git".to_string(),
+            package_name: None,
+            source_package: Some(workspace_target.source_package.clone()),
+            homepage: workspace_target.upstream_url.clone(),
+            acquisition_note: workspace_target.acquisition_note.unwrap_or_else(|| {
+                "Cloned upstream git from interpreter module metadata.".to_string()
+            }),
+        });
+    }
+
     let package_name = package_name_from_opportunity(opportunity);
     let source_package_hint = source_package_from_opportunity(opportunity);
     let metadata = package_name
@@ -443,6 +467,40 @@ fn native_executable_source_target(
         upstream_url: Some(repo_url.to_string()),
         acquisition_note: Some(format!(
             "Cloned {repo_url} from local executable build metadata for {executable_name}; rerun Fixer against upstream HEAD instead of discarding the retained local-executable evidence."
+        )),
+    })
+}
+
+fn interpreter_source_target(opportunity: &OpportunityRecord) -> Option<WorkspaceSourceTarget> {
+    let process = opportunity
+        .evidence
+        .get("details")?
+        .get("interpreter_process")?;
+    let repo_url = process
+        .get("source_repo_url")
+        .and_then(Value::as_str)
+        .filter(|value| is_cloneable_repo_url(value))?;
+    let source_name = process
+        .get("source_name")
+        .and_then(Value::as_str)
+        .or_else(|| process.get("suspected_entrypoint").and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("interpreter-workload-source");
+    let interpreter = process
+        .get("interpreter")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("interpreter");
+    let entrypoint = process
+        .get("suspected_entrypoint")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(source_name);
+    Some(WorkspaceSourceTarget {
+        source_package: sanitize_dir_name(source_name),
+        upstream_url: Some(repo_url.to_string()),
+        acquisition_note: Some(format!(
+            "Cloned {repo_url} from {interpreter} module metadata for {entrypoint}; rerun Fixer against upstream HEAD instead of discarding the retained interpreter workload evidence."
         )),
     })
 }
@@ -1153,13 +1211,14 @@ fn deb_src_enabled() -> bool {
 mod tests {
     use super::{
         WorkspaceSourceTarget, apparmor_profile_path_candidates, chrome_workspace_alias,
-        is_cloneable_repo_url, is_external_binary_package_without_workspace,
-        kernel_source_package_from_opportunity, kernel_upstream_repo_url,
-        native_executable_source_target, normalize_patchable_source_package,
-        origin_is_debian_source_friendly, package_name_from_opportunity, parse_apt_origins,
-        parse_maintainer_url, parse_showsrc_records, sanitize_dir_name, select_showsrc_record,
-        source_dir_version_hint, source_package_from_opportunity, source_package_vcs_url,
-        trim_debian_epoch, upstream_source_alias, vcs_git_clone_url,
+        interpreter_source_target, is_cloneable_repo_url,
+        is_external_binary_package_without_workspace, kernel_source_package_from_opportunity,
+        kernel_upstream_repo_url, native_executable_source_target,
+        normalize_patchable_source_package, origin_is_debian_source_friendly,
+        package_name_from_opportunity, parse_apt_origins, parse_maintainer_url,
+        parse_showsrc_records, sanitize_dir_name, select_showsrc_record, source_dir_version_hint,
+        source_package_from_opportunity, source_package_vcs_url, trim_debian_epoch,
+        upstream_source_alias, vcs_git_clone_url,
     };
     use crate::models::{InstalledPackageMetadata, OpportunityRecord};
     use serde_json::json;
@@ -1355,6 +1414,51 @@ zoom:\n\
                 .acquisition_note
                 .as_deref()
                 .is_some_and(|note| note.contains("local executable build metadata"))
+        );
+    }
+
+    #[test]
+    fn maps_python_module_metadata_to_upstream_source() {
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "python module spins CPU".to_string(),
+            score: 100,
+            state: "open".to_string(),
+            summary: "python module spins".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "runaway-process",
+                    "interpreter_process": {
+                        "interpreter": "python",
+                        "entrypoint_kind": "module",
+                        "suspected_entrypoint": "wyoming_faster_whisper",
+                        "source_kind": "python-distribution",
+                        "source_name": "wyoming-faster-whisper",
+                        "source_repo_url": "https://github.com/rhasspy/wyoming-faster-whisper.git"
+                    }
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+            updated_at: "2026-05-27T00:00:00Z".to_string(),
+        };
+
+        let target = interpreter_source_target(&opportunity)
+            .expect("interpreter metadata should map to an upstream source");
+
+        assert_eq!(target.source_package, "wyoming-faster-whisper");
+        assert_eq!(
+            target.upstream_url.as_deref(),
+            Some("https://github.com/rhasspy/wyoming-faster-whisper.git")
+        );
+        assert!(
+            target
+                .acquisition_note
+                .as_deref()
+                .is_some_and(|note| note.contains("interpreter workload evidence"))
         );
     }
 
