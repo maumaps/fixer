@@ -1012,6 +1012,7 @@ struct PublicPatchEntry {
     validation_notes: Vec<String>,
     harvest_status: String,
     harvest_blockers: Vec<String>,
+    harvest_next_actions: Vec<String>,
     harvest_bucket: String,
     harvest_reason: String,
     upstream_review: Option<PublicPatchUpstreamReview>,
@@ -7814,6 +7815,7 @@ fn annotate_public_patch_harvest_buckets(patches: &mut [PublicPatchEntry]) {
         let (bucket, reason) = public_patch_harvest_bucket_and_reason(patch);
         patch.harvest_bucket = bucket;
         patch.harvest_reason = reason;
+        patch.harvest_next_actions = public_patch_harvest_next_actions(patch);
     }
 }
 
@@ -7904,6 +7906,53 @@ fn public_patch_harvest_bucket_without_related_review(
         );
     }
     ("realish".to_string(), "candidate source diff".to_string())
+}
+
+fn public_patch_harvest_next_actions(patch: &PublicPatchEntry) -> Vec<String> {
+    if patch.harvest_bucket != "needs-review" {
+        return Vec::new();
+    }
+
+    let mut actions = Vec::new();
+    for blocker in &patch.harvest_blockers {
+        let action = match blocker.as_str() {
+            "blocked_validation" => {
+                "Rerun in an environment where the blocked runtime or test validation can complete before upstream submission.".to_string()
+            }
+            "limited_validation" => {
+                "Add independent reproduction or stronger project/runtime validation before upstream submission.".to_string()
+            }
+            "missing_patch_metadata" => {
+                "Backfill proposal metadata: subject, evidence confidence, git add paths, validation notes, and maintainer-facing issue connection.".to_string()
+            }
+            other => format!(
+                "Clear harvest blocker `{}` before treating this retained diff as upstream-ready.",
+                other.replace('_', " ")
+            ),
+        };
+        if !actions.contains(&action) {
+            actions.push(action);
+        }
+    }
+
+    if let Some(review) = patch.related_upstream_review.as_ref() {
+        if review.relation == "source_path_family"
+            && public_upstream_review_state_is_closed(&review.state)
+        {
+            let action = "Review this distinct issue against the closed source-path-family upstream rationale before opening another PR.".to_string();
+            if !actions.contains(&action) {
+                actions.push(action);
+            }
+        }
+    }
+
+    if actions.is_empty() {
+        actions.push(
+            "Inspect the retained diff and add a concrete proof plan before upstream submission."
+                .to_string(),
+        );
+    }
+    actions
 }
 
 fn public_patch_primary_source_paths(patch: &PublicPatchEntry) -> Vec<String> {
@@ -8347,6 +8396,7 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
         validation_notes,
         harvest_status,
         harvest_blockers,
+        harvest_next_actions: Vec::new(),
         harvest_bucket: String::new(),
         harvest_reason: String::new(),
         upstream_review: public_patch_upstream_review_from_row(&row),
@@ -9846,6 +9896,7 @@ fn public_patch_from_sqlite_row(
         validation_notes,
         harvest_status,
         harvest_blockers,
+        harvest_next_actions: Vec::new(),
         harvest_bucket: String::new(),
         harvest_reason: String::new(),
         upstream_review: public_patch_upstream_review_from_sqlite_row(row)?,
@@ -14774,6 +14825,20 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             )
         }
     };
+    let harvest_next_actions = if entry.harvest_next_actions.is_empty() {
+        String::new()
+    } else {
+        let actions = entry
+            .harvest_next_actions
+            .iter()
+            .map(|action| format!("<li>{}</li>", html_escape(action)))
+            .collect::<Vec<_>>()
+            .join("");
+        format!(
+            "<section class=\"patch-summary\"><h4>Next proof/action</h4><ul class=\"attempt-list\">{}</ul></section>",
+            actions
+        )
+    };
     let headline_label = public_patch_headline_label(entry);
 
     format!(
@@ -14793,6 +14858,7 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             {}
             {}
             {}
+            {}
             <p class="fine-print">Full published attempt: <a href="/issues/{}">/issues/{}</a>. Issue JSON: <a href="/v1/issues/{}">/v1/issues/{}</a></p>
         </article>"#,
         entry.id,
@@ -14803,6 +14869,7 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
         html_escape(&entry.best_patch.summary),
         upstream_review_summary,
         harvest_warning,
+        harvest_next_actions,
         cover
             .as_ref()
             .map(|cover| format!(
@@ -16622,6 +16689,7 @@ mod tests {
             validation_notes: Vec::new(),
             harvest_status: "ready".to_string(),
             harvest_blockers: Vec::new(),
+            harvest_next_actions: Vec::new(),
             harvest_bucket: "realish".to_string(),
             harvest_reason: "candidate source diff".to_string(),
             upstream_review: None,
@@ -16689,6 +16757,7 @@ mod tests {
             validation_notes: Vec::new(),
             harvest_status: "ready".to_string(),
             harvest_blockers: Vec::new(),
+            harvest_next_actions: Vec::new(),
             harvest_bucket: "realish".to_string(),
             harvest_reason: "candidate source diff".to_string(),
             upstream_review: None,
@@ -17846,6 +17915,7 @@ mod tests {
         );
         assert_eq!(patch.harvest_status, "ready");
         assert!(patch.harvest_blockers.is_empty());
+        assert!(patch.harvest_next_actions.is_empty());
     }
 
     #[test]
@@ -17905,11 +17975,19 @@ mod tests {
         );
         assert_eq!(patch.harvest_status, "needs_review");
         assert_eq!(patch.harvest_blockers, vec!["blocked_validation"]);
+        assert_eq!(
+            patch.harvest_next_actions,
+            vec![
+                "Rerun in an environment where the blocked runtime or test validation can complete before upstream submission."
+            ]
+        );
 
         let card = render_public_patch_card(patch);
         assert!(card.contains("patch needs review"));
         assert!(card.contains("harvest: needs review"));
         assert!(card.contains("blocked validation"));
+        assert!(card.contains("Next proof/action"));
+        assert!(card.contains("blocked runtime or test validation can complete"));
         assert!(card.contains("/issues/issue-1/best.diff"));
     }
 
@@ -17970,10 +18048,17 @@ mod tests {
         );
         assert_eq!(patch.harvest_status, "needs_review");
         assert_eq!(patch.harvest_blockers, vec!["limited_validation"]);
+        assert_eq!(
+            patch.harvest_next_actions,
+            vec![
+                "Add independent reproduction or stronger project/runtime validation before upstream submission."
+            ]
+        );
 
         let card = render_public_patch_card(patch);
         assert!(card.contains("patch needs review"));
         assert!(card.contains("limited validation"));
+        assert!(card.contains("independent reproduction"));
         assert!(card.contains("/issues/issue-1/best.diff"));
     }
 
@@ -18041,10 +18126,17 @@ mod tests {
         );
         assert_eq!(patch.harvest_status, "needs_review");
         assert_eq!(patch.harvest_blockers, vec!["missing_patch_metadata"]);
+        assert_eq!(
+            patch.harvest_next_actions,
+            vec![
+                "Backfill proposal metadata: subject, evidence confidence, git add paths, validation notes, and maintainer-facing issue connection."
+            ]
+        );
 
         let card = render_public_patch_card(patch);
         assert!(card.contains("patch needs review"));
         assert!(card.contains("missing patch metadata"));
+        assert!(card.contains("Backfill proposal metadata"));
         assert!(card.contains("/issues/issue-1/best.diff"));
     }
 

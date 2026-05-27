@@ -1,3 +1,9 @@
+fixer (0.189.0-1) unstable; urgency=medium
+
+  * Expose next proof actions for retained needs-review public patches.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 06:49:00 +0400
+
 fixer (0.188.0-1) unstable; urgency=medium
 
   * Classify merged source-path-family reviews as merged instead of active
