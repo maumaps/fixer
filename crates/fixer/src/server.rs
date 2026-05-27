@@ -1010,6 +1010,8 @@ struct PublicPatchEntry {
     validation_notes: Vec<String>,
     harvest_status: String,
     harvest_blockers: Vec<String>,
+    harvest_bucket: String,
+    harvest_reason: String,
     upstream_review: Option<PublicPatchUpstreamReview>,
     related_upstream_review: Option<PublicPatchRelatedReview>,
     duplicate_patch: Option<PublicPatchDuplicate>,
@@ -1081,6 +1083,7 @@ struct DashboardSnapshot {
     explained_impossible_count: i64,
     corroborated_public_issue_count: i64,
     largest_public_cluster_size: i64,
+    unlinked_upstream_win_count: i64,
     last_submission_at: Option<String>,
     top_issues: Vec<PublicIssueCandidate>,
     upstream_wins: Vec<UpstreamPatchWin>,
@@ -6889,6 +6892,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 (SELECT COUNT(*) FROM issue_clusters WHERE best_patch_json IS NULL AND best_triage_json IS NOT NULL),
                 (SELECT COUNT(*) FROM issue_clusters WHERE promoted = TRUE AND public_visible = TRUE AND corroboration_count >= 2),
                 (SELECT COALESCE(MAX(corroboration_count), 0) FROM issue_clusters WHERE promoted = TRUE AND public_visible = TRUE),
+                (SELECT COUNT(*) FROM upstream_patch_wins WHERE patch_issue_id IS NULL),
                 (SELECT MAX(received_at) FROM submissions)
             ",
                     &[],
@@ -6898,7 +6902,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
             let (ready_report_count, failed_patch_attempt_count, explained_impossible_count) =
                 load_public_attempt_totals(db).await?;
             let last_submission_at = row
-                .get::<_, Option<DateTime<Utc>>>(8)
+                .get::<_, Option<DateTime<Utc>>>(9)
                 .map(|value| value.to_rfc3339());
             Ok(DashboardSnapshot {
                 install_count: row.get(0),
@@ -6912,6 +6916,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 explained_impossible_count,
                 corroborated_public_issue_count: row.get(6),
                 largest_public_cluster_size: row.get(7),
+                unlinked_upstream_win_count: row.get(8),
                 last_submission_at,
                 top_issues: load_public_issue_candidates(db, 8).await?,
                 upstream_wins: load_upstream_patch_wins(db, LANDING_UPSTREAM_REVIEW_LIMIT).await?,
@@ -6969,6 +6974,13 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                     |row| row.get(0),
                 )
                 .map_err(ApiError::internal)?;
+            let unlinked_upstream_win_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM upstream_patch_wins WHERE patch_issue_id IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ApiError::internal)?;
             let last_submission_at = connection
                 .query_row("SELECT MAX(received_at) FROM submissions", [], |row| {
                     row.get::<_, Option<String>>(0)
@@ -6988,6 +7000,7 @@ async fn load_dashboard_snapshot(db: &ServerDb) -> Result<DashboardSnapshot, Api
                 explained_impossible_count,
                 corroborated_public_issue_count,
                 largest_public_cluster_size,
+                unlinked_upstream_win_count,
                 last_submission_at,
                 top_issues: load_public_issue_candidates(db, 8).await?,
                 upstream_wins: load_upstream_patch_wins(db, LANDING_UPSTREAM_REVIEW_LIMIT).await?,
@@ -7571,6 +7584,7 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
     annotate_public_patch_manual_related_reviews(&mut patches, manual_related_reviews);
     annotate_public_patch_duplicates(&mut patches);
     annotate_public_patch_related_reviews(&mut patches);
+    annotate_public_patch_harvest_buckets(&mut patches);
     patches.sort_by(|left, right| {
         parse_timestamp(&right.best_patch.created_at)
             .cmp(&parse_timestamp(&left.best_patch.created_at))
@@ -7789,6 +7803,82 @@ fn annotate_public_patch_related_reviews(patches: &mut [PublicPatchEntry]) {
             });
         }
     }
+}
+
+fn annotate_public_patch_harvest_buckets(patches: &mut [PublicPatchEntry]) {
+    for patch in patches {
+        let (bucket, reason) = public_patch_harvest_bucket_and_reason(patch);
+        patch.harvest_bucket = bucket;
+        patch.harvest_reason = reason;
+    }
+}
+
+fn public_patch_harvest_bucket_and_reason(patch: &PublicPatchEntry) -> (String, String) {
+    if let Some(review) = patch.upstream_review.as_ref() {
+        if review.state == "merged" {
+            return ("merged".to_string(), "merged upstream".to_string());
+        }
+        if public_upstream_review_state_is_closed(&review.state) {
+            return (
+                "closed-upstream".to_string(),
+                format!("upstream review {}", review.state.replace('_', "-")),
+            );
+        }
+        return (
+            "submitted".to_string(),
+            "already submitted upstream".to_string(),
+        );
+    }
+    if let Some(review) = patch.related_upstream_review.as_ref() {
+        if review.state == "merged" {
+            return (
+                "merged".to_string(),
+                format!("related upstream review {} merged", review.relation),
+            );
+        }
+        if public_upstream_review_state_is_closed(&review.state) {
+            return (
+                "closed-upstream".to_string(),
+                format!(
+                    "related upstream review {} {}",
+                    review.relation,
+                    review.state.replace('_', "-")
+                ),
+            );
+        }
+        return (
+            "related-family".to_string(),
+            format!("related upstream review {}", review.relation),
+        );
+    }
+    if let Some(duplicate) = patch.duplicate_patch.as_ref() {
+        if patch.harvest_status == "ready" && patch.harvest_blockers.is_empty() {
+            return (
+                "duplicate".to_string(),
+                format!(
+                    "duplicate patch diff ({} rows, canonical {})",
+                    duplicate.duplicate_count, duplicate.canonical_issue_id
+                ),
+            );
+        }
+    }
+    if patch.harvest_status != "ready" {
+        if patch.harvest_blockers.is_empty() {
+            return (
+                "needs-review".to_string(),
+                format!("harvest {}", patch.harvest_status),
+            );
+        }
+        return (
+            "needs-review".to_string(),
+            format!(
+                "harvest {}: {}",
+                patch.harvest_status,
+                patch.harvest_blockers.join(", ")
+            ),
+        );
+    }
+    ("realish".to_string(), "candidate source diff".to_string())
 }
 
 fn public_patch_primary_source_paths(patch: &PublicPatchEntry) -> Vec<String> {
@@ -8232,6 +8322,8 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
         validation_notes,
         harvest_status,
         harvest_blockers,
+        harvest_bucket: String::new(),
+        harvest_reason: String::new(),
         upstream_review: public_patch_upstream_review_from_row(&row),
         related_upstream_review: None,
         duplicate_patch: None,
@@ -9729,6 +9821,8 @@ fn public_patch_from_sqlite_row(
         validation_notes,
         harvest_status,
         harvest_blockers,
+        harvest_bucket: String::new(),
+        harvest_reason: String::new(),
         upstream_review: public_patch_upstream_review_from_sqlite_row(row)?,
         related_upstream_review: None,
         duplicate_patch: None,
@@ -9784,6 +9878,13 @@ fn effective_upstream_review_state(raw_state: Option<&str>, merged_at: Option<&s
         | "superseded" => state,
         _ => state,
     }
+}
+
+fn public_upstream_review_state_is_closed(state: &str) -> bool {
+    matches!(
+        state,
+        "closed" | "closed_unmerged" | "rejected" | "reviewer_reduced" | "superseded"
+    )
 }
 
 fn public_upstream_review_state_label(state: &str) -> String {
@@ -13267,6 +13368,10 @@ sudo apt install fixer"
                         </div>
                         <div class="snapshot-stat">
                             <strong>{}</strong>
+                            <span>upstream reviews missing issue links</span>
+                        </div>
+                        <div class="snapshot-stat">
+                            <strong>{}</strong>
                             <span>still quarantined against spam</span>
                         </div>
                     </div>
@@ -13383,6 +13488,7 @@ sudo apt install fixer"
         snapshot.ready_report_count,
         snapshot.failed_patch_attempt_count,
         snapshot.explained_impossible_count,
+        snapshot.unlinked_upstream_win_count,
         snapshot.quarantined_issue_count,
         html_escape(&apt_snippet),
         html_escape(PRIVACY_WARNING),
@@ -16119,6 +16225,7 @@ mod tests {
             explained_impossible_count: 2,
             corroborated_public_issue_count: 4,
             largest_public_cluster_size: 6,
+            unlinked_upstream_win_count: 1,
             last_submission_at: Some("2026-03-30T00:00:00Z".to_string()),
             top_issues: Vec::new(),
             upstream_wins: vec![UpstreamPatchWin {
@@ -16148,6 +16255,37 @@ mod tests {
         assert!(markup.contains("How the queue is sorted"));
         assert!(markup.contains("public issue families seen on 2+ hosts"));
         assert!(markup.contains("largest public issue family right now"));
+        assert!(markup.contains("upstream reviews missing issue links"));
+    }
+
+    #[test]
+    fn dashboard_snapshot_counts_unlinked_upstream_reviews() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        connection
+            .execute(
+                "INSERT INTO upstream_patch_wins
+                 (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, NULL, ?8)",
+                rusqlite::params![
+                    "orphan-review",
+                    "Moby",
+                    "Opened review but forgot issue link.",
+                    "This upstream review should be visible as link drift.",
+                    "https://github.com/moby/moby/pull/52707",
+                    "review",
+                    serde_json::to_string(&json!(["upstream review"])).unwrap(),
+                    "2026-05-27T00:00:00Z",
+                ],
+            )
+            .unwrap();
+
+        let snapshot = match test_runtime().block_on(load_dashboard_snapshot(&db)) {
+            Ok(value) => value,
+            Err(error) => panic!("dashboard snapshot failed: {}", error.message),
+        };
+
+        assert_eq!(snapshot.unlinked_upstream_win_count, 1);
     }
 
     #[test]
@@ -16445,6 +16583,8 @@ mod tests {
             validation_notes: Vec::new(),
             harvest_status: "ready".to_string(),
             harvest_blockers: Vec::new(),
+            harvest_bucket: "realish".to_string(),
+            harvest_reason: "candidate source diff".to_string(),
             upstream_review: None,
             related_upstream_review: None,
             duplicate_patch: None,
@@ -16510,6 +16650,8 @@ mod tests {
             validation_notes: Vec::new(),
             harvest_status: "ready".to_string(),
             harvest_blockers: Vec::new(),
+            harvest_bucket: "realish".to_string(),
+            harvest_reason: "candidate source diff".to_string(),
             upstream_review: None,
             related_upstream_review: None,
             duplicate_patch: None,
@@ -18041,6 +18183,8 @@ mod tests {
             ]
         );
         let patch = patches.first().expect("patch should be visible");
+        assert_eq!(patch.harvest_bucket, "submitted");
+        assert_eq!(patch.harvest_reason, "already submitted upstream");
         assert_eq!(patch.harvest_status, "needs_review");
         assert_eq!(patch.harvest_blockers, vec!["blocked_validation"]);
 
@@ -18506,6 +18650,11 @@ mod tests {
         assert_eq!(review.relation, "alternative");
         assert_eq!(review.family_count, 1);
         assert!(alternative.upstream_review.is_none());
+        assert_eq!(alternative.harvest_bucket, "related-family");
+        assert_eq!(
+            alternative.harvest_reason,
+            "related upstream review alternative"
+        );
     }
 
     #[test]

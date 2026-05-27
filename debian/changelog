@@ -1,3 +1,11 @@
+fixer (0.182.0-1) unstable; urgency=medium
+
+  * Expose public harvest buckets on patch rows and show unlinked upstream
+    review counts on the landing dashboard so upstream handoff link drift is
+    visible before already-submitted patches re-enter the harvest queue.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Wed, 27 May 2026 16:45:00 +0400
+
 fixer (0.181.0-1) unstable; urgency=medium
 
   * Preserve native executable provenance for local non-dpkg runaway
