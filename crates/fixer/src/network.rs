@@ -1847,7 +1847,7 @@ fn build_submission_proposals(
             continue;
         }
         if !push_submission_proposal(&mut proposals, &mut used_bytes, config, candidate)? {
-            break;
+            continue;
         }
     }
 
@@ -1885,7 +1885,7 @@ fn build_submission_proposals(
             continue;
         }
         if !push_submission_proposal(&mut proposals, &mut used_bytes, config, candidate)? {
-            break;
+            continue;
         }
     }
 
@@ -1923,7 +1923,7 @@ fn build_submission_proposals(
             continue;
         }
         if !push_submission_proposal(&mut proposals, &mut used_bytes, config, candidate)? {
-            break;
+            continue;
         }
     }
 
@@ -5579,6 +5579,177 @@ mod tests {
                 .get("supersedes_best_patch")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn build_submission_bundle_skips_oversized_ready_proposals_and_continues() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+
+        let small_finding_id = store
+            .record_finding(&FindingInput {
+                kind: "investigation".to_string(),
+                title: "Small ready patch".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "small-ready-patch".to_string(),
+                summary: "A small patch should still be submitted".to_string(),
+                details: json!({"subsystem": "desktop-input-config"}),
+                artifact: None,
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let small_opportunity = store.get_opportunity_by_finding(small_finding_id).unwrap();
+        store
+            .save_synced_issue_link(small_opportunity.id, "issue-small")
+            .unwrap();
+
+        let large_finding_id = store
+            .record_finding(&FindingInput {
+                kind: "investigation".to_string(),
+                title: "Oversized ready patch".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "oversized-ready-patch".to_string(),
+                summary: "A too-large patch should not block later proposals".to_string(),
+                details: json!({"subsystem": "desktop-input-config"}),
+                artifact: None,
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let large_opportunity = store.get_opportunity_by_finding(large_finding_id).unwrap();
+        store
+            .save_synced_issue_link(large_opportunity.id, "issue-large")
+            .unwrap();
+
+        let small_source = dir.path().join("small-source");
+        let small_workspace = dir.path().join("small-workspace");
+        fs::create_dir_all(&small_source).unwrap();
+        fs::create_dir_all(&small_workspace).unwrap();
+        fs::write(small_source.join("small.c"), "before\n").unwrap();
+        fs::write(small_workspace.join("small.c"), "after\n").unwrap();
+        let small_bundle = dir.path().join("small-bundle");
+        fs::create_dir_all(&small_bundle).unwrap();
+        let small_output = small_bundle.join("codex-output.txt");
+        fs::write(
+            small_bundle.join("evidence.json"),
+            serde_json::to_vec_pretty(&json!({
+                "opportunity": small_opportunity,
+                "workspace": { "repo_root": small_workspace.display().to_string() },
+                "source_workspace": { "repo_root": small_source.display().to_string() },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(small_bundle.join("prompt.md"), "Patch the small case.\n").unwrap();
+        fs::write(&small_output, "Small patch completed.\n").unwrap();
+        let small_proposal = store
+            .create_proposal(
+                small_opportunity.id,
+                "codex",
+                "ready",
+                &small_bundle,
+                Some(&small_output),
+            )
+            .unwrap();
+        fs::write(
+            small_bundle.join("status.json"),
+            serde_json::to_vec_pretty(&CodexJobStatus {
+                job_id: "job-small".to_string(),
+                state: "ready".to_string(),
+                started_at: "2026-05-29T00:00:00Z".to_string(),
+                finished_at: "2026-05-29T00:01:00Z".to_string(),
+                output_path: Some(small_output.clone()),
+                selected_model: Some("codex-default".to_string()),
+                models_used: vec!["codex-default".to_string()],
+                rate_limit_fallback_used: false,
+                failure_stage: None,
+                error: None,
+                failure_kind: None,
+                exit_status: Some(0),
+                last_stderr_excerpt: None,
+                review_failure_category: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let large_source = dir.path().join("large-source");
+        let large_workspace = dir.path().join("large-workspace");
+        fs::create_dir_all(&large_source).unwrap();
+        fs::create_dir_all(&large_workspace).unwrap();
+        fs::write(large_source.join("large.c"), "before\n").unwrap();
+        fs::write(large_workspace.join("large.c"), "after\n".repeat(10_000)).unwrap();
+        let large_bundle = dir.path().join("large-bundle");
+        fs::create_dir_all(&large_bundle).unwrap();
+        let large_output = large_bundle.join("codex-output.txt");
+        fs::write(
+            large_bundle.join("evidence.json"),
+            serde_json::to_vec_pretty(&json!({
+                "opportunity": large_opportunity,
+                "workspace": { "repo_root": large_workspace.display().to_string() },
+                "source_workspace": { "repo_root": large_source.display().to_string() },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(large_bundle.join("prompt.md"), "Patch the large case.\n").unwrap();
+        fs::write(&large_output, "Large patch completed.\n").unwrap();
+        let large_proposal = store
+            .create_proposal(
+                large_opportunity.id,
+                "codex",
+                "ready",
+                &large_bundle,
+                Some(&large_output),
+            )
+            .unwrap();
+        fs::write(
+            large_bundle.join("status.json"),
+            serde_json::to_vec_pretty(&CodexJobStatus {
+                job_id: "job-large".to_string(),
+                state: "ready".to_string(),
+                started_at: "2026-05-29T00:02:00Z".to_string(),
+                finished_at: "2026-05-29T00:03:00Z".to_string(),
+                output_path: Some(large_output.clone()),
+                selected_model: Some("codex-default".to_string()),
+                models_used: vec!["codex-default".to_string()],
+                rate_limit_fallback_used: false,
+                failure_stage: None,
+                error: None,
+                failure_kind: None,
+                exit_status: Some(0),
+                last_stderr_excerpt: None,
+                review_failure_category: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut config = FixerConfig::default();
+        config.network.max_submission_items = 0;
+        config.network.max_submission_proposals = 2;
+        config.network.max_submission_proposal_bytes = 16_000;
+        let identity = store.ensure_install_identity().unwrap();
+        let participation = ParticipationSnapshot {
+            identity,
+            state: ParticipationState {
+                mode: ParticipationMode::SubmitterWorker,
+                ..ParticipationState::default()
+            },
+            server_url: config.network.server_url.clone(),
+            policy_text: "test policy".to_string(),
+        };
+
+        let bundle = build_submission_bundle(&store, &config, &participation).unwrap();
+
+        assert_eq!(bundle.proposals.len(), 1);
+        assert_eq!(bundle.proposals[0].local_proposal_id, small_proposal.id);
+        assert_ne!(bundle.proposals[0].local_proposal_id, large_proposal.id);
+        assert_eq!(
+            bundle.proposals[0].remote_issue_id.as_deref(),
+            Some("issue-small")
         );
     }
 }

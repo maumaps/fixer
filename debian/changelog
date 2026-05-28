@@ -1,3 +1,9 @@
+fixer (0.232.0-1) unstable; urgency=medium
+
+  * Continue submitting later ready proposals when one candidate is too large.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 29 May 2026 02:24:00 +0400
+
 fixer (0.231.0-1) unstable; urgency=medium
 
   * Add a local harvest-candidates command for real ready Codex source
