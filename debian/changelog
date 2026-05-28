@@ -1,3 +1,10 @@
+fixer (0.223.0-1) unstable; urgency=medium
+
+  * Discover local perf DSO repositories under sudo by falling back to
+    filesystem .git markers when root cannot run git in user-owned worktrees.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 28 May 2026 14:50:00 +0400
+
 fixer (0.222.0-1) unstable; urgency=medium
 
   * Keep perf hotspots on local DSO source repositories instead of inheriting

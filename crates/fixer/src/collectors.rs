@@ -6527,15 +6527,27 @@ fn python_module_local_source_hint(
 }
 
 fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
-    let output = command_output_in_dir_with_timeout(
+    if let Ok(output) = command_output_in_dir_with_timeout(
         "git",
         &["rev-parse", "--show-toplevel"],
         path,
         StdDuration::from_secs(BASIC_COMMAND_TIMEOUT_SECONDS),
-    )
-    .ok()?;
-    let repo_path = PathBuf::from(output.trim());
-    repo_path.exists().then_some(maybe_canonicalize(&repo_path))
+    ) {
+        let repo_path = PathBuf::from(output.trim());
+        if repo_path.exists() {
+            return Some(maybe_canonicalize(&repo_path));
+        }
+    }
+    filesystem_git_repo_root_for_path(path)
+}
+
+fn filesystem_git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|candidate| {
+            let git_marker = candidate.join(".git");
+            git_marker.is_dir() || git_marker.is_file()
+        })
+        .map(maybe_canonicalize)
 }
 
 fn python_repo_contains_module(repo_path: &Path, module_root: &str) -> bool {
@@ -8591,13 +8603,13 @@ mod tests {
         coredump_debugger_skip_reason, crash_event_executable, crash_event_label,
         crash_event_process_name, csv_config_values, current_kernel_image_package_name,
         dominant_syscall_sequence, extend_unique_log_lines, file_offset_for_mapped_address,
-        investigation_cooldown_active, is_low_signal_kernel_warning, is_profile_candidate,
-        kernel_module_lookup_names, kernel_module_package_hint, kernel_thread_package_name,
-        kernel_warning_identity, kernel_warning_module_candidates, looks_like_warning,
-        netdev_watchdog_driver, normalize_oom_task_memcg_target, normalize_perf_symbol,
-        normalize_stuck_process_target_name, oom_cgroup_package_candidates, package_lookup_path,
-        package_lookup_path_is_dpkg_candidate, parse_apparmor_denial, parse_coredump_info,
-        parse_desktop_graphics_session_failure, parse_dkms_status_line,
+        git_repo_root_for_path, investigation_cooldown_active, is_low_signal_kernel_warning,
+        is_profile_candidate, kernel_module_lookup_names, kernel_module_package_hint,
+        kernel_thread_package_name, kernel_warning_identity, kernel_warning_module_candidates,
+        looks_like_warning, netdev_watchdog_driver, normalize_oom_task_memcg_target,
+        normalize_perf_symbol, normalize_stuck_process_target_name, oom_cgroup_package_candidates,
+        package_lookup_path, package_lookup_path_is_dpkg_candidate, parse_apparmor_denial,
+        parse_coredump_info, parse_desktop_graphics_session_failure, parse_dkms_status_line,
         parse_go_binary_source_hint, parse_go_binary_source_hint_from_bytes, parse_ini_sections,
         parse_interpreter_command_hints, parse_kernel_oom_kill_events,
         parse_latest_desktop_resume_failure, parse_network_driver_hang_events,
@@ -9469,6 +9481,19 @@ Stack trace of thread 222:\n\
         assert_eq!(source_hint.source_kind, "local-perf-dso-repo");
         assert_eq!(source_hint.source_name, "audio-worker");
         assert_eq!(source_hint.source_repo_path, maybe_canonicalize(&repo));
+    }
+
+    #[test]
+    fn git_repo_root_falls_back_to_filesystem_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("source-tree");
+        let nested = repo.join(".venv").join("lib").join("python3.13");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+
+        let root = git_repo_root_for_path(&nested).expect("git marker should identify repo root");
+
+        assert_eq!(root, maybe_canonicalize(&repo));
     }
 
     #[test]
