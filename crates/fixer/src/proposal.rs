@@ -112,6 +112,7 @@ pub fn create_proposal_with_prior_patch(
     engine: &str,
 ) -> Result<ProposalRecord> {
     if engine == "codex" {
+        reconcile_running_codex_proposals_for_opportunity(store, config, opportunity.id)?;
         let job = prepare_codex_job_with_prior_patch(
             config,
             opportunity,
@@ -127,7 +128,8 @@ pub fn create_proposal_with_prior_patch(
             &job.bundle_dir,
             Some(&job.output_path),
         )?;
-        let status = execute_codex_job(config, &job)?;
+        let status = execute_codex_job(config, &job)
+            .or_else(|error| record_failed_codex_job(&job, "runtime", Some(error.to_string())))?;
         return store.update_proposal_state(
             proposal.id,
             &status.state,
@@ -181,6 +183,114 @@ pub fn create_proposal_with_prior_patch(
         "codex" => unreachable!("codex proposals are handled before deterministic bundle setup"),
         other => Err(anyhow!("unknown proposal engine `{other}`")),
     }
+}
+
+pub fn record_failed_codex_job(
+    job: &CodexJobSpec,
+    failure_stage: &str,
+    error: Option<String>,
+) -> Result<CodexJobStatus> {
+    let finished_at = now_rfc3339();
+    let error = error.unwrap_or_else(|| "Codex job did not complete.".to_string());
+    if !job.output_path.exists() {
+        fs::write(
+            &job.output_path,
+            format!("## Workflow Note\n\nFixer could not complete the Codex job: {error}\n")
+                .as_bytes(),
+        )?;
+    }
+    let status = CodexJobStatus {
+        job_id: job.job_id.clone(),
+        state: "failed".to_string(),
+        started_at: finished_at.clone(),
+        finished_at,
+        output_path: job.output_path.exists().then(|| job.output_path.clone()),
+        selected_model: None,
+        models_used: Vec::new(),
+        rate_limit_fallback_used: false,
+        failure_stage: Some(failure_stage.to_string()),
+        failure_kind: Some(classify_codex_failure(&error)),
+        error: Some(error),
+        exit_status: None,
+        last_stderr_excerpt: None,
+        review_failure_category: None,
+    };
+    fs::write(
+        job.bundle_dir.join("status.json"),
+        serde_json::to_vec_pretty(&status)?,
+    )?;
+    Ok(status)
+}
+
+pub fn reconcile_running_codex_proposals_for_opportunity(
+    store: &Store,
+    config: &FixerConfig,
+    opportunity_id: i64,
+) -> Result<usize> {
+    let mut reconciled = 0;
+    let now = Utc::now();
+    let stale_after = interrupted_codex_stale_after(config);
+    for proposal in store.list_running_codex_proposals_for_opportunity(opportunity_id)? {
+        if let Ok(status) = load_codex_job_status(&proposal.bundle_path) {
+            store.update_proposal_state(
+                proposal.id,
+                &status.state,
+                status
+                    .output_path
+                    .as_deref()
+                    .or(proposal.output_path.as_deref()),
+            )?;
+            reconciled += 1;
+            continue;
+        }
+
+        let marker = proposal.bundle_path.join("runner.json");
+        if codex_runner_marker_is_active(&marker) {
+            continue;
+        }
+
+        let updated_at = DateTime::parse_from_rfc3339(&proposal.updated_at)
+            .map(|value| value.with_timezone(&Utc))
+            .unwrap_or(now);
+        let has_dead_marker = marker.exists();
+        let stale_without_marker = now.signed_duration_since(updated_at) >= stale_after;
+        if has_dead_marker || stale_without_marker {
+            let output_path = proposal
+                .output_path
+                .clone()
+                .unwrap_or_else(|| proposal.bundle_path.join("codex-output.txt"));
+            if !output_path.exists() {
+                fs::write(
+                    &output_path,
+                    "## Workflow Note\n\nFixer marked this proposal failed because its Codex runner disappeared before writing a final status.\n",
+                )?;
+            }
+            let status = CodexJobStatus {
+                job_id: format!("proposal-{}", proposal.id),
+                state: "failed".to_string(),
+                started_at: proposal.created_at.clone(),
+                finished_at: now_rfc3339(),
+                output_path: Some(output_path.clone()),
+                selected_model: None,
+                models_used: Vec::new(),
+                rate_limit_fallback_used: false,
+                failure_stage: Some("runtime".to_string()),
+                failure_kind: Some("interrupted".to_string()),
+                error: Some("Codex runner disappeared before writing a final status.".to_string()),
+                exit_status: None,
+                last_stderr_excerpt: None,
+                review_failure_category: None,
+            };
+            fs::write(
+                proposal.bundle_path.join("status.json"),
+                serde_json::to_vec_pretty(&status)?,
+            )?;
+            let _ = fs::remove_file(marker);
+            store.update_proposal_state(proposal.id, "failed", Some(&output_path))?;
+            reconciled += 1;
+        }
+    }
+    Ok(reconciled)
 }
 
 pub fn prepare_codex_job(
@@ -320,6 +430,55 @@ pub fn load_codex_job_status(bundle_dir: &Path) -> Result<CodexJobStatus> {
     let path = bundle_dir.join("status.json");
     let raw = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&raw).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn interrupted_codex_stale_after(config: &FixerConfig) -> ChronoDuration {
+    let timeout = config.patch.codex_timeout_seconds;
+    let seconds = if timeout == 0 {
+        30 * 60
+    } else {
+        timeout.saturating_mul(2).max(30 * 60)
+    };
+    ChronoDuration::seconds(seconds.min(i64::MAX as u64) as i64)
+}
+
+fn codex_runner_marker_is_active(marker: &Path) -> bool {
+    let raw = match fs::read(marker) {
+        Ok(raw) => raw,
+        Err(_) => return false,
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
+        return false;
+    };
+    let Some(pid) = value.get("pid").and_then(Value::as_u64) else {
+        return false;
+    };
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+struct CodexJobRunMarker {
+    path: PathBuf,
+}
+
+impl CodexJobRunMarker {
+    fn create(job: &CodexJobSpec) -> Result<Self> {
+        let path = job.bundle_dir.join("runner.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "pid": std::process::id(),
+                "job_id": job.job_id,
+                "started_at": now_rfc3339(),
+            }))?,
+        )?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for CodexJobRunMarker {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 pub fn load_published_codex_session(bundle_dir: &Path) -> Result<Value> {
@@ -528,6 +687,7 @@ fn response_declares_no_git_add_paths(response: &str) -> bool {
 }
 
 pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<CodexJobStatus> {
+    let _run_marker = CodexJobRunMarker::create(job)?;
     let started_at = now_rfc3339();
     let base_patch_prompt = read_text(&job.prompt_path)
         .with_context(|| format!("failed to read {}", job.prompt_path.display()))?;
@@ -8983,6 +9143,126 @@ printf 'Subject: test patch\n\n## Commit Message\nok\n\n## Issue Connection\nok\
                     .as_ref()
             )
         );
+    }
+
+    #[test]
+    fn codex_proposal_runtime_errors_finish_failed_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let workspace_root = dir.path().join("source");
+        std::fs::create_dir_all(workspace_root.join("src")).unwrap();
+        std::fs::write(workspace_root.join("src/file.cpp"), "before\n").unwrap();
+
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+        let finding_id = store
+            .record_finding(&FindingInput {
+                kind: "investigation".to_string(),
+                title: "Runtime failure repro".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "codex-runtime-error-row".to_string(),
+                summary: "Codex command cannot be launched".to_string(),
+                details: json!({
+                    "subsystem": "desktop-input-config"
+                }),
+                artifact: None,
+                repo_root: None,
+                ecosystem: Some("debian".to_string()),
+            })
+            .unwrap();
+        let opportunity = store.get_opportunity_by_finding(finding_id).unwrap();
+
+        let mut config = FixerConfig::default();
+        config.service.state_dir = state_dir;
+        config.patch.codex_command = dir
+            .path()
+            .join("definitely-missing-codex")
+            .display()
+            .to_string();
+        config.patch.plan_before_patch = false;
+        config.patch.review_after_patch = false;
+        config.patch.model = None;
+        config.patch.spark_model = None;
+        config.patch.codex_timeout_seconds = 0;
+
+        let workspace = PreparedWorkspace {
+            repo_root: workspace_root,
+            ecosystem: Some("debian".to_string()),
+            source_kind: "debian-source".to_string(),
+            package_name: Some("example".to_string()),
+            source_package: Some("example".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from test source".to_string(),
+        };
+
+        let proposal =
+            super::create_proposal(&store, &config, &opportunity, &workspace, "codex").unwrap();
+
+        assert_eq!(proposal.state, "failed");
+        assert!(!proposal.bundle_path.join("runner.json").exists());
+        let status = super::load_codex_job_status(&proposal.bundle_path).unwrap();
+        assert_eq!(status.state, "failed");
+        assert_eq!(status.failure_stage.as_deref(), Some("runtime"));
+        assert!(
+            std::fs::read_to_string(proposal.output_path.unwrap())
+                .unwrap()
+                .contains("could not complete")
+        );
+    }
+
+    #[test]
+    fn reconciles_interrupted_running_codex_proposals() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+        let finding_id = store
+            .record_finding(&FindingInput {
+                kind: "investigation".to_string(),
+                title: "Interrupted proposal".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "interrupted-codex-row".to_string(),
+                summary: "Codex runner disappeared".to_string(),
+                details: json!({}),
+                artifact: None,
+                repo_root: None,
+                ecosystem: Some("debian".to_string()),
+            })
+            .unwrap();
+        let opportunity = store.get_opportunity_by_finding(finding_id).unwrap();
+        let bundle_dir = dir.path().join("proposal");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(
+            bundle_dir.join("runner.json"),
+            serde_json::to_vec_pretty(&json!({
+                "pid": 999_999_999_u64,
+                "job_id": "lost-job",
+                "started_at": "2026-05-28T00:00:00Z",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let proposal = store
+            .create_proposal(
+                opportunity.id,
+                "codex",
+                "running",
+                &bundle_dir,
+                Some(&bundle_dir.join("codex-output.txt")),
+            )
+            .unwrap();
+
+        let config = FixerConfig::default();
+        let reconciled = super::reconcile_running_codex_proposals_for_opportunity(
+            &store,
+            &config,
+            opportunity.id,
+        )
+        .unwrap();
+
+        assert_eq!(reconciled, 1);
+        let updated = store.get_proposal(proposal.id).unwrap();
+        assert_eq!(updated.state, "failed");
+        assert!(!bundle_dir.join("runner.json").exists());
+        let status = super::load_codex_job_status(&bundle_dir).unwrap();
+        assert_eq!(status.failure_kind.as_deref(), Some("interrupted"));
     }
 
     #[test]

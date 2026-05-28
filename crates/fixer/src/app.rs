@@ -270,6 +270,11 @@ impl App {
                     && self.config.patch.driver == crate::models::PatchDriver::Codex
                     && self.config.patch.auth_mode == CodexAuthMode::UserLease
                 {
+                    proposal::reconcile_running_codex_proposals_for_opportunity(
+                        &self.store,
+                        &self.config,
+                        opportunity.id,
+                    )?;
                     let lease = self
                         .store
                         .load_codex_auth_lease()?
@@ -288,7 +293,14 @@ impl App {
                         &job.bundle_dir,
                         Some(&job.output_path),
                     )?;
-                    let status = network::run_codex_job_as_user(&self.store, &self.config, &job)?;
+                    let status = network::run_codex_job_as_user(&self.store, &self.config, &job)
+                        .or_else(|error| {
+                            proposal::record_failed_codex_job(
+                                &job,
+                                "runtime",
+                                Some(error.to_string()),
+                            )
+                        })?;
                     return self.store.update_proposal_state(
                         proposal.id,
                         &status.state,
