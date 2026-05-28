@@ -1,3 +1,10 @@
+fixer (0.218.0-1) unstable; urgency=medium
+
+  * Recover timed-out refinement passes by reviewing the current edited
+    workspace instead of burying useful source-backed candidates as failed.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 28 May 2026 04:55:00 +0400
+
 fixer (0.217.0-1) unstable; urgency=medium
 
   * Add server-side worker queue indexes so source-backed handoff reruns do not

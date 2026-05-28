@@ -763,6 +763,52 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                     response: refine_stage.output.clone(),
                 });
                 if !refine_stage.success {
+                    if should_attempt_refinement_timeout_recovery(&refine_stage) {
+                        let recovery_label =
+                            format!("Refinement Timeout Recovery {}", refinement_round);
+                        let current_changed_paths =
+                            workspace_changed_paths(&job.workspace.repo_root);
+                        let recovery_prompt = build_refinement_timeout_recovery_prompt(
+                            &evidence_path,
+                            &job.workspace,
+                            source_workspace_root.as_deref(),
+                            &current_author_output_path,
+                            &review_output_path,
+                            &refine_output_path,
+                            &refine_stage.error,
+                            refinement_round,
+                            &current_changed_paths,
+                        );
+                        let recovery_prompt_path = job
+                            .bundle_dir
+                            .join(format!("refine-{}-recovery-prompt.md", refinement_round));
+                        let recovery_output_path = job
+                            .bundle_dir
+                            .join(format!("refine-{}-recovery-output.txt", refinement_round));
+                        let recovery_stage = run_codex_stage(
+                            config,
+                            &job.workspace.repo_root,
+                            &recovery_prompt_path,
+                            &recovery_output_path,
+                            &recovery_label,
+                            &recovery_prompt,
+                            job.subsystem.as_deref(),
+                            Some(&mut codex_resume_state),
+                        )?;
+                        logs.push(render_stage_log(&recovery_stage));
+                        models_used.extend(recovery_stage.models_used.clone());
+                        rate_limit_fallback_used |= recovery_stage.rate_limit_fallback_used;
+                        selected_model = recovery_stage.selected_model.clone().or(selected_model);
+                        transcripts.push(CodexStageTranscript {
+                            label: recovery_stage.label.to_string(),
+                            prompt: recovery_prompt,
+                            response: recovery_stage.output.clone(),
+                        });
+                        if recovery_stage.success {
+                            current_author_output_path = recovery_output_path;
+                            continue;
+                        }
+                    }
                     workflow_failure = Some((
                         classify_codex_failure(&refine_stage.log),
                         refine_stage.error,
@@ -875,6 +921,53 @@ pub fn execute_codex_job(config: &FixerConfig, job: &CodexJobSpec) -> Result<Cod
                         response: refine_stage.output.clone(),
                     });
                     if !refine_stage.success {
+                        if should_attempt_refinement_timeout_recovery(&refine_stage) {
+                            let recovery_label =
+                                format!("Refinement Timeout Recovery {}", refinement_round);
+                            let current_changed_paths =
+                                workspace_changed_paths(&job.workspace.repo_root);
+                            let recovery_prompt = build_refinement_timeout_recovery_prompt(
+                                &evidence_path,
+                                &job.workspace,
+                                source_workspace_root.as_deref(),
+                                &current_author_output_path,
+                                &review_output_path,
+                                &refine_output_path,
+                                &refine_stage.error,
+                                refinement_round,
+                                &current_changed_paths,
+                            );
+                            let recovery_prompt_path = job
+                                .bundle_dir
+                                .join(format!("refine-{}-recovery-prompt.md", refinement_round));
+                            let recovery_output_path = job
+                                .bundle_dir
+                                .join(format!("refine-{}-recovery-output.txt", refinement_round));
+                            let recovery_stage = run_codex_stage(
+                                config,
+                                &job.workspace.repo_root,
+                                &recovery_prompt_path,
+                                &recovery_output_path,
+                                &recovery_label,
+                                &recovery_prompt,
+                                job.subsystem.as_deref(),
+                                Some(&mut codex_resume_state),
+                            )?;
+                            logs.push(render_stage_log(&recovery_stage));
+                            models_used.extend(recovery_stage.models_used.clone());
+                            rate_limit_fallback_used |= recovery_stage.rate_limit_fallback_used;
+                            selected_model =
+                                recovery_stage.selected_model.clone().or(selected_model);
+                            transcripts.push(CodexStageTranscript {
+                                label: recovery_stage.label.to_string(),
+                                prompt: recovery_prompt,
+                                response: recovery_stage.output.clone(),
+                            });
+                            if recovery_stage.success {
+                                current_author_output_path = recovery_output_path;
+                                continue;
+                            }
+                        }
                         workflow_failure = Some((
                             classify_codex_failure(&refine_stage.log),
                             refine_stage.error,
@@ -4425,6 +4518,57 @@ fn build_refinement_prompt(
         plan_hint,
         changed_paths_hint,
         subsystem_hint,
+        upstream_style_hint,
+        build_validation_hint,
+        patch_response_contract(),
+    )
+}
+
+fn should_attempt_refinement_timeout_recovery(stage: &CodexStageOutcome) -> bool {
+    !stage.success && classify_codex_failure(&stage.log) == "timeout"
+}
+
+fn build_refinement_timeout_recovery_prompt(
+    evidence_path: &Path,
+    workspace: &PreparedWorkspace,
+    source_workspace_root: Option<&Path>,
+    latest_patch_output_path: &Path,
+    review_output_path: &Path,
+    timed_out_output_path: &Path,
+    timeout_error: &str,
+    refinement_round: u32,
+    current_changed_paths: &[String],
+) -> String {
+    let source_hint = source_workspace_root
+        .map(|path| {
+            format!(
+                " The original pre-edit snapshot is available at `{}` if you need to compare the current patch against it.",
+                path.display()
+            )
+        })
+        .unwrap_or_default();
+    let changed_paths_hint = if current_changed_paths.is_empty() {
+        " The workspace currently has no tracked source changes; if that is correct, answer with `Git Add Paths: None` and explain why no patch should ship.".to_string()
+    } else {
+        format!(
+            " The workspace currently changes these repo-relative paths: {}. Keep `## Git Add Paths` synchronized with this exact set unless you deliberately revert or add a file.",
+            current_changed_paths.join(", ")
+        )
+    };
+    let upstream_style_hint = upstream_style_prompt_hint(workspace);
+    let build_validation_hint = workspace_build_validation_hint(workspace);
+    format!(
+        "A Fixer refinement stage timed out after it may already have edited the workspace.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the previous author response at `{}` and the review report at `{}`. The timed-out refinement output path is `{}` and the timeout was: `{}`. This was refinement round {}.{}{}{}{}\n\nInspect the current workspace state before answering. If the prior timed-out pass already addressed the review finding, do not redo the patch from scratch; write the complete final author response for the current diff and run only the smallest validation needed to make that response truthful. If the workspace is only partially fixed, finish the smallest safe correction first. If the timeout left the workspace inconsistent or unreviewable, revert the partial edits and explain the blocker.\n\n{}",
+        evidence_path.display(),
+        workspace.repo_root.display(),
+        workspace.source_kind,
+        latest_patch_output_path.display(),
+        review_output_path.display(),
+        timed_out_output_path.display(),
+        timeout_error,
+        refinement_round,
+        source_hint,
+        changed_paths_hint,
         upstream_style_hint,
         build_validation_hint,
         patch_response_contract(),
@@ -9839,6 +9983,52 @@ plain stderr line
         assert!(review_prompt.contains("local compat/helper API"));
         assert!(refinement_prompt.contains("use local project helpers and compat APIs"));
         assert!(refinement_prompt.contains("CONTRIBUTING"));
+    }
+
+    #[test]
+    fn refinement_timeout_recovery_prompt_preserves_review_gate() {
+        let workspace = PreparedWorkspace {
+            repo_root: PathBuf::from("/tmp/perl"),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "upstream-git".to_string(),
+            package_name: Some("perl".to_string()),
+            source_package: Some("perl".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from upstream git".to_string(),
+        };
+        let stage = super::CodexStageOutcome {
+            label: "Refinement Pass 2".to_string(),
+            success: false,
+            output: String::new(),
+            log: "Codex stage timed out after 900 second(s).".to_string(),
+            error: "Codex stage timed out after 900 second(s).".to_string(),
+            selected_model: None,
+            models_used: Vec::new(),
+            rate_limit_fallback_used: false,
+            exit_status: Some(124),
+            stderr_excerpt: Some("Codex stage timed out after 900 second(s).".to_string()),
+        };
+
+        assert!(super::should_attempt_refinement_timeout_recovery(&stage));
+
+        let prompt = super::build_refinement_timeout_recovery_prompt(
+            Path::new("/tmp/evidence.json"),
+            &workspace,
+            Some(Path::new("/tmp/perl-source")),
+            Path::new("/tmp/patch-output.txt"),
+            Path::new("/tmp/review-2-output.txt"),
+            Path::new("/tmp/refine-2-output.txt"),
+            &stage.error,
+            2,
+            &["pp_sys.c".to_string(), "t/op/sselect.t".to_string()],
+        );
+
+        assert!(prompt.contains("timed out after it may already have edited the workspace"));
+        assert!(prompt.contains("Inspect the current workspace state"));
+        assert!(prompt.contains("write the complete final author response for the current diff"));
+        assert!(prompt.contains("pp_sys.c, t/op/sselect.t"));
+        assert!(prompt.contains("## Validation"));
+        assert!(prompt.contains("Use `reproduced` only when"));
     }
 
     #[test]
