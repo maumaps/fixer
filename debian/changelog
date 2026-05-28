@@ -1,3 +1,11 @@
+fixer (0.221.0-1) unstable; urgency=medium
+
+  * Attach retained local Python module repositories from command-line paths so
+    interpreter workload evidence can produce application patches instead of
+    speculative runtime reports.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 28 May 2026 14:05:00 +0400
+
 fixer (0.220.0-1) unstable; urgency=medium
 
   * Symbolize raw perf DSO offsets so hotspot opportunities keep function-level

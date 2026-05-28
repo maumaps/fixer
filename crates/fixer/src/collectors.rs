@@ -4326,6 +4326,7 @@ struct InterpreterRunawayProcessEvidence {
     source_kind: Option<String>,
     source_name: Option<String>,
     source_repo_url: Option<String>,
+    source_repo_path: Option<String>,
     entrypoint_package_name: Option<String>,
     entrypoint_package_metadata: Option<RunawayPackageMetadata>,
     runtime_package_name: Option<String>,
@@ -6280,15 +6281,43 @@ fn collect_interpreter_runaway_process_evidence(
             source.distribution_name
         ));
     }
-    let source_kind = python_module_source
+    let python_local_source = (parsed.interpreter == "python"
+        && parsed.entrypoint_kind == "module")
+        .then(|| {
+            parsed
+                .suspected_entrypoint
+                .as_deref()
+                .and_then(|module| python_module_local_source_hint(command_argv, cwd, module))
+        })
+        .flatten();
+    if let Some(source) = python_local_source.as_ref() {
+        detection_signals.insert(format!(
+            "Retained command-line paths identify local module source {}",
+            source.source_name
+        ));
+    }
+    let source_kind = python_local_source
         .as_ref()
-        .map(|_| "python-distribution".to_string());
-    let source_name = python_module_source
+        .map(|_| "local-python-workload".to_string())
+        .or_else(|| {
+            python_module_source
+                .as_ref()
+                .map(|_| "python-distribution".to_string())
+        });
+    let source_name = python_local_source
         .as_ref()
-        .map(|source| source.distribution_name.clone());
+        .map(|source| source.source_name.clone())
+        .or_else(|| {
+            python_module_source
+                .as_ref()
+                .map(|source| source.distribution_name.clone())
+        });
     let source_repo_url = python_module_source
         .as_ref()
         .and_then(|source| source.repo_url.clone());
+    let source_repo_path = python_local_source
+        .as_ref()
+        .map(|source| source.repo_path.display().to_string());
 
     let evidence_gap = match parsed.entrypoint_kind.as_str() {
         "script" => format!(
@@ -6310,7 +6339,11 @@ fn collect_interpreter_runaway_process_evidence(
     };
     let mut recommended_next_steps =
         vec!["ps -p <pid> -o pid,stat,pcpu,etime,wchan,args".to_string()];
-    if let Some(repo_url) = source_repo_url.as_ref() {
+    if let Some(repo_path) = source_repo_path.as_ref() {
+        recommended_next_steps.push(format!(
+            "Use the local module source at {repo_path} before proposing runtime changes."
+        ));
+    } else if let Some(repo_url) = source_repo_url.as_ref() {
         recommended_next_steps.push(format!(
             "Acquire the module source from {repo_url} and rerun Fixer against that repository before proposing a patch."
         ));
@@ -6331,6 +6364,7 @@ fn collect_interpreter_runaway_process_evidence(
         source_kind,
         source_name,
         source_repo_url,
+        source_repo_path,
         entrypoint_package_name,
         entrypoint_package_metadata,
         runtime_package_name,
@@ -6347,6 +6381,12 @@ fn collect_interpreter_runaway_process_evidence(
 struct PythonModuleSourceHint {
     distribution_name: String,
     repo_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PythonModuleLocalSourceHint {
+    source_name: String,
+    repo_path: PathBuf,
 }
 
 fn python_module_source_hint(
@@ -6423,6 +6463,63 @@ fn parse_python_module_source_hint(output: &str) -> Option<PythonModuleSourceHin
         distribution_name: distribution_name?,
         repo_url,
     })
+}
+
+fn python_module_local_source_hint(
+    command_argv: &[String],
+    cwd: Option<&str>,
+    module: &str,
+) -> Option<PythonModuleLocalSourceHint> {
+    let module_root = module.split('.').next()?.replace('-', "_");
+    let mut candidates = Vec::new();
+    if let Some(cwd) = cwd {
+        candidates.push(PathBuf::from(cwd));
+    }
+    for arg in command_argv {
+        let path = Path::new(arg);
+        if path.is_absolute() {
+            candidates.push(path.to_path_buf());
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let search_dir = if candidate.is_dir() {
+                candidate
+            } else {
+                candidate.parent()?.to_path_buf()
+            };
+            let repo_path = git_repo_root_for_path(&search_dir)?;
+            python_repo_contains_module(&repo_path, &module_root).then(|| {
+                let source_name = repo_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("python-workload-source")
+                    .to_string();
+                PythonModuleLocalSourceHint {
+                    source_name,
+                    repo_path,
+                }
+            })
+        })
+        .next()
+}
+
+fn git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
+    let output = command_output_in_dir_with_timeout(
+        "git",
+        &["rev-parse", "--show-toplevel"],
+        path,
+        StdDuration::from_secs(BASIC_COMMAND_TIMEOUT_SECONDS),
+    )
+    .ok()?;
+    let repo_path = PathBuf::from(output.trim());
+    repo_path.exists().then_some(maybe_canonicalize(&repo_path))
+}
+
+fn python_repo_contains_module(repo_path: &Path, module_root: &str) -> bool {
+    repo_path.join(module_root).exists() || repo_path.join("src").join(module_root).exists()
 }
 
 fn source_repo_url_from_project_url(url: &str) -> Option<String> {
@@ -8450,18 +8547,20 @@ mod tests {
         parse_perf_hot_paths, parse_perl_command_line_hints,
         parse_postgres_collation_mismatch_rows, parse_proc_maps_for_symbolization,
         parse_python_module_source_hint, parse_strace_syscall_name, prioritize_coredump_events,
-        process_runtime_seconds, process_state_is_uninterruptible, richer_evidence_enabled,
-        safe_perf_name, shell_assignment_csv_value, stable_apparmor_denial_name,
-        stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
-        summarize_top_syscalls, symbolize_gdb_backtrace_addresses, system_uptime_seconds,
-        truncate_for_json_field,
+        process_runtime_seconds, process_state_is_uninterruptible, python_module_local_source_hint,
+        richer_evidence_enabled, safe_perf_name, shell_assignment_csv_value,
+        stable_apparmor_denial_name, stuck_process_investigation_fingerprint,
+        stuck_process_source_fingerprint, summarize_top_syscalls,
+        symbolize_gdb_backtrace_addresses, system_uptime_seconds, truncate_for_json_field,
     };
     use crate::config::FixerConfig;
     use crate::models::{ParticipationMode, ParticipationState, PopularBinaryProfile};
     use crate::storage::Store;
+    use crate::util::maybe_canonicalize;
     use chrono::Utc;
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -9694,6 +9793,36 @@ Description: user-space parser utility for AppArmor
             hint.repo_url.as_deref(),
             Some("https://github.com/rhasspy/wyoming-faster-whisper.git")
         );
+    }
+
+    #[test]
+    fn python_module_local_source_uses_retained_repo_path_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("audio-worker");
+        fs::create_dir_all(repo.join("home_audio_mesh")).unwrap();
+        fs::write(repo.join("home_audio_mesh").join("__init__.py"), "").unwrap();
+        Command::new("git")
+            .args(["init"])
+            .arg(&repo)
+            .output()
+            .unwrap();
+        let argv = vec![
+            "/venv/bin/python".to_string(),
+            "-m".to_string(),
+            "home_audio_mesh.ml.live_enricher".to_string(),
+            "--worker-workdir".to_string(),
+            repo.display().to_string(),
+        ];
+
+        let hint = python_module_local_source_hint(
+            &argv,
+            Some(dir.path().to_str().unwrap()),
+            "home_audio_mesh.ml.live_enricher",
+        )
+        .expect("retained workdir should identify local module source");
+
+        assert_eq!(hint.source_name, "audio-worker");
+        assert_eq!(hint.repo_path, maybe_canonicalize(&repo));
     }
 
     #[test]

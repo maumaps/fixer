@@ -67,6 +67,21 @@ pub fn ensure_workspace_for_opportunity(
     }
 
     if let Some(workspace_target) = interpreter_source_target(opportunity) {
+        if let Some(repo_path) = workspace_target.local_path.as_ref() {
+            let repo_root = maybe_canonicalize(repo_path);
+            let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
+            return Ok(PreparedWorkspace {
+                repo_root,
+                ecosystem,
+                source_kind: "interpreter-local-repo".to_string(),
+                package_name: None,
+                source_package: Some(workspace_target.source_package.clone()),
+                homepage: workspace_target.upstream_url.clone(),
+                acquisition_note: workspace_target.acquisition_note.unwrap_or_else(|| {
+                    "Using retained local interpreter workload repository.".to_string()
+                }),
+            });
+        }
         let repo_root = ensure_upstream_clone(
             config,
             &workspace_target.source_package,
@@ -111,6 +126,7 @@ pub fn ensure_workspace_for_opportunity(
         .unwrap_or_else(|| WorkspaceSourceTarget {
             source_package: requested_source_package,
             upstream_url: None,
+            local_path: None,
             acquisition_note: None,
         });
 
@@ -221,6 +237,7 @@ pub fn ensure_workspace_for_opportunity(
 struct WorkspaceSourceTarget {
     source_package: String,
     upstream_url: Option<String>,
+    local_path: Option<PathBuf>,
     acquisition_note: Option<String>,
 }
 
@@ -439,6 +456,7 @@ fn upstream_source_alias(source_package: &str) -> Option<WorkspaceSourceTarget> 
     Some(WorkspaceSourceTarget {
         source_package: source_package.to_string(),
         upstream_url: Some(upstream_url.to_string()),
+        local_path: None,
         acquisition_note: Some(format!(
             "Mapped `{source_package}` to the {project_name} upstream git default branch so source patches are prepared against upstream HEAD instead of the installed distro version."
         )),
@@ -473,6 +491,7 @@ fn native_executable_source_target(
     Some(WorkspaceSourceTarget {
         source_package: sanitize_dir_name(&source_name),
         upstream_url: Some(repo_url.clone()),
+        local_path: None,
         acquisition_note: Some(format!(
             "Cloned {repo_url} from local executable build metadata for {}; rerun Fixer against upstream HEAD instead of discarding the retained local-executable evidence.",
             source_hint.executable_name
@@ -522,6 +541,7 @@ fn native_executable_handoff_source_target(
         Some(WorkspaceSourceTarget {
             source_package: sanitize_dir_name(&source_name),
             upstream_url: Some(repo_url.to_string()),
+            local_path: None,
             acquisition_note: Some(acquisition_note),
         })
     })
@@ -594,7 +614,17 @@ fn interpreter_source_target(opportunity: &OpportunityRecord) -> Option<Workspac
     let repo_url = process
         .get("source_repo_url")
         .and_then(Value::as_str)
-        .filter(|value| is_cloneable_repo_url(value))?;
+        .filter(|value| is_cloneable_repo_url(value));
+    let local_path = process
+        .get("source_repo_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.exists());
+    if repo_url.is_none() && local_path.is_none() {
+        return None;
+    }
     let source_name = process
         .get("source_name")
         .and_then(Value::as_str)
@@ -613,10 +643,24 @@ fn interpreter_source_target(opportunity: &OpportunityRecord) -> Option<Workspac
         .unwrap_or(source_name);
     Some(WorkspaceSourceTarget {
         source_package: sanitize_dir_name(source_name),
-        upstream_url: Some(repo_url.to_string()),
-        acquisition_note: Some(format!(
-            "Cloned {repo_url} from {interpreter} module metadata for {entrypoint}; rerun Fixer against upstream HEAD instead of discarding the retained interpreter workload evidence."
-        )),
+        upstream_url: repo_url.map(ToString::to_string),
+        local_path,
+        acquisition_note: Some(
+            if let Some(path) = process
+                .get("source_repo_path")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                format!(
+                    "Using retained local {interpreter} workload repository {path} for {entrypoint}; patch the application entrypoint before considering runtime changes."
+                )
+            } else {
+                let repo_url = repo_url.unwrap_or("");
+                format!(
+                    "Cloned {repo_url} from {interpreter} module metadata for {entrypoint}; rerun Fixer against upstream HEAD instead of discarding the retained interpreter workload evidence."
+                )
+            },
+        ),
     })
 }
 
@@ -651,6 +695,7 @@ fn chrome_workspace_alias(
             source_package.to_string()
         },
         upstream_url: Some("https://chromium.googlesource.com/chromium/src.git".to_string()),
+        local_path: None,
         acquisition_note: Some(
             "Mapped Google Chrome to Chromium sources so Fixer can inspect the closest available upstream codebase.".to_string(),
         ),
@@ -1337,7 +1382,9 @@ mod tests {
     };
     use crate::models::{InstalledPackageMetadata, OpportunityRecord};
     use serde_json::json;
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     #[test]
     fn detects_cloneable_urls() {
@@ -1715,6 +1762,52 @@ zoom:\n\
     }
 
     #[test]
+    fn maps_python_module_local_repo_path_to_existing_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("audio-worker");
+        fs::create_dir_all(repo.join("home_audio_mesh")).unwrap();
+        fs::write(repo.join("home_audio_mesh").join("__init__.py"), "").unwrap();
+        Command::new("git")
+            .args(["init"])
+            .arg(&repo)
+            .output()
+            .unwrap();
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "investigation".to_string(),
+            title: "python module spins CPU".to_string(),
+            score: 100,
+            state: "open".to_string(),
+            summary: "python module spins".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "runaway-process",
+                    "interpreter_process": {
+                        "interpreter": "python",
+                        "entrypoint_kind": "module",
+                        "suspected_entrypoint": "home_audio_mesh.ml.live_enricher",
+                        "source_kind": "local-python-workload",
+                        "source_name": "audio-worker",
+                        "source_repo_path": repo.display().to_string()
+                    }
+                }
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+            updated_at: "2026-05-27T00:00:00Z".to_string(),
+        };
+
+        let target = interpreter_source_target(&opportunity)
+            .expect("local interpreter source should map to a workspace");
+
+        assert_eq!(target.source_package, "audio-worker");
+        assert_eq!(target.local_path.as_deref(), Some(repo.as_path()));
+        assert!(target.upstream_url.is_none());
+    }
+
+    #[test]
     fn non_aliased_external_binary_package_still_requires_external_handoff() {
         let metadata = InstalledPackageMetadata {
             package_name: "zoom".to_string(),
@@ -1740,6 +1833,7 @@ zoom:\n\
         let target = WorkspaceSourceTarget {
             source_package: metadata.source_package.clone(),
             upstream_url: None,
+            local_path: None,
             acquisition_note: None,
         };
         assert!(is_external_binary_package_without_workspace(
