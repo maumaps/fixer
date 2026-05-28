@@ -1,3 +1,10 @@
+fixer (0.220.0-1) unstable; urgency=medium
+
+  * Symbolize raw perf DSO offsets so hotspot opportunities keep function-level
+    evidence instead of collapsing sampled addresses to unresolved offsets.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 28 May 2026 13:45:00 +0400
+
 fixer (0.219.0-1) unstable; urgency=medium
 
   * Symbolize GDB backtrace addresses through proc maps so PIE Go binaries can

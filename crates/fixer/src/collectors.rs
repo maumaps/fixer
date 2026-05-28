@@ -7627,11 +7627,12 @@ fn parse_perf_hot_paths(
         if symbol_index >= parts.len() {
             continue;
         }
-        let symbol = normalize_perf_symbol(&parts[symbol_index..].join(" "));
+        let raw_symbol = parts[symbol_index..].join(" ");
+        let (dso_path, package_name) = resolve_perf_dso_owner(dso.as_str(), dso_paths, target);
+        let symbol = normalize_perf_symbol_with_dso(&raw_symbol, dso_path.as_deref());
         if symbol.is_empty() {
             continue;
         }
-        let (dso_path, package_name) = resolve_perf_dso_owner(dso.as_str(), dso_paths, target);
         hot_paths.push(PerfHotPath {
             percent,
             comm,
@@ -7647,7 +7648,12 @@ fn parse_perf_hot_paths(
     hot_paths
 }
 
+#[cfg(test)]
 fn normalize_perf_symbol(symbol: &str) -> String {
+    normalize_perf_symbol_with_dso(symbol, None)
+}
+
+fn normalize_perf_symbol_with_dso(symbol: &str, dso_path: Option<&Path>) -> String {
     let mut normalized = symbol.split_whitespace().collect::<Vec<_>>().join(" ");
     while let Some(stripped) = normalized.strip_suffix(" - -") {
         normalized = stripped.trim_end().to_string();
@@ -7655,18 +7661,35 @@ fn normalize_perf_symbol(symbol: &str) -> String {
     if let Some(stripped) = normalized.strip_prefix("(deleted) [.] ") {
         normalized = stripped.trim_start().to_string();
     }
+    if let Some(offset) = perf_raw_symbol_offset(&normalized) {
+        if let Some(symbol) = dso_path.and_then(|path| symbolize_perf_offset(path, offset)) {
+            return symbol;
+        }
+        return "unresolved offset".to_string();
+    }
+    normalized
+}
+
+fn perf_raw_symbol_offset(symbol: &str) -> Option<u64> {
     let bare_address_re = Regex::new(r"^0x[0-9a-fA-F]+$").expect("valid perf address regex");
     let thread_address_re =
         Regex::new(r"^tid\s+\d+\s+\[.\]\s+0x[0-9a-fA-F]+$").expect("valid perf JIT address regex");
     let deleted_address_re =
         Regex::new(r"\(deleted\)\s+\[.\]\s+0x[0-9a-fA-F]+$").expect("valid deleted address regex");
-    if bare_address_re.is_match(&normalized)
-        || thread_address_re.is_match(&normalized)
-        || deleted_address_re.is_match(&normalized)
-    {
-        return "unresolved offset".to_string();
+    if bare_address_re.is_match(symbol) {
+        return parse_hex_u64(symbol);
     }
-    normalized
+    if thread_address_re.is_match(symbol) || deleted_address_re.is_match(symbol) {
+        return symbol.split_whitespace().last().and_then(parse_hex_u64);
+    }
+    None
+}
+
+fn symbolize_perf_offset(dso_path: &Path, offset: u64) -> Option<String> {
+    if dso_path.exists() && command_exists("addr2line") {
+        return symbol_from_addr2line(dso_path, offset);
+    }
+    None
 }
 
 fn resolve_perf_dso_owner(
@@ -9241,6 +9264,54 @@ Stack trace of thread 222:\n\
             hot_paths[1].dso_path.as_deref(),
             Some(Path::new("/opt/google/chrome/chrome"))
         );
+    }
+
+    #[test]
+    fn perf_report_parser_symbolizes_raw_dso_offsets() {
+        let Some(object_path) = std::env::current_exe().ok() else {
+            return;
+        };
+        let Some(symbol_offset) = first_addr2line_resolvable_symbol_offset(&object_path) else {
+            return;
+        };
+        let report = format!("  12.50%  fixer  fixer-tests  [.] 0x{symbol_offset:016x}\n");
+        let target = PopularBinaryProfile {
+            name: "fixer".to_string(),
+            path: object_path.clone(),
+            package_name: Some("fixer".to_string()),
+            process_count: 1,
+            total_cpu_percent: 12.5,
+            max_cpu_percent: 12.5,
+        };
+        let mut dso_paths = HashMap::new();
+        dso_paths.insert("fixer-tests".to_string(), object_path);
+
+        let hot_paths = parse_perf_hot_paths(&report, &target, &dso_paths);
+
+        assert_eq!(hot_paths.len(), 1);
+        assert_ne!(hot_paths[0].symbol, "unresolved offset");
+    }
+
+    fn first_addr2line_resolvable_symbol_offset(object_path: &Path) -> Option<u64> {
+        let nm_output = Command::new("nm")
+            .args(["-n"])
+            .arg(object_path)
+            .output()
+            .ok()?;
+        if !nm_output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&nm_output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let parts = line.split_whitespace().collect::<Vec<_>>();
+                if parts.len() < 3 || !matches!(parts[1], "T" | "t") {
+                    return None;
+                }
+                let offset = u64::from_str_radix(parts[0], 16).ok()?;
+                super::symbol_from_addr2line(object_path, offset).map(|_| offset)
+            })
+            .find(|offset| *offset > 0)
     }
 
     #[test]
