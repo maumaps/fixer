@@ -685,11 +685,6 @@ fn interpreter_source_target(opportunity: &OpportunityRecord) -> Option<Workspac
 }
 
 fn local_artifact_source_target(opportunity: &OpportunityRecord) -> Option<WorkspaceSourceTarget> {
-    if package_name_from_opportunity(opportunity).is_some()
-        || source_package_from_opportunity(opportunity).is_some()
-    {
-        return None;
-    }
     let artifact_path = opportunity
         .evidence
         .get("artifact_path")
@@ -1925,6 +1920,50 @@ zoom:\n\
             .expect("local artifact path should map to a containing source repo");
 
         assert_eq!(target.source_package, "audio-worker");
+        assert_eq!(target.local_path.as_deref(), Some(repo.as_path()));
+        assert!(
+            target
+                .acquisition_note
+                .as_deref()
+                .is_some_and(|note| note.contains("owning application"))
+        );
+    }
+
+    #[test]
+    fn maps_packaged_process_local_dso_to_containing_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("h3-pg");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("build/h3_postgis")).unwrap();
+        let artifact_path = repo.join("build/h3_postgis/h3_postgis.so");
+        fs::write(&artifact_path, "").unwrap();
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "hotspot".to_string(),
+            title: "postgres extension is hot".to_string(),
+            score: 79,
+            state: "open".to_string(),
+            summary: "postgres extension is hot".to_string(),
+            evidence: json!({
+                "artifact_path": artifact_path.display().to_string(),
+                "details": {
+                    "subsystem": "perf-hotspot",
+                    "hot_path_package_name": "postgresql-14",
+                    "hot_path_dso_path": artifact_path.display().to_string()
+                },
+                "package_name": "postgresql-14"
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-05-28T00:00:00Z".to_string(),
+            updated_at: "2026-05-28T00:00:00Z".to_string(),
+        };
+
+        let target = local_artifact_source_target(&opportunity)
+            .expect("local DSO path should beat the host process package");
+
+        assert_eq!(target.source_package, "h3-pg");
         assert_eq!(target.local_path.as_deref(), Some(repo.as_path()));
         assert!(
             target

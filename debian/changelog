@@ -1,3 +1,10 @@
+fixer (0.227.0-1) unstable; urgency=medium
+
+  * Route local git-backed perf DSO artifacts to their containing source tree
+    even when the profiled host process has an installed package name.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 28 May 2026 16:15:00 +0400
+
 fixer (0.226.0-1) unstable; urgency=medium
 
   * Snapshot git-backed proposal workspaces from HEAD so unrelated local
