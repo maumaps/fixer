@@ -7866,7 +7866,6 @@ fn perf_dso_local_source_hint(
     let path = dso_path?;
     let search_dir = if path.is_dir() { path } else { path.parent()? };
     let repo_path = git_repo_root_for_path(search_dir)?;
-    inspect_repo(&repo_path)?;
     let source_name = repo_path
         .file_name()
         .and_then(|value| value.to_str())
