@@ -1,3 +1,10 @@
+fixer (0.231.0-1) unstable; urgency=medium
+
+  * Add a local harvest-candidates command for real ready Codex source
+    patches.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 28 May 2026 23:30:00 +0400
+
 fixer (0.230.0-1) unstable; urgency=medium
 
   * Allow performance patches to mention root sandbox validation

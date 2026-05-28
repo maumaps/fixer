@@ -1404,6 +1404,95 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn list_latest_ready_codex_proposals(
+        &self,
+        limit: usize,
+        unpublished_only: bool,
+    ) -> Result<Vec<(ProposalRecord, OpportunityRecord, Option<String>)>> {
+        let publication_filter = if unpublished_only {
+            "AND pp.proposal_id IS NULL"
+        } else {
+            ""
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "
+            SELECT
+                p.id,
+                p.opportunity_id,
+                p.engine,
+                p.state,
+                p.bundle_path,
+                p.output_path,
+                p.created_at,
+                p.updated_at,
+                o.id,
+                o.finding_id,
+                o.kind,
+                o.title,
+                o.score,
+                o.state,
+                o.summary,
+                o.evidence_json,
+                o.repo_root,
+                o.ecosystem,
+                o.created_at,
+                o.updated_at,
+                pp.remote_issue_id
+            FROM proposals p
+            JOIN opportunities o ON o.id = p.opportunity_id
+            LEFT JOIN proposal_publications pp ON pp.proposal_id = p.id
+            WHERE p.engine = 'codex'
+              AND p.state = 'ready'
+              {publication_filter}
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM proposals newer
+                    WHERE newer.opportunity_id = p.opportunity_id
+                      AND newer.engine = 'codex'
+                      AND newer.state = 'ready'
+                      AND (
+                            newer.updated_at > p.updated_at
+                            OR (newer.updated_at = p.updated_at AND newer.id > p.id)
+                      )
+                )
+            ORDER BY p.updated_at DESC, p.id DESC
+            LIMIT ?1
+            ",
+        ))?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok((
+                ProposalRecord {
+                    id: row.get(0)?,
+                    opportunity_id: row.get(1)?,
+                    engine: row.get(2)?,
+                    state: row.get(3)?,
+                    bundle_path: PathBuf::from(row.get::<_, String>(4)?),
+                    output_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                },
+                OpportunityRecord {
+                    id: row.get(8)?,
+                    finding_id: row.get(9)?,
+                    kind: row.get(10)?,
+                    title: row.get(11)?,
+                    score: row.get(12)?,
+                    state: row.get(13)?,
+                    summary: row.get(14)?,
+                    evidence: serde_json::from_str(&row.get::<_, String>(15)?)
+                        .unwrap_or(Value::Null),
+                    repo_root: row.get::<_, Option<String>>(16)?.map(PathBuf::from),
+                    ecosystem: row.get(17)?,
+                    created_at: row.get(18)?,
+                    updated_at: row.get(19)?,
+                },
+                row.get(20)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn latest_ready_codex_proposal_for_opportunity(
         &self,
         opportunity_id: i64,
@@ -2249,6 +2338,98 @@ mod tests {
             .unwrap();
 
         assert_eq!(paths, vec![unpublished.bundle_path]);
+    }
+
+    #[test]
+    fn latest_unpublished_ready_codex_proposals_skip_stale_and_published_rows() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        let first_finding_id = store
+            .record_finding(&FindingInput {
+                kind: "hotspot".to_string(),
+                title: "First hotspot".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "harvest-hotspot-1".to_string(),
+                summary: "first hotspot summary".to_string(),
+                details: json!({"subsystem": "perf-hotspot"}),
+                artifact: None,
+                repo_root: Some(PathBuf::from("/repo/one")),
+                ecosystem: Some("c".to_string()),
+            })
+            .unwrap();
+        let second_finding_id = store
+            .record_finding(&FindingInput {
+                kind: "crash".to_string(),
+                title: "Second crash".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "harvest-crash-2".to_string(),
+                summary: "second crash summary".to_string(),
+                details: json!({"subsystem": "crash"}),
+                artifact: None,
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let first = store.get_opportunity_by_finding(first_finding_id).unwrap();
+        let second = store.get_opportunity_by_finding(second_finding_id).unwrap();
+        store
+            .create_proposal(
+                first.id,
+                "codex",
+                "ready",
+                &PathBuf::from("/tmp/stale-ready"),
+                None,
+            )
+            .unwrap();
+        let latest = store
+            .create_proposal(
+                first.id,
+                "codex",
+                "ready",
+                &PathBuf::from("/tmp/latest-ready"),
+                None,
+            )
+            .unwrap();
+        let published = store
+            .create_proposal(
+                second.id,
+                "codex",
+                "ready",
+                &PathBuf::from("/tmp/published-ready"),
+                None,
+            )
+            .unwrap();
+        store
+            .create_proposal(
+                second.id,
+                "deterministic",
+                "ready",
+                &PathBuf::from("/tmp/process-report"),
+                None,
+            )
+            .unwrap();
+        store
+            .mark_proposal_published(published.id, "remote-issue", "hash")
+            .unwrap();
+
+        let proposals = store.list_latest_ready_codex_proposals(10, true).unwrap();
+
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].0.id, latest.id);
+        assert_eq!(proposals[0].1.id, first.id);
+        assert_eq!(proposals[0].2, None);
+        assert_eq!(
+            proposals[0].1.repo_root.as_deref(),
+            Some(Path::new("/repo/one"))
+        );
+        assert_eq!(proposals[0].1.ecosystem.as_deref(), Some("c"));
+
+        let proposals = store.list_latest_ready_codex_proposals(10, false).unwrap();
+
+        assert_eq!(proposals.len(), 2);
+        assert_eq!(proposals[0].0.id, published.id);
+        assert_eq!(proposals[0].2.as_deref(), Some("remote-issue"));
+        assert_eq!(proposals[1].0.id, latest.id);
     }
 
     #[test]

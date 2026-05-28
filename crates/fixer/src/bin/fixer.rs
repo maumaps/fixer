@@ -49,6 +49,14 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
+    HarvestCandidates {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 200)]
+        scan_limit: usize,
+        #[arg(long)]
+        unpublished_only: bool,
+    },
     Top {
         #[arg(long, default_value = "binary")]
         kind: TopKind,
@@ -352,6 +360,64 @@ fn main() -> Result<()> {
                     items.len(),
                     total
                 );
+            }
+        }
+        Commands::HarvestCandidates {
+            limit,
+            scan_limit,
+            unpublished_only,
+        } => {
+            let candidates = app
+                .store
+                .list_latest_ready_codex_proposals(scan_limit, unpublished_only)?;
+            let mut printed = 0usize;
+            for (proposal, opportunity, remote_issue_id) in candidates {
+                let Some(metadata) = read_harvest_candidate_metadata(&proposal.bundle_path)? else {
+                    continue;
+                };
+                if metadata.git_add_paths.is_empty() {
+                    continue;
+                }
+                printed += 1;
+                println!(
+                    "#{} opp=#{} [{}] {}",
+                    proposal.id, opportunity.id, opportunity.kind, opportunity.title
+                );
+                println!(
+                    "  subject: {}",
+                    metadata.subject.unwrap_or_else(|| "(none)".to_string())
+                );
+                println!(
+                    "  confidence: {}",
+                    metadata
+                        .evidence_confidence
+                        .unwrap_or_else(|| "(unknown)".to_string())
+                );
+                println!("  git_add_paths: {}", metadata.git_add_paths.join(", "));
+                println!("  bundle: {}", proposal.bundle_path.display());
+                if let Some(remote_issue_id) = remote_issue_id {
+                    println!(
+                        "  public_issue: {}/issues/{}",
+                        app.config.network.server_url, remote_issue_id
+                    );
+                }
+                if let Some(repo_root) = opportunity.repo_root {
+                    println!("  repo: {}", repo_root.display());
+                }
+                if let Some(ecosystem) = opportunity.ecosystem {
+                    println!("  ecosystem: {ecosystem}");
+                }
+                if printed >= limit {
+                    break;
+                }
+            }
+            if printed == 0 {
+                let qualifier = if unpublished_only { "unpublished " } else { "" };
+                println!(
+                    "no {qualifier}ready Codex proposals with real Git Add Paths in latest {scan_limit}"
+                );
+            } else if printed >= limit {
+                eprintln!("showing first {printed}; increase --limit for more");
             }
         }
         Commands::Top { kind } => {
@@ -676,6 +742,90 @@ fn shell_quote(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+struct HarvestCandidateMetadata {
+    subject: Option<String>,
+    evidence_confidence: Option<String>,
+    git_add_paths: Vec<String>,
+}
+
+fn read_harvest_candidate_metadata(
+    bundle_path: &std::path::Path,
+) -> Result<Option<HarvestCandidateMetadata>> {
+    let patch_output = bundle_path.join("patch-output.txt");
+    if !patch_output.exists() {
+        return Ok(None);
+    }
+    let response = fs::read_to_string(&patch_output)
+        .with_context(|| format!("failed to read {}", patch_output.display()))?;
+    Ok(Some(HarvestCandidateMetadata {
+        subject: extract_labeled_line(&response, "Subject:"),
+        evidence_confidence: extract_markdown_section_raw(&response, "Evidence Confidence")
+            .and_then(|section| {
+                section
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(|line| line.trim_matches('`').to_string())
+            }),
+        git_add_paths: extract_markdown_section_raw(&response, "Git Add Paths")
+            .map(|section| parse_git_add_path_notes(&section))
+            .unwrap_or_default(),
+    }))
+}
+
+fn extract_labeled_line(text: &str, label: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(label))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn extract_markdown_section_raw(text: &str, heading: &str) -> Option<String> {
+    let target = heading.trim();
+    let mut in_section = false;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if let Some(current) = markdown_heading_text(line) {
+            if in_section {
+                break;
+            }
+            in_section = current == target;
+            continue;
+        }
+        if in_section {
+            lines.push(line);
+        }
+    }
+    in_section.then(|| lines.join("\n").trim().to_string())
+}
+
+fn markdown_heading_text(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix('#')?;
+    if !rest.starts_with('#') && !rest.starts_with(' ') {
+        return None;
+    }
+    Some(rest.trim_start_matches('#').trim())
+}
+
+fn parse_git_add_path_notes(section: &str) -> Vec<String> {
+    section
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            let value = line
+                .strip_prefix("- ")
+                .or_else(|| line.strip_prefix("* "))
+                .unwrap_or(line)
+                .trim()
+                .trim_matches('`')
+                .trim();
+            (!value.is_empty() && !value.eq_ignore_ascii_case("none")).then(|| value.to_string())
+        })
+        .collect()
 }
 
 fn colorize(text: &str, code: &str, use_color: bool) -> String {
