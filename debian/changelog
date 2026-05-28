@@ -1,3 +1,12 @@
+fixer (0.226.0-1) unstable; urgency=medium
+
+  * Snapshot git-backed proposal workspaces from HEAD so unrelated local
+    uncommitted changes do not appear as generated patches.
+  * Keep an in-progress proposal row while Codex runs and preserve perf
+    hotspot opportunities that already have proposal context.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 28 May 2026 15:55:00 +0400
+
 fixer (0.225.0-1) unstable; urgency=medium
 
   * Prepare workspaces from local artifact paths inside git worktrees when

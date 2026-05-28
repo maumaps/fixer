@@ -1312,6 +1312,29 @@ impl Store {
         })
     }
 
+    pub fn update_proposal_state(
+        &self,
+        proposal_id: i64,
+        state: &str,
+        output_path: Option<&Path>,
+    ) -> Result<ProposalRecord> {
+        let now = now_rfc3339();
+        self.conn.execute(
+            "
+            UPDATE proposals
+            SET state = ?1, output_path = ?2, updated_at = ?3
+            WHERE id = ?4
+            ",
+            params![
+                state,
+                output_path.map(|x| x.to_string_lossy().to_string()),
+                now,
+                proposal_id
+            ],
+        )?;
+        self.get_proposal(proposal_id)
+    }
+
     pub fn get_proposal(&self, id: i64) -> Result<ProposalRecord> {
         self.conn.query_row(
             "
@@ -1824,10 +1847,30 @@ impl Store {
                 if current_fingerprints.iter().any(|item| item == &fingerprint) {
                     continue;
                 }
+                if self.finding_has_proposals(finding_id)? {
+                    continue;
+                }
                 self.delete_finding_cascade(finding_id)?;
             }
         }
         Ok(())
+    }
+
+    fn finding_has_proposals(&self, finding_id: i64) -> Result<bool> {
+        self.conn
+            .query_row(
+                "
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM opportunities o
+                    JOIN proposals p ON p.opportunity_id = o.id
+                    WHERE o.finding_id = ?1
+                )
+                ",
+                [finding_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn prune_runaway_investigation_findings(
@@ -1955,7 +1998,7 @@ mod tests {
     use super::Store;
     use crate::models::{FindingInput, ObservedArtifact};
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
     #[test]
@@ -2041,6 +2084,94 @@ mod tests {
         assert_eq!(store.count("synced_issue_links").unwrap(), 0);
         assert_eq!(store.count("opportunities").unwrap(), 0);
         assert_eq!(store.count("findings").unwrap(), 0);
+    }
+
+    #[test]
+    fn perf_hotspot_prune_preserves_findings_with_running_proposals() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        let target_path = "/tmp/profiled-worker";
+        let finding_id = store
+            .record_finding(&FindingInput {
+                kind: "hotspot".to_string(),
+                title: "Example hotspot".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "stale-hotspot".to_string(),
+                summary: "hotspot summary".to_string(),
+                details: json!({
+                    "subsystem": "perf-hotspot",
+                    "profile_target": {
+                        "path": target_path
+                    }
+                }),
+                artifact: None,
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let opportunity = store.get_opportunity_by_finding(finding_id).unwrap();
+        store
+            .create_proposal(
+                opportunity.id,
+                "codex",
+                "running",
+                &PathBuf::from("/tmp/running-proposal"),
+                None,
+            )
+            .unwrap();
+
+        store
+            .prune_perf_hotspot_findings(&[target_path.to_string()], &[])
+            .unwrap();
+
+        assert_eq!(store.count("findings").unwrap(), 1);
+        assert_eq!(store.count("opportunities").unwrap(), 1);
+        assert_eq!(store.count("proposals").unwrap(), 1);
+    }
+
+    #[test]
+    fn update_proposal_state_preserves_existing_row() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        let finding_id = store
+            .record_finding(&FindingInput {
+                kind: "hotspot".to_string(),
+                title: "Example hotspot".to_string(),
+                severity: "medium".to_string(),
+                fingerprint: "hotspot-update-proposal".to_string(),
+                summary: "hotspot summary".to_string(),
+                details: json!({"subsystem": "perf-hotspot"}),
+                artifact: None,
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+        let opportunity = store.get_opportunity_by_finding(finding_id).unwrap();
+        let proposal = store
+            .create_proposal(
+                opportunity.id,
+                "codex",
+                "running",
+                &PathBuf::from("/tmp/proposal-bundle"),
+                None,
+            )
+            .unwrap();
+
+        let updated = store
+            .update_proposal_state(
+                proposal.id,
+                "failed",
+                Some(&PathBuf::from("/tmp/proposal-bundle/codex-output.txt")),
+            )
+            .unwrap();
+
+        assert_eq!(updated.id, proposal.id);
+        assert_eq!(updated.state, "failed");
+        assert_eq!(store.count("proposals").unwrap(), 1);
+        assert_eq!(
+            updated.output_path.as_deref(),
+            Some(Path::new("/tmp/proposal-bundle/codex-output.txt"))
+        );
     }
 
     #[test]

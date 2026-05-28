@@ -120,13 +120,18 @@ pub fn create_proposal_with_prior_patch(
             "",
             false,
         )?;
-        let status = execute_codex_job(config, &job)?;
-        return store.create_proposal(
+        let proposal = store.create_proposal(
             opportunity.id,
             "codex",
-            &status.state,
+            "running",
             &job.bundle_dir,
             Some(&job.output_path),
+        )?;
+        let status = execute_codex_job(config, &job)?;
+        return store.update_proposal_state(
+            proposal.id,
+            &status.state,
+            status.output_path.as_deref().or(Some(&job.output_path)),
         );
     }
 
@@ -1532,14 +1537,19 @@ fn snapshot_workspace_for_job(
     bundle_dir: &std::path::Path,
 ) -> Result<PreparedWorkspace> {
     let target = bundle_dir.join("workspace");
-    copy_directory_recursively(&workspace.repo_root, &target)?;
+    let used_git_snapshot = snapshot_git_head_workspace(&workspace.repo_root, &target, bundle_dir)?;
+    if !used_git_snapshot {
+        copy_directory_recursively(&workspace.repo_root, &target)?;
+    }
     let _ = initialize_workspace_git_baseline(&target);
     let mut job_workspace = workspace.clone();
     job_workspace.repo_root = target;
-    job_workspace.acquisition_note = format!(
-        "{} Fixer created an isolated job snapshot for autonomous Codex execution.",
-        workspace.acquisition_note
-    );
+    let snapshot_note = if used_git_snapshot {
+        "Fixer created an isolated job snapshot from the source repository HEAD for autonomous Codex execution, omitting pre-existing uncommitted workspace state."
+    } else {
+        "Fixer created an isolated job snapshot for autonomous Codex execution."
+    };
+    job_workspace.acquisition_note = format!("{} {}", workspace.acquisition_note, snapshot_note);
     Ok(job_workspace)
 }
 
@@ -1617,6 +1627,77 @@ fn copy_directory_recursively(
         ));
     }
     Ok(())
+}
+
+fn snapshot_git_head_workspace(
+    source: &Path,
+    destination: &Path,
+    bundle_dir: &Path,
+) -> Result<bool> {
+    if !source.join(".git").exists() || !command_exists("git") || !command_exists("tar") {
+        return Ok(false);
+    }
+    if destination.exists() {
+        fs::remove_dir_all(destination).with_context(|| {
+            format!(
+                "failed to clear existing workspace snapshot {}",
+                destination.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(destination).with_context(|| {
+        format!(
+            "failed to create workspace snapshot directory {}",
+            destination.display()
+        )
+    })?;
+
+    let archive_path = bundle_dir.join("workspace-head.tar");
+    let archive_status = command_status_in_dir_with_timeout(
+        "git",
+        &[
+            "archive",
+            "--format=tar",
+            "--output",
+            archive_path.to_string_lossy().as_ref(),
+            "HEAD",
+        ],
+        source,
+        StdDuration::from_secs(PROPOSAL_COPY_TIMEOUT_SECONDS),
+    );
+    let Ok(status) = archive_status else {
+        let _ = fs::remove_dir_all(destination);
+        let _ = fs::remove_file(&archive_path);
+        return Ok(false);
+    };
+    if !status.success() {
+        let _ = fs::remove_dir_all(destination);
+        let _ = fs::remove_file(&archive_path);
+        return Ok(false);
+    }
+
+    let extract_status = command_status_os_with_timeout(
+        "tar",
+        &[
+            std::ffi::OsStr::new("-xf"),
+            archive_path.as_os_str(),
+            std::ffi::OsStr::new("-C"),
+            destination.as_os_str(),
+        ],
+        StdDuration::from_secs(PROPOSAL_COPY_TIMEOUT_SECONDS),
+    )
+    .with_context(|| format!("failed to extract {}", archive_path.display()))?;
+    fs::remove_file(&archive_path)
+        .with_context(|| format!("failed to remove {}", archive_path.display()))?;
+    if !extract_status.success() {
+        let _ = fs::remove_dir_all(destination);
+        return Err(anyhow!(
+            "failed to extract git HEAD snapshot from {} into {}",
+            source.display(),
+            destination.display()
+        ));
+    }
+    Ok(true)
 }
 
 fn render_public_session_diff(
@@ -8898,6 +8979,58 @@ printf 'Subject: test patch\n\n## Commit Message\nok\n\n## Issue Connection\nok\
                     .to_string_lossy()
                     .as_ref()
             )
+        );
+    }
+
+    #[test]
+    fn git_backed_codex_snapshots_omit_preexisting_dirty_workspace_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_dir = dir.path().join("proposal");
+        let workspace_root = dir.path().join("source");
+        std::fs::create_dir_all(workspace_root.join("src")).unwrap();
+        std::fs::write(workspace_root.join("src/file.py"), "committed\n").unwrap();
+
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "Fixer Test"],
+            vec!["config", "user.email", "fixer-test@localhost"],
+            vec!["add", "src/file.py"],
+            vec!["commit", "-q", "-m", "initial"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&workspace_root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        std::fs::write(workspace_root.join("src/file.py"), "dirty\n").unwrap();
+        std::fs::write(workspace_root.join("src/untracked.py"), "untracked\n").unwrap();
+
+        let workspace = PreparedWorkspace {
+            repo_root: workspace_root.clone(),
+            ecosystem: Some("pip".to_string()),
+            source_kind: "local-artifact-repo".to_string(),
+            package_name: None,
+            source_package: Some("audio-worker".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from local artifact".to_string(),
+        };
+
+        let snapshot = super::snapshot_workspace_for_job(&workspace, &bundle_dir).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(snapshot.repo_root.join("src/file.py")).unwrap(),
+            "committed\n"
+        );
+        assert!(!snapshot.repo_root.join("src/untracked.py").exists());
+        assert!(snapshot.acquisition_note.contains("omitting pre-existing"));
+        assert!(
+            super::workspace_changed_paths(&snapshot.repo_root).is_empty(),
+            "job snapshot should start from a clean git baseline"
         );
     }
 

@@ -281,13 +281,18 @@ impl App {
                         &lease.user,
                         lease.allow_kernel,
                     )?;
-                    let status = network::run_codex_job_as_user(&self.store, &self.config, &job)?;
-                    return self.store.create_proposal(
+                    let proposal = self.store.create_proposal(
                         opportunity.id,
                         engine,
-                        &status.state,
+                        "running",
                         &job.bundle_dir,
-                        status.output_path.as_deref(),
+                        Some(&job.output_path),
+                    )?;
+                    let status = network::run_codex_job_as_user(&self.store, &self.config, &job)?;
+                    return self.store.update_proposal_state(
+                        proposal.id,
+                        &status.state,
+                        status.output_path.as_deref().or(Some(&job.output_path)),
                     );
                 }
                 proposal::create_proposal(
