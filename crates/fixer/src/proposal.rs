@@ -3805,8 +3805,11 @@ fn observed_response_has_reproduction_caveat(issue_lower: &str) -> bool {
 }
 
 fn response_has_security_sensitive_patch_surface(response: &str, issue_connection: &str) -> bool {
-    let response_lower = response.to_ascii_lowercase();
     let issue_lower = issue_connection.to_ascii_lowercase();
+    let commit_lower = extract_patch_markdown_section_raw(response, "Commit Message")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let security_text = format!("{commit_lower}\n{issue_lower}");
     let changed_paths = sanitize_git_add_paths(&extract_git_add_paths_from_response(response));
     let has_sensitive_path = changed_paths.iter().any(|path| {
         let path = path.to_ascii_lowercase();
@@ -3856,7 +3859,7 @@ fn response_has_security_sensitive_patch_surface(response: &str, issue_connectio
         "privilege",
     ]
     .iter()
-    .any(|marker| response_lower.contains(marker));
+    .any(|marker| security_text.contains(marker));
     let has_timing_or_throttle_text = [
         "timing",
         "delay",
@@ -3871,7 +3874,7 @@ fn response_has_security_sensitive_patch_surface(response: &str, issue_connectio
         "failed login",
     ]
     .iter()
-    .any(|marker| issue_lower.contains(marker) || response_lower.contains(marker));
+    .any(|marker| security_text.contains(marker));
 
     has_sensitive_text || (has_sensitive_path && has_timing_or_throttle_text)
 }
@@ -10576,6 +10579,30 @@ Ran `autoreconf && ./configure && make -j2 auth2.o sshd-auth`.
 
         assert!(error.contains("Security-sensitive source patches"));
         assert!(error.contains("observed-only"));
+    }
+
+    #[test]
+    fn patch_explanation_quality_guard_allows_observed_performance_patch_with_sandboxed_validation()
+    {
+        let response = r#"Subject: h3_postgis: prune segment pairs before polygonization math
+
+## Commit Message
+Add a conservative endpoint bounding-box check before exact polygonization math, so segment pairs whose planar boxes cannot touch are skipped early.
+
+## Evidence Confidence
+observed
+
+## Issue Connection
+Fixer observed a PostgreSQL CPU profile where `polygonize_noded_linked_polygon` in `h3_postgis.so` accounted for sampled CPU. I did not independently reproduce that runtime workload. This patch stores per-segment latitude/longitude endpoint bounds and skips exact pair checks when those boxes do not overlap. The expected effect is to reduce CPU spent in the hot polygonization path for inputs with many spatially separated boundary segments.
+
+## Git Add Paths
+h3_postgis/src/wkb_regions.c
+
+## Validation
+`cmake -S . -B build-fix -G Ninja && cmake --build build-fix && ctest --test-dir build-fix --output-on-failure` failed during configure because the sandbox could not resolve `github.com`.
+"#;
+
+        assert!(super::patch_explanation_quality_failure(response, None).is_none());
     }
 
     #[test]
