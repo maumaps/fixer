@@ -1,3 +1,11 @@
+fixer (0.222.0-1) unstable; urgency=medium
+
+  * Keep perf hotspots on local DSO source repositories instead of inheriting
+    the profiled interpreter package when a venv/native extension is not owned
+    by dpkg.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 28 May 2026 14:35:00 +0400
+
 fixer (0.221.0-1) unstable; urgency=medium
 
   * Attach retained local Python module repositories from command-line paths so

@@ -4083,10 +4083,15 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
                 .dso_path
                 .clone()
                 .unwrap_or_else(|| target.path.clone());
-            let artifact_package_name = hot_path
-                .package_name
-                .clone()
-                .or_else(|| target.package_name.clone());
+            let artifact_package_name = hot_path.package_name.clone().or_else(|| {
+                perf_dso_can_inherit_target_package(hot_path.dso_path.as_deref(), &target)
+                    .then(|| target.package_name.clone())
+                    .flatten()
+            });
+            let hot_path_source_repo_path = hot_path
+                .source_hint
+                .as_ref()
+                .map(|hint| hint.source_repo_path.clone());
             let package_metadata = artifact_package_name
                 .as_deref()
                 .and_then(installed_package_metadata_value);
@@ -4107,7 +4112,7 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
                     .to_string(),
                 path: Some(artifact_path.clone()),
                 package_name: artifact_package_name.clone(),
-                repo_root: None,
+                repo_root: hot_path_source_repo_path.clone(),
                 ecosystem: None,
                 metadata: json!({
                     "source": "perf",
@@ -4117,6 +4122,7 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
                     "package_metadata": package_metadata,
                     "profile_target_package_metadata": target_package_metadata,
                     "hot_path_package_metadata": hot_path_package_metadata,
+                    "hot_path_source_hint": hot_path.source_hint.as_ref(),
                     "process_count": target.process_count,
                     "total_cpu_percent": target.total_cpu_percent,
                     "max_cpu_percent": target.max_cpu_percent,
@@ -4179,10 +4185,16 @@ fn collect_perf_hotspots(config: &FixerConfig, store: &Store) -> Result<usize> {
                     "hot_path_dso_path": hot_path.dso_path,
                     "hot_path_package_name": hot_path.package_name,
                     "hot_path_package_metadata": hot_path_package_metadata,
+                    "hot_path_source_kind": hot_path.source_hint.as_ref().map(|hint| hint.source_kind.as_str()),
+                    "hot_path_source_name": hot_path.source_hint.as_ref().map(|hint| hint.source_name.as_str()),
+                    "hot_path_source_repo_path": hot_path_source_repo_path,
                     "hot_paths": profile.hot_paths,
                 }),
                 artifact: Some(artifact),
-                repo_root: None,
+                repo_root: hot_path
+                    .source_hint
+                    .as_ref()
+                    .map(|hint| hint.source_repo_path.clone()),
                 ecosystem: None,
             };
             let _ = store.record_finding(&finding)?;
@@ -4237,7 +4249,15 @@ struct PerfHotPath {
     dso: String,
     dso_path: Option<PathBuf>,
     package_name: Option<String>,
+    source_hint: Option<PerfDsoSourceHint>,
     symbol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PerfDsoSourceHint {
+    source_kind: String,
+    source_name: String,
+    source_repo_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -7726,6 +7746,7 @@ fn parse_perf_hot_paths(
         }
         let raw_symbol = parts[symbol_index..].join(" ");
         let (dso_path, package_name) = resolve_perf_dso_owner(dso.as_str(), dso_paths, target);
+        let source_hint = perf_dso_local_source_hint(dso_path.as_deref(), package_name.as_deref());
         let symbol = normalize_perf_symbol_with_dso(&raw_symbol, dso_path.as_deref());
         if symbol.is_empty() {
             continue;
@@ -7736,6 +7757,7 @@ fn parse_perf_hot_paths(
             dso,
             dso_path,
             package_name,
+            source_hint,
             symbol,
         });
     }
@@ -7807,8 +7829,43 @@ fn resolve_perf_dso_owner(
     let package_name = dso_path
         .as_deref()
         .and_then(map_path_to_package)
-        .or_else(|| target.package_name.clone());
+        .or_else(|| {
+            perf_dso_can_inherit_target_package(dso_path.as_deref(), target)
+                .then(|| target.package_name.clone())
+                .flatten()
+        });
     (dso_path, package_name)
+}
+
+fn perf_dso_can_inherit_target_package(
+    dso_path: Option<&Path>,
+    target: &PopularBinaryProfile,
+) -> bool {
+    dso_path.is_some_and(|path| maybe_canonicalize(path) == maybe_canonicalize(&target.path))
+}
+
+fn perf_dso_local_source_hint(
+    dso_path: Option<&Path>,
+    package_name: Option<&str>,
+) -> Option<PerfDsoSourceHint> {
+    if package_name.is_some() {
+        return None;
+    }
+    let path = dso_path?;
+    let search_dir = if path.is_dir() { path } else { path.parent()? };
+    let repo_path = git_repo_root_for_path(search_dir)?;
+    inspect_repo(&repo_path)?;
+    let source_name = repo_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("perf-dso-source")
+        .to_string();
+    Some(PerfDsoSourceHint {
+        source_kind: "local-perf-dso-repo".to_string(),
+        source_name,
+        source_repo_path: repo_path,
+    })
 }
 
 fn resolve_perf_dso_path(
@@ -9366,6 +9423,82 @@ Stack trace of thread 222:\n\
     }
 
     #[test]
+    fn perf_report_parser_does_not_blame_target_package_for_local_dso() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("audio-worker");
+        let dso_path = repo
+            .join(".venv")
+            .join("lib")
+            .join("python3.13")
+            .join("site-packages")
+            .join("numpy.libs")
+            .join("libopenblas_test.so");
+        fs::create_dir_all(dso_path.parent().unwrap()).unwrap();
+        fs::write(
+            repo.join("pyproject.toml"),
+            "[project]\nname = \"audio-worker\"\n",
+        )
+        .unwrap();
+        fs::write(&dso_path, "").unwrap();
+        Command::new("git")
+            .args(["init"])
+            .arg(&repo)
+            .output()
+            .unwrap();
+        let report = "  12.99%  home-audio-mesh  libopenblas_test.so  [.] blas_thread_server\n";
+        let target = PopularBinaryProfile {
+            name: "python3.13".to_string(),
+            path: PathBuf::from("/usr/bin/python3.13"),
+            package_name: Some("python3.13-minimal".to_string()),
+            process_count: 1,
+            total_cpu_percent: 12.99,
+            max_cpu_percent: 12.99,
+        };
+        let mut dso_paths = HashMap::new();
+        dso_paths.insert("libopenblas_test.so".to_string(), dso_path.clone());
+
+        let hot_paths = parse_perf_hot_paths(report, &target, &dso_paths);
+
+        assert_eq!(hot_paths.len(), 1);
+        assert_eq!(hot_paths[0].package_name, None);
+        assert_eq!(hot_paths[0].dso_path.as_deref(), Some(dso_path.as_path()));
+        let source_hint = hot_paths[0]
+            .source_hint
+            .as_ref()
+            .expect("local DSO should retain its repo source");
+        assert_eq!(source_hint.source_kind, "local-perf-dso-repo");
+        assert_eq!(source_hint.source_name, "audio-worker");
+        assert_eq!(source_hint.source_repo_path, maybe_canonicalize(&repo));
+    }
+
+    #[test]
+    fn perf_report_parser_keeps_target_package_for_target_binary_dso() {
+        let report = "  18.10%  python3.13  python3.13  [.] _PyEval_EvalFrameDefault\n";
+        let target = PopularBinaryProfile {
+            name: "python3.13".to_string(),
+            path: PathBuf::from("/usr/bin/python3.13"),
+            package_name: Some("python3.13-minimal".to_string()),
+            process_count: 1,
+            total_cpu_percent: 18.10,
+            max_cpu_percent: 18.10,
+        };
+        let mut dso_paths = HashMap::new();
+        dso_paths.insert(
+            "python3.13".to_string(),
+            PathBuf::from("/usr/bin/python3.13"),
+        );
+
+        let hot_paths = parse_perf_hot_paths(report, &target, &dso_paths);
+
+        assert_eq!(hot_paths.len(), 1);
+        assert_eq!(
+            hot_paths[0].package_name.as_deref(),
+            Some("python3.13-minimal")
+        );
+        assert!(hot_paths[0].source_hint.is_none());
+    }
+
+    #[test]
     fn perf_report_parser_symbolizes_raw_dso_offsets() {
         let Some(object_path) = std::env::current_exe().ok() else {
             return;
@@ -9746,6 +9879,7 @@ Description: user-space parser utility for AppArmor
                 dso: "python3.13".to_string(),
                 dso_path: Some(PathBuf::from("/usr/bin/python3")),
                 package_name: Some("python3.13-minimal".to_string()),
+                source_hint: None,
                 symbol: "PyEval_EvalFrameDefault".to_string(),
             }],
         };
@@ -10043,6 +10177,7 @@ Description: user-space parser utility for AppArmor
                 dso: "perl".to_string(),
                 dso_path: Some(PathBuf::from("/usr/bin/perl")),
                 package_name: Some("perl-base".to_string()),
+                source_hint: None,
                 symbol: "Perl_runops_standard".to_string(),
             }],
         };
