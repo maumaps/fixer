@@ -1,3 +1,10 @@
+fixer (0.225.0-1) unstable; urgency=medium
+
+  * Prepare workspaces from local artifact paths inside git worktrees when
+    perf hotspot evidence has no package or source package.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 28 May 2026 15:20:00 +0400
+
 fixer (0.224.0-1) unstable; urgency=medium
 
   * Treat a local perf DSO's containing git worktree as source evidence even

@@ -105,6 +105,26 @@ pub fn ensure_workspace_for_opportunity(
         });
     }
 
+    if let Some(workspace_target) = local_artifact_source_target(opportunity) {
+        let repo_path = workspace_target
+            .local_path
+            .as_ref()
+            .expect("local artifact source target requires a local path");
+        let repo_root = maybe_canonicalize(repo_path);
+        let ecosystem = inspect_repo(&repo_root).map(|x| x.ecosystem);
+        return Ok(PreparedWorkspace {
+            repo_root,
+            ecosystem,
+            source_kind: "local-artifact-repo".to_string(),
+            package_name: None,
+            source_package: Some(workspace_target.source_package.clone()),
+            homepage: None,
+            acquisition_note: workspace_target
+                .acquisition_note
+                .unwrap_or_else(|| "Using retained local artifact repository.".to_string()),
+        });
+    }
+
     let package_name = package_name_from_opportunity(opportunity);
     let source_package_hint = source_package_from_opportunity(opportunity);
     let metadata = package_name
@@ -662,6 +682,58 @@ fn interpreter_source_target(opportunity: &OpportunityRecord) -> Option<Workspac
             },
         ),
     })
+}
+
+fn local_artifact_source_target(opportunity: &OpportunityRecord) -> Option<WorkspaceSourceTarget> {
+    if package_name_from_opportunity(opportunity).is_some()
+        || source_package_from_opportunity(opportunity).is_some()
+    {
+        return None;
+    }
+    let artifact_path = opportunity
+        .evidence
+        .get("artifact_path")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            opportunity
+                .evidence
+                .get("details")?
+                .get("hot_path_dso_path")?
+                .as_str()
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)?;
+    let search_dir = if artifact_path.is_dir() {
+        artifact_path.as_path()
+    } else {
+        artifact_path.parent()?
+    };
+    let repo_path = filesystem_git_repo_root_for_path(search_dir)?;
+    let source_name = repo_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local-artifact-source");
+    Some(WorkspaceSourceTarget {
+        source_package: sanitize_dir_name(source_name),
+        upstream_url: None,
+        local_path: Some(repo_path.clone()),
+        acquisition_note: Some(format!(
+            "Using retained local source repository {} for artifact {}; patch the owning application before considering runtime package changes.",
+            repo_path.display(),
+            artifact_path.display()
+        )),
+    })
+}
+
+fn filesystem_git_repo_root_for_path(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|candidate| {
+            let git_marker = candidate.join(".git");
+            git_marker.is_dir() || git_marker.is_file()
+        })
+        .map(maybe_canonicalize)
 }
 
 fn chrome_workspace_alias(
@@ -1373,7 +1445,7 @@ mod tests {
         WorkspaceSourceTarget, apparmor_profile_path_candidates, chrome_workspace_alias,
         interpreter_source_target, is_cloneable_repo_url,
         is_external_binary_package_without_workspace, kernel_source_package_from_opportunity,
-        kernel_upstream_repo_url, native_executable_source_target,
+        kernel_upstream_repo_url, local_artifact_source_target, native_executable_source_target,
         normalize_patchable_source_package, origin_is_debian_source_friendly,
         package_name_from_opportunity, parse_apt_origins, parse_maintainer_url,
         parse_showsrc_records, sanitize_dir_name, select_showsrc_record, source_dir_version_hint,
@@ -1805,6 +1877,61 @@ zoom:\n\
         assert_eq!(target.source_package, "audio-worker");
         assert_eq!(target.local_path.as_deref(), Some(repo.as_path()));
         assert!(target.upstream_url.is_none());
+    }
+
+    #[test]
+    fn maps_local_artifact_path_to_containing_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("audio-worker");
+        let artifact_path = repo
+            .join(".venv")
+            .join("lib")
+            .join("python3.13")
+            .join("site-packages")
+            .join("numpy.libs")
+            .join("libnative-worker.so");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        fs::write(
+            repo.join("pyproject.toml"),
+            "[project]\nname = \"audio-worker\"\n",
+        )
+        .unwrap();
+        fs::write(&artifact_path, "").unwrap();
+        let opportunity = OpportunityRecord {
+            id: 1,
+            finding_id: 1,
+            kind: "hotspot".to_string(),
+            title: "local extension is hot".to_string(),
+            score: 79,
+            state: "open".to_string(),
+            summary: "local extension is hot".to_string(),
+            evidence: json!({
+                "artifact_path": artifact_path.display().to_string(),
+                "details": {
+                    "subsystem": "perf-hotspot",
+                    "hot_path_package_name": null,
+                    "hot_path_dso_path": artifact_path.display().to_string()
+                },
+                "package_name": null
+            }),
+            repo_root: None,
+            ecosystem: None,
+            created_at: "2026-05-28T00:00:00Z".to_string(),
+            updated_at: "2026-05-28T00:00:00Z".to_string(),
+        };
+
+        let target = local_artifact_source_target(&opportunity)
+            .expect("local artifact path should map to a containing source repo");
+
+        assert_eq!(target.source_package, "audio-worker");
+        assert_eq!(target.local_path.as_deref(), Some(repo.as_path()));
+        assert!(
+            target
+                .acquisition_note
+                .as_deref()
+                .is_some_and(|note| note.contains("owning application"))
+        );
     }
 
     #[test]
