@@ -1,3 +1,11 @@
+fixer (0.219.0-1) unstable; urgency=medium
+
+  * Symbolize GDB backtrace addresses through proc maps so PIE Go binaries can
+    produce function-level runaway-process evidence instead of unresolved
+    offsets.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 28 May 2026 13:30:00 +0400
+
 fixer (0.218.0-1) unstable; urgency=medium
 
   * Recover timed-out refinement passes by reviewing the current edited

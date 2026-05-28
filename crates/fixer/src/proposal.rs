@@ -7260,6 +7260,7 @@ mod tests {
     };
     use crate::storage::Store;
     use serde_json::{Value, json};
+    use std::io::Write;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -9126,9 +9127,10 @@ RESULT: ok
         let prompt_path = dir.path().join("prompt.md");
         let output_path = dir.path().join("output.txt");
         std::fs::create_dir_all(&repo_root).unwrap();
-        std::fs::write(
-            &fake_codex,
-            format!(
+        {
+            let mut script = std::fs::File::create(&fake_codex).unwrap();
+            write!(
+                script,
                 r#"#!/bin/sh
 args_log='{args_log}'
 count_file='{count_file}'
@@ -9158,9 +9160,10 @@ exit 0
 "#,
                 args_log = args_log.display(),
                 count_file = count_file.display(),
-            ),
-        )
-        .unwrap();
+            )
+            .unwrap();
+            script.sync_all().unwrap();
+        }
         let mut perms = std::fs::metadata(&fake_codex).unwrap().permissions();
         #[cfg(unix)]
         {

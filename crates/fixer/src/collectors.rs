@@ -5266,14 +5266,14 @@ fn capture_gdb_backtrace_sample(
     let bt_path = capture_dir.join("gdb-bt.txt");
     let bt_full_path = capture_dir.join("gdb-bt-full.txt");
     let maps_path = capture_dir.join("maps.txt");
-    let maps_excerpt = fs::read_to_string(format!("/proc/{pid}/maps"))
+    let maps_raw = fs::read_to_string(format!("/proc/{pid}/maps"))
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| {
-            let excerpt = excerpt_lines(&value, RUNAWAY_STRACE_EXCERPT_LIMIT * 2);
-            let _ = fs::write(&maps_path, &value);
-            excerpt
-        });
+        .filter(|value| !value.trim().is_empty());
+    let maps_excerpt = maps_raw.as_ref().map(|value| {
+        let excerpt = excerpt_lines(value, RUNAWAY_STRACE_EXCERPT_LIMIT * 2);
+        let _ = fs::write(&maps_path, value);
+        excerpt
+    });
     let commands = gdb_commands_for_hotspot(config);
     let child = match Command::new("gdb")
         .env("LC_ALL", "C")
@@ -5327,7 +5327,10 @@ fn capture_gdb_backtrace_sample(
         ));
     }
 
-    let raw_bt = extract_marked_gdb_section(&stdout, "FIXER_BT");
+    let raw_bt = symbolize_gdb_backtrace_addresses(
+        &extract_marked_gdb_section(&stdout, "FIXER_BT"),
+        maps_raw.as_deref(),
+    );
     if raw_bt.trim().is_empty() {
         return Ok((
             None,
@@ -5339,7 +5342,10 @@ fn capture_gdb_backtrace_sample(
     }
     fs::write(&bt_path, &raw_bt)?;
     if config.service.hotspot_investigation_backtrace_full_enabled {
-        let full_backtrace = extract_marked_gdb_section(&stdout, "FIXER_BTFULL");
+        let full_backtrace = symbolize_gdb_backtrace_addresses(
+            &extract_marked_gdb_section(&stdout, "FIXER_BTFULL"),
+            maps_raw.as_deref(),
+        );
         if !full_backtrace.trim().is_empty() {
             fs::write(&bt_full_path, &full_backtrace)?;
         }
@@ -5483,6 +5489,111 @@ fn parse_gdb_thread_backtraces(raw_bt: &str, thread_limit: usize) -> Vec<ParsedG
     }
     threads.truncate(thread_limit.max(1));
     threads
+}
+
+#[derive(Debug, Clone)]
+struct ProcMapEntry {
+    start: u64,
+    end: u64,
+    file_offset: u64,
+    path: PathBuf,
+}
+
+fn symbolize_gdb_backtrace_addresses(raw_bt: &str, maps_raw: Option<&str>) -> String {
+    let Some(maps_raw) = maps_raw else {
+        return raw_bt.to_string();
+    };
+    let maps = parse_proc_maps_for_symbolization(maps_raw);
+    if maps.is_empty() || !command_exists("addr2line") {
+        return raw_bt.to_string();
+    }
+    let unresolved_frame_re = Regex::new(
+        r"^(?P<prefix>\s*#\d+\s+)(?P<address>0x[0-9a-fA-F]+)(?P<suffix>\s+in\s+)\?\?(?P<tail>.*)$",
+    )
+    .expect("valid gdb unresolved frame regex");
+    raw_bt
+        .lines()
+        .map(|line| {
+            let Some(captures) = unresolved_frame_re.captures(line) else {
+                return line.to_string();
+            };
+            let Some(address) = captures
+                .name("address")
+                .and_then(|value| parse_hex_u64(value.as_str()))
+            else {
+                return line.to_string();
+            };
+            let Some((object, offset)) = file_offset_for_mapped_address(&maps, address) else {
+                return line.to_string();
+            };
+            let Some(symbol) = symbol_from_addr2line(object, offset) else {
+                return line.to_string();
+            };
+            format!(
+                "{}{}{}{}{}",
+                captures
+                    .name("prefix")
+                    .map(|value| value.as_str())
+                    .unwrap_or(""),
+                captures
+                    .name("address")
+                    .map(|value| value.as_str())
+                    .unwrap_or(""),
+                captures
+                    .name("suffix")
+                    .map(|value| value.as_str())
+                    .unwrap_or(" in "),
+                symbol,
+                captures
+                    .name("tail")
+                    .map(|value| value.as_str())
+                    .unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_proc_maps_for_symbolization(raw: &str) -> Vec<ProcMapEntry> {
+    raw.lines()
+        .filter_map(parse_proc_map_entry_for_symbolization)
+        .collect()
+}
+
+fn parse_proc_map_entry_for_symbolization(line: &str) -> Option<ProcMapEntry> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 6 {
+        return None;
+    }
+    let (start_raw, end_raw) = fields[0].split_once('-')?;
+    let start = parse_hex_u64(start_raw)?;
+    let end = parse_hex_u64(end_raw)?;
+    if start >= end || !fields[1].contains('x') {
+        return None;
+    }
+    let file_offset = parse_hex_u64(fields[2])?;
+    let path = PathBuf::from(fields[5]);
+    path.exists().then_some(ProcMapEntry {
+        start,
+        end,
+        file_offset,
+        path,
+    })
+}
+
+fn file_offset_for_mapped_address(maps: &[ProcMapEntry], address: u64) -> Option<(&Path, u64)> {
+    maps.iter()
+        .find(|entry| address >= entry.start && address < entry.end)
+        .map(|entry| {
+            (
+                entry.path.as_path(),
+                entry.file_offset + address.saturating_sub(entry.start),
+            )
+        })
+}
+
+fn parse_hex_u64(raw: &str) -> Option<u64> {
+    u64::from_str_radix(raw.trim().trim_start_matches("0x"), 16).ok()
 }
 
 fn normalize_gdb_frame(frame: &str) -> String {
@@ -8302,11 +8413,11 @@ mod tests {
         complaint_mentions_keyboard_layout_issue, coredump_debugger_arguments,
         coredump_debugger_skip_reason, crash_event_executable, crash_event_label,
         crash_event_process_name, csv_config_values, current_kernel_image_package_name,
-        dominant_syscall_sequence, extend_unique_log_lines, investigation_cooldown_active,
-        is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
-        kernel_module_package_hint, kernel_thread_package_name, kernel_warning_identity,
-        kernel_warning_module_candidates, looks_like_warning, netdev_watchdog_driver,
-        normalize_oom_task_memcg_target, normalize_perf_symbol,
+        dominant_syscall_sequence, extend_unique_log_lines, file_offset_for_mapped_address,
+        investigation_cooldown_active, is_low_signal_kernel_warning, is_profile_candidate,
+        kernel_module_lookup_names, kernel_module_package_hint, kernel_thread_package_name,
+        kernel_warning_identity, kernel_warning_module_candidates, looks_like_warning,
+        netdev_watchdog_driver, normalize_oom_task_memcg_target, normalize_perf_symbol,
         normalize_stuck_process_target_name, oom_cgroup_package_candidates, package_lookup_path,
         package_lookup_path_is_dpkg_candidate, parse_apparmor_denial, parse_coredump_info,
         parse_desktop_graphics_session_failure, parse_dkms_status_line,
@@ -8314,12 +8425,13 @@ mod tests {
         parse_interpreter_command_hints, parse_kernel_oom_kill_events,
         parse_latest_desktop_resume_failure, parse_network_driver_hang_events,
         parse_perf_hot_paths, parse_perl_command_line_hints,
-        parse_postgres_collation_mismatch_rows, parse_python_module_source_hint,
-        parse_strace_syscall_name, prioritize_coredump_events, process_runtime_seconds,
-        process_state_is_uninterruptible, richer_evidence_enabled, safe_perf_name,
-        shell_assignment_csv_value, stable_apparmor_denial_name,
+        parse_postgres_collation_mismatch_rows, parse_proc_maps_for_symbolization,
+        parse_python_module_source_hint, parse_strace_syscall_name, prioritize_coredump_events,
+        process_runtime_seconds, process_state_is_uninterruptible, richer_evidence_enabled,
+        safe_perf_name, shell_assignment_csv_value, stable_apparmor_denial_name,
         stuck_process_investigation_fingerprint, stuck_process_source_fingerprint,
-        summarize_top_syscalls, system_uptime_seconds, truncate_for_json_field,
+        summarize_top_syscalls, symbolize_gdb_backtrace_addresses, system_uptime_seconds,
+        truncate_for_json_field,
     };
     use crate::config::FixerConfig;
     use crate::models::{ParticipationMode, ParticipationState, PopularBinaryProfile};
@@ -8328,6 +8440,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     #[test]
     fn warning_detection_handles_common_keywords() {
@@ -9657,6 +9770,58 @@ Description: user-space parser utility for AppArmor
             hint.repo_url.as_deref(),
             Some("https://github.com/ollama/ollama.git")
         );
+    }
+
+    #[test]
+    fn proc_maps_symbolization_translates_pie_address_to_file_offset() {
+        let binary_path = std::env::current_exe().unwrap();
+        let maps = format!(
+            "55c5c3942000-55c5c4e21000 r-xp 0034f000 fe:00 70254595                   {}\n",
+            binary_path.display()
+        );
+        let entries = parse_proc_maps_for_symbolization(&maps);
+
+        let (_, offset) = file_offset_for_mapped_address(&entries, 0x55c5c39ed143)
+            .expect("address should map through executable text segment");
+
+        assert_eq!(offset, 0x3fa143);
+    }
+
+    #[test]
+    fn gdb_backtrace_symbolization_replaces_unresolved_pie_frame_when_symbols_exist() {
+        let binary_path = std::env::current_exe().unwrap();
+        let Ok(nm_output) = Command::new("nm").args(["-n"]).arg(&binary_path).output() else {
+            return;
+        };
+        if !nm_output.status.success() {
+            return;
+        }
+        let Some(symbol_offset) = String::from_utf8_lossy(&nm_output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let parts = line.split_whitespace().collect::<Vec<_>>();
+                if parts.len() < 3 || !matches!(parts[1], "T" | "t") {
+                    return None;
+                }
+                u64::from_str_radix(parts[0], 16).ok()
+            })
+            .find(|offset| *offset > 0)
+        else {
+            return;
+        };
+        let load_start = 0x7000_0000_0000u64;
+        let raw_bt = format!("#0  0x{:x} in ?? ()", load_start + symbol_offset);
+        let maps = format!(
+            "{:x}-{:x} r-xp 00000000 fe:00 1                   {}\n",
+            load_start,
+            load_start + symbol_offset + 0x1000,
+            binary_path.display()
+        );
+
+        let symbolized = symbolize_gdb_backtrace_addresses(&raw_bt, Some(&maps));
+
+        assert!(!symbolized.contains("??"));
+        assert!(symbolized.contains(" in "));
     }
 
     fn push_uvarint(output: &mut Vec<u8>, mut value: u64) {
