@@ -4012,7 +4012,7 @@ fn response_has_security_sensitive_patch_surface(response: &str, issue_connectio
         "secret",
         "timing secret",
         "cryptograph",
-        "sandbox",
+        "sandboxing",
         "seccomp",
         "apparmor",
         "permission",
@@ -10880,6 +10880,30 @@ h3_postgis/src/wkb_regions.c
 
 ## Validation
 `cmake -S . -B build-fix -G Ninja && cmake --build build-fix && ctest --test-dir build-fix --output-on-failure` failed during configure because the sandbox could not resolve `github.com`.
+"#;
+
+        assert!(super::patch_explanation_quality_failure(response, None).is_none());
+    }
+
+    #[test]
+    fn patch_explanation_quality_guard_allows_observed_performance_patch_with_root_sandbox_blocker()
+    {
+        let response = r#"Subject: Optimize h3_postgis polygonizer vertex lookup
+
+## Commit Message
+Add a bucketed vertex index for polygonizer endpoint lookup while keeping geoAlmostEqual as the final equality rule.
+
+## Evidence Confidence
+observed
+
+## Issue Connection
+Fixer observed a perf hotspot where `postgres` spent sampled CPU in `polygonize_noded_linked_polygon` inside `h3_postgis.so`. This was observed by Fixer and not independently reproduced; the evidence is profiler-only, so this patch is a targeted mitigation rather than a claim of a reproduced user-visible failure. The change adds a local bucketed index keyed by latitude/longitude buckets, and the expected effect is to reduce CPU spent in noded polygonization by avoiding full vertex-list scans. PostgreSQL regression startup is blocked in this root sandbox because `initdb` cannot be run as root.
+
+## Git Add Paths
+h3_postgis/src/wkb_regions.c
+
+## Validation
+`cmake --build build-local` passed. `ctest --test-dir build-local --output-on-failure` failed because PostgreSQL regression tests run `initdb`, and `initdb` reported `cannot be run as root`.
 "#;
 
         assert!(super::patch_explanation_quality_failure(response, None).is_none());
