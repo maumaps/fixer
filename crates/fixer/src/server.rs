@@ -1125,6 +1125,7 @@ struct PublicTriageEntry {
     last_seen: String,
     best_triage: PublicAttempt,
     handoff: PublicTriageHandoff,
+    handoff_group_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -8690,6 +8691,11 @@ fn public_patch_primary_path(path: &str) -> bool {
 }
 
 async fn load_public_triage(db: &ServerDb, limit: i64) -> Result<Vec<PublicTriageEntry>, ApiError> {
+    let query_limit = if limit > 0 {
+        limit.saturating_mul(10).clamp(limit, 1000)
+    } else {
+        limit
+    };
     let mut triage = match db {
         ServerDb::Postgres(db) => {
             let rows = db
@@ -8705,7 +8711,7 @@ async fn load_public_triage(db: &ServerDb, limit: i64) -> Result<Vec<PublicTriag
             ORDER BY last_seen DESC, score DESC
             LIMIT $1
             ",
-                    &[&limit],
+                    &[&query_limit],
                 )
                 .await
                 .map_err(ApiError::internal)?;
@@ -8731,7 +8737,7 @@ async fn load_public_triage(db: &ServerDb, limit: i64) -> Result<Vec<PublicTriag
                 )
                 .map_err(ApiError::internal)?;
             let rows = stmt
-                .query_map([limit], public_triage_from_sqlite_row)
+                .query_map([query_limit], public_triage_from_sqlite_row)
                 .map_err(ApiError::internal)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(ApiError::internal)?
@@ -8746,6 +8752,10 @@ async fn load_public_triage(db: &ServerDb, limit: i64) -> Result<Vec<PublicTriag
             .then_with(|| right.score.cmp(&left.score))
     });
     propagate_public_triage_report_urls(&mut triage);
+    triage = collapse_public_triage_handoff_families(triage);
+    if limit > 0 {
+        triage.truncate(limit as usize);
+    }
     Ok(triage)
 }
 
@@ -8875,6 +8885,77 @@ fn propagate_public_triage_report_urls(entries: &mut [PublicTriageEntry]) {
             }
         }
     }
+}
+
+fn public_triage_handoff_family_key(
+    entry: &PublicTriageEntry,
+) -> Option<(String, String, Option<String>)> {
+    let (classification, target) = public_triage_handoff_key(&entry.handoff)?;
+    let report_url = entry
+        .handoff
+        .report_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    Some((classification, target, report_url))
+}
+
+fn public_triage_entry_preferred_representative(
+    current: &PublicTriageEntry,
+    candidate: &PublicTriageEntry,
+) -> bool {
+    candidate
+        .score
+        .cmp(&current.score)
+        .then_with(|| {
+            parse_timestamp(&candidate.best_triage.created_at)
+                .cmp(&parse_timestamp(&current.best_triage.created_at))
+        })
+        .then_with(|| {
+            parse_timestamp(&candidate.last_seen).cmp(&parse_timestamp(&current.last_seen))
+        })
+        .is_gt()
+}
+
+fn collapse_public_triage_handoff_families(
+    entries: Vec<PublicTriageEntry>,
+) -> Vec<PublicTriageEntry> {
+    let mut collapsed = Vec::<PublicTriageEntry>::new();
+    let mut indexes = HashMap::<(String, String, Option<String>), usize>::new();
+
+    for mut entry in entries {
+        entry.handoff_group_count = entry.handoff_group_count.max(1);
+        let Some(key) = public_triage_handoff_family_key(&entry) else {
+            collapsed.push(entry);
+            continue;
+        };
+        let Some(index) = indexes.get(&key).copied() else {
+            indexes.insert(key, collapsed.len());
+            collapsed.push(entry);
+            continue;
+        };
+
+        let combined_count = collapsed[index].handoff_group_count + entry.handoff_group_count;
+        if public_triage_entry_preferred_representative(&collapsed[index], &entry) {
+            entry.handoff_group_count = combined_count;
+            collapsed[index] = entry;
+        } else {
+            collapsed[index].handoff_group_count = combined_count;
+        }
+    }
+
+    collapsed.sort_by(|left, right| {
+        right
+            .handoff_group_count
+            .cmp(&left.handoff_group_count)
+            .then_with(|| right.score.cmp(&left.score))
+            .then_with(|| {
+                parse_timestamp(&right.best_triage.created_at)
+                    .cmp(&parse_timestamp(&left.best_triage.created_at))
+            })
+    });
+    collapsed
 }
 
 async fn load_public_attempts(
@@ -9313,6 +9394,7 @@ fn public_triage_from_row(row: Row) -> Result<Option<PublicTriageEntry>, ApiErro
         last_seen: last_seen.to_rfc3339(),
         best_triage,
         handoff,
+        handoff_group_count: 1,
     }))
 }
 
@@ -10900,6 +10982,7 @@ fn public_triage_from_sqlite_row(
         last_seen: row.get(11)?,
         best_triage,
         handoff,
+        handoff_group_count: 1,
     }))
 }
 
@@ -16413,6 +16496,13 @@ fn render_public_triage_card(entry: &PublicTriageEntry) -> String {
             html_escape(status)
         );
     }
+    if entry.handoff_group_count > 1 {
+        let _ = write!(
+            triage_tags,
+            "<span class=\"tag\">{} matching handoffs</span>",
+            entry.handoff_group_count
+        );
+    }
     format!(
         r#"<article class="issue-card patch-card">
             <div class="issue-topline">
@@ -19545,6 +19635,7 @@ mod tests {
                     failure_context: None,
                 },
                 handoff,
+                handoff_group_count: 1,
             }
         }
 
@@ -19617,6 +19708,7 @@ mod tests {
                     failure_context: None,
                 },
                 handoff,
+                handoff_group_count: 1,
             }
         }
 
@@ -19672,6 +19764,7 @@ mod tests {
                     failure_context: None,
                 },
                 handoff,
+                handoff_group_count: 1,
             }
         }
 
@@ -19701,6 +19794,59 @@ mod tests {
         assert!(entries[1].handoff.report_url.is_none());
         assert!(entries[3].handoff.report_url.is_none());
         assert!(entries[5].handoff.report_url.is_none());
+    }
+
+    #[test]
+    fn triage_rows_collapse_repeated_handoff_families() {
+        fn entry(id: &str, score: i64, created_at: &str) -> PublicTriageEntry {
+            let handoff = PublicTriageHandoff {
+                reason: "workspace-acquisition".to_string(),
+                classification: Some("external-local-executable".to_string()),
+                target: "local executable synthetic-llm".to_string(),
+                report_url: Some("https://github.com/example/synthetic-llm.git".to_string()),
+                next_steps: local_executable_triage_next_steps(
+                    "local executable synthetic-llm",
+                    Some("https://github.com/example/synthetic-llm.git"),
+                ),
+            };
+            PublicTriageEntry {
+                id: id.to_string(),
+                kind: "investigation".to_string(),
+                title: format!("Runaway CPU investigation {id}"),
+                summary: "synthetic-llm burned CPU in a native loop.".to_string(),
+                package_name: None,
+                source_package: None,
+                ecosystem: None,
+                severity: Some("high".to_string()),
+                score,
+                corroboration_count: 2,
+                last_seen: created_at.to_string(),
+                best_triage: PublicAttempt {
+                    outcome: "triage".to_string(),
+                    state: "ready".to_string(),
+                    summary: format!("Triage summary for {id}."),
+                    validation_status: Some("ready".to_string()),
+                    created_at: created_at.to_string(),
+                    published_session: None,
+                    handoff: Some(handoff.clone()),
+                    blocker_reason: None,
+                    failure_diagnostics: None,
+                    failure_context: None,
+                },
+                handoff,
+                handoff_group_count: 1,
+            }
+        }
+
+        let collapsed = collapse_public_triage_handoff_families(vec![
+            entry("newer-lower-score", 100, "2026-05-28T00:00:00Z"),
+            entry("older-higher-score", 110, "2026-05-27T00:00:00Z"),
+            entry("same-family", 90, "2026-05-29T00:00:00Z"),
+        ]);
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].id, "older-higher-score");
+        assert_eq!(collapsed[0].handoff_group_count, 3);
     }
 
     #[test]
