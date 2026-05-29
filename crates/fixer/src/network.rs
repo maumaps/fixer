@@ -1629,6 +1629,11 @@ fn recover_unpublished_worker_result(
             details.insert("published_session".to_string(), public_session);
         }
         let published_session = details.get("published_session").cloned();
+        let publication_blocker =
+            published_session_publication_blocker(&opportunity, published_session.as_ref());
+        if let Some(blocker) = publication_blocker.as_deref() {
+            append_publication_repair_details(&mut details, blocker);
+        }
         let is_triage_ready = status.state == "ready"
             && !published_session_has_diff(published_session.as_ref())
             && published_session_marks_successful_triage(published_session.as_ref());
@@ -1643,7 +1648,11 @@ fn recover_unpublished_worker_result(
             );
         }
         let summary = if status.state == "ready" {
-            if is_triage_ready {
+            if let Some(blocker) = publication_blocker.as_deref() {
+                format!(
+                    "Fixer withheld a recovered local patch from the public best-patch slot after a publication-quality check: {blocker}"
+                )
+            } else if is_triage_ready {
                 if supports_process_report {
                     format!(
                         "{} A diagnosis report and external handoff were created locally.",
@@ -1681,7 +1690,9 @@ fn recover_unpublished_worker_result(
                         .worker_install_id
                         .clone()
                         .unwrap_or_else(|| participation.identity.install_id.clone()),
-                    outcome: if is_triage_ready {
+                    outcome: if publication_blocker.is_some() {
+                        "report".to_string()
+                    } else if is_triage_ready {
                         "triage".to_string()
                     } else {
                         "patch".to_string()
@@ -1693,7 +1704,11 @@ fn recover_unpublished_worker_result(
                         .output_path
                         .as_ref()
                         .map(|path| path.display().to_string()),
-                    validation_status: Some(status.state.clone()),
+                    validation_status: Some(if publication_blocker.is_some() {
+                        "review-rejected".to_string()
+                    } else {
+                        status.state.clone()
+                    }),
                     details: Value::Object(details),
                     created_at: status.finished_at.clone(),
                 },
@@ -3860,8 +3875,8 @@ pub fn verify_worker_pull_pow(
 mod tests {
     use super::*;
     use crate::models::{
-        Capability, CodexJobStatus, FindingInput, FindingRecord, OpportunityRecord,
-        ParticipationMode, ParticipationState, StatusSnapshot,
+        Capability, CodexJobSpec, CodexJobStatus, FindingInput, FindingRecord, OpportunityRecord,
+        ParticipationMode, ParticipationState, PreparedWorkspace, StatusSnapshot,
     };
     use crate::storage::Store;
     use serde_json::json;
@@ -3967,6 +3982,137 @@ mod tests {
         });
 
         assert!(published_session_publication_blocker(&opportunity, Some(&session)).is_none());
+    }
+
+    #[test]
+    fn recovered_worker_result_applies_publication_blocker() {
+        let dir = tempdir().unwrap();
+        let mut config = FixerConfig::default();
+        config.service.state_dir = dir.path().join("state");
+        let proposals_root = config.service.state_dir.join("proposals");
+        let bundle_dir = proposals_root.join("1-2026-05-29T00-00-00Z");
+        fs::create_dir_all(&bundle_dir).unwrap();
+
+        let source_root = dir.path().join("source");
+        let workspace_root = dir.path().join("workspace");
+        fs::create_dir_all(source_root.join("profiles/apparmor.d")).unwrap();
+        fs::create_dir_all(workspace_root.join("profiles/apparmor.d")).unwrap();
+        fs::write(source_root.join("profiles/apparmor.d/lsusb"), "").unwrap();
+        fs::write(
+            workspace_root.join("profiles/apparmor.d/lsusb"),
+            "profile lsusb /usr/bin/lsusb {\n  / r,\n}\n",
+        )
+        .unwrap();
+
+        let opportunity = sample_apparmor_opportunity();
+        let workspace = PreparedWorkspace {
+            repo_root: workspace_root.clone(),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "test".to_string(),
+            package_name: Some("apparmor".to_string()),
+            source_package: Some("apparmor".to_string()),
+            homepage: None,
+            acquisition_note: "test workspace".to_string(),
+        };
+        let prompt_path = bundle_dir.join("prompt.md");
+        let output_path = bundle_dir.join("codex-output.txt");
+        fs::write(&prompt_path, "Patch the AppArmor profile.\n").unwrap();
+        fs::write(
+            &output_path,
+            "Subject: profiles: allow lsusb to read /\n\n## Evidence Confidence\nobserved\n\n## Issue Connection\nFixer observed the denial and did not independently reproduce it.\n\n## Git Add Paths\nprofiles/apparmor.d/lsusb\n\n## Validation\nnot run\n",
+        )
+        .unwrap();
+        fs::write(
+            bundle_dir.join("evidence.json"),
+            serde_json::to_vec_pretty(&json!({
+                "opportunity": opportunity,
+                "workspace": { "repo_root": workspace_root.display().to_string() },
+                "source_workspace": { "repo_root": source_root.display().to_string() },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            bundle_dir.join("job.json"),
+            serde_json::to_vec_pretty(&CodexJobSpec {
+                job_id: "job-recovered-apparmor".to_string(),
+                opportunity_id: opportunity.id,
+                subsystem: Some("apparmor".to_string()),
+                run_as_user: "kom".to_string(),
+                worker_lease_id: Some("lease-recovered".to_string()),
+                worker_issue_id: Some("issue-recovered".to_string()),
+                worker_install_id: Some("install-recovered".to_string()),
+                workspace,
+                bundle_dir: bundle_dir.clone(),
+                prompt_path: prompt_path.clone(),
+                output_path: output_path.clone(),
+                failure_pause_threshold: 3,
+                failure_pause_window_seconds: 3600,
+                allow_kernel: false,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            bundle_dir.join("status.json"),
+            serde_json::to_vec_pretty(&CodexJobStatus {
+                job_id: "job-recovered-apparmor".to_string(),
+                state: "ready".to_string(),
+                started_at: "2026-05-29T00:00:00Z".to_string(),
+                finished_at: "2026-05-29T00:01:00Z".to_string(),
+                output_path: Some(output_path),
+                selected_model: Some("codex-default".to_string()),
+                models_used: vec!["codex-default".to_string()],
+                rate_limit_fallback_used: false,
+                failure_stage: None,
+                error: None,
+                failure_kind: None,
+                exit_status: Some(0),
+                last_stderr_excerpt: None,
+                review_failure_category: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let participation = ParticipationSnapshot {
+            identity: InstallIdentity {
+                install_id: "install-local".to_string(),
+                created_at: "2026-05-29T00:00:00Z".to_string(),
+            },
+            state: ParticipationState {
+                mode: ParticipationMode::SubmitterWorker,
+                ..ParticipationState::default()
+            },
+            server_url: config.network.server_url.clone(),
+            policy_text: "test policy".to_string(),
+        };
+
+        let recovered = recover_unpublished_worker_result(&config, &participation)
+            .unwrap()
+            .expect("worker result should be recoverable");
+
+        assert_eq!(recovered.result.attempt.outcome, "report");
+        assert_eq!(
+            recovered.result.attempt.validation_status.as_deref(),
+            Some("review-rejected")
+        );
+        assert_eq!(
+            recovered
+                .result
+                .attempt
+                .details
+                .get("report_only_reason")
+                .and_then(Value::as_str),
+            Some("publication-quality")
+        );
+        assert!(
+            recovered
+                .result
+                .attempt
+                .summary
+                .contains("withheld a recovered local patch")
+        );
     }
 
     fn sample_postgresql_opportunity() -> OpportunityRecord {

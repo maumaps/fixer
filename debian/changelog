@@ -1,3 +1,10 @@
+fixer (0.234.0-1) unstable; urgency=medium
+
+  * Apply publication-quality blockers to recovered worker results before
+    they reach the public patch slot.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 29 May 2026 12:26:25 +0400
+
 fixer (0.233.0-1) unstable; urgency=medium
 
   * Scan deeper linked proposal queues before publication filtering.
