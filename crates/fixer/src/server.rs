@@ -1069,6 +1069,7 @@ struct PublicPatchEntry {
     upstream_review: Option<PublicPatchUpstreamReview>,
     related_upstream_review: Option<PublicPatchRelatedReview>,
     duplicate_patch: Option<PublicPatchDuplicate>,
+    duplicate_group_count: i64,
     manual_disposition: Option<PublicPatchDisposition>,
     best_patch: PublicAttempt,
 }
@@ -7976,6 +7977,7 @@ async fn load_public_issue_best_triage(
 }
 
 async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatchEntry>, ApiError> {
+    let query_limit = limit.saturating_mul(10).clamp(limit.max(1), 1000);
     let mut patches = match db {
         ServerDb::Postgres(db) => {
             let rows = db
@@ -8038,7 +8040,7 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
             ORDER BY last_seen DESC, score DESC
             LIMIT $1
             ",
-                    &[&limit],
+                    &[&query_limit],
                 )
                 .await
                 .map_err(ApiError::internal)?;
@@ -8115,7 +8117,7 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
                 )
                 .map_err(ApiError::internal)?;
             let rows = stmt
-                .query_map([limit], public_patch_from_sqlite_row)
+                .query_map([query_limit], public_patch_from_sqlite_row)
                 .map_err(ApiError::internal)?;
             rows.filter_map(|row| match row {
                 Ok(Some(entry)) => Some(Ok(entry)),
@@ -8133,11 +8135,13 @@ async fn load_public_patches(db: &ServerDb, limit: i64) -> Result<Vec<PublicPatc
     annotate_public_patch_related_reviews(&mut patches);
     annotate_public_patch_manual_dispositions(&mut patches, manual_dispositions);
     annotate_public_patch_harvest_buckets(&mut patches);
+    patches = collapse_public_patch_duplicate_diffs(patches);
     patches.sort_by(|left, right| {
         parse_timestamp(&right.best_patch.created_at)
             .cmp(&parse_timestamp(&left.best_patch.created_at))
             .then_with(|| right.score.cmp(&left.score))
     });
+    patches.truncate(limit.max(0) as usize);
     Ok(patches)
 }
 
@@ -8359,6 +8363,7 @@ fn annotate_public_patch_duplicates(patches: &mut [PublicPatchEntry]) {
             .patch_diff_hash
             .clone()
             .unwrap_or_default();
+        patches[canonical_index].duplicate_group_count = indexes.len() as i64;
         for index in indexes {
             if *index == canonical_index {
                 continue;
@@ -8371,6 +8376,13 @@ fn annotate_public_patch_duplicates(patches: &mut [PublicPatchEntry]) {
             });
         }
     }
+}
+
+fn collapse_public_patch_duplicate_diffs(patches: Vec<PublicPatchEntry>) -> Vec<PublicPatchEntry> {
+    patches
+        .into_iter()
+        .filter(|patch| patch.duplicate_patch.is_none())
+        .collect()
 }
 
 fn public_patch_duplicate_rank(patch: &PublicPatchEntry) -> i32 {
@@ -9312,6 +9324,7 @@ fn public_patch_from_row(row: Row) -> Result<Option<PublicPatchEntry>, ApiError>
         upstream_review: public_patch_upstream_review_from_row(&row),
         related_upstream_review: None,
         duplicate_patch: None,
+        duplicate_group_count: 1,
         manual_disposition: None,
         best_patch,
     }))
@@ -10817,6 +10830,7 @@ fn public_patch_from_sqlite_row(
         upstream_review: public_patch_upstream_review_from_sqlite_row(row)?,
         related_upstream_review: None,
         duplicate_patch: None,
+        duplicate_group_count: 1,
         manual_disposition: None,
         best_patch,
     }))
@@ -16328,6 +16342,12 @@ fn render_public_patch_card(entry: &PublicPatchEntry) -> String {
             "<span class=\"tag\">duplicate diff: {}</span>",
             duplicate.duplicate_count
         );
+    } else if entry.duplicate_group_count > 1 {
+        let _ = write!(
+            patch_tags,
+            "<span class=\"tag\">{} duplicate diffs collapsed</span>",
+            entry.duplicate_group_count
+        );
     }
     let upstream_review_summary = entry
         .upstream_review
@@ -18407,6 +18427,7 @@ mod tests {
             upstream_review: None,
             related_upstream_review: None,
             duplicate_patch: None,
+            duplicate_group_count: 1,
             manual_disposition: None,
             best_patch: PublicAttempt {
                 outcome: "patch".to_string(),
@@ -18476,6 +18497,7 @@ mod tests {
             upstream_review: None,
             related_upstream_review: None,
             duplicate_patch: None,
+            duplicate_group_count: 1,
             manual_disposition: None,
             best_patch: PublicAttempt {
                 outcome: "patch".to_string(),
@@ -20614,25 +20636,26 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("load public patches failed: {}", error.message),
         };
-        let older = patches
+        assert!(
+            patches.iter().all(|patch| patch.id != "issue-old"),
+            "older duplicate should be hidden by the public patch loader"
+        );
+        let canonical = patches
             .iter()
-            .find(|patch| patch.id == "issue-old")
-            .expect("older duplicate should be visible");
-        let duplicate = older
-            .duplicate_patch
-            .as_ref()
-            .expect("older patch should point at canonical duplicate");
-
-        assert_eq!(duplicate.canonical_issue_id, "issue-new");
-        assert_eq!(duplicate.duplicate_count, 2);
+            .find(|patch| patch.id == "issue-new")
+            .expect("canonical duplicate should remain visible");
+        assert_eq!(canonical.duplicate_group_count, 2);
+        assert!(canonical.duplicate_patch.is_none());
         assert_eq!(
-            duplicate.patch_diff_hash.as_str(),
-            hash_text(normalize_published_diff(diff)).as_str()
+            canonical.patch_diff_hash.as_deref(),
+            Some(hash_text(normalize_published_diff(diff)).as_str())
         );
         assert_eq!(
-            duplicate.canonical_subject.as_deref(),
+            canonical.patch_subject.as_deref(),
             Some("channels: set poll events")
         );
+        let card = render_public_patch_card(canonical);
+        assert!(card.contains("2 duplicate diffs collapsed"));
     }
 
     #[test]
