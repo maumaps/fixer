@@ -1,3 +1,10 @@
+fixer (0.235.0-1) unstable; urgency=medium
+
+  * Skip worker refreshes for patch source families that already have an
+    upstream review.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 29 May 2026 12:44:17 +0400
+
 fixer (0.234.0-1) unstable; urgency=medium
 
   * Apply publication-quality blockers to recovered worker results before

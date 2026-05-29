@@ -6487,6 +6487,7 @@ struct WorkerCandidate {
     last_attempt_model: Option<String>,
     latest_attempt: Option<PatchAttempt>,
     has_best_triage: bool,
+    best_patch_has_upstream_review: bool,
     rerunnable_source_handoff: Option<PublicTriageHandoff>,
 }
 
@@ -6522,7 +6523,12 @@ async fn next_issue_for_worker(
                     WHERE attempt.cluster_id = issue.id
                     ORDER BY attempt.created_at DESC
                     LIMIT 1
-               ) AS latest_attempt_json
+               ) AS latest_attempt_json,
+               EXISTS (
+                    SELECT 1
+                    FROM upstream_reviews review
+                    WHERE review.patch_issue_id = issue.id
+               ) AS best_patch_has_upstream_review
         FROM issue_clusters issue
         WHERE promoted = TRUE
           AND public_visible = TRUE
@@ -6575,7 +6581,12 @@ async fn next_issue_for_worker(
                     WHERE attempt.cluster_id = issue.id
                     ORDER BY attempt.created_at DESC
                     LIMIT 1
-               ) AS latest_attempt_json
+               ) AS latest_attempt_json,
+               EXISTS (
+                    SELECT 1
+                    FROM upstream_reviews review
+                    WHERE review.patch_issue_id = issue.id
+               ) AS best_patch_has_upstream_review
         FROM issue_clusters issue
         WHERE promoted = 1
           AND public_visible = 1
@@ -6614,6 +6625,7 @@ async fn next_issue_for_worker(
                     let latest_attempt = row
                         .get::<_, Option<String>>(19)?
                         .and_then(|raw| latest_attempt_from_json_str(&raw).ok());
+                    let best_patch_has_upstream_review = row.get::<_, i64>(20)? != 0;
                     let rerunnable_source_handoff = best_triage
                         .as_ref()
                         .and_then(rerunnable_source_handoff)
@@ -6629,6 +6641,7 @@ async fn next_issue_for_worker(
                         last_attempt_model,
                         latest_attempt,
                         has_best_triage: best_triage.is_some(),
+                        best_patch_has_upstream_review,
                         rerunnable_source_handoff,
                     })
                 },
@@ -6668,6 +6681,7 @@ fn select_worker_candidate(
 ) -> Option<IssueCluster> {
     let cooldown_cutoff = (worker_attempt_cooldown_seconds > 0)
         .then(|| Utc::now() - Duration::seconds(worker_attempt_cooldown_seconds as i64));
+    let reviewed_source_families = reviewed_worker_source_families(&candidates);
     let mut sorted_candidates = candidates.iter().collect::<Vec<_>>();
     sorted_candidates.sort_by(compare_worker_candidate_priority);
     // Source-backed triage handoffs have already reached "bring me the real
@@ -6717,7 +6731,10 @@ fn select_worker_candidate(
                 .find(|candidate| {
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
                         && candidate.has_foreign_reports
-                        && candidate_needs_patch_refresh(candidate)
+                        && candidate_needs_patch_refresh_outside_reviewed_family(
+                            candidate,
+                            &reviewed_source_families,
+                        )
                         && candidate_model_differs(candidate, worker_model)
                 })
                 .map(|candidate| candidate.issue.clone())
@@ -6729,6 +6746,10 @@ fn select_worker_candidate(
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
                         && candidate.has_foreign_reports
                         && candidate_is_available_for_worker(candidate)
+                        && !candidate_is_in_reviewed_source_family(
+                            candidate,
+                            &reviewed_source_families,
+                        )
                         && candidate_model_differs(candidate, worker_model)
                 })
                 .map(|candidate| candidate.issue.clone())
@@ -6738,7 +6759,10 @@ fn select_worker_candidate(
                 .iter()
                 .find(|candidate| {
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
-                        && candidate_needs_patch_refresh(candidate)
+                        && candidate_needs_patch_refresh_outside_reviewed_family(
+                            candidate,
+                            &reviewed_source_families,
+                        )
                         && candidate_model_differs(candidate, worker_model)
                 })
                 .map(|candidate| candidate.issue.clone())
@@ -6749,6 +6773,10 @@ fn select_worker_candidate(
                 .find(|candidate| {
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
                         && candidate_is_available_for_worker(candidate)
+                        && !candidate_is_in_reviewed_source_family(
+                            candidate,
+                            &reviewed_source_families,
+                        )
                         && candidate_model_differs(candidate, worker_model)
                 })
                 .map(|candidate| candidate.issue.clone())
@@ -6760,7 +6788,10 @@ fn select_worker_candidate(
                 .find(|candidate| {
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
                         && candidate.has_foreign_reports
-                        && candidate_needs_patch_refresh(candidate)
+                        && candidate_needs_patch_refresh_outside_reviewed_family(
+                            candidate,
+                            &reviewed_source_families,
+                        )
                 })
                 .map(|candidate| candidate.issue.clone())
         })
@@ -6771,6 +6802,10 @@ fn select_worker_candidate(
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
                         && candidate.has_foreign_reports
                         && candidate_is_available_for_worker(candidate)
+                        && !candidate_is_in_reviewed_source_family(
+                            candidate,
+                            &reviewed_source_families,
+                        )
                 })
                 .map(|candidate| candidate.issue.clone())
         })
@@ -6779,7 +6814,10 @@ fn select_worker_candidate(
                 .iter()
                 .find(|candidate| {
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
-                        && candidate_needs_patch_refresh(candidate)
+                        && candidate_needs_patch_refresh_outside_reviewed_family(
+                            candidate,
+                            &reviewed_source_families,
+                        )
                 })
                 .map(|candidate| candidate.issue.clone())
         })
@@ -6789,6 +6827,10 @@ fn select_worker_candidate(
                 .find(|candidate| {
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
                         && candidate_is_available_for_worker(candidate)
+                        && !candidate_is_in_reviewed_source_family(
+                            candidate,
+                            &reviewed_source_families,
+                        )
                 })
                 .map(|candidate| candidate.issue.clone())
         })
@@ -6796,7 +6838,11 @@ fn select_worker_candidate(
             sorted_candidates
                 .iter()
                 .filter(|candidate| {
-                    candidate.has_foreign_reports && candidate_needs_patch_refresh(candidate)
+                    candidate.has_foreign_reports
+                        && candidate_needs_patch_refresh_outside_reviewed_family(
+                            candidate,
+                            &reviewed_source_families,
+                        )
                 })
                 .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
                 .map(|candidate| candidate.issue.clone())
@@ -6805,7 +6851,12 @@ fn select_worker_candidate(
             sorted_candidates
                 .iter()
                 .filter(|candidate| {
-                    candidate.has_foreign_reports && candidate_is_available_for_worker(candidate)
+                    candidate.has_foreign_reports
+                        && candidate_is_available_for_worker(candidate)
+                        && !candidate_is_in_reviewed_source_family(
+                            candidate,
+                            &reviewed_source_families,
+                        )
                 })
                 .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
                 .map(|candidate| candidate.issue.clone())
@@ -6813,17 +6864,95 @@ fn select_worker_candidate(
         .or_else(|| {
             sorted_candidates
                 .iter()
-                .filter(|candidate| candidate_needs_patch_refresh(candidate))
+                .filter(|candidate| {
+                    candidate_needs_patch_refresh_outside_reviewed_family(
+                        candidate,
+                        &reviewed_source_families,
+                    )
+                })
                 .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
                 .map(|candidate| candidate.issue.clone())
         })
         .or_else(|| {
             sorted_candidates
                 .iter()
-                .filter(|candidate| candidate_is_available_for_worker(candidate))
+                .filter(|candidate| {
+                    candidate_is_available_for_worker(candidate)
+                        && !candidate_is_in_reviewed_source_family(
+                            candidate,
+                            &reviewed_source_families,
+                        )
+                })
                 .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
                 .map(|candidate| candidate.issue.clone())
         })
+}
+
+type WorkerSourceFamily = (String, Vec<String>);
+
+fn reviewed_worker_source_families(candidates: &[WorkerCandidate]) -> HashSet<WorkerSourceFamily> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.best_patch_has_upstream_review)
+        .filter_map(worker_candidate_source_family)
+        .collect()
+}
+
+fn candidate_needs_patch_refresh_outside_reviewed_family(
+    candidate: &WorkerCandidate,
+    reviewed_source_families: &HashSet<WorkerSourceFamily>,
+) -> bool {
+    candidate_needs_patch_refresh(candidate)
+        && !candidate_is_in_reviewed_source_family(candidate, reviewed_source_families)
+}
+
+fn candidate_is_in_reviewed_source_family(
+    candidate: &WorkerCandidate,
+    reviewed_source_families: &HashSet<WorkerSourceFamily>,
+) -> bool {
+    if candidate.best_patch_has_upstream_review {
+        return true;
+    }
+    worker_candidate_source_family(candidate)
+        .as_ref()
+        .is_some_and(|family| reviewed_source_families.contains(family))
+}
+
+fn worker_candidate_source_family(candidate: &WorkerCandidate) -> Option<WorkerSourceFamily> {
+    let source = candidate
+        .issue
+        .source_package
+        .as_deref()
+        .or(candidate.issue.package_name.as_deref())
+        .filter(|value| !value.trim().is_empty())?;
+    let best_patch = candidate.issue.best_patch.as_ref()?;
+    let paths = patch_attempt_primary_source_paths(best_patch);
+    (!paths.is_empty()).then(|| (source.to_string(), paths))
+}
+
+fn patch_attempt_primary_source_paths(attempt: &PatchAttempt) -> Vec<String> {
+    let response_metadata = attempt_response_text(attempt)
+        .map(extract_patch_response_metadata)
+        .unwrap_or_default();
+    let changed_files = attempt_diff_text(attempt)
+        .map(patch_changed_files)
+        .unwrap_or_default();
+    let paths = if response_metadata.git_add_paths.is_empty() {
+        &changed_files
+    } else {
+        &response_metadata.git_add_paths
+    };
+    let mut source_paths = paths
+        .iter()
+        .filter(|path| public_patch_primary_path(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if source_paths.is_empty() {
+        source_paths = paths.clone();
+    }
+    source_paths.sort();
+    source_paths.dedup();
+    source_paths
 }
 
 fn compare_worker_candidate_priority(
@@ -6889,6 +7018,9 @@ fn candidate_is_in_recent_attempt_cooldown(
 }
 
 fn candidate_needs_patch_refresh(candidate: &WorkerCandidate) -> bool {
+    if candidate.best_patch_has_upstream_review {
+        return false;
+    }
     candidate
         .issue
         .best_patch
@@ -7105,6 +7237,7 @@ fn worker_candidate_from_row(row: Row) -> Result<WorkerCandidate> {
         .get::<_, Option<Value>>(19)
         .map(latest_attempt_from_json_value)
         .transpose()?;
+    let best_patch_has_upstream_review: bool = row.get(20);
     let rerunnable_source_handoff = best_triage
         .as_ref()
         .and_then(rerunnable_source_handoff)
@@ -7122,6 +7255,7 @@ fn worker_candidate_from_row(row: Row) -> Result<WorkerCandidate> {
         last_attempt_model,
         latest_attempt,
         has_best_triage: best_triage.is_some(),
+        best_patch_has_upstream_review,
         rerunnable_source_handoff,
     })
 }
@@ -21911,6 +22045,137 @@ mod tests {
             issue.representative.finding.details["rerun_reason"].as_str(),
             Some("rerunnable-source-handoff")
         );
+    }
+
+    #[test]
+    fn worker_queue_skips_reviewed_source_path_patch_families() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "docker.io",
+            "Top frame: processEventStream [dockerd]",
+            &["processEventStream [dockerd]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-reviewed",
+            "cluster-reviewed",
+            300,
+            "2026-03-30T10:00:00Z",
+            &representative,
+            &["install-a"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-related",
+            "cluster-related",
+            400,
+            "2026-03-30T10:01:00Z",
+            &representative,
+            &["install-b"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-fresh",
+            "cluster-fresh",
+            100,
+            "2026-03-30T10:02:00Z",
+            &representative,
+            &["install-c"],
+        );
+        let reviewed_patch = PatchAttempt {
+            cluster_id: "issue-reviewed".to_string(),
+            install_id: "worker-install-reviewed".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Throttle event stream restarts.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: libcontainerd: throttle event stream restarts\n\n## Evidence Confidence\nobserved\n\n## Git Add Paths\nengine/libcontainerd/remote/client.go\nengine/libcontainerd/remote/client_test.go\n\n## Validation\ngo test passed\n",
+                    "diff": "--- a/engine/libcontainerd/remote/client.go\n+++ b/engine/libcontainerd/remote/client.go\n@@ -1 +1 @@\n-old\n+new\n",
+                }
+            }),
+            created_at: "2026-03-30T10:03:00Z".to_string(),
+        };
+        let related_patch = PatchAttempt {
+            cluster_id: "issue-related".to_string(),
+            install_id: "worker-install-related".to_string(),
+            outcome: "patch".to_string(),
+            state: "ready".to_string(),
+            summary: "Handle closed event stream channel.".to_string(),
+            bundle_path: None,
+            output_path: None,
+            validation_status: Some("ready".to_string()),
+            details: json!({
+                "published_session": {
+                    "prompt": "patch prompt",
+                    "response": "Subject: libcontainerd: handle closed event stream channel\n\n## Evidence Confidence\nobserved\n\n## Git Add Paths\nengine/libcontainerd/remote/client.go\n\n## Validation\ngo test passed\n",
+                    "diff": "--- a/engine/libcontainerd/remote/client.go\n+++ b/engine/libcontainerd/remote/client.go\n@@ -1 +1 @@\n-old\n+newer\n",
+                }
+            }),
+            created_at: "2026-03-30T10:04:00Z".to_string(),
+        };
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-reviewed",
+                    serde_json::to_string(&reviewed_patch).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    "issue-related",
+                    serde_json::to_string(&related_patch).unwrap()
+                ],
+            )
+            .unwrap();
+        insert_test_attempt(
+            &connection,
+            "attempt-reviewed",
+            "lease-reviewed",
+            &reviewed_patch,
+            "2026-03-30T10:03:00Z",
+        );
+        insert_test_attempt(
+            &connection,
+            "attempt-related",
+            "lease-related",
+            &related_patch,
+            "2026-03-30T10:04:00Z",
+        );
+        connection
+            .execute(
+                "INSERT INTO upstream_reviews
+                 (id, project, title, summary, pr_url, state, merged_at, tags_json, patch_issue_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9)",
+                rusqlite::params![
+                    "moby-libcontainerd-review",
+                    "Moby",
+                    "Throttle event stream restarts.",
+                    "Active source-path-family review.",
+                    "https://github.com/moby/moby/pull/52709",
+                    "review",
+                    serde_json::to_string(&json!(["upstream review"])).unwrap(),
+                    "issue-reviewed",
+                    "2026-03-30T10:05:00Z",
+                ],
+            )
+            .unwrap();
+
+        let issue = test_runtime()
+            .block_on(next_issue_for_worker(&db, "new-worker-install", 0, None))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(issue.id, "issue-fresh");
     }
 
     #[test]
