@@ -1,3 +1,10 @@
+fixer (0.237.0-1) unstable; urgency=medium
+
+  * Treat project build success separately from later sandbox validation
+    blockers.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 29 May 2026 13:24:37 +0400
+
 fixer (0.236.0-1) unstable; urgency=medium
 
   * Generate public proposal diffs from worker-owned git snapshots.

@@ -11661,36 +11661,9 @@ fn public_patch_harvest_blockers(
 }
 
 fn public_patch_has_substantive_validation_success(validation_notes: &[String]) -> bool {
-    validation_notes.iter().any(|note| {
-        let note = note.to_ascii_lowercase();
-        if note.contains("blocked")
-            || note.contains("could not run")
-            || note.contains("did not run")
-        {
-            return false;
-        }
-        let has_project_command = note.contains("go test")
-            || note.contains("cargo test")
-            || note.contains("pytest")
-            || note.contains("make ")
-            || note.contains("ninja")
-            || note.contains("ctest")
-            || note.contains("mvn test")
-            || note.contains("npm test")
-            || note.contains("pnpm test")
-            || note.contains("yarn test")
-            || note.contains("unit test")
-            || note.contains("integration test")
-            || note.contains("full suite")
-            || note.contains("project test")
-            || note.contains("build completed");
-        let has_success = note.contains(" passed")
-            || note.contains(" ok")
-            || note.contains(" successful")
-            || note.contains(" completed successfully")
-            || note.contains(" succeeded");
-        has_project_command && has_success
-    })
+    validation_fragments(validation_notes)
+        .iter()
+        .any(|fragment| validation_fragment_has_project_success(fragment))
 }
 
 fn public_patch_has_limited_observed_validation(
@@ -11712,33 +11685,77 @@ fn public_patch_has_limited_observed_validation(
 }
 
 fn public_patch_has_project_test_success(validation_notes: &[String]) -> bool {
-    validation_notes.iter().any(|note| {
-        let note = note.to_ascii_lowercase();
-        if note.contains("blocked")
-            || note.contains("could not run")
-            || note.contains("did not run")
-            || note.contains("no such target")
-        {
-            return false;
-        }
-        let has_project_test = note.contains("go test")
-            || note.contains("cargo test")
-            || note.contains("pytest")
-            || note.contains("ctest")
-            || note.contains("mvn test")
-            || note.contains("npm test")
-            || note.contains("pnpm test")
-            || note.contains("yarn test")
-            || note.contains("unit test")
-            || note.contains("integration test")
-            || note.contains("make test")
-            || note.contains("make check")
-            || note.contains("make t-exec");
-        has_project_test
-            && (note.contains("passed")
-                || note.contains("completed successfully")
-                || note.contains("ok"))
-    })
+    validation_fragments(validation_notes)
+        .iter()
+        .any(|fragment| {
+            validation_fragment_has_project_test(fragment)
+                && validation_fragment_has_success(fragment)
+        })
+}
+
+fn validation_fragments(validation_notes: &[String]) -> Vec<String> {
+    validation_notes
+        .iter()
+        .flat_map(|note| note.split(['\n', '.']))
+        .map(str::trim)
+        .filter(|fragment| !fragment.is_empty())
+        .map(|fragment| fragment.to_ascii_lowercase())
+        .collect()
+}
+
+fn validation_fragment_has_project_success(fragment: &str) -> bool {
+    if validation_fragment_has_blocker(fragment) {
+        return false;
+    }
+    (validation_fragment_has_project_command(fragment) && validation_fragment_has_success(fragment))
+        || fragment.contains("build completed")
+        || fragment.contains("configure and build completed")
+}
+
+fn validation_fragment_has_project_command(fragment: &str) -> bool {
+    validation_fragment_has_project_test(fragment)
+        || fragment.contains("cmake")
+        || fragment.contains("ninja")
+        || fragment.contains("cargo build")
+        || fragment.contains("make ")
+        || fragment.contains("full suite")
+        || fragment.contains("project build")
+        || fragment.contains("project-level")
+}
+
+fn validation_fragment_has_project_test(fragment: &str) -> bool {
+    fragment.contains("go test")
+        || fragment.contains("cargo test")
+        || fragment.contains("pytest")
+        || fragment.contains("ctest")
+        || fragment.contains("mvn test")
+        || fragment.contains("npm test")
+        || fragment.contains("pnpm test")
+        || fragment.contains("yarn test")
+        || fragment.contains("unit test")
+        || fragment.contains("integration test")
+        || fragment.contains("make test")
+        || fragment.contains("make check")
+        || fragment.contains("make t-exec")
+}
+
+fn validation_fragment_has_success(fragment: &str) -> bool {
+    fragment.contains(" passed")
+        || fragment.contains(" ok")
+        || fragment.contains(" successful")
+        || fragment.contains(" successfully")
+        || fragment.contains(" completed successfully")
+        || fragment.contains(" succeeded")
+}
+
+fn validation_fragment_has_blocker(fragment: &str) -> bool {
+    fragment.contains("blocked")
+        || fragment.contains("could not run")
+        || fragment.contains("did not run")
+        || fragment.contains("no such target")
+        || fragment.contains("failed")
+        || fragment.contains("fatal:")
+        || fragment.contains("error:")
 }
 
 fn extract_patch_response_metadata(response: &str) -> PatchResponseMetadata {
@@ -20198,6 +20215,26 @@ mod tests {
         assert!(card.contains("Next proof/action"));
         assert!(card.contains("blocked runtime or test validation can complete"));
         assert!(card.contains("/issues/issue-1/best.diff"));
+    }
+
+    #[test]
+    fn validation_success_detector_accepts_project_build_before_sandbox_blocker() {
+        let notes = vec![
+            "Configure and build completed, including h3_postgis/src/wkb_regions.c. CTest failed because PostgreSQL regression tests need initdb, and this sandbox runs as root: initdb: error: cannot be run as root.".to_string(),
+        ];
+
+        assert!(public_patch_has_substantive_validation_success(&notes));
+        assert!(!public_patch_has_project_test_success(&notes));
+    }
+
+    #[test]
+    fn validation_success_detector_rejects_format_only_success_before_test_blocker() {
+        let notes = vec![
+            "`gofmt -w engine/daemon/daemon.go engine/daemon/daemon_test.go` ran successfully. `git diff --check -- engine/daemon/daemon.go engine/daemon/daemon_test.go` passed. Focused test attempted: `go test ./daemon -run TestStartParallelStartupTaskBoundsWaitingGoroutines -count=1` Blocked because dependencies could not be resolved.".to_string(),
+        ];
+
+        assert!(!public_patch_has_substantive_validation_success(&notes));
+        assert!(!public_patch_has_project_test_success(&notes));
     }
 
     #[test]
