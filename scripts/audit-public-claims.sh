@@ -4,7 +4,7 @@ set -eu
 HOST=${FIXER_DEPLOY_HOST:-root@fixer.maumap.com}
 SITE=${FIXER_SITE_NAME:-fixer.maumap.com}
 
-if curl -fsS "https://$SITE/" | grep -q "Merged CPython event-driven subprocess wait optimization"; then
+if curl --max-time 60 -fsS "https://$SITE/" | grep -q "Merged CPython event-driven subprocess wait optimization"; then
     echo "public claim audit failed: CPython external coverage is on the landing wins section" >&2
     exit 1
 fi
