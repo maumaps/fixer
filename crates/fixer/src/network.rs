@@ -1805,6 +1805,7 @@ fn build_submission_proposals(
 ) -> Result<Vec<SubmittedProposal>> {
     let mut proposals = Vec::new();
     let mut used_bytes = 0_usize;
+    let linked_proposal_scan_limit = linked_submission_proposal_scan_limit(config);
     let item_ids = items
         .iter()
         .map(|item| item.local_opportunity_id)
@@ -1851,10 +1852,8 @@ fn build_submission_proposals(
         }
     }
 
-    for (local_proposal, remote_issue_id) in store
-        .list_latest_ready_codex_proposals_with_issue_links(
-            config.network.max_submission_proposals,
-        )?
+    for (local_proposal, remote_issue_id) in
+        store.list_latest_ready_codex_proposals_with_issue_links(linked_proposal_scan_limit)?
     {
         if proposals.len() >= config.network.max_submission_proposals {
             break;
@@ -1890,9 +1889,7 @@ fn build_submission_proposals(
     }
 
     for (local_proposal, remote_issue_id) in store
-        .list_latest_ready_process_report_proposals_with_issue_links(
-            config.network.max_submission_proposals,
-        )?
+        .list_latest_ready_process_report_proposals_with_issue_links(linked_proposal_scan_limit)?
     {
         if proposals.len() >= config.network.max_submission_proposals {
             break;
@@ -1928,6 +1925,14 @@ fn build_submission_proposals(
     }
 
     Ok(proposals)
+}
+
+fn linked_submission_proposal_scan_limit(config: &FixerConfig) -> usize {
+    config
+        .network
+        .max_submission_proposals
+        .saturating_mul(8)
+        .max(config.network.max_submission_proposals)
 }
 
 fn push_submission_proposal(
@@ -5729,7 +5734,7 @@ mod tests {
 
         let mut config = FixerConfig::default();
         config.network.max_submission_items = 0;
-        config.network.max_submission_proposals = 2;
+        config.network.max_submission_proposals = 1;
         config.network.max_submission_proposal_bytes = 16_000;
         let identity = store.ensure_install_identity().unwrap();
         let participation = ParticipationSnapshot {

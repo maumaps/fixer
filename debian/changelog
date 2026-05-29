@@ -1,3 +1,9 @@
+fixer (0.233.0-1) unstable; urgency=medium
+
+  * Scan deeper linked proposal queues before publication filtering.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 29 May 2026 12:08:10 +0400
+
 fixer (0.232.0-1) unstable; urgency=medium
 
   * Continue submitting later ready proposals when one candidate is too large.
