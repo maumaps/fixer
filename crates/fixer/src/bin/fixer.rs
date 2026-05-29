@@ -55,7 +55,7 @@ enum Commands {
         #[arg(long, default_value_t = 200)]
         scan_limit: usize,
         #[arg(long)]
-        unpublished_only: bool,
+        include_published: bool,
     },
     Top {
         #[arg(long, default_value = "binary")]
@@ -365,8 +365,9 @@ fn main() -> Result<()> {
         Commands::HarvestCandidates {
             limit,
             scan_limit,
-            unpublished_only,
+            include_published,
         } => {
+            let unpublished_only = !include_published;
             let candidates = app
                 .store
                 .list_latest_ready_codex_proposals(scan_limit, unpublished_only)?;

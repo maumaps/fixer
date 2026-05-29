@@ -1,3 +1,9 @@
+fixer (0.240.0-1) unstable; urgency=medium
+
+  * Prefer unpublished proposals in harvest-candidates output.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 29 May 2026 20:55:00 +0400
+
 fixer (0.239.0-1) unstable; urgency=medium
 
   * Collapse duplicate public patch diffs behind their canonical card.
