@@ -8,7 +8,8 @@ use crate::native_provenance::enrich_runaway_native_executable_provenance;
 use crate::storage::Store;
 use crate::util::{
     command_exists, command_output_with_timeout, command_run_in_dir_with_timeout,
-    command_run_os_with_timeout, command_run_with_timeout, command_status_in_dir_with_timeout,
+    command_run_os_in_dir_with_timeout, command_run_os_with_timeout, command_run_with_timeout,
+    command_status_in_dir_with_timeout, command_status_os_in_dir_with_timeout,
     command_status_os_with_timeout, now_rfc3339, read_text,
 };
 use crate::workspace::resolve_installed_package_metadata;
@@ -18,6 +19,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
 use std::io::Write;
@@ -1930,18 +1932,19 @@ fn render_public_session_git_diff(
     }
     let intended_paths = sanitize_git_add_paths(git_add_paths);
     if !intended_paths.is_empty() {
-        let mut args = vec!["add", "-N", "--"];
-        args.extend(intended_paths.iter().map(String::as_str));
-        let _ = command_status_in_dir_with_timeout(
+        let mut args = git_workspace_args(workspace_root, &["add", "-N", "--"]);
+        args.extend(intended_paths.iter().map(OsString::from));
+        let arg_refs = args.iter().map(OsString::as_os_str).collect::<Vec<_>>();
+        let _ = command_status_os_in_dir_with_timeout(
             "git",
-            &args,
+            &arg_refs,
             workspace_root,
             StdDuration::from_secs(PROPOSAL_HELPER_COMMAND_TIMEOUT_SECONDS),
         );
     }
 
-    let output = command_run_in_dir_with_timeout(
-        "git",
+    let args = git_workspace_args(
+        workspace_root,
         &[
             "diff",
             "--no-ext-diff",
@@ -1953,6 +1956,11 @@ fn render_public_session_git_diff(
             "--",
             ".",
         ],
+    );
+    let arg_refs = args.iter().map(OsString::as_os_str).collect::<Vec<_>>();
+    let output = command_run_os_in_dir_with_timeout(
+        "git",
+        &arg_refs,
         workspace_root,
         StdDuration::from_secs(PROPOSAL_DIFF_TIMEOUT_SECONDS),
     )
@@ -1969,20 +1977,42 @@ fn render_public_session_git_diff(
     }
 }
 
+fn git_workspace_args(workspace_root: &Path, args: &[&str]) -> Vec<OsString> {
+    let mut safe_args = vec![
+        OsString::from("-c"),
+        OsString::from(format!("safe.directory={}", workspace_root.display())),
+    ];
+    safe_args.extend(args.iter().map(OsString::from));
+    safe_args
+}
+
 fn workspace_changed_paths(workspace_root: &Path) -> Vec<String> {
     if !workspace_root.join(".git").exists() || !command_exists("git") {
         return Vec::new();
     }
 
-    let tracked_output = command_run_in_dir_with_timeout(
+    let tracked_args = git_workspace_args(workspace_root, &["diff", "--name-only", "--relative"]);
+    let tracked_arg_refs = tracked_args
+        .iter()
+        .map(OsString::as_os_str)
+        .collect::<Vec<_>>();
+    let tracked_output = command_run_os_in_dir_with_timeout(
         "git",
-        &["diff", "--name-only", "--relative"],
+        &tracked_arg_refs,
         workspace_root,
         StdDuration::from_secs(PROPOSAL_HELPER_COMMAND_TIMEOUT_SECONDS),
     );
-    let untracked_output = command_run_in_dir_with_timeout(
-        "git",
+    let untracked_args = git_workspace_args(
+        workspace_root,
         &["ls-files", "--others", "--exclude-standard"],
+    );
+    let untracked_arg_refs = untracked_args
+        .iter()
+        .map(OsString::as_os_str)
+        .collect::<Vec<_>>();
+    let untracked_output = command_run_os_in_dir_with_timeout(
+        "git",
+        &untracked_arg_refs,
         workspace_root,
         StdDuration::from_secs(PROPOSAL_HELPER_COMMAND_TIMEOUT_SECONDS),
     );
@@ -7485,7 +7515,7 @@ mod tests {
     use super::{
         build_compact_patch_retry_prompt, classify_codex_failure, diagnose_desktop_app_failure,
         extract_git_add_paths_from_response, filter_generated_public_diff_blocks,
-        initialize_workspace_git_baseline, is_generated_public_diff_path,
+        git_workspace_args, initialize_workspace_git_baseline, is_generated_public_diff_path,
         load_published_codex_session, parse_review_verdict, pg_amcheck_command,
         prepare_codex_job_with_prior_patch, primary_model_rate_limit_active,
         process_investigation_blocker_kind, rank_complaint_package_candidates,
@@ -7504,6 +7534,7 @@ mod tests {
     };
     use crate::storage::Store;
     use serde_json::{Value, json};
+    use std::ffi::OsString;
     use std::io::Write;
     use std::path::{Path, PathBuf};
 
@@ -9531,6 +9562,21 @@ RESULT: ok
 
         assert!(diff.contains("src/new.c"));
         assert!(!diff.contains(".deps-temp"));
+    }
+
+    #[test]
+    fn git_workspace_args_marks_proposal_workspace_safe() {
+        let workspace = Path::new("/var/lib/fixer/proposals/example/workspace");
+
+        let args = git_workspace_args(workspace, &["diff", "--relative"]);
+
+        assert_eq!(args[0], OsString::from("-c"));
+        assert_eq!(
+            args[1],
+            OsString::from("safe.directory=/var/lib/fixer/proposals/example/workspace")
+        );
+        assert_eq!(args[2], OsString::from("diff"));
+        assert_eq!(args[3], OsString::from("--relative"));
     }
 
     #[test]

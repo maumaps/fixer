@@ -1,3 +1,9 @@
+fixer (0.236.0-1) unstable; urgency=medium
+
+  * Generate public proposal diffs from worker-owned git snapshots.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 29 May 2026 13:01:32 +0400
+
 fixer (0.235.0-1) unstable; urgency=medium
 
   * Skip worker refreshes for patch source families that already have an
