@@ -1,3 +1,9 @@
+fixer (0.242.0-1) unstable; urgency=medium
+
+  * Ignore negated Security impact lines in patch-surface classifier.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 29 May 2026 22:27:00 +0400
+
 fixer (0.241.0-1) unstable; urgency=medium
 
   * Symbolize stripped Go binary perf offsets via go tool addr2line.

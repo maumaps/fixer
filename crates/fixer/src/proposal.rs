@@ -3999,7 +3999,7 @@ fn response_has_security_sensitive_patch_surface(response: &str, issue_connectio
     let commit_lower = extract_patch_markdown_section_raw(response, "Commit Message")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let security_text = format!("{commit_lower}\n{issue_lower}");
+    let security_text = security_sensitive_scan_text(&format!("{commit_lower}\n{issue_lower}"));
     let changed_paths = sanitize_git_add_paths(&extract_git_add_paths_from_response(response));
     let has_sensitive_path = changed_paths.iter().any(|path| {
         let path = path.to_ascii_lowercase();
@@ -4067,6 +4067,20 @@ fn response_has_security_sensitive_patch_surface(response: &str, issue_connectio
     .any(|marker| security_text.contains(marker));
 
     has_sensitive_text || (has_sensitive_path && has_timing_or_throttle_text)
+}
+
+fn security_sensitive_scan_text(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            let marker_index = ["security impact:", "security-impact:", "security note:"]
+                .iter()
+                .filter_map(|marker| lower.find(marker))
+                .min();
+            marker_index.map(|index| &line[..index]).unwrap_or(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn validation_names_reproduction(validation_lower: &str) -> bool {
@@ -10905,6 +10919,29 @@ Ran `autoreconf && ./configure && make -j2 auth2.o sshd-auth`.
 
         assert!(error.contains("Security-sensitive source patches"));
         assert!(error.contains("observed-only"));
+    }
+
+    #[test]
+    fn patch_explanation_quality_guard_ignores_negated_security_impact_line() {
+        let response = r#"Subject: linux: reduce proc maps scans for stale-library checks
+
+## Commit Message
+Limit `/proc/<pid>/maps` scans when htop is only checking for deleted mapped libraries.
+
+## Evidence Confidence
+observed
+
+## Issue Connection
+Fixer observed sampled CPU in htop's procfs map formatting path, and I did not independently reproduce the original runtime workload. This patch splits the deleted-library highlighting cadence from the displayed library-size column, so the expected effect is fewer maps reads during ordinary refreshes. Security impact: this changes UI polling cadence for a visual hint only; it is not authentication, authorization, permissions, or a security throttle.
+
+## Git Add Paths
+linux/LinuxProcessTable.c
+
+## Validation
+Ran `./autogen.sh && ./configure && make`, `make check`, and `git diff --check`.
+"#;
+
+        assert!(super::patch_explanation_quality_failure(response, None).is_none());
     }
 
     #[test]
