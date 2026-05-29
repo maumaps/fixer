@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -7817,8 +7818,15 @@ fn perf_raw_symbol_offset(symbol: &str) -> Option<u64> {
 }
 
 fn symbolize_perf_offset(dso_path: &Path, offset: u64) -> Option<String> {
-    if dso_path.exists() && command_exists("addr2line") {
-        return symbol_from_addr2line(dso_path, offset);
+    if dso_path.exists() {
+        if command_exists("addr2line") {
+            if let Some(symbol) = symbol_from_addr2line(dso_path, offset) {
+                return Some(symbol);
+            }
+        }
+        if command_exists("go") {
+            return symbol_from_go_addr2line(dso_path, offset);
+        }
     }
     None
 }
@@ -8468,6 +8476,11 @@ fn resolve_frame_symbol(
             return Some((symbol, "addr2line".to_string()));
         }
     }
+    if command_exists("go") {
+        if let Some(symbol) = symbol_from_go_addr2line(object, offset) {
+            return Some((symbol, "go-addr2line".to_string()));
+        }
+    }
     if command_exists("nm") {
         if let Some(symbol) = nearest_dynamic_symbol(object, offset, nm_cache) {
             return Some((symbol, "nm-dynamic".to_string()));
@@ -8492,6 +8505,35 @@ fn symbol_from_addr2line(object: &Path, offset: u64) -> Option<String> {
         return None;
     }
     Some(line.split(" at ").next().unwrap_or(line).trim().to_string())
+}
+
+fn symbol_from_go_addr2line(object: &Path, offset: u64) -> Option<String> {
+    let mut child = Command::new("go")
+        .args(["tool", "addr2line"])
+        .arg(object)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    {
+        let stdin = child.stdin.as_mut()?;
+        writeln!(stdin, "0x{offset:x}").ok()?;
+    }
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let mut lines = rendered
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "?" && !line.starts_with("?:"));
+    let function = lines.next()?;
+    if function == "??" {
+        return None;
+    }
+    Some(function.to_string())
 }
 
 fn nearest_dynamic_symbol(
@@ -8624,7 +8666,7 @@ mod tests {
     use crate::config::FixerConfig;
     use crate::models::{ParticipationMode, ParticipationState, PopularBinaryProfile};
     use crate::storage::Store;
-    use crate::util::maybe_canonicalize;
+    use crate::util::{command_exists, maybe_canonicalize};
     use chrono::Utc;
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -9546,6 +9588,75 @@ Stack trace of thread 222:\n\
 
         assert_eq!(hot_paths.len(), 1);
         assert_ne!(hot_paths[0].symbol, "unresolved offset");
+    }
+
+    #[test]
+    fn perf_report_parser_symbolizes_stripped_go_offsets() {
+        if !command_exists("go") || !command_exists("strip") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("main.go");
+        fs::write(
+            &source_path,
+            "package main\nfunc hotspot() {}\nfunc main() { hotspot() }\n",
+        )
+        .unwrap();
+        let binary_path = dir.path().join("go-hotspot");
+        let build = Command::new("go")
+            .args(["build", "-o"])
+            .arg(&binary_path)
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        if !build.status.success() {
+            return;
+        }
+        let nm = Command::new("go")
+            .args(["tool", "nm"])
+            .arg(&binary_path)
+            .output()
+            .unwrap();
+        if !nm.status.success() {
+            return;
+        }
+        let Some(symbol_offset) = String::from_utf8_lossy(&nm.stdout)
+            .lines()
+            .find_map(|line| {
+                let parts = line.split_whitespace().collect::<Vec<_>>();
+                if parts.len() < 3 || parts[2] != "main.main" {
+                    return None;
+                }
+                u64::from_str_radix(parts[0], 16).ok()
+            })
+        else {
+            return;
+        };
+        let strip = Command::new("strip")
+            .arg("-s")
+            .arg(&binary_path)
+            .output()
+            .unwrap();
+        if !strip.status.success() {
+            return;
+        }
+        let report = format!("  12.50%  go-hotspot  go-hotspot  [.] 0x{symbol_offset:016x}\n");
+        let target = PopularBinaryProfile {
+            name: "go-hotspot".to_string(),
+            path: binary_path.clone(),
+            package_name: None,
+            process_count: 1,
+            total_cpu_percent: 12.5,
+            max_cpu_percent: 12.5,
+        };
+        let mut dso_paths = HashMap::new();
+        dso_paths.insert("go-hotspot".to_string(), binary_path);
+
+        let hot_paths = parse_perf_hot_paths(&report, &target, &dso_paths);
+
+        assert_eq!(hot_paths.len(), 1);
+        assert_ne!(hot_paths[0].symbol, "unresolved offset");
+        assert!(hot_paths[0].symbol.contains("main.main"));
     }
 
     fn first_addr2line_resolvable_symbol_offset(object_path: &Path) -> Option<u64> {

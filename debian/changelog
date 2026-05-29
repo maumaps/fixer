@@ -1,3 +1,9 @@
+fixer (0.241.0-1) unstable; urgency=medium
+
+  * Symbolize stripped Go binary perf offsets via go tool addr2line.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Fri, 29 May 2026 22:00:00 +0400
+
 fixer (0.240.0-1) unstable; urgency=medium
 
   * Prefer unpublished proposals in harvest-candidates output.
