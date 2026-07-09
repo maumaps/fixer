@@ -370,13 +370,27 @@ fn main() -> Result<()> {
             let unpublished_only = !include_published;
             let candidates = app
                 .store
-                .list_latest_ready_codex_proposals(scan_limit, unpublished_only)?;
+                .list_latest_ready_codex_proposals(scan_limit, false)?;
             let mut printed = 0usize;
-            for (proposal, opportunity, remote_issue_id) in candidates {
+            let mut skipped_published = 0usize;
+            let mut skipped_missing_bundle = 0usize;
+            let mut skipped_missing_patch_output = 0usize;
+            let mut skipped_without_git_add_paths = 0usize;
+            for (proposal, opportunity, remote_issue_id) in candidates.iter() {
+                if unpublished_only && remote_issue_id.is_some() {
+                    skipped_published += 1;
+                    continue;
+                }
+                if !proposal.bundle_path.exists() {
+                    skipped_missing_bundle += 1;
+                    continue;
+                }
                 let Some(metadata) = read_harvest_candidate_metadata(&proposal.bundle_path)? else {
+                    skipped_missing_patch_output += 1;
                     continue;
                 };
                 if metadata.git_add_paths.is_empty() {
+                    skipped_without_git_add_paths += 1;
                     continue;
                 }
                 printed += 1;
@@ -402,10 +416,10 @@ fn main() -> Result<()> {
                         app.config.network.server_url, remote_issue_id
                     );
                 }
-                if let Some(repo_root) = opportunity.repo_root {
+                if let Some(repo_root) = &opportunity.repo_root {
                     println!("  repo: {}", repo_root.display());
                 }
-                if let Some(ecosystem) = opportunity.ecosystem {
+                if let Some(ecosystem) = &opportunity.ecosystem {
                     println!("  ecosystem: {ecosystem}");
                 }
                 if printed >= limit {
@@ -419,6 +433,19 @@ fn main() -> Result<()> {
                 );
             } else if printed >= limit {
                 eprintln!("showing first {printed}; increase --limit for more");
+            }
+            eprintln!(
+                "harvest scan summary: scanned_latest_ready={} skipped_published={} skipped_missing_bundle={} skipped_missing_patch_output={} skipped_without_git_add_paths={}",
+                candidates.len(),
+                skipped_published,
+                skipped_missing_bundle,
+                skipped_missing_patch_output,
+                skipped_without_git_add_paths
+            );
+            if unpublished_only && skipped_published > 0 {
+                eprintln!(
+                    "hint: rerun with --include-published to audit already-published local bundles"
+                );
             }
         }
         Commands::Top { kind } => {

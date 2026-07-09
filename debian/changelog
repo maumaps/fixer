@@ -1,3 +1,10 @@
+fixer (0.244.0-1) unstable; urgency=medium
+
+  * Prompt Codex runs to fan out bounded subagents and use Spark leaf workers.
+  * Show harvest-candidates skip counts and include-published hints.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 09 Jul 2026 20:35:00 +0400
+
 fixer (0.243.0-1) unstable; urgency=medium
 
   * Bound Codex worker memory in transient user units.

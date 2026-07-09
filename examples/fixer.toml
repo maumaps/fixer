@@ -21,20 +21,21 @@ codex_args = []
 codex_memory_max = "8G"
 model = "gpt-5.5"
 reasoning_effort = "high"
-spark_model = ""
+spark_model = "gpt-5.3-codex-spark"
 sandbox = "workspace-write"
 approval_policy = "never"
 extra_instructions = "Keep the change narrowly scoped and leave a concise summary in the final message."
 plan_before_patch = true
 review_after_patch = true
 review_fix_passes = 1
-spark_fallback_on_rate_limit = false
+spark_fallback_on_rate_limit = true
 rate_limit_cooldown_seconds = 21600
 opportunistic_worker = false
 opportunistic_admission_url = "http://127.0.0.1:2455/backend-api/codex/opportunistic/admission"
 # opportunistic_admission_token_file = "/etc/fixer/codex-lb.key"
-# For full multi-step repairs, prefer normal Codex with planning.
-# Set spark_model only when the configured Codex token is allowed to use it.
+# For full multi-step repairs, keep normal Codex as the lead with planning, but
+# use Spark aggressively for bounded subagent leaves and rate-limit fallback.
+# Clear spark_model only when the configured Codex token cannot use it.
 
 [network]
 server_url = "http://127.0.0.1:8080/"

@@ -3571,6 +3571,10 @@ fn summarize_failure_log(log: &str) -> String {
     }
 }
 
+fn codex_subagent_prompt_hint() -> &'static str {
+    "\n\nCodex subagent/fan-out expectation: for any non-trivial investigation, do not keep all checking in the lead context. Proactively spawn bounded leaf subagents for independent source inspection, duplicate/upstream search, implementation sanity checks, and verification while the lead owns integration. Use the newest available mini model for read-only scouts, and use `gpt-5.3-codex-spark` aggressively for tiny coding, test, and verification leaves even when the lead model is `gpt-5.5`. Pass model names explicitly when spawning. Keep subagents as leaves: tell them not to spawn their own agents, not to run recursive `codex review`, not to perform public/external/destructive actions, and not to duplicate the same live-state operation. Merge their evidence into the final patch/report instead of merely saying a subagent looked."
+}
+
 fn build_prompt(
     opportunity: &OpportunityRecord,
     evidence_path: &std::path::Path,
@@ -3619,8 +3623,9 @@ fn build_prompt(
     let validation_hint = investigation_validation_hint(opportunity, workspace);
     let build_validation_hint = workspace_build_validation_hint(workspace);
     let upstream_style_hint = upstream_style_prompt_hint(workspace);
+    let subagent_hint = codex_subagent_prompt_hint();
     format!(
-        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, keep the change upstreamable, prefer the clearest control flow available, and do not keep avoidable `goto` when a simpler structure would read better. Before introducing new file, process, allocation, locking, networking, or platform APIs, inspect nearby code and project contribution docs for existing helpers or compatibility wrappers and use those local patterns unless you can explain why they do not fit. Validate from a reproducible workspace-root entrypoint before falling back to focused leaf commands; if a build or test cannot run, report the exact command, the exact blocker, and any narrower check you ran instead. During validation, also try one bounded independent reproduction of the collected failure signal when it is safe and cheap, such as a failing test, smoke command, perf/strace comparison, or before/after runtime check. Only use `reproduced` if that command or test actually reproduced the failure; otherwise keep `observed` and report the reproduction blocker. The final explanation must connect the observed issue evidence to the actual code change, not just paraphrase the diff. Write like a maintainer is going to read the patch mail cold: explain the bug in plain language, define subsystem-specific jargon the first time you need it, and make the causal story obvious. Explicitly classify evidence confidence as `reproduced`, `observed`, or `inferred`: `reproduced` means you reproduced the failure locally; `observed` means Fixer has direct crash/log/trace evidence but you did not independently reproduce it; `inferred` means the source patch is not pull-request-ready, so do not leave a source diff unless you first gather stronger observed/reproduced evidence; otherwise return a no-patch diagnosis/report. For any source-changing `observed` patch, say explicitly in `## Issue Connection` that the failure was observed by Fixer and not independently reproduced. Security-sensitive areas such as authentication, authorization, credentials, cryptography, sandboxing, permissions, and timing/throttling behavior need reproduced evidence plus explicit security-impact analysis before leaving a source diff; otherwise return a no-patch diagnosis/report for human review. If you introduce non-obvious state translation, index remapping, or backend split logic, add a short source comment that explains the invariant being preserved.{}{}{}{}{} \n\n{}\n\n{}",
+        "You are working on a bounded fixer proposal.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Produce the smallest reasonable patch for the target repository, keep the change upstreamable, prefer the clearest control flow available, and do not keep avoidable `goto` when a simpler structure would read better. Before introducing new file, process, allocation, locking, networking, or platform APIs, inspect nearby code and project contribution docs for existing helpers or compatibility wrappers and use those local patterns unless you can explain why they do not fit. Validate from a reproducible workspace-root entrypoint before falling back to focused leaf commands; if a build or test cannot run, report the exact command, the exact blocker, and any narrower check you ran instead. During validation, also try one bounded independent reproduction of the collected failure signal when it is safe and cheap, such as a failing test, smoke command, perf/strace comparison, or before/after runtime check. Only use `reproduced` if that command or test actually reproduced the failure; otherwise keep `observed` and report the reproduction blocker. The final explanation must connect the observed issue evidence to the actual code change, not just paraphrase the diff. Write like a maintainer is going to read the patch mail cold: explain the bug in plain language, define subsystem-specific jargon the first time you need it, and make the causal story obvious. Explicitly classify evidence confidence as `reproduced`, `observed`, or `inferred`: `reproduced` means you reproduced the failure locally; `observed` means Fixer has direct crash/log/trace evidence but you did not independently reproduce it; `inferred` means the source patch is not pull-request-ready, so do not leave a source diff unless you first gather stronger observed/reproduced evidence; otherwise return a no-patch diagnosis/report. For any source-changing `observed` patch, say explicitly in `## Issue Connection` that the failure was observed by Fixer and not independently reproduced. Security-sensitive areas such as authentication, authorization, credentials, cryptography, sandboxing, permissions, and timing/throttling behavior need reproduced evidence plus explicit security-impact analysis before leaving a source diff; otherwise return a no-patch diagnosis/report for human review. If you introduce non-obvious state translation, index remapping, or backend split logic, add a short source comment that explains the invariant being preserved.{}{}{}{}{}{} \n\n{}\n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -3629,6 +3634,7 @@ fn build_prompt(
         validation_hint,
         build_validation_hint,
         upstream_style_hint,
+        subagent_hint,
         extra,
         patch_response_contract(),
     )
@@ -3652,8 +3658,9 @@ fn build_plan_prompt(
     let validation_hint = plan_validation_hint(subsystem, workspace);
     let build_validation_hint = workspace_build_validation_hint(workspace);
     let upstream_style_hint = upstream_style_prompt_hint(workspace);
+    let subagent_hint = codex_subagent_prompt_hint();
     format!(
-        "You are planning a fixer patch before any edits happen.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`.{}{}{}{}{} Inspect the relevant code, nearby callers, project contribution docs, and local helper/compat APIs, but do not edit files in this pass.\n\nReturn a short markdown plan with these exact sections:\n\n## Problem\n## Evidence Confidence\n## Proposed Subject\n## Patch Plan\n## Risks\n## Validation\n\nClassify `## Evidence Confidence` as exactly one of `reproduced`, `observed`, or `inferred`. Use `inferred` only for a no-patch diagnosis/report plan unless you can name the extra evidence you will collect before editing; inferred source patches are blocked by Fixer because they are not pull-request-ready. For `observed` source-patch plans, plan to say in the final `## Issue Connection` that the failure was observed by Fixer and not independently reproduced. If the plan touches authentication, authorization, credentials, cryptography, sandboxing, permissions, timing/throttling behavior, or PostgreSQL database-core behavior such as dynamic library resolution, extension loading, transaction semantics, locking, planner/executor behavior, catalog changes, or storage changes, treat it as high-risk: do not plan a source patch unless validation can reproduce the behavior and analyze the semantic impact; otherwise plan a no-patch diagnosis/report. The plan must explain how the proposed code change addresses the observed issue evidence, call out any prior Fixer patch that should be improved or replaced, reject awkward control flow such as avoidable `goto` if there is a cleaner bounded alternative, name any local helper APIs or maintainer conventions the patch should follow, and keep the intended maintainer-facing explanation clear enough that someone unfamiliar with the local complaint wording can still follow the fix. In `## Validation`, name the reproducible configure/build/test entrypoint you will try from the workspace root before any focused leaf compile or smoke check, and include one bounded independent reproduction attempt for the collected failure signal when it is safe and cheap. Do not plan to claim `reproduced` unless that reproduction command or test can actually show the failure.",
+        "You are planning a fixer patch before any edits happen.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`.{}{}{}{}{}{} Inspect the relevant code, nearby callers, project contribution docs, and local helper/compat APIs, but do not edit files in this pass.\n\nReturn a short markdown plan with these exact sections:\n\n## Problem\n## Evidence Confidence\n## Proposed Subject\n## Patch Plan\n## Risks\n## Validation\n\nClassify `## Evidence Confidence` as exactly one of `reproduced`, `observed`, or `inferred`. Use `inferred` only for a no-patch diagnosis/report plan unless you can name the extra evidence you will collect before editing; inferred source patches are blocked by Fixer because they are not pull-request-ready. For `observed` source-patch plans, plan to say in the final `## Issue Connection` that the failure was observed by Fixer and not independently reproduced. If the plan touches authentication, authorization, credentials, cryptography, sandboxing, permissions, timing/throttling behavior, or PostgreSQL database-core behavior such as dynamic library resolution, extension loading, transaction semantics, locking, planner/executor behavior, catalog changes, or storage changes, treat it as high-risk: do not plan a source patch unless validation can reproduce the behavior and analyze the semantic impact; otherwise plan a no-patch diagnosis/report. The plan must explain how the proposed code change addresses the observed issue evidence, call out any prior Fixer patch that should be improved or replaced, reject awkward control flow such as avoidable `goto` if there is a cleaner bounded alternative, name any local helper APIs or maintainer conventions the patch should follow, and keep the intended maintainer-facing explanation clear enough that someone unfamiliar with the local complaint wording can still follow the fix. In `## Validation`, name the reproducible configure/build/test entrypoint you will try from the workspace root before any focused leaf compile or smoke check, and include one bounded independent reproduction attempt for the collected failure signal when it is safe and cheap. Do not plan to claim `reproduced` unless that reproduction command or test can actually show the failure.",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -3662,6 +3669,7 @@ fn build_plan_prompt(
         validation_hint,
         build_validation_hint,
         upstream_style_hint,
+        subagent_hint,
     )
 }
 
@@ -4722,6 +4730,7 @@ fn build_review_prompt(
     };
     let upstream_style_hint = upstream_style_prompt_hint(workspace);
     let build_validation_hint = workspace_build_validation_hint(workspace);
+    let subagent_hint = codex_subagent_prompt_hint();
     let subsystem_hint = match investigation_subsystem_from_bundle(evidence_path).as_deref() {
         Some("desktop-input-config") => {
             "\n\nFor `desktop-input-config` patches, also verify semantic correctness: reject any patch that only hides, disables, unregisters, or de-interactivates the keyboard-layout runtime surface instead of fixing the reported behavior. A patch is `fix-needed` if it preserves only static config state, makes current-layout reporting synthetic, turns switching methods into no-ops, or otherwise removes the user-visible switcher path to avoid the original bug."
@@ -4735,7 +4744,7 @@ fn build_review_prompt(
         _ => "",
     };
     format!(
-        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{}{}{}{}{} The latest author response is at `{}`. Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, weak or non-gittable commit message text, and explanations that fail to connect the observed issue evidence to the code change. Also review the maintainer experience: the patch mail should be easy to accept upstream, the user-visible bug should be explained in plain language, subsystem-specific jargon should be defined when first used, and any non-obvious state translation or index remapping in code should have a short explanatory comment. Reject patches that omit `## Evidence Confidence`, use anything other than `reproduced`, `observed`, or `inferred`, or sound more certain than that evidence level allows. Reject patches that claim `reproduced` unless `## Validation` names the concrete reproduction command or test and its result. Reject source patches in security-sensitive areas such as authentication, authorization, credentials, cryptography, sandboxing, permissions, and timing/throttling behavior unless the author reproduced the behavior and explicitly analyzed the security impact of the change; observed-only evidence should become a diagnosis/report, not a PR-ready source diff. Reject patches that invent a reproducer, command line, crash, or user-visible failure not present in the evidence bundle; indirect profiler or strace evidence may justify a cautious mitigation, but the author must say it is indirect instead of presenting it as a confirmed upstream bug. Reject patches that introduce generic libc/std APIs when nearby code or project docs provide a local compat/helper API for the same job, unless the author explicitly justifies the exception. Reject validation that only reports a leaf object/syntax build when a project-level configure/build/test entrypoint exists and was not attempted; if a full build cannot run, the author must show the exact failed command and blocker.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
+        "You are reviewing a freshly generated fixer patch.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. {}{}{}{}{}{}{} The latest author response is at `{}`. Inspect the current code and changed paths like a strict code reviewer. Focus on correctness, regressions, maintainability, awkward control flow such as avoidable `goto`, missing validation, weak or non-gittable commit message text, and explanations that fail to connect the observed issue evidence to the code change. Also review the maintainer experience: the patch mail should be easy to accept upstream, the user-visible bug should be explained in plain language, subsystem-specific jargon should be defined when first used, and any non-obvious state translation or index remapping in code should have a short explanatory comment. Reject patches that omit `## Evidence Confidence`, use anything other than `reproduced`, `observed`, or `inferred`, or sound more certain than that evidence level allows. Reject patches that claim `reproduced` unless `## Validation` names the concrete reproduction command or test and its result. Reject source patches in security-sensitive areas such as authentication, authorization, credentials, cryptography, sandboxing, permissions, and timing/throttling behavior unless the author reproduced the behavior and explicitly analyzed the security impact of the change; observed-only evidence should become a diagnosis/report, not a PR-ready source diff. Reject patches that invent a reproducer, command line, crash, or user-visible failure not present in the evidence bundle; indirect profiler or strace evidence may justify a cautious mitigation, but the author must say it is indirect instead of presenting it as a confirmed upstream bug. Reject patches that introduce generic libc/std APIs when nearby code or project docs provide a local compat/helper API for the same job, unless the author explicitly justifies the exception. Reject validation that only reports a leaf object/syntax build when a project-level configure/build/test entrypoint exists and was not attempted; if a full build cannot run, the author must show the exact failed command and blocker.\n\nDo not apply code changes in this pass.\n\nReturn a short markdown review report. The first non-empty line must be exactly one of:\n\nRESULT: ok\nRESULT: fix-needed\n\nIf you choose `RESULT: fix-needed`, add a `## Findings` section with concrete, actionable items.",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -4745,6 +4754,7 @@ fn build_review_prompt(
         subsystem_hint,
         upstream_style_hint,
         build_validation_hint,
+        subagent_hint,
         latest_patch_output_path.display(),
     )
 }
@@ -4794,8 +4804,9 @@ fn build_refinement_prompt(
     };
     let upstream_style_hint = upstream_style_prompt_hint(workspace);
     let build_validation_hint = workspace_build_validation_hint(workspace);
+    let subagent_hint = codex_subagent_prompt_hint();
     format!(
-        "You are refining a fixer patch after an explicit code review.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the latest author response at `{}`. Read the review report at `{}`. This is refinement round {}.{}{}{}{}{}{} Address the review findings with the smallest reasonable follow-up changes. If the review identifies a runtime or correctness bug in the changed code, you must update the code itself before answering; a metadata-only response is not sufficient. Keep the patch upstream-friendly, use local project helpers and compat APIs when available, avoid awkward control flow when a simpler structure will do, keep the final response gittable, make the maintainer-facing explanation plain and direct, keep `## Evidence Confidence` honest, add short comments for any non-obvious translation or remapping logic, run relevant project-level build/tests from the workspace root before narrower checks when possible, try a bounded independent reproduction command/test if the review or plan shows one is safe, and summarize which review findings you addressed.\n\n{}",
+        "You are refining a fixer patch after an explicit code review.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the latest author response at `{}`. Read the review report at `{}`. This is refinement round {}.{}{}{}{}{}{}{} Address the review findings with the smallest reasonable follow-up changes. If the review identifies a runtime or correctness bug in the changed code, you must update the code itself before answering; a metadata-only response is not sufficient. Keep the patch upstream-friendly, use local project helpers and compat APIs when available, avoid awkward control flow when a simpler structure will do, keep the final response gittable, make the maintainer-facing explanation plain and direct, keep `## Evidence Confidence` honest, add short comments for any non-obvious translation or remapping logic, run relevant project-level build/tests from the workspace root before narrower checks when possible, try a bounded independent reproduction command/test if the review or plan shows one is safe, and summarize which review findings you addressed.\n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -4808,6 +4819,7 @@ fn build_refinement_prompt(
         subsystem_hint,
         upstream_style_hint,
         build_validation_hint,
+        subagent_hint,
         patch_response_contract(),
     )
 }
@@ -4845,8 +4857,9 @@ fn build_refinement_timeout_recovery_prompt(
     };
     let upstream_style_hint = upstream_style_prompt_hint(workspace);
     let build_validation_hint = workspace_build_validation_hint(workspace);
+    let subagent_hint = codex_subagent_prompt_hint();
     format!(
-        "A Fixer refinement stage timed out after it may already have edited the workspace.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the previous author response at `{}` and the review report at `{}`. The timed-out refinement output path is `{}` and the timeout was: `{}`. This was refinement round {}.{}{}{}{}\n\nInspect the current workspace state before answering. If the prior timed-out pass already addressed the review finding, do not redo the patch from scratch; write the complete final author response for the current diff and run only the smallest validation needed to make that response truthful. If the workspace is only partially fixed, finish the smallest safe correction first. If the timeout left the workspace inconsistent or unreviewable, revert the partial edits and explain the blocker.\n\n{}",
+        "A Fixer refinement stage timed out after it may already have edited the workspace.\n\nRead the evidence bundle at `{}`. The prepared workspace is `{}` and it was acquired via `{}`. Read the previous author response at `{}` and the review report at `{}`. The timed-out refinement output path is `{}` and the timeout was: `{}`. This was refinement round {}.{}{}{}{}{}\n\nInspect the current workspace state before answering. If the prior timed-out pass already addressed the review finding, do not redo the patch from scratch; write the complete final author response for the current diff and run only the smallest validation needed to make that response truthful. If the workspace is only partially fixed, finish the smallest safe correction first. If the timeout left the workspace inconsistent or unreviewable, revert the partial edits and explain the blocker.\n\n{}",
         evidence_path.display(),
         workspace.repo_root.display(),
         workspace.source_kind,
@@ -4859,6 +4872,7 @@ fn build_refinement_timeout_recovery_prompt(
         changed_paths_hint,
         upstream_style_hint,
         build_validation_hint,
+        subagent_hint,
         patch_response_contract(),
     )
 }
@@ -8970,6 +8984,18 @@ mod tests {
     }
 
     #[test]
+    fn default_codex_policy_keeps_spark_available_for_fallback_and_leaves() {
+        let config = FixerConfig::default();
+
+        assert_eq!(config.patch.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            config.patch.spark_model.as_deref(),
+            Some("gpt-5.3-codex-spark")
+        );
+        assert!(config.patch.spark_fallback_on_rate_limit);
+    }
+
+    #[test]
     fn desktop_input_config_jobs_do_not_force_spark_when_primary_unset() {
         let mut config = FixerConfig::default();
         config.patch.model = None;
@@ -10460,8 +10486,63 @@ plain stderr line
 
         assert!(review_prompt.contains("Reject patches that introduce generic libc/std APIs"));
         assert!(review_prompt.contains("local compat/helper API"));
+        assert!(review_prompt.contains("gpt-5.3-codex-spark"));
+        assert!(review_prompt.contains("Keep subagents as leaves"));
         assert!(refinement_prompt.contains("use local project helpers and compat APIs"));
         assert!(refinement_prompt.contains("CONTRIBUTING"));
+        assert!(refinement_prompt.contains("Pass model names explicitly when spawning"));
+    }
+
+    #[test]
+    fn plan_and_patch_prompts_tell_codex_to_fan_out_with_spark_leaves() {
+        let opportunity = OpportunityRecord {
+            id: 42,
+            finding_id: 42,
+            kind: "investigation".to_string(),
+            title: "Runaway CPU investigation for htop".to_string(),
+            score: 98,
+            state: "open".to_string(),
+            summary: "htop repeats optional sysfs probes.".to_string(),
+            evidence: json!({
+                "details": {
+                    "subsystem": "runaway-process"
+                }
+            }),
+            repo_root: None,
+            ecosystem: Some("debian".to_string()),
+            created_at: "2026-04-04T00:00:00Z".to_string(),
+            updated_at: "2026-04-04T00:00:00Z".to_string(),
+        };
+        let workspace = PreparedWorkspace {
+            repo_root: PathBuf::from("/tmp/htop"),
+            ecosystem: Some("debian".to_string()),
+            source_kind: "upstream-git".to_string(),
+            package_name: Some("htop".to_string()),
+            source_package: Some("htop".to_string()),
+            homepage: None,
+            acquisition_note: "prepared from upstream git".to_string(),
+        };
+
+        let patch_prompt = super::build_prompt(
+            &opportunity,
+            Path::new("/tmp/evidence.json"),
+            &workspace,
+            None,
+            &FixerConfig::default(),
+        );
+        let plan_prompt = super::build_plan_prompt(
+            Some("runaway-process"),
+            Path::new("/tmp/evidence.json"),
+            &workspace,
+            None,
+        );
+
+        for prompt in [&patch_prompt, &plan_prompt] {
+            assert!(prompt.contains("Proactively spawn bounded leaf subagents"));
+            assert!(prompt.contains("gpt-5.3-codex-spark"));
+            assert!(prompt.contains("even when the lead model is `gpt-5.5`"));
+            assert!(prompt.contains("not to perform public/external/destructive actions"));
+        }
     }
 
     #[test]

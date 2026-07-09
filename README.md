@@ -213,7 +213,11 @@ Worker jobs run in isolated per-job workspace snapshots under `/var/lib/fixer/pr
 For `desktop-input-config` investigations such as Plasma keyboard-layout complaints, Fixer keeps the full Codex path by default:
 
 - it respects `patch.plan_before_patch`, so multi-step repairs still get a plan pass
-- it prefers the primary Codex model when available
+- it keeps the primary Codex model as the lead when available, but prompts Codex
+  to fan out independent subagent leaves for scout, implementation, and
+  verification work
+- it treats `gpt-5.3-codex-spark` as the preferred small leaf-worker/fallback
+  model when that model is available to the configured token
 - when the installed Codex CLI supports it, it defaults reasoning effort to `xhigh` for this subsystem unless you override it
 - it keeps Spark available as a fallback when rate limits or usage pressure make that the better tradeoff
 - it still keeps the normal review pass enabled, with at least two refinement chances for this subsystem

@@ -11,5 +11,5 @@
 ## Repair Discipline
 
 - No hacks. Do not ship or recommend local wrappers, launcher overrides, environment-variable shims, or other band-aids as a substitute for a proper system-wide fix when the underlying issue belongs in packages, services, or distro configuration.
-- For Codex usage, treat `gpt-5.3-codex-spark` as a good fallback and a good fit for one-liner or narrowly bounded fixes.
-- For fuller multi-step patches, prefer normal Codex with a planning pass and high reasoning effort when usage limits are not the gating factor.
+- For Codex usage, treat `gpt-5.3-codex-spark` as a good fallback and as the default leaf-worker model for small implementation, test, and verification subagents.
+- For fuller multi-step patches, keep normal Codex as the lead with a planning pass and high reasoning effort, but fan out independent scouts/workers aggressively instead of forcing the lead to serially inspect every surface.
