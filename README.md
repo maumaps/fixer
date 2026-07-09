@@ -195,12 +195,17 @@ human lease:
 [patch]
 auth_mode = "service-key"
 codex_home = "/var/lib/fixer/codex"
+codex_memory_max = "8G"
 ```
 
 `codex_home` must contain a Codex `config.toml`; Fixer passes it to Codex as
 `CODEX_HOME`, so the service can use a machine-scoped API key without copying a
 person's `~/.codex` login into root. Keep this directory writable by the
 service because Codex stores session and app-server state under `CODEX_HOME`;
+`codex_memory_max` is applied as the transient user unit `MemoryMax` so a
+runaway Codex job is killed inside its own worker unit instead of pushing the
+desktop session or terminal host into global OOM. Set it to an empty string or
+`0` only for deliberately unbounded local debugging.
 `/etc/fixer` is only for static configuration and token files.
 
 Worker jobs run in isolated per-job workspace snapshots under `/var/lib/fixer/proposals/...`. The goal is not perfect sandboxing yet, but a much more supervised path than “run Codex as root and hope for the best.”

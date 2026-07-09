@@ -1,3 +1,10 @@
+fixer (0.243.0-1) unstable; urgency=medium
+
+  * Bound Codex worker memory in transient user units.
+  * Keep OOM reports from blaming terminal host scopes for killed child jobs.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 09 Jul 2026 19:10:00 +0400
+
 fixer (0.242.0-1) unstable; urgency=medium
 
   * Ignore negated Security impact lines in patch-surface classifier.

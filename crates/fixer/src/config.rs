@@ -97,6 +97,8 @@ pub struct PatchConfig {
     pub codex_args: Vec<String>,
     #[serde(default)]
     pub codex_home: Option<PathBuf>,
+    #[serde(default = "default_codex_memory_max")]
+    pub codex_memory_max: Option<String>,
     #[serde(default = "default_patch_model")]
     pub model: Option<String>,
     #[serde(default)]
@@ -289,6 +291,7 @@ impl Default for PatchConfig {
             codex_timeout_seconds: default_codex_timeout(),
             codex_args: Vec::new(),
             codex_home: None,
+            codex_memory_max: default_codex_memory_max(),
             model: default_patch_model(),
             reasoning_effort: None,
             spark_model: default_spark_model(),
@@ -536,6 +539,10 @@ fn default_lease_default_ttl() -> u64 {
 
 fn default_review_fix_passes() -> u32 {
     2
+}
+
+fn default_codex_memory_max() -> Option<String> {
+    Some("8G".to_string())
 }
 
 fn default_patch_model() -> Option<String> {

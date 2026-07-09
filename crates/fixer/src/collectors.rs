@@ -3002,13 +3002,13 @@ impl KernelOomKillEvent {
         self.cgroup_target
             .as_ref()
             .filter(|value| !value.trim().is_empty() && *value != &self.process_name)
+            .filter(|value| !oom_cgroup_target_is_terminal_host(value, &self.process_name))
             .cloned()
     }
 
     fn resolved_package_name(&self) -> Option<String> {
         self.package_name()
             .as_deref()
-            .or(self.cgroup_target.as_deref())
             .and_then(resolve_oom_cgroup_package_name)
     }
 
@@ -3018,13 +3018,38 @@ impl KernelOomKillEvent {
         let scope = self
             .cgroup_target
             .as_deref()
-            .map(|target| format!(" in `{target}`"))
+            .map(|target| {
+                if oom_cgroup_target_is_terminal_host(target, &self.process_name) {
+                    format!(" inside terminal scope `{target}`")
+                } else {
+                    format!(" in `{target}`")
+                }
+            })
             .unwrap_or_default();
         format!(
             "{} was killed by the kernel OOM killer after reaching about {:.0} MiB anonymous RSS ({:.1} GiB virtual memory){}.",
             self.process_name, anon_mib, total_vm_gib, scope
         )
     }
+}
+
+fn oom_cgroup_target_is_terminal_host(target: &str, process_name: &str) -> bool {
+    let target = target.trim();
+    !target.eq_ignore_ascii_case(process_name.trim())
+        && matches!(
+            target,
+            "yakuake"
+                | "org.kde.yakuake"
+                | "konsole"
+                | "org.kde.konsole"
+                | "gnome-terminal"
+                | "org.gnome.Terminal"
+                | "xfce4-terminal"
+                | "tilix"
+                | "alacritty"
+                | "kitty"
+                | "wezterm"
+        )
 }
 
 fn resolve_oom_cgroup_package_name(target: &str) -> Option<String> {
@@ -8636,7 +8661,7 @@ fn frame_is_useful(frame: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        RunawayHypothesis, StuckProcessGroup, StuckProcessInvestigationSummary,
+        KernelOomKillEvent, RunawayHypothesis, StuckProcessGroup, StuckProcessInvestigationSummary,
         apparmor_finding_from_kernel_line, apparmor_profile_path_candidates, classify_runaway_loop,
         classify_stuck_process, collect_interpreter_runaway_process_evidence,
         collect_native_executable_provenance, collect_perl_runaway_process_evidence,
@@ -9140,6 +9165,37 @@ Apr 03 14:00:04 nucat systemd-coredump[1600]: Process 1144 (spectacle) of user 1
                 "/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.kde.yakuake-12836.scope/tab(595051).scope"
             ),
             Some("org.kde.yakuake".to_string())
+        );
+    }
+
+    #[test]
+    fn oom_events_do_not_blame_terminal_host_for_killed_child() {
+        let event = KernelOomKillEvent {
+            process_name: "codex".to_string(),
+            pid: 378391,
+            uid: 1000,
+            total_vm_kb: 13_892_040,
+            anon_rss_kb: 7_258_780,
+            file_rss_kb: 8,
+            shmem_rss_kb: 0,
+            oom_score_adj: 200,
+            constraint: Some("CONSTRAINT_NONE".to_string()),
+            cpuset: Some("user.slice".to_string()),
+            task_memcg: Some("/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.kde.yakuake-6061.scope/tab(378319).scope".to_string()),
+            cgroup_target: Some("org.kde.yakuake".to_string()),
+            invoker: Some("ThreadPoolServi".to_string()),
+            killed_line: "Out of memory: Killed process 378391 (codex)".to_string(),
+            oom_kill_line: None,
+            invoker_line: None,
+        };
+
+        assert_eq!(event.package_name(), None);
+        assert_eq!(event.resolved_package_name(), None);
+        assert!(event.public_summary().contains("codex was killed"));
+        assert!(
+            event
+                .public_summary()
+                .contains("inside terminal scope `org.kde.yakuake`")
         );
     }
 

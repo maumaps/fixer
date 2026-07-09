@@ -769,6 +769,16 @@ pub(crate) fn run_codex_job_as_user(
             "RuntimeMaxSec={}",
             lease.budget.job_timeout_seconds
         ));
+        if let Some(memory_max) = config
+            .patch
+            .codex_memory_max
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "0")
+        {
+            command.arg("-p").arg(format!("MemoryMax={memory_max}"));
+            command.arg("-p").arg("OOMPolicy=stop");
+        }
         command
             .arg("-p")
             .arg(format!("ReadWritePaths={}", job.bundle_dir.display()));

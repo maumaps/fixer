@@ -16,6 +16,7 @@ warning_logs = []
 [patch]
 codex_command = "codex"
 codex_args = []
+codex_memory_max = "8G"
 sandbox = "workspace-write"
 approval_policy = "never"
 extra_instructions = "Keep the change narrowly scoped and summarize validation clearly."
