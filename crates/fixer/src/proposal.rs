@@ -8984,15 +8984,14 @@ mod tests {
     }
 
     #[test]
-    fn default_codex_policy_keeps_spark_available_for_fallback_and_leaves() {
+    fn default_codex_policy_keeps_spark_as_prompted_leaf_not_stage_fallback() {
         let config = FixerConfig::default();
 
         assert_eq!(config.patch.model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(
-            config.patch.spark_model.as_deref(),
-            Some("gpt-5.3-codex-spark")
-        );
-        assert!(config.patch.spark_fallback_on_rate_limit);
+        assert_eq!(config.patch.spark_model.as_deref(), None);
+        assert!(!config.patch.spark_fallback_on_rate_limit);
+        assert!(super::codex_subagent_prompt_hint().contains("gpt-5.3-codex-spark"));
+        assert!(super::codex_subagent_prompt_hint().contains("leaf subagents"));
     }
 
     #[test]

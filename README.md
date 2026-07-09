@@ -216,10 +216,11 @@ For `desktop-input-config` investigations such as Plasma keyboard-layout complai
 - it keeps the primary Codex model as the lead when available, but prompts Codex
   to fan out independent subagent leaves for scout, implementation, and
   verification work
-- it treats `gpt-5.3-codex-spark` as the preferred small leaf-worker/fallback
-  model when that model is available to the configured token
+- it tells the primary Codex lead to use `gpt-5.3-codex-spark` as the
+  preferred small leaf-worker model when subagents are available, instead of
+  rerouting the whole Fixer stage to Spark
 - when the installed Codex CLI supports it, it defaults reasoning effort to `xhigh` for this subsystem unless you override it
-- it keeps Spark available as a fallback when rate limits or usage pressure make that the better tradeoff
+- stage-level Spark fallback remains opt-in configuration, not the default
 - it still keeps the normal review pass enabled, with at least two refinement chances for this subsystem
 
 ## Privacy and participation

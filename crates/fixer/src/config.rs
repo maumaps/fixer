@@ -301,7 +301,7 @@ impl Default for PatchConfig {
             plan_before_patch: true,
             review_after_patch: true,
             review_fix_passes: default_review_fix_passes(),
-            spark_fallback_on_rate_limit: true,
+            spark_fallback_on_rate_limit: false,
             spark_weekly_headroom_threshold: default_spark_weekly_headroom_threshold(),
             rate_limit_cooldown_seconds: default_rate_limit_cooldown(),
             opportunistic_worker: false,
@@ -550,7 +550,7 @@ fn default_patch_model() -> Option<String> {
 }
 
 fn default_spark_model() -> Option<String> {
-    Some("gpt-5.3-codex-spark".to_string())
+    None
 }
 
 fn default_rate_limit_cooldown() -> u64 {

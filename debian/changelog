@@ -1,3 +1,9 @@
+fixer (0.245.0-1) unstable; urgency=medium
+
+  * Keep Spark as a prompted subagent leaf model, not a default stage fallback.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Thu, 09 Jul 2026 20:45:00 +0400
+
 fixer (0.244.0-1) unstable; urgency=medium
 
   * Prompt Codex runs to fan out bounded subagents and use Spark leaf workers.
