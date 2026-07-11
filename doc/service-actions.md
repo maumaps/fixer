@@ -264,6 +264,91 @@ scripts/verify-public-services.sh
 - If release validation fails locally, fix the versioning or git state first.
 - If deployment fails after package build, rerun `scripts/deploy-fixer-server.sh` once the host issue is corrected.
 
+## Action: record-upstream-review
+
+Action ID: `record-upstream-review`
+
+### Purpose
+
+Record one upstream review and its direct or related Fixer issue links without editing the server database by hand.
+
+### When To Use
+
+Use this after a Fixer patch becomes an upstream pull request, merge request, merged change, closed review, or explicitly related source-family review.
+
+### Implementation
+
+- Type: `manual`
+- Validator: `scripts/validate-service-actions.py`
+
+### Prerequisites
+
+- The upstream review URL and current state were read from the canonical forge.
+- Every direct or related Fixer issue ID was read from the current public API.
+- The installed `fixer-server` version contains the `record-upstream-review` command.
+- The server config points at the intended database. Run the command on the database-owning host.
+
+### Inputs
+
+- stable review ID using letters, digits, dots, underscores, or dashes
+- project, title, summary, and absolute HTTP(S) review URL
+- state: `review`, `merged`, `closed`, `closed_unmerged`, `rejected`, `reviewer_reduced`, or `superseded`
+- RFC3339 `--merged-at` timestamp when state is `merged`
+- optional direct `--patch-issue-id`
+- zero or more `--related-issue-id` values and their relation label
+- `--replace-related-issues` only when the supplied related issue list is the complete desired set
+- `--clear-patch-issue` only when deliberately removing the current direct issue link
+
+### Commands
+
+Run a syntax-only dry run first:
+
+```bash
+fixer-server --config /etc/fixer/fixer-server.toml record-upstream-review \
+  --id REVIEW_ID \
+  --project PROJECT \
+  --title 'UPSTREAM REVIEW TITLE' \
+  --summary 'MAINTAINER-FACING OUTCOME SUMMARY' \
+  --pr-url https://forge.example/project/review/123 \
+  --state review \
+  --patch-issue-id FIXER_ISSUE_ID \
+  --tag 'upstream review'
+```
+
+After checking the preview, rerun the identical command with `--apply`:
+
+```bash
+fixer-server --config /etc/fixer/fixer-server.toml record-upstream-review \
+  --id REVIEW_ID \
+  --project PROJECT \
+  --title 'UPSTREAM REVIEW TITLE' \
+  --summary 'MAINTAINER-FACING OUTCOME SUMMARY' \
+  --pr-url https://forge.example/project/review/123 \
+  --state review \
+  --patch-issue-id FIXER_ISSUE_ID \
+  --tag 'upstream review' \
+  --apply
+```
+
+The command is additive by default: omitted direct and related links are preserved. Pass `--replace-related-issues` to remove related links not named in the command. Pass `--clear-patch-issue` to remove the direct link explicitly.
+
+### Verification
+
+```bash
+curl -fsS https://fixer.maumap.com/v1/patches \
+  | jq -r '.[] | select(.id == "FIXER_ISSUE_ID") | {id,harvest_bucket,upstream_review,related_upstream_review}'
+curl -fsS https://fixer.maumap.com/issues/FIXER_ISSUE_ID >/dev/null
+```
+
+Confirm the direct review, related review, state, relation, and harvest bucket match the requested record. Re-read the canonical forge before marking a merged or closed state.
+
+### Failure / Rollback
+
+- If validation rejects an issue ID, refresh `/v1/patches` and use the current Fixer issue ID; no write has occurred.
+- If metadata is wrong, rerun the same stable review ID with corrected values.
+- To remove incorrect related links, rerun with the complete desired list plus `--replace-related-issues`; an empty desired list removes all related links for that review.
+- To remove an incorrect direct link, rerun with `--clear-patch-issue`. The upstream review row remains as an unlinked audit record instead of being destroyed.
+
 ## Action: enroll-client-host
 
 Action ID: `enroll-client-host`

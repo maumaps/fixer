@@ -31,9 +31,35 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio_postgres::{Client, NoTls, Row};
+use url::Url;
 use uuid::Uuid;
 
 const LANDING_UPSTREAM_REVIEW_LIMIT: i64 = 6;
+
+#[derive(Debug, Clone)]
+pub struct UpstreamReviewRecord {
+    pub id: String,
+    pub project: String,
+    pub title: String,
+    pub summary: String,
+    pub pr_url: String,
+    pub state: String,
+    pub merged_at: Option<String>,
+    pub fixer_credit: bool,
+    pub tags: Vec<String>,
+    pub patch_issue_id: Option<String>,
+    pub clear_patch_issue: bool,
+    pub related_issue_ids: Vec<String>,
+    pub replace_related_issues: bool,
+    pub relation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamReviewRecordResult {
+    pub review_id: String,
+    pub patch_issue_id: Option<String>,
+    pub related_issue_count: usize,
+}
 
 const APP_CSS: &str = r#"
 :root {
@@ -1220,6 +1246,390 @@ async fn db_ping(db: &ServerDb) -> Result<()> {
     }
 }
 
+pub fn validate_upstream_review_record(record: &UpstreamReviewRecord) -> Result<()> {
+    for (label, value) in [
+        ("review id", record.id.as_str()),
+        ("project", record.project.as_str()),
+        ("title", record.title.as_str()),
+        ("summary", record.summary.as_str()),
+        ("PR URL", record.pr_url.as_str()),
+        ("state", record.state.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(anyhow!("{label} must not be empty"));
+        }
+    }
+    if record.id.len() > 120
+        || !record
+            .id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(anyhow!(
+            "review id must be at most 120 ASCII letters, digits, dots, underscores, or dashes"
+        ));
+    }
+    let state = normalized_upstream_review_state(&record.state);
+    if !matches!(
+        state.as_str(),
+        "review"
+            | "merged"
+            | "closed"
+            | "closed_unmerged"
+            | "rejected"
+            | "reviewer_reduced"
+            | "superseded"
+    ) {
+        return Err(anyhow!(
+            "unsupported upstream review state {}; expected review, merged, closed, closed_unmerged, rejected, reviewer_reduced, or superseded",
+            record.state
+        ));
+    }
+    let url = Url::parse(&record.pr_url)
+        .with_context(|| format!("invalid upstream review URL {}", record.pr_url))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(anyhow!(
+            "upstream review URL must be an absolute HTTP(S) URL"
+        ));
+    }
+    match (state.as_str(), record.merged_at.as_deref()) {
+        ("merged", None) => return Err(anyhow!("merged reviews require --merged-at")),
+        ("merged", Some(value)) => {
+            DateTime::parse_from_rfc3339(value)
+                .with_context(|| format!("invalid merged timestamp {value}"))?;
+        }
+        (_, Some(_)) => {
+            return Err(anyhow!(
+                "--merged-at is only valid when --state merged is selected"
+            ));
+        }
+        (_, None) => {}
+    }
+    if record.relation.trim().is_empty()
+        || !record
+            .relation
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return Err(anyhow!(
+            "relation must use lowercase letters, digits, and underscores"
+        ));
+    }
+    let mut issue_ids = HashSet::new();
+    if record.clear_patch_issue && record.patch_issue_id.is_some() {
+        return Err(anyhow!(
+            "--clear-patch-issue conflicts with --patch-issue-id"
+        ));
+    }
+    if let Some(issue_id) = record.patch_issue_id.as_deref() {
+        if issue_id.trim().is_empty() {
+            return Err(anyhow!("patch issue id must not be empty"));
+        }
+        issue_ids.insert(issue_id);
+    }
+    for issue_id in &record.related_issue_ids {
+        if issue_id.trim().is_empty() {
+            return Err(anyhow!("related issue id must not be empty"));
+        }
+        if !issue_ids.insert(issue_id) {
+            return Err(anyhow!(
+                "issue {issue_id} is listed more than once across direct and related links"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalized_upstream_review_state(state: &str) -> String {
+    state.trim().replace('-', "_")
+}
+
+pub async fn record_upstream_review(
+    config: &FixerConfig,
+    record: &UpstreamReviewRecord,
+) -> Result<UpstreamReviewRecordResult> {
+    validate_upstream_review_record(record)?;
+    let db = open_server_db(config).await?;
+    init_db(&db, config).await?;
+    record_upstream_review_storage(&db, record).await
+}
+
+async fn record_upstream_review_storage(
+    db: &ServerDb,
+    record: &UpstreamReviewRecord,
+) -> Result<UpstreamReviewRecordResult> {
+    validate_upstream_review_record(record)?;
+    let mut issue_ids = record
+        .patch_issue_id
+        .iter()
+        .chain(record.related_issue_ids.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    issue_ids.sort();
+    issue_ids.dedup();
+    ensure_upstream_review_issue_ids_exist(db, &issue_ids).await?;
+
+    let tags_json = serde_json::to_string(&record.tags)?;
+    let state = normalized_upstream_review_state(&record.state);
+    match db {
+        ServerDb::Postgres(client) => {
+            client.batch_execute("BEGIN").await?;
+            let write_result =
+                record_upstream_review_postgres(client, record, &state, &tags_json).await;
+            match write_result {
+                Ok(()) => client.batch_execute("COMMIT").await?,
+                Err(error) => {
+                    let _ = client.batch_execute("ROLLBACK").await;
+                    return Err(error);
+                }
+            }
+        }
+        ServerDb::Sqlite(path) => {
+            let mut connection = sqlite_connection(path)?;
+            let transaction = connection.transaction()?;
+            record_upstream_review_sqlite(&transaction, record, &state, &tags_json)?;
+            transaction.commit()?;
+        }
+    }
+
+    let stored_patch_issue_id = load_upstream_review_patch_issue_id(db, &record.id).await?;
+    Ok(UpstreamReviewRecordResult {
+        review_id: record.id.clone(),
+        patch_issue_id: stored_patch_issue_id,
+        related_issue_count: record.related_issue_ids.len(),
+    })
+}
+
+async fn load_upstream_review_patch_issue_id(
+    db: &ServerDb,
+    review_id: &str,
+) -> Result<Option<String>> {
+    match db {
+        ServerDb::Postgres(client) => Ok(client
+            .query_one(
+                "SELECT patch_issue_id FROM upstream_reviews WHERE id = $1",
+                &[&review_id],
+            )
+            .await?
+            .get(0)),
+        ServerDb::Sqlite(path) => Ok(sqlite_connection(path)?.query_row(
+            "SELECT patch_issue_id FROM upstream_reviews WHERE id = ?1",
+            params![review_id],
+            |row| row.get(0),
+        )?),
+    }
+}
+
+async fn record_upstream_review_postgres(
+    client: &Client,
+    record: &UpstreamReviewRecord,
+    state: &str,
+    tags_json: &str,
+) -> Result<()> {
+    client
+        .execute(
+            "
+            INSERT INTO upstream_reviews
+                (id, project, title, summary, pr_url, state, merged_at,
+                 fixer_credit, tags_json, patch_issue_id, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8, $9::jsonb, $10, now())
+            ON CONFLICT (id) DO UPDATE SET
+                project = EXCLUDED.project,
+                title = EXCLUDED.title,
+                summary = EXCLUDED.summary,
+                pr_url = EXCLUDED.pr_url,
+                state = EXCLUDED.state,
+                merged_at = EXCLUDED.merged_at,
+                fixer_credit = EXCLUDED.fixer_credit,
+                tags_json = CASE
+                    WHEN EXCLUDED.tags_json = '[]'::jsonb THEN upstream_reviews.tags_json
+                    ELSE EXCLUDED.tags_json
+                END,
+                patch_issue_id = CASE
+                    WHEN $11 THEN NULL
+                    ELSE COALESCE(EXCLUDED.patch_issue_id, upstream_reviews.patch_issue_id)
+                END
+            ",
+            &[
+                &record.id,
+                &record.project,
+                &record.title,
+                &record.summary,
+                &record.pr_url,
+                &state,
+                &record.merged_at,
+                &record.fixer_credit,
+                &tags_json,
+                &record.patch_issue_id,
+                &record.clear_patch_issue,
+            ],
+        )
+        .await?;
+    if record.replace_related_issues {
+        client
+            .execute(
+                "DELETE FROM upstream_patch_relations
+                 WHERE upstream_patch_win_id = $1
+                   AND NOT (issue_id = ANY($2::text[]))",
+                &[&record.id, &record.related_issue_ids],
+            )
+            .await?;
+    }
+    for issue_id in &record.related_issue_ids {
+        let relation_id = upstream_review_relation_id(&record.id, issue_id);
+        client
+            .execute(
+                "DELETE FROM upstream_patch_relations
+                 WHERE issue_id = $1 AND upstream_patch_win_id = $2 AND id <> $3",
+                &[issue_id, &record.id, &relation_id],
+            )
+            .await?;
+        client
+            .execute(
+                "
+                INSERT INTO upstream_patch_relations
+                    (id, issue_id, upstream_patch_win_id, relation, created_at)
+                VALUES ($1, $2, $3, $4, now())
+                ON CONFLICT (id) DO UPDATE SET
+                    issue_id = EXCLUDED.issue_id,
+                    upstream_patch_win_id = EXCLUDED.upstream_patch_win_id,
+                    relation = EXCLUDED.relation
+                ",
+                &[&relation_id, issue_id, &record.id, &record.relation],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+fn record_upstream_review_sqlite(
+    transaction: &rusqlite::Transaction<'_>,
+    record: &UpstreamReviewRecord,
+    state: &str,
+    tags_json: &str,
+) -> Result<()> {
+    let created_at = now_rfc3339();
+    transaction.execute(
+        "
+        INSERT INTO upstream_reviews
+            (id, project, title, summary, pr_url, state, merged_at,
+             fixer_credit, tags_json, patch_issue_id, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ON CONFLICT (id) DO UPDATE SET
+            project = excluded.project,
+            title = excluded.title,
+            summary = excluded.summary,
+            pr_url = excluded.pr_url,
+            state = excluded.state,
+            merged_at = excluded.merged_at,
+            fixer_credit = excluded.fixer_credit,
+            tags_json = CASE
+                WHEN excluded.tags_json = '[]' THEN upstream_reviews.tags_json
+                ELSE excluded.tags_json
+            END,
+            patch_issue_id = CASE
+                WHEN ?12 THEN NULL
+                ELSE COALESCE(excluded.patch_issue_id, upstream_reviews.patch_issue_id)
+            END
+        ",
+        params![
+            record.id,
+            record.project,
+            record.title,
+            record.summary,
+            record.pr_url,
+            state,
+            record.merged_at,
+            record.fixer_credit,
+            tags_json,
+            record.patch_issue_id,
+            created_at,
+            record.clear_patch_issue,
+        ],
+    )?;
+    if record.replace_related_issues {
+        let requested = record
+            .related_issue_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let existing = {
+            let mut stmt = transaction.prepare(
+                "SELECT issue_id FROM upstream_patch_relations
+                 WHERE upstream_patch_win_id = ?1",
+            )?;
+            stmt.query_map(params![record.id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for issue_id in existing {
+            if !requested.contains(issue_id.as_str()) {
+                transaction.execute(
+                    "DELETE FROM upstream_patch_relations
+                     WHERE upstream_patch_win_id = ?1 AND issue_id = ?2",
+                    params![record.id, issue_id],
+                )?;
+            }
+        }
+    }
+    for issue_id in &record.related_issue_ids {
+        let relation_id = upstream_review_relation_id(&record.id, issue_id);
+        transaction.execute(
+            "DELETE FROM upstream_patch_relations
+             WHERE issue_id = ?1 AND upstream_patch_win_id = ?2 AND id <> ?3",
+            params![issue_id, record.id, relation_id],
+        )?;
+        transaction.execute(
+            "
+            INSERT INTO upstream_patch_relations
+                (id, issue_id, upstream_patch_win_id, relation, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT (id) DO UPDATE SET
+                issue_id = excluded.issue_id,
+                upstream_patch_win_id = excluded.upstream_patch_win_id,
+                relation = excluded.relation
+            ",
+            params![
+                relation_id,
+                issue_id,
+                record.id,
+                record.relation,
+                created_at
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+async fn ensure_upstream_review_issue_ids_exist(db: &ServerDb, issue_ids: &[String]) -> Result<()> {
+    for issue_id in issue_ids {
+        let exists = match db {
+            ServerDb::Postgres(client) => client
+                .query_opt("SELECT 1 FROM issue_clusters WHERE id = $1", &[issue_id])
+                .await?
+                .is_some(),
+            ServerDb::Sqlite(path) => sqlite_connection(path)?
+                .query_row(
+                    "SELECT 1 FROM issue_clusters WHERE id = ?1",
+                    params![issue_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some(),
+        };
+        if !exists {
+            return Err(anyhow!("Fixer issue {issue_id} does not exist"));
+        }
+    }
+    Ok(())
+}
+
+fn upstream_review_relation_id(review_id: &str, issue_id: &str) -> String {
+    format!(
+        "upstream-relation-{}",
+        hash_text(&format!("{review_id}:{issue_id}"))
+    )
+}
+
 pub async fn serve(config: FixerConfig) -> Result<()> {
     let db = open_server_db(&config).await?;
     let state = Arc::new(ServerState {
@@ -1824,10 +2234,143 @@ async fn list_attempts(
 async fn get_issue(
     State(state): State<Arc<ServerState>>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<PublicIssueDetail>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     validate_uuid_param(&id, "issue id")?;
     let issue = load_public_issue_detail(&state.db, id, true).await?;
-    Ok(Json(issue))
+    let harvest = public_issue_detail_harvest_bucket_and_reason(&issue);
+    Ok(Json(public_issue_detail_api_value(
+        &issue,
+        harvest
+            .as_ref()
+            .map(|(bucket, reason)| (bucket.as_str(), reason.as_str())),
+    )?))
+}
+
+fn public_issue_detail_api_value(
+    issue: &PublicIssueDetail,
+    harvest: Option<(&str, &str)>,
+) -> Result<Value, ApiError> {
+    let mut value = serde_json::to_value(issue).map_err(ApiError::internal)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("public issue detail did not serialize to an object"))?;
+    object.insert(
+        "harvest_bucket".to_string(),
+        harvest
+            .map(|(bucket, _)| json!(bucket))
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "harvest_reason".to_string(),
+        harvest
+            .map(|(_, reason)| json!(reason))
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "upstream_review".to_string(),
+        serde_json::to_value(&issue.best_patch_upstream_review).map_err(ApiError::internal)?,
+    );
+    object.insert(
+        "related_upstream_review".to_string(),
+        serde_json::to_value(&issue.best_patch_related_upstream_review)
+            .map_err(ApiError::internal)?,
+    );
+    Ok(value)
+}
+
+fn public_issue_detail_harvest_bucket_and_reason(
+    issue: &PublicIssueDetail,
+) -> Option<(String, String)> {
+    issue.best_patch.as_ref()?;
+    if let Some(review) = issue.best_patch_upstream_review.as_ref() {
+        if review.state == "merged" {
+            return Some(if review.fixer_credit {
+                ("merged".to_string(), "merged upstream".to_string())
+            } else {
+                (
+                    "covered-upstream".to_string(),
+                    "covered by independent upstream fix".to_string(),
+                )
+            });
+        }
+        if public_upstream_review_state_is_closed(&review.state) {
+            return Some((
+                "closed-upstream".to_string(),
+                format!("upstream review {}", review.state.replace('_', "-")),
+            ));
+        }
+        return Some((
+            "submitted".to_string(),
+            "already submitted upstream".to_string(),
+        ));
+    }
+    if let Some(disposition) = issue.best_patch_manual_disposition.as_ref() {
+        return Some(public_patch_manual_disposition_bucket_and_reason(
+            disposition,
+        ));
+    }
+    if let Some(review) = issue.best_patch_related_upstream_review.as_ref() {
+        if review.state == "merged" {
+            return Some(if review.fixer_credit {
+                (
+                    "merged".to_string(),
+                    format!("related upstream review {} merged", review.relation),
+                )
+            } else {
+                (
+                    "covered-upstream".to_string(),
+                    format!("related independent upstream fix {}", review.relation),
+                )
+            });
+        }
+        if review.relation == "source_path_family" {
+            return Some(if public_upstream_review_state_is_closed(&review.state) {
+                (
+                    "evidence-upgrade".to_string(),
+                    format!(
+                        "related source-path family review {} needs new evidence or a distinct fix",
+                        review.state.replace('_', "-")
+                    ),
+                )
+            } else {
+                (
+                    "source-family-review".to_string(),
+                    "related source-path family review is active".to_string(),
+                )
+            });
+        }
+        return Some(if public_upstream_review_state_is_closed(&review.state) {
+            (
+                "closed-upstream".to_string(),
+                format!(
+                    "related upstream review {} {}",
+                    review.relation,
+                    review.state.replace('_', "-")
+                ),
+            )
+        } else {
+            (
+                "related-family".to_string(),
+                format!("related upstream review {}", review.relation),
+            )
+        });
+    }
+    let harvest = issue.best_patch_harvest.as_ref()?;
+    if harvest.status != "ready" {
+        return Some((
+            "needs-review".to_string(),
+            if harvest.blockers.is_empty() {
+                format!("harvest {}", harvest.status)
+            } else {
+                format!(
+                    "harvest {}: {}",
+                    harvest.status,
+                    harvest.blockers.join(", ")
+                )
+            },
+        ));
+    }
+    Some(("realish".to_string(), "candidate source diff".to_string()))
 }
 
 async fn respond_evidence_request(
@@ -7640,16 +8183,24 @@ async fn load_public_issue_detail(
     } else {
         None
     };
-    let (best_patch_upstream_review, best_patch_related_upstream_review) = if best_patch.is_some() {
-        load_public_patches(db, 512)
+    let (best_patch_upstream_review, mut best_patch_related_upstream_review) =
+        if best_patch.is_some() {
+            let direct = load_public_patch_upstream_review_by_issue_id(db, &id).await?;
+            let mut manual_related = load_public_patch_manual_related_reviews(db).await?;
+            (direct, manual_related.remove(&id))
+        } else {
+            (None, None)
+        };
+    if best_patch.is_some()
+        && best_patch_upstream_review.is_none()
+        && best_patch_related_upstream_review.is_none()
+    {
+        best_patch_related_upstream_review = load_public_patches(db, 512)
             .await?
             .into_iter()
             .find(|patch| patch.id == id)
-            .map(|patch| (patch.upstream_review, patch.related_upstream_review))
-            .unwrap_or((None, None))
-    } else {
-        (None, None)
-    };
+            .and_then(|patch| patch.related_upstream_review);
+    }
     let best_patch_diff_url = public_best_patch_diff_url(&id, best_patch.as_ref());
     let possible_duplicates = load_possible_duplicates(db, &id, &issue, 6).await?;
     let all_attempts = load_public_attempts(db, &id, 1024).await?;
@@ -8306,6 +8857,90 @@ async fn load_public_patch_manual_related_reviews(
         }
     }
     Ok(relations)
+}
+
+async fn load_public_patch_upstream_review_by_issue_id(
+    db: &ServerDb,
+    issue_id: &str,
+) -> Result<Option<PublicPatchUpstreamReview>, ApiError> {
+    match db {
+        ServerDb::Postgres(client) => {
+            let row = client
+                .query_opt(
+                    "
+                    SELECT id, project, title, pr_url, merged_at, tags_json, state, fixer_credit
+                    FROM upstream_reviews
+                    WHERE patch_issue_id = $1
+                    ORDER BY COALESCE(merged_at, created_at) DESC, created_at DESC
+                    LIMIT 1
+                    ",
+                    &[&issue_id],
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            Ok(row.map(|row| {
+                let merged_at = row
+                    .get::<_, Option<DateTime<Utc>>>(4)
+                    .map(|value| value.to_rfc3339());
+                let tags: Value = row.get(5);
+                let raw_state: Option<String> = row.get(6);
+                PublicPatchUpstreamReview {
+                    id: row.get(0),
+                    project: row.get(1),
+                    title: row.get(2),
+                    pr_url: row.get(3),
+                    state: effective_upstream_review_state(
+                        raw_state.as_deref(),
+                        merged_at.as_deref(),
+                    ),
+                    merged_at,
+                    fixer_credit: row.get(7),
+                    tags: string_array_from_value(&tags),
+                }
+            }))
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path).map_err(ApiError::internal)?;
+            connection
+                .query_row(
+                    "
+                    SELECT id, project, title, pr_url, merged_at, tags_json, state, fixer_credit
+                    FROM upstream_reviews
+                    WHERE patch_issue_id = ?1
+                    ORDER BY COALESCE(merged_at, created_at) DESC, created_at DESC
+                    LIMIT 1
+                    ",
+                    params![issue_id],
+                    |row| {
+                        let merged_at: Option<String> = row.get(4)?;
+                        let tags_raw: String = row.get(5)?;
+                        let tags = serde_json::from_str::<Value>(&tags_raw).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                        let raw_state: Option<String> = row.get(6)?;
+                        Ok(PublicPatchUpstreamReview {
+                            id: row.get(0)?,
+                            project: row.get(1)?,
+                            title: row.get(2)?,
+                            pr_url: row.get(3)?,
+                            state: effective_upstream_review_state(
+                                raw_state.as_deref(),
+                                merged_at.as_deref(),
+                            ),
+                            merged_at,
+                            fixer_credit: row.get(7)?,
+                            tags: string_array_from_value(&tags),
+                        })
+                    },
+                )
+                .optional()
+                .map_err(ApiError::internal)
+        }
+    }
 }
 
 fn annotate_public_patch_manual_related_reviews(
@@ -17268,6 +17903,191 @@ mod tests {
         (dir, db)
     }
 
+    fn sample_upstream_review_record() -> UpstreamReviewRecord {
+        UpstreamReviewRecord {
+            id: "supervisor-pr-1717".to_string(),
+            project: "Supervisor".to_string(),
+            title: "Skip idle reaping without child pids".to_string(),
+            summary: "Closed after maintainer review.".to_string(),
+            pr_url: "https://github.com/Supervisor/supervisor/pull/1717".to_string(),
+            state: "closed_unmerged".to_string(),
+            merged_at: None,
+            fixer_credit: true,
+            tags: vec!["upstream review".to_string()],
+            patch_issue_id: Some("issue-reviewed".to_string()),
+            clear_patch_issue: false,
+            related_issue_ids: vec!["issue-related".to_string()],
+            replace_related_issues: false,
+            relation: "source_path_family".to_string(),
+        }
+    }
+
+    #[test]
+    fn upstream_review_record_validation_rejects_ambiguous_or_invalid_input() {
+        let mut record = sample_upstream_review_record();
+        record.pr_url = "file:///tmp/review".to_string();
+        assert!(validate_upstream_review_record(&record).is_err());
+
+        let mut record = sample_upstream_review_record();
+        record.state = "reviewer-reduced".to_string();
+        assert!(validate_upstream_review_record(&record).is_ok());
+
+        let mut record = sample_upstream_review_record();
+        record.state = "merged".to_string();
+        assert!(validate_upstream_review_record(&record).is_err());
+
+        let mut record = sample_upstream_review_record();
+        record.related_issue_ids.push("issue-reviewed".to_string());
+        assert!(validate_upstream_review_record(&record).is_err());
+    }
+
+    #[test]
+    fn upstream_review_record_is_idempotent_and_preserves_omitted_metadata() {
+        let (_dir, db) = init_test_server_db();
+        let connection = sqlite_test_connection(&db);
+        let representative = sample_crash(
+            "supervisor",
+            "Top frame: waitpid [supervisord]",
+            &["waitpid [supervisord]"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-reviewed",
+            "cluster-reviewed",
+            110,
+            "2026-03-30T00:00:00Z",
+            &representative,
+            &["install-reviewed"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-related",
+            "cluster-related",
+            109,
+            "2026-03-31T00:00:00Z",
+            &representative,
+            &["install-related"],
+        );
+        insert_test_issue(
+            &connection,
+            "issue-related-2",
+            "cluster-related-2",
+            108,
+            "2026-04-01T00:00:00Z",
+            &representative,
+            &["install-related-2"],
+        );
+        let mut record = sample_upstream_review_record();
+        record.related_issue_ids.push("issue-related-2".to_string());
+        record.replace_related_issues = true;
+        let first = test_runtime()
+            .block_on(record_upstream_review_storage(&db, &record))
+            .unwrap();
+        assert_eq!(first.review_id, "supervisor-pr-1717");
+        assert_eq!(first.related_issue_count, 2);
+
+        let mut updated = record.clone();
+        updated.title = "Skip idle reaping without tracked child pids".to_string();
+        updated.patch_issue_id = None;
+        updated.tags.clear();
+        updated.related_issue_ids = vec!["issue-related".to_string()];
+        let second = test_runtime()
+            .block_on(record_upstream_review_storage(&db, &updated))
+            .unwrap();
+        assert_eq!(second.patch_issue_id.as_deref(), Some("issue-reviewed"));
+
+        let review = connection
+            .query_row(
+                "SELECT title, patch_issue_id, tags_json
+                 FROM upstream_reviews WHERE id = 'supervisor-pr-1717'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(review.0, "Skip idle reaping without tracked child pids");
+        assert_eq!(review.1.as_deref(), Some("issue-reviewed"));
+        assert_eq!(review.2, r#"["upstream review"]"#);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM upstream_reviews WHERE id = 'supervisor-pr-1717'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM upstream_patch_relations
+                     WHERE issue_id = 'issue-related'
+                       AND upstream_patch_win_id = 'supervisor-pr-1717'
+                       AND relation = 'source_path_family'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        let mut cleared = updated;
+        cleared.clear_patch_issue = true;
+        cleared.related_issue_ids.clear();
+        let cleared_result = test_runtime()
+            .block_on(record_upstream_review_storage(&db, &cleared))
+            .unwrap();
+        assert!(cleared_result.patch_issue_id.is_none());
+        assert!(
+            connection
+                .query_row(
+                    "SELECT patch_issue_id FROM upstream_reviews
+                     WHERE id = 'supervisor-pr-1717'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM upstream_patch_relations
+                     WHERE upstream_patch_win_id = 'supervisor-pr-1717'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn upstream_review_record_checks_issue_links_before_writing() {
+        let (_dir, db) = init_test_server_db();
+        let record = sample_upstream_review_record();
+        let error = test_runtime()
+            .block_on(record_upstream_review_storage(&db, &record))
+            .unwrap_err();
+        assert!(error.to_string().contains("issue-related"));
+
+        let connection = sqlite_test_connection(&db);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM upstream_reviews", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
     fn sqlite_test_connection(db: &ServerDb) -> Connection {
         match db {
             ServerDb::Sqlite(path) => sqlite_connection(path).unwrap(),
@@ -18873,6 +19693,21 @@ mod tests {
         assert!(!markup.contains("patch needs review"));
         assert!(!markup.contains("Harvest review needed"));
         assert!(!markup.contains("Backfill proposal metadata"));
+
+        let api = match public_issue_detail_api_value(
+            &issue,
+            Some(("submitted", "already submitted upstream")),
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("issue detail API serialization failed: {}", error.message),
+        };
+        assert_eq!(api["harvest_bucket"], "submitted");
+        assert_eq!(api["harvest_reason"], "already submitted upstream");
+        assert_eq!(
+            api["upstream_review"]["pr_url"],
+            "https://github.com/htop-dev/htop/pull/2011"
+        );
+        assert!(api["related_upstream_review"].is_null());
     }
 
     #[test]
@@ -20840,6 +21675,71 @@ mod tests {
         assert!(!card.contains("patch needs review"));
         assert!(!card.contains("Harvest review needed"));
         assert!(!card.contains("harvest: needs review"));
+
+        insert_test_issue(
+            &connection,
+            "issue-newer",
+            "cluster-newer",
+            111,
+            "2026-04-02T00:00:00Z",
+            &representative,
+            &["install-newer"],
+        );
+        let mut newer_patch = source_patch;
+        newer_patch.cluster_id = "issue-newer".to_string();
+        newer_patch.created_at = "2026-04-02T00:00:00Z".to_string();
+        newer_patch.details["published_session"]["diff"] = json!(
+            "--- a/src/smtpd/smtpd.c\n+++ b/src/smtpd/smtpd.c\n@@ -2 +2 @@\n-old-newer\n+new-newer\n"
+        );
+        connection
+            .execute(
+                "UPDATE issue_clusters SET best_patch_json = ?2 WHERE id = ?1",
+                rusqlite::params!["issue-newer", serde_json::to_string(&newer_patch).unwrap()],
+            )
+            .unwrap();
+        let constrained_board = match test_runtime().block_on(load_public_patches(&db, 1)) {
+            Ok(value) => value,
+            Err(error) => panic!(
+                "load constrained public patch board failed: {}",
+                error.message
+            ),
+        };
+        assert_eq!(constrained_board[0].id, "issue-newer");
+
+        let detail = match test_runtime().block_on(load_public_issue_detail(
+            &db,
+            "issue-1".to_string(),
+            true,
+        )) {
+            Ok(value) => value,
+            Err(error) => panic!("load exact issue detail failed: {}", error.message),
+        };
+        assert_eq!(
+            detail
+                .best_patch_upstream_review
+                .as_ref()
+                .map(|review| review.pr_url.as_str()),
+            Some("https://github.com/vdukhovni/postfix/pull/22")
+        );
+        assert_eq!(
+            public_issue_detail_harvest_bucket_and_reason(&detail),
+            Some((
+                "submitted".to_string(),
+                "already submitted upstream".to_string()
+            ))
+        );
+        let api = match public_issue_detail_api_value(
+            &detail,
+            Some(("submitted", "already submitted upstream")),
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("serialize exact issue detail failed: {}", error.message),
+        };
+        assert_eq!(api["harvest_bucket"], "submitted");
+        assert_eq!(
+            api["upstream_review"]["pr_url"],
+            "https://github.com/vdukhovni/postfix/pull/22"
+        );
     }
 
     #[test]
