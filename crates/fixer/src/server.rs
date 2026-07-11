@@ -8400,51 +8400,80 @@ fn public_patch_duplicate_rank(patch: &PublicPatchEntry) -> i32 {
 }
 
 fn annotate_public_patch_related_reviews(patches: &mut [PublicPatchEntry]) {
-    let mut families: HashMap<(String, Vec<String>), Vec<usize>> = HashMap::new();
-    for (index, patch) in patches.iter().enumerate() {
-        let source = patch
-            .source_package
-            .as_deref()
-            .or(patch.package_name.as_deref())
-            .unwrap_or("");
-        let source_paths = public_patch_primary_source_paths(patch);
-        if source.is_empty() || source_paths.is_empty() {
-            continue;
-        }
-        families
-            .entry((source.to_string(), source_paths))
-            .or_default()
-            .push(index);
-    }
+    let family_shapes = patches
+        .iter()
+        .map(|patch| {
+            (
+                public_patch_family_identities(patch),
+                public_patch_primary_source_paths(patch),
+            )
+        })
+        .collect::<Vec<_>>();
+    let reviewed = patches
+        .iter()
+        .enumerate()
+        .filter_map(|(index, patch)| patch.upstream_review.clone().map(|review| (index, review)))
+        .collect::<Vec<_>>();
+    let mut annotations = Vec::new();
 
-    for indexes in families.values() {
-        if indexes.len() <= 1 {
+    for (index, patch) in patches.iter().enumerate() {
+        if patch.upstream_review.is_some() || patch.related_upstream_review.is_some() {
             continue;
         }
-        let Some((review_index, review)) = indexes.iter().find_map(|index| {
-            patches[*index]
-                .upstream_review
-                .clone()
-                .map(|review| (*index, review))
-        }) else {
+        let Some((review_index, review)) = reviewed
+            .iter()
+            .filter(|(review_index, _)| {
+                public_patch_family_shapes_match(
+                    &family_shapes[index],
+                    &family_shapes[*review_index],
+                )
+            })
+            .max_by_key(|(review_index, _)| public_patch_duplicate_rank(&patches[*review_index]))
+        else {
             continue;
         };
-        for index in indexes {
-            if patches[*index].upstream_review.is_some()
-                || patches[*index].related_upstream_review.is_some()
-            {
-                continue;
-            }
-            patches[*index].related_upstream_review = Some(PublicPatchRelatedReview {
-                issue_id: patches[review_index].id.clone(),
-                pr_url: review.pr_url.clone(),
-                state: review.state.clone(),
-                fixer_credit: review.fixer_credit,
-                relation: "source_path_family".to_string(),
-                family_count: indexes.len() as i64,
-            });
-        }
+        let family_count = family_shapes
+            .iter()
+            .filter(|shape| public_patch_family_shapes_match(shape, &family_shapes[*review_index]))
+            .count() as i64;
+        annotations.push((index, *review_index, review.clone(), family_count));
     }
+
+    for (index, review_index, review, family_count) in annotations {
+        patches[index].related_upstream_review = Some(PublicPatchRelatedReview {
+            issue_id: patches[review_index].id.clone(),
+            pr_url: review.pr_url,
+            state: review.state,
+            fixer_credit: review.fixer_credit,
+            relation: "source_path_family".to_string(),
+            family_count,
+        });
+    }
+}
+
+fn public_patch_family_identities(patch: &PublicPatchEntry) -> Vec<String> {
+    let mut identities = [
+        patch.source_package.as_deref(),
+        patch.package_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| !value.is_empty())
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
+    identities.sort();
+    identities.dedup();
+    identities
+}
+
+fn public_patch_family_shapes_match(
+    left: &(Vec<String>, Vec<String>),
+    right: &(Vec<String>, Vec<String>),
+) -> bool {
+    !left.0.is_empty()
+        && !left.1.is_empty()
+        && left.1 == right.1
+        && left.0.iter().any(|identity| right.0.contains(identity))
 }
 
 fn annotate_public_patch_harvest_buckets(patches: &mut [PublicPatchEntry]) {
@@ -11778,7 +11807,18 @@ fn public_patch_has_limited_observed_validation(
         || validation_text.contains("could not run")
         || validation_text.contains("did not run")
         || validation_text.contains("blocked");
-    project_validation_unavailable && !public_patch_has_project_test_success(validation_notes)
+    let behavior_reproduction_blocked = validation_text.contains("blocked")
+        && [
+            "independent reproduction",
+            "reproduction attempt",
+            "runtime reproduction",
+            "independent trace attempt",
+        ]
+        .iter()
+        .any(|marker| validation_text.contains(marker));
+    behavior_reproduction_blocked
+        || (project_validation_unavailable
+            && !public_patch_has_project_test_success(validation_notes))
 }
 
 fn public_patch_has_project_test_success(validation_notes: &[String]) -> bool {
@@ -20406,6 +20446,49 @@ mod tests {
     }
 
     #[test]
+    fn observed_patch_with_blocked_behavior_reproduction_stays_limited() {
+        let metadata = PatchResponseMetadata {
+            evidence_confidence: Some("observed".to_string()),
+            git_add_paths: vec!["app/sessionstack.cpp".to_string()],
+            ..PatchResponseMetadata::default()
+        };
+        let notes = vec![
+            "The yakuake target built successfully and ctest passed appstreamtest. Bounded runtime reproduction attempt: blocked before GUI focus handling because no D-Bus session was available. Evidence confidence remains observed.".to_string(),
+        ];
+
+        assert!(public_patch_has_substantive_validation_success(&notes));
+        assert!(public_patch_has_project_test_success(&notes));
+        assert!(public_patch_has_limited_observed_validation(
+            &metadata, &notes
+        ));
+    }
+
+    #[test]
+    fn source_family_shapes_use_binary_package_alias_without_path_only_matches() {
+        let supervisor_source = (
+            vec!["python3.13-minimal".to_string(), "supervisor".to_string()],
+            vec!["supervisor/supervisord.py".to_string()],
+        );
+        let legacy_misrouted_source = (
+            vec!["python3.13".to_string(), "python3.13-minimal".to_string()],
+            vec!["supervisor/supervisord.py".to_string()],
+        );
+        let unrelated_project = (
+            vec!["unrelated".to_string()],
+            vec!["supervisor/supervisord.py".to_string()],
+        );
+
+        assert!(public_patch_family_shapes_match(
+            &supervisor_source,
+            &legacy_misrouted_source
+        ));
+        assert!(!public_patch_family_shapes_match(
+            &supervisor_source,
+            &unrelated_project
+        ));
+    }
+
+    #[test]
     fn public_patch_loader_demotes_observed_patch_without_project_validation() {
         let (_dir, db) = init_test_server_db();
         let connection = sqlite_test_connection(&db);
@@ -20863,6 +20946,22 @@ mod tests {
             &representative,
             &["install-2"],
         );
+        connection
+            .execute(
+                "UPDATE issue_clusters
+                 SET package_name = 'python3.13-minimal', source_package = 'python3.13'
+                 WHERE id = 'issue-reviewed'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE issue_clusters
+                 SET package_name = 'python3.13-minimal', source_package = 'supervisor'
+                 WHERE id = 'issue-related'",
+                [],
+            )
+            .unwrap();
         let reviewed_patch = PatchAttempt {
             cluster_id: "issue-reviewed".to_string(),
             install_id: "worker-install".to_string(),
