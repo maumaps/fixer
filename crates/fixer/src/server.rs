@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1206,8 +1207,7 @@ fn sqlite_path_from_url(url: &str) -> Option<PathBuf> {
 
 fn sqlite_connection(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+        ensure_sqlite_parent_dir(parent)?;
     }
     let connection =
         Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -1215,6 +1215,20 @@ fn sqlite_connection(path: &Path) -> Result<Connection> {
         .busy_timeout(StdDuration::from_secs(5))
         .context("failed to configure sqlite busy timeout")?;
     Ok(connection)
+}
+
+fn ensure_sqlite_parent_dir(parent: &Path) -> Result<()> {
+    match std::fs::metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(anyhow!(
+            "sqlite parent {} exists but is not a directory",
+            parent.display()
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display())),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect sqlite parent {}", parent.display())),
+    }
 }
 
 async fn open_server_db(config: &FixerConfig) -> Result<ServerDb> {
@@ -1426,6 +1440,20 @@ async fn record_upstream_review_postgres(
     state: &str,
     tags_json: &str,
 ) -> Result<()> {
+    let merged_at = record
+        .merged_at
+        .as_deref()
+        .map(DateTime::parse_from_rfc3339)
+        .transpose()
+        .with_context(|| {
+            format!(
+                "invalid merged timestamp {}",
+                record.merged_at.as_deref().unwrap_or_default()
+            )
+        })?
+        .map(|timestamp| timestamp.with_timezone(&Utc));
+    let tags_value: Value =
+        serde_json::from_str(tags_json).context("invalid upstream review tags")?;
     client
         .execute(
             "
@@ -1457,9 +1485,9 @@ async fn record_upstream_review_postgres(
                 &record.summary,
                 &record.pr_url,
                 &state,
-                &record.merged_at,
+                &merged_at,
                 &record.fixer_credit,
-                &tags_json,
+                &tags_value,
                 &record.patch_issue_id,
                 &record.clear_patch_issue,
             ],
@@ -18915,6 +18943,24 @@ mod tests {
         assert!(legacy_exists.is_none());
         assert!(!cpython_credit);
         assert!(htop_credit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_connection_accepts_parent_symlink_to_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real-state");
+        std::fs::create_dir(&real).expect("real state dir");
+        let link = dir.path().join("linked-state");
+        std::os::unix::fs::symlink(&real, &link).expect("state dir symlink");
+        let path = link.join("server.sqlite");
+
+        let connection = sqlite_connection(&path).expect("sqlite via parent symlink");
+        let value: i64 = connection
+            .query_row("SELECT 1", [], |row| row.get(0))
+            .expect("query");
+
+        assert_eq!(value, 1);
     }
 
     #[test]
