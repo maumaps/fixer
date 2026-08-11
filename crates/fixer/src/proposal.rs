@@ -6214,6 +6214,41 @@ fn render_process_investigation_report(
             body.push_str(stack_excerpt);
             body.push_str("\n```\n");
         }
+        if let Some(storage_wait) = details.get("storage_wait").and_then(Value::as_object) {
+            body.push_str("\n## Storage Wait Correlation\n\n");
+            if let Some(owner_hint) = storage_wait.get("owner_hint").and_then(Value::as_str) {
+                body.push_str(&format!("Likely owner: {owner_hint}\n"));
+            }
+            if let Some(signals) = storage_wait.get("signals").and_then(Value::as_array) {
+                let signals = signals
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .take(8)
+                    .collect::<Vec<_>>();
+                if !signals.is_empty() {
+                    body.push_str("\nSignals:\n");
+                    for signal in signals {
+                        body.push_str(&format!("- `{signal}`\n"));
+                    }
+                }
+            }
+            if let Some(steps) = storage_wait
+                .get("recommended_next_steps")
+                .and_then(Value::as_array)
+            {
+                let steps = steps
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .take(5)
+                    .collect::<Vec<_>>();
+                if !steps.is_empty() {
+                    body.push_str("\nStorage-specific follow-up:\n");
+                    for step in steps {
+                        body.push_str(&format!("- {step}\n"));
+                    }
+                }
+            }
+        }
     }
 
     body.push_str("\n## Validation Steps\n\n");
@@ -6260,7 +6295,16 @@ fn render_process_investigation_report(
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
         {
-            body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points below user space, so the next action is usually a kernel, mount, or storage investigation rather than a package patch.\n");
+            if details
+                .get("storage_wait")
+                .and_then(|value| value.get("family"))
+                .and_then(Value::as_str)
+                == Some("bcachefs")
+            {
+                body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points at bcachefs or its backing block device, so the next action is to verify filesystem progress, moving/copygc/reconcile state, and sibling D-state waits before filing a package bug or proposing a source patch.\n");
+            } else {
+                body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points below user space, so the next action is usually a kernel, mount, or storage investigation rather than a package patch.\n");
+            }
         } else if is_desktop_resume {
             if desktop_issue_variant == "sddm-greeter-nss-compat-crash" {
                 body.push_str("Treat this as the diagnosis half of the pipeline. The evidence currently points at display-manager startup and NSS configuration, so the next action is usually a system-configuration fix or distro integration bug report rather than a narrow application patch.\n");
@@ -8117,6 +8161,14 @@ mod tests {
                     ],
                     "io_excerpt": "read_bytes: 0\nwrite_bytes: 0",
                     "stack_excerpt": "fuse_wait_answer\nrequest_wait_answer\n",
+                    "storage_wait": {
+                        "family": "block-writeback",
+                        "owner_hint": "backing filesystem or block device",
+                        "signals": ["submit_bio"],
+                        "recommended_next_steps": [
+                            "Map the sampled process fd/cwd/root paths to a mount and backing block device before filing a package bug."
+                        ]
+                    },
                     "likely_external_root_cause": true
                 }
             }),
@@ -8140,6 +8192,9 @@ mod tests {
         assert!(rendered.contains("fuse-wait"));
         assert!(rendered.contains("fuse_wait_answer"));
         assert!(rendered.contains("/mnt/problematic-tree"));
+        assert!(rendered.contains("Storage Wait Correlation"));
+        assert!(rendered.contains("backing filesystem or block device"));
+        assert!(rendered.contains("submit_bio"));
         assert!(rendered.contains("kernel, mount, or storage investigation"));
     }
 

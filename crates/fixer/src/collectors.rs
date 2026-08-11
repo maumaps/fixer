@@ -4474,9 +4474,18 @@ struct StuckProcessInvestigationSummary {
     sched_excerpt: Option<String>,
     stack_excerpt: Option<String>,
     hypothesis: RunawayHypothesis,
+    storage_wait: Option<StorageWaitEvidence>,
     likely_external_root_cause: bool,
     raw_artifacts: BTreeMap<String, String>,
     package_metadata: Option<RunawayPackageMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StorageWaitEvidence {
+    family: String,
+    owner_hint: String,
+    signals: Vec<String>,
+    recommended_next_steps: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4771,6 +4780,7 @@ fn maybe_record_stuck_process_investigation(
         "loop_classification": investigation.hypothesis.classification,
         "loop_confidence": investigation.hypothesis.confidence,
         "loop_explanation": investigation.hypothesis.explanation,
+        "storage_wait": investigation.storage_wait,
         "likely_external_root_cause": investigation.likely_external_root_cause,
         "package_metadata": investigation.package_metadata,
         "richer_evidence_included": include_richer_evidence,
@@ -6074,6 +6084,24 @@ fn classify_stuck_process(
                     .to_string(),
         };
     }
+    if storage_wait_has_bcachefs_signal(&stack, &wchan, &fd_targets) {
+        return RunawayHypothesis {
+            classification: "bcachefs-storage-wait".to_string(),
+            confidence: 0.86,
+            explanation:
+                "The kernel stack, wait channel, or file descriptors point at bcachefs or bcache-backed writeback paths, so the D-state process is likely a victim of storage-layer progress rather than a standalone package bug."
+                    .to_string(),
+        };
+    }
+    if storage_wait_has_block_writeback_signal(&stack, &wchan, &fd_targets) {
+        return RunawayHypothesis {
+            classification: "block-writeback-wait".to_string(),
+            confidence: 0.79,
+            explanation:
+                "The kernel stack or wait channel points at journal, writeback, or block-layer throttling paths, so correlate the affected process with the backing device and filesystem before attempting a package patch."
+                    .to_string(),
+        };
+    }
     if stack.contains("ext4")
         || stack.contains("xfs")
         || stack.contains("btrfs")
@@ -6107,6 +6135,122 @@ fn classify_stuck_process(
         explanation:
             "The process is stuck in `D` state, but the current `/proc` evidence does not yet isolate which kernel or filesystem path is blocking it."
                 .to_string(),
+    }
+}
+
+fn storage_wait_has_bcachefs_signal(stack: &str, wchan: &str, _fd_targets: &str) -> bool {
+    stack.contains("bcachefs")
+        || stack.contains("bch2_")
+        || stack.contains("bcache_allocator")
+        || stack.contains("copygc")
+        || stack.contains("reconcile")
+        || wchan.contains("bcachefs")
+        || wchan.contains("bch2_")
+        || wchan.contains("bcache_allocator")
+        || wchan.contains("copygc")
+        || wchan.contains("reconcile")
+}
+
+fn storage_wait_has_block_writeback_signal(stack: &str, wchan: &str, _fd_targets: &str) -> bool {
+    stack.contains("jbd2")
+        || stack.contains("ext4_wait_block_bitmap")
+        || stack.contains("do_get_write_access")
+        || stack.contains("rq_qos_wait")
+        || stack.contains("balance_dirty_pages")
+        || stack.contains("inode_switch_wbs")
+        || stack.contains("wb_workfn")
+        || stack.contains("writeback")
+        || stack.contains("submit_bio")
+        || stack.contains("blk_")
+        || wchan.contains("jbd2")
+        || wchan.contains("ext4_wait_block_bitmap")
+        || wchan.contains("do_get_write_access")
+        || wchan.contains("rq_qos_wait")
+        || wchan.contains("balance_dirty_pages")
+        || wchan.contains("inode_switch_wbs")
+        || wchan.contains("wb_workfn")
+        || wchan.contains("writeback")
+        || wchan.contains("submit_bio")
+        || wchan.contains("blk_")
+}
+
+fn stuck_process_storage_wait_evidence(
+    hypothesis: &RunawayHypothesis,
+    proc_snapshot: &ProcSnapshot,
+) -> Option<StorageWaitEvidence> {
+    let family = match hypothesis.classification.as_str() {
+        "bcachefs-storage-wait" => "bcachefs",
+        "block-writeback-wait" | "filesystem-io-wait" | "mount-io-wait" => "block-writeback",
+        _ => return None,
+    };
+    let mut signals = BTreeSet::new();
+    collect_storage_wait_signals(
+        proc_snapshot.stack_excerpt.as_deref(),
+        proc_snapshot.wchan.as_deref(),
+        &proc_snapshot.fd_targets,
+        &mut signals,
+    );
+    if signals.is_empty() {
+        signals.insert(hypothesis.classification.clone());
+    }
+    let owner_hint = match family {
+        "bcachefs" => "bcachefs or the backing block device".to_string(),
+        _ => "backing filesystem or block device".to_string(),
+    };
+    let mut recommended_next_steps = vec![
+        "Map the sampled process fd/cwd/root paths to a mount and backing block device before filing a package bug.".to_string(),
+        "Correlate sibling D-state clusters by wait channel, filesystem, and device instead of treating each user process as a separate source patch lead.".to_string(),
+    ];
+    if family == "bcachefs" {
+        recommended_next_steps.push(
+            "For bcachefs, check fs usage, moving/copygc/reconcile state, and recent kernel stacks to distinguish moving progress from a stuck pool."
+                .to_string(),
+        );
+    } else {
+        recommended_next_steps.push(
+            "Check journal/writeback throttling, dirty pages, and block-layer latency for the backing device."
+                .to_string(),
+        );
+    }
+    Some(StorageWaitEvidence {
+        family: family.to_string(),
+        owner_hint,
+        signals: signals.into_iter().collect(),
+        recommended_next_steps,
+    })
+}
+
+fn collect_storage_wait_signals(
+    stack_excerpt: Option<&str>,
+    wchan: Option<&str>,
+    fd_targets: &[String],
+    signals: &mut BTreeSet<String>,
+) {
+    let haystack = [
+        stack_excerpt.unwrap_or_default(),
+        wchan.unwrap_or_default(),
+        &fd_targets.join("\n"),
+    ]
+    .join("\n")
+    .to_ascii_lowercase();
+    for signal in [
+        "bcachefs",
+        "bch2_",
+        "bcache_allocator",
+        "copygc",
+        "reconcile",
+        "jbd2",
+        "ext4_wait_block_bitmap",
+        "do_get_write_access",
+        "rq_qos_wait",
+        "balance_dirty_pages",
+        "inode_switch_wbs",
+        "submit_bio",
+        "blk_",
+    ] {
+        if haystack.contains(signal) {
+            signals.insert(signal.to_string());
+        }
     }
 }
 
@@ -7384,6 +7528,7 @@ fn build_stuck_process_investigation_summary(
             None
         },
         hypothesis: hypothesis.clone(),
+        storage_wait: stuck_process_storage_wait_evidence(hypothesis, proc_snapshot),
         likely_external_root_cause: !matches!(
             hypothesis.classification.as_str(),
             "unknown-uninterruptible-wait"
@@ -8661,21 +8806,22 @@ fn frame_is_useful(frame: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        KernelOomKillEvent, RunawayHypothesis, StuckProcessGroup, StuckProcessInvestigationSummary,
-        apparmor_finding_from_kernel_line, apparmor_profile_path_candidates, classify_runaway_loop,
-        classify_stuck_process, collect_interpreter_runaway_process_evidence,
-        collect_native_executable_provenance, collect_perl_runaway_process_evidence,
-        complaint_mentions_keyboard_layout_issue, coredump_debugger_arguments,
-        coredump_debugger_skip_reason, crash_event_executable, crash_event_label,
-        crash_event_process_name, csv_config_values, current_kernel_image_package_name,
-        dominant_syscall_sequence, extend_unique_log_lines, file_offset_for_mapped_address,
-        git_repo_root_for_path, investigation_cooldown_active, is_low_signal_kernel_warning,
-        is_profile_candidate, kernel_module_lookup_names, kernel_module_package_hint,
-        kernel_thread_package_name, kernel_warning_identity, kernel_warning_module_candidates,
-        looks_like_warning, netdev_watchdog_driver, normalize_oom_task_memcg_target,
-        normalize_perf_symbol, normalize_stuck_process_target_name, oom_cgroup_package_candidates,
-        package_lookup_path, package_lookup_path_is_dpkg_candidate, parse_apparmor_denial,
-        parse_coredump_info, parse_desktop_graphics_session_failure, parse_dkms_status_line,
+        KernelOomKillEvent, ProcSnapshot, RunawayHypothesis, StuckProcessGroup,
+        StuckProcessInvestigationSummary, apparmor_finding_from_kernel_line,
+        apparmor_profile_path_candidates, classify_runaway_loop, classify_stuck_process,
+        collect_interpreter_runaway_process_evidence, collect_native_executable_provenance,
+        collect_perl_runaway_process_evidence, complaint_mentions_keyboard_layout_issue,
+        coredump_debugger_arguments, coredump_debugger_skip_reason, crash_event_executable,
+        crash_event_label, crash_event_process_name, csv_config_values,
+        current_kernel_image_package_name, dominant_syscall_sequence, extend_unique_log_lines,
+        file_offset_for_mapped_address, git_repo_root_for_path, investigation_cooldown_active,
+        is_low_signal_kernel_warning, is_profile_candidate, kernel_module_lookup_names,
+        kernel_module_package_hint, kernel_thread_package_name, kernel_warning_identity,
+        kernel_warning_module_candidates, looks_like_warning, netdev_watchdog_driver,
+        normalize_oom_task_memcg_target, normalize_perf_symbol,
+        normalize_stuck_process_target_name, oom_cgroup_package_candidates, package_lookup_path,
+        package_lookup_path_is_dpkg_candidate, parse_apparmor_denial, parse_coredump_info,
+        parse_desktop_graphics_session_failure, parse_dkms_status_line,
         parse_go_binary_source_hint, parse_go_binary_source_hint_from_bytes, parse_ini_sections,
         parse_interpreter_command_hints, parse_kernel_oom_kill_events,
         parse_latest_desktop_resume_failure, parse_network_driver_hang_events,
@@ -8685,8 +8831,9 @@ mod tests {
         process_runtime_seconds, process_state_is_uninterruptible, python_module_local_source_hint,
         richer_evidence_enabled, safe_perf_name, shell_assignment_csv_value,
         stable_apparmor_denial_name, stuck_process_investigation_fingerprint,
-        stuck_process_source_fingerprint, summarize_top_syscalls,
-        symbolize_gdb_backtrace_addresses, system_uptime_seconds, truncate_for_json_field,
+        stuck_process_source_fingerprint, stuck_process_storage_wait_evidence,
+        summarize_top_syscalls, symbolize_gdb_backtrace_addresses, system_uptime_seconds,
+        truncate_for_json_field,
     };
     use crate::config::FixerConfig;
     use crate::models::{ParticipationMode, ParticipationState, PopularBinaryProfile};
@@ -8905,6 +9052,7 @@ Kthread:\t0\n";
                 confidence: 0.5,
                 explanation: "kernel worker is blocked in flip wait".to_string(),
             },
+            storage_wait: None,
             likely_external_root_cause: false,
             raw_artifacts: BTreeMap::new(),
             package_metadata: None,
@@ -10429,6 +10577,70 @@ Description: user-space parser utility for AppArmor
         );
         assert_eq!(hypothesis.classification, "fuse-wait");
         assert!(hypothesis.confidence > 0.8);
+    }
+
+    #[test]
+    fn classifies_stuck_processes_waiting_on_bcachefs_progress() {
+        let hypothesis = classify_stuck_process(
+            Some("bch2_move_ratelimit\nbch2_rebalance_work\nschedule\n"),
+            Some("bch2_move_ratelimit"),
+            &["/mnt/synthetic-bcachefs-pool/project/build.log".to_string()],
+        );
+        assert_eq!(hypothesis.classification, "bcachefs-storage-wait");
+        assert!(hypothesis.confidence > 0.8);
+        assert!(hypothesis.explanation.contains("storage-layer"));
+    }
+
+    #[test]
+    fn classifies_stuck_processes_waiting_on_block_writeback() {
+        let hypothesis = classify_stuck_process(
+            Some("balance_dirty_pages\nrq_qos_wait\nsubmit_bio_wait\n"),
+            Some("rq_qos_wait"),
+            &["/var/lib/synthetic-db/base/123".to_string()],
+        );
+        assert_eq!(hypothesis.classification, "block-writeback-wait");
+        assert!(hypothesis.confidence > 0.7);
+        assert!(hypothesis.explanation.contains("backing device"));
+    }
+
+    #[test]
+    fn stuck_process_storage_wait_evidence_records_signals_and_followup() {
+        let hypothesis = RunawayHypothesis {
+            classification: "bcachefs-storage-wait".to_string(),
+            confidence: 0.86,
+            explanation: "bcachefs wait".to_string(),
+        };
+        let snapshot = ProcSnapshot {
+            command_line: None,
+            command_argv: Vec::new(),
+            executable: None,
+            process_state: Some("D (disk sleep)".to_string()),
+            wchan: Some("bch2_move_ratelimit".to_string()),
+            cwd: Some("/mnt/synthetic-bcachefs-pool/work".to_string()),
+            root: Some("/".to_string()),
+            fd_targets: vec!["/mnt/synthetic-bcachefs-pool/work/item".to_string()],
+            io_excerpt: None,
+            status_excerpt: None,
+            sched_excerpt: None,
+            stack_excerpt: Some("bch2_move_ratelimit\ncopygc_wait\n".to_string()),
+            raw_artifacts: BTreeMap::new(),
+        };
+        let storage_wait =
+            stuck_process_storage_wait_evidence(&hypothesis, &snapshot).expect("storage evidence");
+
+        assert_eq!(storage_wait.family, "bcachefs");
+        assert_eq!(
+            storage_wait.owner_hint,
+            "bcachefs or the backing block device"
+        );
+        assert!(storage_wait.signals.contains(&"bch2_".to_string()));
+        assert!(storage_wait.signals.contains(&"copygc".to_string()));
+        assert!(
+            storage_wait
+                .recommended_next_steps
+                .iter()
+                .any(|step| step.contains("moving/copygc/reconcile"))
+        );
     }
 
     #[test]
