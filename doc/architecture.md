@@ -194,6 +194,16 @@ When Fixer wants to validate or propose a fix, it tries to find a real workspace
 
 If none of those work, Fixer should not bluff. It falls back to a triage or bug-report path rather than pretending a patch exists.
 
+Steps 2 to 5 all assume the installed files are the distribution's. Before taking
+any of them, Fixer verifies with `dpkg -V` that the files the evidence names --
+the artifact and the modules in the recorded stack -- still match their packages.
+A developer machine routinely carries locally built libraries over packaged ones,
+and distribution source is then not the code that produced the evidence. When a
+file diverges, Fixer refuses with the file, the package, and the way out rather
+than handing Codex a source tree that never ran. Step 1, and the paths that
+resolve a workspace from the binary's own provenance or a retained local
+checkout, are unaffected: those already point at the tree that built the file.
+
 ## Proposal flow
 
 Proposal generation is deliberately narrow:
