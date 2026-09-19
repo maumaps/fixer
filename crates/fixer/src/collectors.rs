@@ -4583,7 +4583,6 @@ fn maybe_record_runaway_investigation(
     );
     let fingerprint = runaway_investigation_fingerprint(
         target,
-        &investigation.top_hot_symbols,
         &investigation.top_syscalls,
         &investigation.dominant_sequence,
         &investigation.hypothesis,
@@ -7590,25 +7589,23 @@ fn runaway_investigation_source_fingerprint(target: &PopularBinaryProfile) -> St
     ))
 }
 
+// The sampled hot symbols are deliberately absent from the identity. Whichever
+// kernel frame a 3-second profile happens to land on changes from run to run,
+// so including it split one runaway process into a separate investigation --
+// and a separate Codex-authored patch -- per sample: sshd-auth alone reached
+// the public board five times with the same timer-churn loop.
 fn runaway_investigation_fingerprint(
     target: &PopularBinaryProfile,
-    top_hot_symbols: &[String],
     top_syscalls: &[RunawaySyscallStat],
     dominant_sequence: &[String],
     hypothesis: &RunawayHypothesis,
     common_frame_clusters: &[RunawayFrameCluster],
 ) -> String {
     hash_text(format!(
-        "runaway-process:{}:{}:{}:{}:{}:{}:{}:{}",
+        "runaway-process:{}:{}:{}:{}:{}:{}:{}",
         target.name,
         target.path.display(),
         target.package_name.as_deref().unwrap_or("unknown"),
-        top_hot_symbols
-            .iter()
-            .take(3)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("|"),
         top_syscalls
             .iter()
             .take(3)
@@ -8806,7 +8803,8 @@ fn frame_is_useful(frame: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        KernelOomKillEvent, ProcSnapshot, RunawayHypothesis, StuckProcessGroup,
+        KernelOomKillEvent, ProcSnapshot, RunawayFrameCluster, RunawayHypothesis,
+        RunawaySyscallStat, StuckProcessGroup,
         StuckProcessInvestigationSummary, apparmor_finding_from_kernel_line,
         apparmor_profile_path_candidates, classify_runaway_loop, classify_stuck_process,
         collect_interpreter_runaway_process_evidence, collect_native_executable_provenance,
@@ -8830,7 +8828,8 @@ mod tests {
         parse_python_module_source_hint, parse_strace_syscall_name, prioritize_coredump_events,
         process_runtime_seconds, process_state_is_uninterruptible, python_module_local_source_hint,
         richer_evidence_enabled, safe_perf_name, shell_assignment_csv_value,
-        stable_apparmor_denial_name, stuck_process_investigation_fingerprint,
+        runaway_investigation_fingerprint, stable_apparmor_denial_name,
+        stuck_process_investigation_fingerprint,
         stuck_process_source_fingerprint, stuck_process_storage_wait_evidence,
         summarize_top_syscalls, symbolize_gdb_backtrace_addresses, system_uptime_seconds,
         truncate_for_json_field,
@@ -9638,6 +9637,51 @@ Stack trace of thread 222:\n\
         assert_eq!(prioritized.len(), 2);
         assert_eq!(prioritized[0].get("pid").and_then(Value::as_i64), Some(11));
         assert_eq!(prioritized[1].get("pid").and_then(Value::as_i64), Some(12));
+    }
+
+    #[test]
+    fn one_runaway_loop_keeps_one_identity_across_samples() {
+        let target = PopularBinaryProfile {
+            name: "sshd-auth".to_string(),
+            path: PathBuf::from("/usr/sbin/sshd"),
+            package_name: Some("openssh-server".to_string()),
+            process_count: 4,
+            total_cpu_percent: 41.0,
+            max_cpu_percent: 22.5,
+        };
+        let syscalls = vec![RunawaySyscallStat {
+            name: "clock_nanosleep".to_string(),
+            count: 120,
+        }];
+        let sequence = vec!["clock_nanosleep".to_string(), "futex".to_string()];
+        let timer_churn = RunawayHypothesis {
+            classification: "timer-churn".to_string(),
+            confidence: 0.7,
+            explanation: "repeated short sleeps".to_string(),
+        };
+        let clusters = vec![RunawayFrameCluster {
+            signature: "sshd-auth:wait".to_string(),
+            thread_count: 2,
+            frames: vec!["ppoll".to_string()],
+        }];
+
+        // Two profiles of the same loop land on different kernel frames --
+        // apparmor_socket_recvmsg one cycle, dequeue_task_fair the next. The
+        // frame is not part of the identity, so this stays one investigation.
+        let first =
+            runaway_investigation_fingerprint(&target, &syscalls, &sequence, &timer_churn, &clusters);
+        let second =
+            runaway_investigation_fingerprint(&target, &syscalls, &sequence, &timer_churn, &clusters);
+        assert_eq!(first, second);
+
+        let busy_poll = RunawayHypothesis {
+            classification: "busy-poll".to_string(),
+            ..timer_churn.clone()
+        };
+        assert_ne!(
+            first,
+            runaway_investigation_fingerprint(&target, &syscalls, &sequence, &busy_poll, &clusters)
+        );
     }
 
     #[test]

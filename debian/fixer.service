@@ -12,7 +12,11 @@ WorkingDirectory=/var/lib/fixer
 StateDirectory=fixer
 LogsDirectory=fixer
 NoNewPrivileges=yes
-ProtectHome=yes
+# read-only, not yes: the patch engine and the repositories Fixer builds
+# workspaces from live in a user home on a normal developer machine. With
+# ProtectHome=yes the daemon cannot even see its own `codex` binary, so every
+# worker poll reported "Codex is not installed on this host".
+ProtectHome=read-only
 ProtectSystem=full
 PrivateTmp=yes
 

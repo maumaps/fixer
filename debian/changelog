@@ -1,3 +1,18 @@
+fixer (0.248.0-1) unstable; urgency=medium
+
+  * Keep collecting after a failed cycle instead of exiting the daemon, and log
+    the whole cause chain: a database lock held by the CLI killed fixerd
+    twenty-three times in one day.
+  * Wait a minute, not rusqlite's five seconds, for a lock the other Fixer
+    process holds.
+  * Let the daemon reach its own patch engine: ProtectHome=yes hid the codex
+    binary, so every worker poll reported "Codex is not installed on this host".
+  * Keep one runaway-process investigation per loop. The sampled kernel frame
+    was part of its identity, so one stuck process reached the public board as
+    up to seven separate issues, each with its own authored patch.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sat, 19 Sep 2026 11:20:00 +0400
+
 fixer (0.247.0-1) unstable; urgency=medium
 
   * Log at info by default so reconnects, recoveries and startup are recorded

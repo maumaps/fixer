@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 
 pub struct Store {
@@ -69,6 +70,12 @@ fn stored_kernel_warning_message(summary: &str) -> &str {
         .unwrap_or(summary)
 }
 
+/// How long a writer waits for a lock held by the other Fixer process before
+/// giving up. rusqlite defaults to five seconds, which a collection cycle
+/// writing a few hundred findings, or a CLI command scanning the opportunity
+/// table, routinely outlasts.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -77,6 +84,11 @@ impl Store {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open database {}", path.display()))?;
+        // The daemon and the CLI share one database file. Without a busy
+        // timeout the second writer gets SQLITE_BUSY on the first attempt, and
+        // for the daemon that means exiting the collection loop.
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .with_context(|| format!("failed to set busy timeout on {}", path.display()))?;
         let store = Self { conn };
         store.init()?;
         Ok(store)
@@ -2114,11 +2126,54 @@ fn map_opportunity_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpportunityR
 
 #[cfg(test)]
 mod tests {
-    use super::Store;
+    use super::{BUSY_TIMEOUT, Connection, Duration, Store};
     use crate::models::{FindingInput, ObservedArtifact};
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    #[test]
+    fn a_write_waits_for_the_other_process_instead_of_failing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("fixer.sqlite");
+        let store = Store::open(&path).unwrap();
+
+        // rusqlite would leave five seconds here. That is shorter than a
+        // collection cycle, and the daemon treated the resulting SQLITE_BUSY
+        // as fatal, so the CLI writing at the wrong moment took the service
+        // down twenty-three times in one day.
+        let configured: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(configured, BUSY_TIMEOUT.as_millis() as i64);
+
+        // And the wait really is a wait: a write issued while the other
+        // process holds the lock lands once that process lets go.
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            blocker.execute_batch("COMMIT").unwrap();
+        });
+
+        store
+            .record_finding(&FindingInput {
+                kind: "warning".to_string(),
+                title: "Written while the other process held the lock".to_string(),
+                severity: "low".to_string(),
+                fingerprint: "contended".to_string(),
+                summary: "contended write".to_string(),
+                details: json!({}),
+                artifact: None,
+                repo_root: None,
+                ecosystem: None,
+            })
+            .unwrap();
+
+        release.join().unwrap();
+        assert_eq!(store.status().unwrap().findings, 1);
+    }
 
     #[test]
     fn records_findings_and_opportunities() {

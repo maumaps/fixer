@@ -141,54 +141,69 @@ impl App {
 
     pub fn run_loop(&self) -> Result<()> {
         loop {
-            let report = self.collect_once()?;
-            tracing::info!(
-                capabilities = report.capabilities_seen,
-                artifacts = report.artifacts_seen,
-                findings = report.findings_seen,
-                "completed collection cycle"
-            );
-            let participation = self.participation()?;
-            if participation.state.mode.can_submit()
-                && self.should_run_network_task(
-                    "last_sync_at",
-                    self.config.network.sync_interval_seconds,
-                )
-            {
-                match self.sync() {
-                    Ok(outcome) => {
-                        if let Some(message) = network::server_upgrade_message(&outcome.hello) {
-                            tracing::warn!(message = %message, "server recommends upgrading fixer");
-                        }
-                        tracing::info!(
-                            items_uploaded = outcome.items_uploaded,
-                            promoted_clusters = outcome.receipt.promoted_clusters,
-                            "completed sync cycle"
-                        );
-                    }
-                    Err(error) => tracing::warn!(error = %error, "sync cycle failed"),
-                }
-            }
-            if participation.state.mode.can_work()
-                && self.should_run_network_task(
-                    "last_worker_run_at",
-                    self.config.service.poll_interval_seconds,
-                )
-            {
-                match self.worker_once() {
-                    Ok(outcome) => {
-                        if let Some(message) = network::server_upgrade_message(&outcome.hello) {
-                            tracing::warn!(message = %message, "server recommends upgrading fixer");
-                        }
-                        tracing::info!(message = %outcome.offer.message, "completed worker poll");
-                    }
-                    Err(error) => tracing::warn!(error = %error, "worker poll failed"),
-                }
+            // A failing cycle is transient here: the other Fixer process holds
+            // the database, a probe broke after a package upgrade, the server
+            // is down. Exiting would leave the host collecting no evidence at
+            // all, so log the whole cause chain and take the next cycle.
+            if let Err(error) = self.run_cycle() {
+                tracing::warn!(error = format!("{error:#}"), "collection cycle failed");
             }
             thread::sleep(Duration::from_secs(
                 self.config.service.poll_interval_seconds,
             ));
         }
+    }
+
+    fn run_cycle(&self) -> Result<()> {
+        let report = self.collect_once()?;
+        tracing::info!(
+            capabilities = report.capabilities_seen,
+            artifacts = report.artifacts_seen,
+            findings = report.findings_seen,
+            "completed collection cycle"
+        );
+        let participation = self.participation()?;
+        if participation.state.mode.can_submit()
+            && self.should_run_network_task(
+                "last_sync_at",
+                self.config.network.sync_interval_seconds,
+            )
+        {
+            match self.sync() {
+                Ok(outcome) => {
+                    if let Some(message) = network::server_upgrade_message(&outcome.hello) {
+                        tracing::warn!(message = %message, "server recommends upgrading fixer");
+                    }
+                    tracing::info!(
+                        items_uploaded = outcome.items_uploaded,
+                        promoted_clusters = outcome.receipt.promoted_clusters,
+                        "completed sync cycle"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(error = format!("{error:#}"), "sync cycle failed")
+                }
+            }
+        }
+        if participation.state.mode.can_work()
+            && self.should_run_network_task(
+                "last_worker_run_at",
+                self.config.service.poll_interval_seconds,
+            )
+        {
+            match self.worker_once() {
+                Ok(outcome) => {
+                    if let Some(message) = network::server_upgrade_message(&outcome.hello) {
+                        tracing::warn!(message = %message, "server recommends upgrading fixer");
+                    }
+                    tracing::info!(message = %outcome.offer.message, "completed worker poll");
+                }
+                Err(error) => {
+                    tracing::warn!(error = format!("{error:#}"), "worker poll failed")
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn validate(&self, opportunity_id: i64) -> Result<Vec<(String, String)>> {
