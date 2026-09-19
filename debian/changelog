@@ -1,3 +1,10 @@
+fixer (0.246.0-1) unstable; urgency=medium
+
+  * Reconnect to postgres automatically instead of serving `connection closed`
+    from every route, including /healthz, until the process is restarted.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sat, 19 Sep 2026 12:00:00 +0400
+
 fixer (0.245.0-1) unstable; urgency=medium
 
   * Keep Spark as a prompted subagent leaf model, not a default stage fallback.

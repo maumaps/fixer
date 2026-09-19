@@ -5,6 +5,7 @@ use crate::models::{
 };
 use crate::native_provenance::enrich_runaway_native_executable_provenance;
 use crate::network::verify_worker_pull_pow;
+use crate::pg::PgClient;
 use crate::pow::verify_pow;
 use crate::privacy::PRIVACY_WARNING;
 use crate::protocol::{
@@ -31,7 +32,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
-use tokio_postgres::{Client, NoTls, Row};
+use tokio_postgres::Row;
 use url::Url;
 use uuid::Uuid;
 
@@ -806,7 +807,7 @@ struct ServerState {
 
 #[derive(Clone)]
 enum ServerDb {
-    Postgres(Arc<Client>),
+    Postgres(Arc<PgClient>),
     Sqlite(PathBuf),
 }
 
@@ -1235,14 +1236,9 @@ async fn open_server_db(config: &FixerConfig) -> Result<ServerDb> {
     if let Some(path) = sqlite_path_from_url(&config.server.postgres_url) {
         return Ok(ServerDb::Sqlite(path));
     }
-    let (client, connection) = tokio_postgres::connect(&config.server.postgres_url, NoTls)
+    let client = PgClient::connect(&config.server.postgres_url)
         .await
         .with_context(|| format!("failed to connect to {}", config.server.postgres_url))?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::error!(?error, "postgres connection failed");
-        }
-    });
     Ok(ServerDb::Postgres(Arc::new(client)))
 }
 
@@ -1435,7 +1431,7 @@ async fn load_upstream_review_patch_issue_id(
 }
 
 async fn record_upstream_review_postgres(
-    client: &Client,
+    client: &PgClient,
     record: &UpstreamReviewRecord,
     state: &str,
     tags_json: &str,
@@ -4619,7 +4615,7 @@ async fn load_legacy_state(db: &ServerDb) -> Result<LegacyServerState> {
     }
 }
 
-async fn load_legacy_state_postgres(db: &Client) -> Result<LegacyServerState> {
+async fn load_legacy_state_postgres(db: &PgClient) -> Result<LegacyServerState> {
     let submissions = db
         .query(
             "
@@ -6659,7 +6655,7 @@ async fn load_latest_patch_context_for_worker(
     }
 }
 
-async fn refresh_issue_cluster_best_results(db: &Client, cluster_id: &str) -> Result<()> {
+async fn refresh_issue_cluster_best_results(db: &PgClient, cluster_id: &str) -> Result<()> {
     let rows = db
         .query(
             "

@@ -7,6 +7,7 @@ pub mod gc;
 pub mod models;
 pub mod native_provenance;
 pub mod network;
+pub mod pg;
 pub mod pow;
 pub mod privacy;
 pub mod proposal;
