@@ -1,3 +1,12 @@
+fixer (0.249.0-1) unstable; urgency=medium
+
+  * Accept the word the authoring prompt asks for. The prompt requires an
+    "independent reproduction command/test and result"; the quality gate only
+    matched past-tense spellings, so a patch that named its reproducer and its
+    exit code was failed for wording and thrown away.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sat, 19 Sep 2026 20:05:00 +0400
+
 fixer (0.248.0-1) unstable; urgency=medium
 
   * Keep collecting after a failed cycle instead of exiting the daemon, and log

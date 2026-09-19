@@ -3967,8 +3967,7 @@ fn evidence_confidence_quality_failure(
     }
     if confidence == "reproduced" {
         let reproduced_markers = [
-            "reproduced",
-            "reproducible",
+            "reproduc",
             "ran the failing command",
             "failing test",
             "before/after",
@@ -4109,8 +4108,11 @@ fn security_sensitive_scan_text(text: &str) -> String {
 
 fn validation_names_reproduction(validation_lower: &str) -> bool {
     let reproduction_terms = [
-        "reproduced",
-        "reproducer",
+        // "reproduc" on purpose: the authoring prompt asks for the
+        // "independent reproduction command", and that noun matched none of
+        // the past-tense spellings, so a patch that named its reproducer and
+        // its exit code was rejected for wording.
+        "reproduc",
         "failing command",
         "failing test",
         "before/after",
@@ -4118,7 +4120,6 @@ fn validation_names_reproduction(validation_lower: &str) -> bool {
         "confirmed the failure",
         "confirmed failure",
         "repro command",
-        "smoke reproduced",
     ];
     reproduction_terms
         .iter()
@@ -11372,6 +11373,33 @@ Reproduced with `strace -f -e openat,read ./src/redis-server /tmp/redis.conf` be
 "#;
 
         assert!(super::patch_explanation_quality_failure(response, None).is_none());
+    }
+
+    #[test]
+    fn patch_explanation_quality_guard_accepts_the_noun_the_prompt_asks_for() {
+        // The authoring prompt says "include the independent reproduction
+        // command/test and result". A real sshpass patch wrote exactly that,
+        // named the command and its exit code, and the guard rejected it
+        // because the word list only held past-tense spellings.
+        let response = r#"Subject: sshpass: do not hide a password that was never read
+
+## Commit Message
+`-e` without the environment variable set printed a diagnostic and then crashed.
+
+## Evidence Confidence
+reproduced
+
+## Issue Connection
+The user-visible symptom is that `sshpass -e` prints "environment variable is not set" and then dies on SIGSEGV instead of exiting with an argument error. The code-level cause is that `hide_password()` ran on the error path too and passed the null `orig_password` to `strdup`. The change moves `hide_password()` and `unsetenv()` into the branch where the variable was actually found. The expected effect is a clean exit code 1 on that path. I reproduced the crash independently before the change.
+
+## Git Add Paths
+main.c
+
+## Validation
+Independent reproduction against the installed package: `env -u SSHPASS /usr/bin/sshpass -e /bin/true` printed the diagnostic and then segfaulted, exit 139. After the patch the same command exits 1.
+"#;
+
+        assert_eq!(super::patch_explanation_quality_failure(response, None), None);
     }
 
     #[test]
