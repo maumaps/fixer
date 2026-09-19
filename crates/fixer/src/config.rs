@@ -167,6 +167,8 @@ pub struct NetworkConfig {
     pub sync_interval_seconds: u64,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_seconds: u64,
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout_seconds: u64,
     #[serde(default = "default_submission_pow_difficulty")]
     pub submission_pow_difficulty: u32,
     #[serde(default = "default_worker_pow_difficulty")]
@@ -331,6 +333,7 @@ impl Default for NetworkConfig {
             server_url: default_server_url(),
             sync_interval_seconds: default_sync_interval(),
             connect_timeout_seconds: default_connect_timeout(),
+            request_timeout_seconds: default_request_timeout(),
             submission_pow_difficulty: default_submission_pow_difficulty(),
             worker_pow_difficulty: default_worker_pow_difficulty(),
             max_submission_items: default_max_submission_items(),
@@ -581,6 +584,15 @@ fn default_connect_timeout() -> u64 {
     20
 }
 
+/// How long a whole request may take, reaching the server included. A worker
+/// pull on a busy board measured 35 seconds against fixer.maumap.com, so the
+/// connect budget is nowhere near enough for it: with one timeout serving both,
+/// every worker poll from this host died at twenty seconds and the daemon
+/// accepted no work at all.
+fn default_request_timeout() -> u64 {
+    300
+}
+
 fn default_submission_pow_difficulty() -> u32 {
     4
 }
@@ -643,4 +655,32 @@ fn default_abuse_threshold() -> i64 {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FixerConfig;
+
+    #[test]
+    fn a_config_written_before_the_split_still_gets_a_request_timeout() {
+        // Hosts carry /etc/fixer/fixer.toml from an older package. Reading a
+        // whole-request budget out of the connect budget is what killed every
+        // worker poll on nucat: v1/work/pull takes about 35 seconds against a
+        // busy board, and the connect budget is 20.
+        let config: FixerConfig = toml::from_str(
+            "
+[network]
+server_url = \"https://fixer.maumap.com\"
+connect_timeout_seconds = 20
+",
+        )
+        .expect("an older config must still parse");
+
+        assert_eq!(config.network.connect_timeout_seconds, 20);
+        assert!(
+            config.network.request_timeout_seconds >= 120,
+            "a whole request needs far more than the connect budget, got {}",
+            config.network.request_timeout_seconds
+        );
+    }
 }

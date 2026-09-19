@@ -1,3 +1,14 @@
+fixer (0.251.0-1) unstable; urgency=medium
+
+  * Give a request its own timeout instead of spending the connect budget on
+    it. A worker pull against a busy board measures about 35 seconds, the
+    connect budget is 20, and every poll from this host died there: the daemon
+    reached its patch engine and still accepted no work at all.
+  * Say which proposals an opportunity has when prepare-submit is handed an
+    opportunity id, instead of "Query returned no rows".
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sat, 19 Sep 2026 21:45:00 +0400
+
 fixer (0.250.0-1) unstable; urgency=medium
 
   * Do not patch distribution source for a file the machine rebuilt itself.

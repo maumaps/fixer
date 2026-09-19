@@ -2520,7 +2520,8 @@ fn default_participation_state(config: &FixerConfig) -> ParticipationState {
 
 fn http_client(config: &FixerConfig) -> Result<Client> {
     Client::builder()
-        .timeout(Duration::from_secs(config.network.connect_timeout_seconds))
+        .connect_timeout(Duration::from_secs(config.network.connect_timeout_seconds))
+        .timeout(Duration::from_secs(config.network.request_timeout_seconds))
         .build()
         .context("failed to build HTTP client")
 }

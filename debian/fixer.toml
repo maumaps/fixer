@@ -43,6 +43,7 @@ lease_bootstrap_enable_linger = true
 server_url = "https://fixer.maumap.com"
 sync_interval_seconds = 900
 connect_timeout_seconds = 20
+request_timeout_seconds = 300
 submission_pow_difficulty = 4
 worker_pow_difficulty = 5
 max_submission_items = 50
