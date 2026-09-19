@@ -1,3 +1,18 @@
+fixer (0.252.0-1) unstable; urgency=medium
+
+  * Stop sending a worker the whole evidence board to pick one issue from. A
+    pull ranks up to 1024 candidates, and it used to read every candidate's
+    representative: 35 MB of JSON on the live board, parsed into structs only
+    to read three scalars out of each. The query now projects those three
+    signals in SQL and the chosen cluster alone is loaded whole. Measured
+    against fixer.maumap.com: 58.1 MB per candidate set, now 22.2 MB.
+  * The representative-shaped ranking adjustment stays as the reference the
+    projection is checked against, so a signal that stops travelling shows up
+    as a ranking difference in the test suite rather than as a worker quietly
+    choosing a different issue.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sat, 19 Sep 2026 23:18:25 +0400
+
 fixer (0.251.0-1) unstable; urgency=medium
 
   * Give a request its own timeout instead of spending the connect budget on

@@ -7049,8 +7049,24 @@ async fn upsert_issue_cluster(
     }
 }
 
+/// What ranking a worker candidate actually needs.
+///
+/// Deliberately not the whole `IssueCluster`: the representative carries the
+/// evidence bundle, and a pull looks at up to 1024 candidates to choose one.
+/// On the live board that was 35 MB of JSON read and parsed per poll, which is
+/// most of the 35 seconds a pull took. Ranking reads three scalars out of the
+/// representative, so the query projects those and the winner is loaded whole.
+#[derive(Debug, Clone)]
 struct WorkerCandidate {
-    issue: IssueCluster,
+    id: String,
+    kind: String,
+    package_name: Option<String>,
+    source_package: Option<String>,
+    score: i64,
+    corroboration_count: i64,
+    last_seen: String,
+    best_patch: Option<PatchAttempt>,
+    priority_signals: IssuePrioritySignals,
     has_foreign_reports: bool,
     last_attempt_at: Option<DateTime<Utc>>,
     last_attempt_model: Option<String>,
@@ -7067,14 +7083,36 @@ async fn next_issue_for_worker(
     worker_model: Option<String>,
 ) -> Result<Option<IssueCluster>> {
     let candidate_limit: i64 = 1024;
-    match db {
+    // Both arms shadow `db` with the backend handle; keep the enum for the
+    // second phase, which loads the chosen cluster whole.
+    let db_ref = db;
+    let chosen = match db {
         ServerDb::Postgres(db) => {
             let rows = db
                 .query(
                     "
-        SELECT id, cluster_key, kind, title, summary, package_name, source_package, ecosystem,
-               severity, score, corroboration_count, quarantined, promoted, representative_json,
-               best_patch_json, last_seen, best_triage_json,
+        SELECT id, kind, package_name, source_package, score, corroboration_count, last_seen,
+               best_patch_json, best_triage_json,
+               jsonb_build_object(
+                    'finding', jsonb_build_object(
+                        'kind', representative_json->'finding'->'kind',
+                        'artifact_name', representative_json->'finding'->'artifact_name',
+                        'package_name', representative_json->'finding'->'package_name',
+                        'details', jsonb_build_object(
+                            'subsystem',
+                                representative_json->'finding'->'details'->'subsystem',
+                            'likely_external_root_cause',
+                                representative_json->'finding'->'details'->'likely_external_root_cause',
+                            'process_name',
+                                representative_json->'finding'->'details'->'process_name',
+                            'profile_target',
+                                representative_json->'finding'->'details'->'profile_target'
+                        )
+                    ),
+                    'opportunity', jsonb_build_object(
+                        'title', representative_json->'opportunity'->'title'
+                    )
+               ) AS priority_signals_json,
                EXISTS (
                     SELECT 1
                     FROM cluster_reports report
@@ -7119,20 +7157,19 @@ async fn next_issue_for_worker(
                 .into_iter()
                 .map(worker_candidate_from_row)
                 .collect::<Result<Vec<_>>>()?;
-            Ok(select_worker_candidate(
+            select_worker_candidate(
                 candidates,
                 worker_attempt_cooldown_seconds,
                 worker_model.as_deref(),
-            ))
+            )
         }
         ServerDb::Sqlite(path) => {
             let connection = sqlite_connection(path)?;
             let now = Utc::now().to_rfc3339();
             let mut stmt = connection.prepare(
                 "
-        SELECT id, cluster_key, kind, title, summary, package_name, source_package, ecosystem,
-               severity, score, corroboration_count, quarantined, promoted, representative_json,
-               best_patch_json, last_seen, best_triage_json,
+        SELECT id, kind, package_name, source_package, score, corroboration_count, last_seen,
+               best_patch_json, best_triage_json, representative_json,
                EXISTS (
                     SELECT 1
                     FROM cluster_reports report
@@ -7174,37 +7211,64 @@ async fn next_issue_for_worker(
             let rows = stmt.query_map(
                 params![worker_install_id, now.as_str(), candidate_limit],
                 |row| {
-                    let best_triage = row
-                        .get::<_, Option<String>>(16)?
+                    let best_patch = row
+                        .get::<_, Option<String>>(7)?
                         .map(|raw| serde_json::from_str::<PatchAttempt>(&raw))
                         .transpose()
                         .map_err(|error| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                16,
+                                7,
                                 rusqlite::types::Type::Text,
                                 Box::new(error),
                             )
                         })?;
-                    let mut issue = issue_from_sqlite_row(row)?;
-                    let has_foreign_reports = row.get::<_, i64>(17)? != 0;
+                    let best_triage = row
+                        .get::<_, Option<String>>(8)?
+                        .map(|raw| serde_json::from_str::<PatchAttempt>(&raw))
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                8,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                    // A local store is small enough to read the representative
+                    // and pick the ranking signals out of it here; the shared
+                    // board projects them in SQL instead.
+                    let priority_signals = serde_json::from_str::<Value>(
+                        &row.get::<_, String>(9)?,
+                    )
+                    .map(|representative| {
+                        issue_priority_signals_from_value(&priority_signals_projection(
+                            &representative,
+                        ))
+                    })
+                    .unwrap_or_default();
+                    let has_foreign_reports = row.get::<_, i64>(10)? != 0;
                     let last_attempt_at = row
-                        .get::<_, Option<String>>(18)?
+                        .get::<_, Option<String>>(11)?
                         .as_deref()
                         .and_then(parse_timestamp);
                     let latest_attempt = row
-                        .get::<_, Option<String>>(19)?
+                        .get::<_, Option<String>>(12)?
                         .and_then(|raw| latest_attempt_from_json_str(&raw).ok());
-                    let best_patch_has_upstream_review = row.get::<_, i64>(20)? != 0;
+                    let best_patch_has_upstream_review = row.get::<_, i64>(13)? != 0;
                     let rerunnable_source_handoff = best_triage
                         .as_ref()
                         .and_then(rerunnable_source_handoff)
                         .or_else(|| latest_attempt.as_ref().and_then(rerunnable_source_handoff));
-                    if let Some(handoff) = rerunnable_source_handoff.as_ref() {
-                        attach_rerunnable_source_handoff_to_issue(&mut issue, handoff);
-                    }
-                    let last_attempt_model = patch_attempt_model(issue.best_patch.as_ref());
+                    let last_attempt_model = patch_attempt_model(best_patch.as_ref());
                     Ok(WorkerCandidate {
-                        issue,
+                        id: row.get(0)?,
+                        kind: row.get(1)?,
+                        package_name: row.get(2)?,
+                        source_package: row.get(3)?,
+                        score: row.get(4)?,
+                        corroboration_count: row.get(5)?,
+                        last_seen: row.get(6)?,
+                        best_patch,
+                        priority_signals,
                         has_foreign_reports,
                         last_attempt_at,
                         last_attempt_model,
@@ -7216,13 +7280,15 @@ async fn next_issue_for_worker(
                 },
             )?;
             let candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(select_worker_candidate(
+            select_worker_candidate(
                 candidates,
                 worker_attempt_cooldown_seconds,
                 worker_model.as_deref(),
-            ))
+            )
         }
-    }
+    };
+    // The rusqlite handles above are gone by now, so the second phase can await.
+    materialize_worker_issue(db_ref, chosen).await
 }
 
 fn candidate_model_differs(candidate: &WorkerCandidate, worker_model: Option<&str>) -> bool {
@@ -7236,7 +7302,7 @@ fn candidate_is_available_for_worker(candidate: &WorkerCandidate) -> bool {
     if candidate_has_rerunnable_source_handoff(candidate) {
         return true;
     }
-    !candidate.has_best_triage && issue_is_available_for_worker(&candidate.issue)
+    !candidate.has_best_triage && best_patch_leaves_work_for_a_worker(candidate.best_patch.as_ref())
 }
 
 fn candidate_has_rerunnable_source_handoff(candidate: &WorkerCandidate) -> bool {
@@ -7247,7 +7313,7 @@ fn select_worker_candidate(
     candidates: Vec<WorkerCandidate>,
     worker_attempt_cooldown_seconds: u64,
     worker_model: Option<&str>,
-) -> Option<IssueCluster> {
+) -> Option<WorkerCandidate> {
     let cooldown_cutoff = (worker_attempt_cooldown_seconds > 0)
         .then(|| Utc::now() - Duration::seconds(worker_attempt_cooldown_seconds as i64));
     let reviewed_source_families = reviewed_worker_source_families(&candidates);
@@ -7263,7 +7329,7 @@ fn select_worker_candidate(
                 && candidate_has_rerunnable_source_handoff(candidate)
                 && candidate_model_differs(candidate, worker_model)
         })
-        .map(|candidate| candidate.issue.clone())
+        .map(|candidate| (*candidate).clone())
         .or_else(|| {
             sorted_candidates
                 .iter()
@@ -7272,7 +7338,7 @@ fn select_worker_candidate(
                         && candidate_has_rerunnable_source_handoff(candidate)
                         && candidate_model_differs(candidate, worker_model)
                 })
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         .or_else(|| {
             sorted_candidates
@@ -7282,7 +7348,7 @@ fn select_worker_candidate(
                         && candidate.has_foreign_reports
                         && candidate_has_rerunnable_source_handoff(candidate)
                 })
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         .or_else(|| {
             sorted_candidates
@@ -7291,7 +7357,7 @@ fn select_worker_candidate(
                     !candidate_is_in_recent_attempt_cooldown(candidate, cooldown_cutoff)
                         && candidate_has_rerunnable_source_handoff(candidate)
                 })
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         // Model-rotation tiers: prefer issues whose last attempt used a different model.
         .or_else(|| {
@@ -7306,7 +7372,7 @@ fn select_worker_candidate(
                         )
                         && candidate_model_differs(candidate, worker_model)
                 })
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         .or_else(|| {
             sorted_candidates
@@ -7321,7 +7387,7 @@ fn select_worker_candidate(
                         )
                         && candidate_model_differs(candidate, worker_model)
                 })
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         .or_else(|| {
             sorted_candidates
@@ -7334,7 +7400,7 @@ fn select_worker_candidate(
                         )
                         && candidate_model_differs(candidate, worker_model)
                 })
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         .or_else(|| {
             sorted_candidates
@@ -7348,7 +7414,7 @@ fn select_worker_candidate(
                         )
                         && candidate_model_differs(candidate, worker_model)
                 })
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         // Fall through to standard tiers (same-model fallback for single-model deployments)
         .or_else(|| {
@@ -7362,7 +7428,7 @@ fn select_worker_candidate(
                             &reviewed_source_families,
                         )
                 })
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         .or_else(|| {
             sorted_candidates
@@ -7376,7 +7442,7 @@ fn select_worker_candidate(
                             &reviewed_source_families,
                         )
                 })
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         .or_else(|| {
             sorted_candidates
@@ -7388,7 +7454,7 @@ fn select_worker_candidate(
                             &reviewed_source_families,
                         )
                 })
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         .or_else(|| {
             sorted_candidates
@@ -7401,7 +7467,7 @@ fn select_worker_candidate(
                             &reviewed_source_families,
                         )
                 })
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         .or_else(|| {
             sorted_candidates
@@ -7414,7 +7480,7 @@ fn select_worker_candidate(
                         )
                 })
                 .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         .or_else(|| {
             sorted_candidates
@@ -7428,7 +7494,7 @@ fn select_worker_candidate(
                         )
                 })
                 .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         .or_else(|| {
             sorted_candidates
@@ -7440,7 +7506,7 @@ fn select_worker_candidate(
                     )
                 })
                 .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
         .or_else(|| {
             sorted_candidates
@@ -7453,7 +7519,7 @@ fn select_worker_candidate(
                         )
                 })
                 .min_by(|left, right| compare_worker_candidate_attempt_age(*left, *right))
-                .map(|candidate| candidate.issue.clone())
+                .map(|candidate| (*candidate).clone())
         })
 }
 
@@ -7489,12 +7555,11 @@ fn candidate_is_in_reviewed_source_family(
 
 fn worker_candidate_source_family(candidate: &WorkerCandidate) -> Option<WorkerSourceFamily> {
     let source = candidate
-        .issue
         .source_package
         .as_deref()
-        .or(candidate.issue.package_name.as_deref())
+        .or(candidate.package_name.as_deref())
         .filter(|value| !value.trim().is_empty())?;
-    let best_patch = candidate.issue.best_patch.as_ref()?;
+    let best_patch = candidate.best_patch.as_ref()?;
     let paths = patch_attempt_primary_source_paths(best_patch);
     (!paths.is_empty()).then(|| (source.to_string(), paths))
 }
@@ -7528,25 +7593,25 @@ fn compare_worker_candidate_priority(
     left: &&WorkerCandidate,
     right: &&WorkerCandidate,
 ) -> Ordering {
-    compare_issue_priority_for_representatives(
-        &left.issue.kind,
-        left.issue.package_name.as_deref(),
-        left.issue.source_package.as_deref(),
-        left.issue.score,
-        left.issue.corroboration_count,
-        left.issue.best_patch.is_some(),
+    compare_issue_priority_for_signals(
+        &left.kind,
+        left.package_name.as_deref(),
+        left.source_package.as_deref(),
+        left.score,
+        left.corroboration_count,
+        left.best_patch.is_some(),
         false,
-        &left.issue.last_seen,
-        &left.issue.representative,
-        &right.issue.kind,
-        right.issue.package_name.as_deref(),
-        right.issue.source_package.as_deref(),
-        right.issue.score,
-        right.issue.corroboration_count,
-        right.issue.best_patch.is_some(),
+        &left.last_seen,
+        &left.priority_signals,
+        &right.kind,
+        right.package_name.as_deref(),
+        right.source_package.as_deref(),
+        right.score,
+        right.corroboration_count,
+        right.best_patch.is_some(),
         false,
-        &right.issue.last_seen,
-        &right.issue.representative,
+        &right.last_seen,
+        &right.priority_signals,
     )
     .then_with(|| compare_worker_candidate_attempt_age(left, right))
 }
@@ -7591,14 +7656,13 @@ fn candidate_needs_patch_refresh(candidate: &WorkerCandidate) -> bool {
         return false;
     }
     candidate
-        .issue
         .best_patch
         .as_ref()
         .is_some_and(patch_attempt_needs_worker_refresh)
 }
 
-fn issue_is_available_for_worker(issue: &IssueCluster) -> bool {
-    match issue.best_patch.as_ref() {
+fn best_patch_leaves_work_for_a_worker(best_patch: Option<&PatchAttempt>) -> bool {
+    match best_patch {
         None => true,
         Some(best_patch) => patch_attempt_needs_worker_refresh(best_patch),
     }
@@ -7796,29 +7860,39 @@ fn issue_from_row(row: Row) -> Result<IssueCluster> {
 }
 
 fn worker_candidate_from_row(row: Row) -> Result<WorkerCandidate> {
-    let best_triage = row
-        .get::<_, Option<Value>>(16)
+    let best_patch = row
+        .get::<_, Option<Value>>(7)
         .map(serde_json::from_value::<PatchAttempt>)
         .transpose()?;
-    let has_foreign_reports: bool = row.get(17);
-    let last_attempt_at: Option<DateTime<Utc>> = row.get(18);
+    let best_triage = row
+        .get::<_, Option<Value>>(8)
+        .map(serde_json::from_value::<PatchAttempt>)
+        .transpose()?;
+    let priority_signals = issue_priority_signals_from_value(&row.get::<_, Value>(9));
+    let has_foreign_reports: bool = row.get(10);
+    let last_attempt_at: Option<DateTime<Utc>> = row.get(11);
     let latest_attempt = row
-        .get::<_, Option<Value>>(19)
+        .get::<_, Option<Value>>(12)
         .map(latest_attempt_from_json_value)
         .transpose()?;
-    let best_patch_has_upstream_review: bool = row.get(20);
+    let best_patch_has_upstream_review: bool = row.get(13);
     let rerunnable_source_handoff = best_triage
         .as_ref()
         .and_then(rerunnable_source_handoff)
         .or_else(|| latest_attempt.as_ref().and_then(rerunnable_source_handoff));
-    let mut issue = issue_from_row(row)?;
-    if let Some(handoff) = rerunnable_source_handoff.as_ref() {
-        attach_rerunnable_source_handoff_to_issue(&mut issue, handoff);
-    }
     let last_attempt_model = patch_attempt_model(latest_attempt.as_ref())
-        .or_else(|| patch_attempt_model(issue.best_patch.as_ref()));
+        .or_else(|| patch_attempt_model(best_patch.as_ref()));
+    let last_seen: DateTime<Utc> = row.get(6);
     Ok(WorkerCandidate {
-        issue,
+        id: row.get(0),
+        kind: row.get(1),
+        package_name: row.get(2),
+        source_package: row.get(3),
+        score: row.get(4),
+        corroboration_count: row.get(5),
+        last_seen: last_seen.to_rfc3339(),
+        best_patch,
+        priority_signals,
         has_foreign_reports,
         last_attempt_at,
         last_attempt_model,
@@ -7827,6 +7901,49 @@ fn worker_candidate_from_row(row: Row) -> Result<WorkerCandidate> {
         best_patch_has_upstream_review,
         rerunnable_source_handoff,
     })
+}
+
+/// Second phase of a worker pull: read the cluster the ranking chose, whole,
+/// and hand it the source handoff the candidate already parsed.
+async fn materialize_worker_issue(
+    db: &ServerDb,
+    chosen: Option<WorkerCandidate>,
+) -> Result<Option<IssueCluster>> {
+    let Some(candidate) = chosen else {
+        return Ok(None);
+    };
+    let Some(mut issue) = load_issue_cluster_by_id(db, &candidate.id).await? else {
+        // The cluster went away between the two queries. Reporting no work is
+        // honest; the next poll will rank what is still there.
+        return Ok(None);
+    };
+    if let Some(handoff) = candidate.rerunnable_source_handoff.as_ref() {
+        attach_rerunnable_source_handoff_to_issue(&mut issue, handoff);
+    }
+    Ok(Some(issue))
+}
+
+async fn load_issue_cluster_by_id(db: &ServerDb, id: &str) -> Result<Option<IssueCluster>> {
+    const COLUMNS: &str = "id, cluster_key, kind, title, summary, package_name, source_package, \
+         ecosystem, severity, score, corroboration_count, quarantined, promoted, \
+         representative_json, best_patch_json, last_seen";
+    match db {
+        ServerDb::Postgres(db) => {
+            let statement = format!("SELECT {COLUMNS} FROM issue_clusters WHERE id = $1");
+            let rows = db.query(statement.as_str(), &[&id]).await?;
+            rows.into_iter().next().map(issue_from_row).transpose()
+        }
+        ServerDb::Sqlite(path) => {
+            let connection = sqlite_connection(path)?;
+            let statement = format!("SELECT {COLUMNS} FROM issue_clusters WHERE id = ?1");
+            let mut stmt = connection.prepare(statement.as_str())?;
+            let mut rows = stmt.query(params![id])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(issue_from_sqlite_row(row)?)),
+                None => Ok(None),
+            }
+        }
+    }
 }
 
 fn rerunnable_source_handoff(attempt: &PatchAttempt) -> Option<PublicTriageHandoff> {
@@ -10397,53 +10514,16 @@ fn compare_issue_priority_for_signals(
         .then_with(|| right_score.cmp(&left_score))
 }
 
-fn compare_issue_priority_for_representatives(
-    left_kind: &str,
-    left_package_name: Option<&str>,
-    left_source_package: Option<&str>,
-    left_score: i64,
-    left_corroboration_count: i64,
-    left_best_patch_available: bool,
-    left_best_triage_available: bool,
-    left_last_seen: &str,
-    left_representative: &SharedOpportunity,
-    right_kind: &str,
-    right_package_name: Option<&str>,
-    right_source_package: Option<&str>,
-    right_score: i64,
-    right_corroboration_count: i64,
-    right_best_patch_available: bool,
-    right_best_triage_available: bool,
-    right_last_seen: &str,
-    right_representative: &SharedOpportunity,
-) -> Ordering {
-    let left_priority = left_score
-        + issue_fixability_adjustment_for_representative(
-            left_kind,
-            left_package_name,
-            left_source_package,
-            left_corroboration_count,
-            left_best_patch_available,
-            left_best_triage_available,
-            left_representative,
-        );
-    let right_priority = right_score
-        + issue_fixability_adjustment_for_representative(
-            right_kind,
-            right_package_name,
-            right_source_package,
-            right_corroboration_count,
-            right_best_patch_available,
-            right_best_triage_available,
-            right_representative,
-        );
-    right_priority
-        .cmp(&left_priority)
-        .then_with(|| right_corroboration_count.cmp(&left_corroboration_count))
-        .then_with(|| parse_timestamp(right_last_seen).cmp(&parse_timestamp(left_last_seen)))
-        .then_with(|| right_score.cmp(&left_score))
-}
-
+/// The ranking adjustment read straight off a whole representative.
+///
+/// Production ranks from `IssuePrioritySignals` now: a worker pull asks the
+/// board for the projection, not the evidence bundle. This stays as the
+/// reference that projection is checked against -- see
+/// `the_projection_keeps_every_signal_worker_ranking_reads`, which asserts the
+/// two agree on every sample representative, so a signal that stops travelling
+/// through the projection surfaces as a ranking difference rather than as a
+/// worker quietly picking a different issue.
+#[cfg(test)]
 fn issue_fixability_adjustment_for_representative(
     kind: &str,
     package_name: Option<&str>,
@@ -10556,6 +10636,7 @@ fn issue_fixability_adjustment_for_signals(
     adjustment
 }
 
+#[cfg(test)]
 fn representative_subsystem(representative: &SharedOpportunity) -> Option<&str> {
     representative
         .finding
@@ -10564,6 +10645,7 @@ fn representative_subsystem(representative: &SharedOpportunity) -> Option<&str> 
         .and_then(Value::as_str)
 }
 
+#[cfg(test)]
 fn representative_likely_external_root_cause(representative: &SharedOpportunity) -> bool {
     representative
         .finding
@@ -10573,6 +10655,7 @@ fn representative_likely_external_root_cause(representative: &SharedOpportunity)
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn representative_fixability_target_name(representative: &SharedOpportunity) -> Option<String> {
     if representative.finding.kind == "investigation" {
         return Some(normalized_investigation_target_name(representative));
@@ -11097,6 +11180,37 @@ fn duplicate_candidate_from_row(row: Row) -> Result<DuplicateCandidateIssue, Api
     Ok(DuplicateCandidateIssue {
         issue,
         representative,
+    })
+}
+
+/// The only parts of a representative that worker ranking reads.
+///
+/// `next_issue_for_worker` asks postgres for exactly this shape instead of the
+/// whole representative, which on the live board is 35 MB across one pull's
+/// candidates. The local-store path builds it here, so every worker-queue test
+/// runs through the same projection the shared board gets from SQL: if this
+/// list ever stops being enough, those tests are what says so.
+fn priority_signals_projection(representative: &Value) -> Value {
+    let finding = representative.get("finding");
+    let details = finding.and_then(|finding| finding.get("details"));
+    let pick = |source: Option<&Value>, key: &str| {
+        source.and_then(|value| value.get(key)).cloned().unwrap_or(Value::Null)
+    };
+    json!({
+        "finding": {
+            "kind": pick(finding, "kind"),
+            "artifact_name": pick(finding, "artifact_name"),
+            "package_name": pick(finding, "package_name"),
+            "details": {
+                "subsystem": pick(details, "subsystem"),
+                "likely_external_root_cause": pick(details, "likely_external_root_cause"),
+                "process_name": pick(details, "process_name"),
+                "profile_target": pick(details, "profile_target"),
+            },
+        },
+        "opportunity": {
+            "title": pick(representative.get("opportunity"), "title"),
+        },
     })
 }
 
@@ -17475,6 +17589,68 @@ mod tests {
     use tempfile::tempdir;
     use tokio::runtime::Runtime;
 
+    #[test]
+    fn the_projection_keeps_every_signal_worker_ranking_reads() {
+        // The shared board no longer sends the whole representative to rank
+        // candidates, only the projection. Ranking must not notice: for real
+        // representatives, the adjustment computed from the projected signals
+        // has to equal the one the representative itself used to produce.
+        // The third case is the one that makes this test bite: the profiled
+        // target is a kernel worker (-18) while the artifact name is not, so a
+        // projection that forgot `profile_target` would silently fall back to
+        // the artifact name and rank the candidate differently.
+        let mut kernel_worker_runaway = sample_runaway_investigation("redis-server", Some("redis-server"));
+        kernel_worker_runaway.finding.details["profile_target"] =
+            json!({ "name": "kworker/u65:3+kcryptd" });
+        let representatives = [
+            sample_crash("sshpass", "SIGSEGV in strlen", &["__strlen_evex", "strdup"]),
+            sample_stuck_process_investigation("kworker/u65:3+kcryptd", 900, "2026-09-19T11:00:00Z"),
+            sample_runaway_investigation("redis-server", Some("redis-server")),
+            kernel_worker_runaway,
+        ];
+
+        for representative in representatives {
+            let full = serde_json::to_value(&representative).expect("representative serializes");
+            let projected = super::priority_signals_projection(&full);
+
+            let from_full = super::issue_priority_signals_from_value(&full);
+            let from_projection = super::issue_priority_signals_from_value(&projected);
+            assert_eq!(from_full.subsystem, from_projection.subsystem);
+            assert_eq!(from_full.target_name, from_projection.target_name);
+            assert_eq!(
+                from_full.likely_external_root_cause,
+                from_projection.likely_external_root_cause
+            );
+
+            let kind = representative.finding.kind.clone();
+            let package_name = representative.finding.package_name.clone();
+            for best_patch_available in [false, true] {
+                assert_eq!(
+                    super::issue_fixability_adjustment_for_representative(
+                        &kind,
+                        package_name.as_deref(),
+                        None,
+                        2,
+                        best_patch_available,
+                        false,
+                        &representative,
+                    ),
+                    super::issue_fixability_adjustment_for_signals(
+                        &kind,
+                        package_name.as_deref(),
+                        None,
+                        2,
+                        best_patch_available,
+                        false,
+                        &from_projection,
+                    ),
+                    "ranking changed for {kind} representative {:?}",
+                    representative.finding.title
+                );
+            }
+        }
+    }
+
     fn sample_crash(process_name: &str, summary: &str, stack_frames: &[&str]) -> SharedOpportunity {
         SharedOpportunity {
             local_opportunity_id: 1,
@@ -20963,7 +21139,7 @@ mod tests {
             last_seen: "2026-03-29T16:13:42Z".to_string(),
         };
 
-        assert!(issue_is_available_for_worker(&issue));
+        assert!(best_patch_leaves_work_for_a_worker(issue.best_patch.as_ref()));
     }
 
     #[test]
