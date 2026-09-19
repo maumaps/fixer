@@ -56,8 +56,14 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Default to info so the service records what it does — reconnects,
+    // recoveries, startup — instead of staying silent until something reaches
+    // ERROR. RUST_LOG still overrides this.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let cli = Cli::parse();
