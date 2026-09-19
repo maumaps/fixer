@@ -1,22 +1,38 @@
 //! Self-healing postgres handle.
 //!
 //! A `tokio_postgres::Client` is bound to exactly one TCP connection. When the
-//! server goes away — a restart hands out `57P01 terminating connection due to
-//! administrator command` and then closes the socket — that client is dead for
-//! good and every later statement fails with `connection closed`. A handle that
-//! stores a single client therefore turns one postgres restart into a permanent
-//! outage that only a process restart clears.
+//! server goes away, that client is dead for good: every later statement fails
+//! with `connection closed`. A handle that stores a single client therefore
+//! turns one postgres restart into a permanent outage that only a process
+//! restart clears.
 //!
 //! [`PgClient`] keeps the connection string next to the current client and
-//! swaps in a fresh client the first time it notices the old one is closed, so
-//! the process heals itself once postgres is back.
+//! swaps in a fresh client as soon as it sees the old one fail, so the process
+//! heals itself once postgres is back.
+//!
+//! A restart is not one failure but three, and the retry rule has to cover all
+//! of them. A statement already in flight when the socket dies fails with an
+//! `Io` error (`error communicating with the server`) and never reaches the
+//! server at all. A statement that arrives while postgres is shutting down gets
+//! a real answer: `57P01`, `57P02` or `57P03`. Everything after that fails with
+//! `connection closed`. Only the middle case carries a SQLSTATE, so the rule is
+//! phrased around whether the server answered — see [`should_retry`].
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockWriteGuard};
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, Error, NoTls, Row, ToStatement};
+
+/// SQLSTATEs postgres reports while it is going down or not yet taking work.
+/// A connection that answers with one of these is finished, but the answer
+/// itself proves the statement was rejected rather than applied.
+const SHUTDOWN_SQLSTATES: [&str; 3] = [
+    "57P01", // admin_shutdown
+    "57P02", // crash_shutdown
+    "57P03", // cannot_connect_now
+];
 
 /// Which kind of statement failed, for [`should_retry`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,19 +43,42 @@ pub(crate) enum DbOp {
     Write,
 }
 
+/// Whether the failure means this connection is finished, rather than the
+/// statement being wrong.
+///
+/// `db_error_sqlstate` is the SQLSTATE the server reported, or `None` when the
+/// server reported nothing at all — an IO, protocol or already-closed failure.
+/// `None` is the interesting case: no server answer means the statement did not
+/// run, and the connection that should have carried it is gone.
+pub(crate) fn connection_is_at_fault(db_error_sqlstate: Option<&str>) -> bool {
+    match db_error_sqlstate {
+        None => true,
+        Some(code) => SHUTDOWN_SQLSTATES.contains(&code),
+    }
+}
+
 /// Decide whether a failed statement may be replayed on a fresh connection.
 ///
-/// Reads are replayed once when the failure was the connection dropping: the
-/// statement had no effect, so running it again on a new connection is
+/// A read is replayed once when the connection, not the statement, was at
+/// fault: a read has no side effect, so running it again on a new connection is
 /// indistinguishable from having run it on a healthy one.
 ///
-/// Writes are never replayed. `connection closed` does not say whether the
-/// server applied the statement before the socket died, so a blind retry can
-/// duplicate an insert or double-apply an update. The caller gets the error and
-/// decides; the handle has already dropped the dead client, so the caller's
-/// *next* call reconnects.
-pub(crate) fn should_retry(op: DbOp, connection_closed: bool) -> bool {
-    matches!(op, DbOp::Read) && connection_closed
+/// A write is never replayed. Neither a dead socket nor a shutdown code says
+/// whether the server applied the statement before the connection died, so a
+/// blind retry can duplicate an insert or double-apply an update. The caller
+/// gets the error and decides; the handle still drops the broken connection, so
+/// the caller's *next* call runs on a fresh one.
+///
+/// Any other SQLSTATE — `42601` syntax_error, `23505` unique_violation — is the
+/// server answering correctly about a bad statement. Replaying it would fail
+/// identically forever, so neither reads nor writes retry.
+pub(crate) fn should_retry(op: DbOp, db_error_sqlstate: Option<&str>) -> bool {
+    matches!(op, DbOp::Read) && connection_is_at_fault(db_error_sqlstate)
+}
+
+/// The SQLSTATE the server reported for this error, if the server reported one.
+fn db_error_sqlstate(error: &Error) -> Option<&str> {
+    error.code().map(|state| state.code())
 }
 
 /// Tracks when the current connection was last observed dead, so a reconnect
@@ -117,16 +156,38 @@ impl PgClient {
         self.reconnect().await
     }
 
-    /// Replace the stored client unless another task already did it.
+    /// Replace the stored client because it is closed.
     async fn reconnect(&self) -> Result<Arc<Client>, Error> {
         let mut slot = self.client.write().await;
         if !slot.is_closed() {
             // Lost the race to another caller; its client is fresh.
             return Ok(Arc::clone(&slot));
         }
+        self.install(&mut slot).await
+    }
+
+    /// Replace `stale` after a statement failed on it.
+    ///
+    /// Identity, not `is_closed()`, decides: a statement can fail on a socket
+    /// that has not been reaped yet, and such a client would pass an
+    /// `is_closed()` check and be handed straight back to the retry.
+    async fn replace(&self, stale: &Arc<Client>) -> Result<Arc<Client>, Error> {
+        let mut slot = self.client.write().await;
+        if !Arc::ptr_eq(&slot, stale) {
+            // Another caller already replaced this client.
+            return Ok(Arc::clone(&slot));
+        }
+        self.install(&mut slot).await
+    }
+
+    /// Connect and store the result, with the caller already holding the lock.
+    async fn install(
+        &self,
+        slot: &mut RwLockWriteGuard<'_, Arc<Client>>,
+    ) -> Result<Arc<Client>, Error> {
         let observed = self.liveness.observe();
         let client = Self::spawn_connection(&self.url, &self.liveness).await?;
-        *slot = Arc::clone(&client);
+        **slot = Arc::clone(&client);
         self.liveness.clear_if(observed);
         tracing::info!(
             dead_for = ?observed.map(|since| since.elapsed()),
@@ -154,8 +215,33 @@ impl PgClient {
         Ok(Arc::new(client))
     }
 
-    /// Like [`Client::query`], retried once on a fresh connection if the
-    /// connection dropped.
+    /// React to a failed statement: drop the connection when the connection was
+    /// at fault, and hand back a fresh client only when the statement may be
+    /// replayed on it.
+    ///
+    /// Both reads and writes come through here, which is what lets a write heal
+    /// the handle for the next caller while still refusing to replay itself.
+    async fn recover(&self, op: DbOp, stale: &Arc<Client>, error: &Error) -> Option<Arc<Client>> {
+        let sqlstate = db_error_sqlstate(error);
+        if !connection_is_at_fault(sqlstate) {
+            // The connection is healthy; the statement is not. Keep both.
+            return None;
+        }
+        let fresh = match self.replace(stale).await {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "postgres reconnect after a failed statement did not succeed"
+                );
+                return None;
+            }
+        };
+        should_retry(op, sqlstate).then_some(fresh)
+    }
+
+    /// Like [`Client::query`], retried once on a fresh connection when the
+    /// connection, not the statement, was at fault.
     pub async fn query<T>(
         &self,
         statement: &T,
@@ -167,15 +253,15 @@ impl PgClient {
         let client = self.current().await?;
         match client.query(statement, params).await {
             Ok(rows) => Ok(rows),
-            Err(error) if should_retry(DbOp::Read, error.is_closed()) => {
-                self.reconnect().await?.query(statement, params).await
-            }
-            Err(error) => Err(error),
+            Err(error) => match self.recover(DbOp::Read, &client, &error).await {
+                Some(fresh) => fresh.query(statement, params).await,
+                None => Err(error),
+            },
         }
     }
 
-    /// Like [`Client::query_one`], retried once on a fresh connection if the
-    /// connection dropped.
+    /// Like [`Client::query_one`], retried once on a fresh connection when the
+    /// connection, not the statement, was at fault.
     pub async fn query_one<T>(
         &self,
         statement: &T,
@@ -187,15 +273,15 @@ impl PgClient {
         let client = self.current().await?;
         match client.query_one(statement, params).await {
             Ok(row) => Ok(row),
-            Err(error) if should_retry(DbOp::Read, error.is_closed()) => {
-                self.reconnect().await?.query_one(statement, params).await
-            }
-            Err(error) => Err(error),
+            Err(error) => match self.recover(DbOp::Read, &client, &error).await {
+                Some(fresh) => fresh.query_one(statement, params).await,
+                None => Err(error),
+            },
         }
     }
 
-    /// Like [`Client::query_opt`], retried once on a fresh connection if the
-    /// connection dropped.
+    /// Like [`Client::query_opt`], retried once on a fresh connection when the
+    /// connection, not the statement, was at fault.
     pub async fn query_opt<T>(
         &self,
         statement: &T,
@@ -207,19 +293,18 @@ impl PgClient {
         let client = self.current().await?;
         match client.query_opt(statement, params).await {
             Ok(row) => Ok(row),
-            Err(error) if should_retry(DbOp::Read, error.is_closed()) => {
-                self.reconnect().await?.query_opt(statement, params).await
-            }
-            Err(error) => Err(error),
+            Err(error) => match self.recover(DbOp::Read, &client, &error).await {
+                Some(fresh) => fresh.query_opt(statement, params).await,
+                None => Err(error),
+            },
         }
     }
 
     /// Like [`Client::execute`].
     ///
-    /// Never auto-retried: a write that fails with `connection closed` may
-    /// already have been applied by the server, so replaying it could duplicate
-    /// the effect. The dead client is still dropped, so the next call
-    /// reconnects.
+    /// Never auto-retried: a write that fails mid-restart may already have been
+    /// applied by the server, so replaying it could duplicate the effect. The
+    /// handle still heals, so the caller's next call runs on a fresh connection.
     pub async fn execute<T>(
         &self,
         statement: &T,
@@ -228,18 +313,33 @@ impl PgClient {
     where
         T: ?Sized + ToStatement,
     {
-        debug_assert!(!should_retry(DbOp::Write, true));
-        self.current().await?.execute(statement, params).await
+        let client = self.current().await?;
+        match client.execute(statement, params).await {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                // `should_retry` is false for every write, so `recover` only
+                // drops the broken connection here; it never returns a client
+                // to replay on.
+                let _never_replayed = self.recover(DbOp::Write, &client, &error).await;
+                Err(error)
+            }
+        }
     }
 
     /// Like [`Client::batch_execute`].
     ///
     /// Never auto-retried, for the same reason as [`PgClient::execute`]: the
     /// batch may have been applied in part or in full before the connection
-    /// dropped.
+    /// died.
     pub async fn batch_execute(&self, query: &str) -> Result<(), Error> {
-        debug_assert!(!should_retry(DbOp::Write, true));
-        self.current().await?.batch_execute(query).await
+        let client = self.current().await?;
+        match client.batch_execute(query).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _never_replayed = self.recover(DbOp::Write, &client, &error).await;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -248,24 +348,76 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// The measured failure of a real restart: the socket died mid-statement,
+    /// so the server reported no SQLSTATE at all.
+    const NO_SERVER_ANSWER: Option<&str> = None;
+
     #[test]
-    fn should_retry_read_when_connection_closed() {
-        assert!(should_retry(DbOp::Read, true));
+    fn retries_a_read_when_the_server_did_not_answer() {
+        assert!(should_retry(DbOp::Read, NO_SERVER_ANSWER));
     }
 
     #[test]
-    fn should_not_retry_read_when_connection_alive() {
-        assert!(!should_retry(DbOp::Read, false));
+    fn retries_a_read_on_admin_shutdown() {
+        assert!(should_retry(DbOp::Read, Some("57P01")));
     }
 
     #[test]
-    fn should_not_retry_write_when_connection_closed() {
-        assert!(!should_retry(DbOp::Write, true));
+    fn retries_a_read_on_crash_shutdown() {
+        assert!(should_retry(DbOp::Read, Some("57P02")));
     }
 
     #[test]
-    fn should_not_retry_write_when_connection_alive() {
-        assert!(!should_retry(DbOp::Write, false));
+    fn retries_a_read_on_cannot_connect_now() {
+        assert!(should_retry(DbOp::Read, Some("57P03")));
+    }
+
+    #[test]
+    fn does_not_retry_a_read_on_syntax_error() {
+        assert!(!should_retry(DbOp::Read, Some("42601")));
+    }
+
+    #[test]
+    fn does_not_retry_a_read_on_unique_violation() {
+        assert!(!should_retry(DbOp::Read, Some("23505")));
+    }
+
+    #[test]
+    fn does_not_retry_a_write_when_the_server_did_not_answer() {
+        assert!(!should_retry(DbOp::Write, NO_SERVER_ANSWER));
+    }
+
+    #[test]
+    fn does_not_retry_a_write_on_admin_shutdown() {
+        assert!(!should_retry(DbOp::Write, Some("57P01")));
+    }
+
+    #[test]
+    fn blames_the_connection_when_the_server_did_not_answer() {
+        assert!(connection_is_at_fault(NO_SERVER_ANSWER));
+    }
+
+    #[test]
+    fn blames_the_connection_for_every_shutdown_sqlstate() {
+        for code in SHUTDOWN_SQLSTATES {
+            assert!(connection_is_at_fault(Some(code)), "{code} ends a connection");
+        }
+    }
+
+    #[test]
+    fn blames_the_statement_for_an_ordinary_sql_error() {
+        assert!(!connection_is_at_fault(Some("42601")));
+        assert!(!connection_is_at_fault(Some("23505")));
+    }
+
+    #[test]
+    fn a_write_is_never_replayed_whatever_the_failure() {
+        for sqlstate in [NO_SERVER_ANSWER, Some("57P01"), Some("57P02"), Some("57P03")] {
+            assert!(
+                !should_retry(DbOp::Write, sqlstate),
+                "{sqlstate:?} must not replay a write"
+            );
+        }
     }
 
     #[test]
