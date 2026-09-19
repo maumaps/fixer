@@ -1539,8 +1539,32 @@ pub fn create_complaint_plan_proposal(
     )
 }
 
+fn missing_proposal_message(store: &Store, id: i64, error: anyhow::Error) -> String {
+    if store.get_opportunity(id).is_err() {
+        return format!("no proposal {id} in this store: {error}");
+    }
+    let proposals = store.list_proposals_for_opportunity(id).unwrap_or_default();
+    if proposals.is_empty() {
+        return format!(
+            "{id} is an opportunity, not a proposal, and it has no proposals yet; run `propose-fix {id}` first"
+        );
+    }
+    let listed = proposals
+        .iter()
+        .map(|proposal| format!("{} ({})", proposal.id, proposal.state))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{id} is an opportunity, not a proposal; its proposals are {listed}")
+}
+
 pub fn prepare_submission(store: &Store, proposal_id: i64) -> Result<PathBuf> {
-    let proposal = store.get_proposal(proposal_id)?;
+    let proposal = match store.get_proposal(proposal_id) {
+        Ok(proposal) => proposal,
+        // rusqlite says "Query returned no rows", which tells an operator who
+        // passed an opportunity id nothing at all -- and that is the easy
+        // mistake to make, since every other command in this CLI takes one.
+        Err(error) => return Err(anyhow!(missing_proposal_message(store, proposal_id, error))),
+    };
     let opportunity = store.get_opportunity(proposal.opportunity_id)?;
     let path = proposal.bundle_path.join("submission.md");
     let output_text = proposal
@@ -11369,6 +11393,36 @@ Reproduced with `strace -f -e openat,read ./src/redis-server /tmp/redis.conf` be
 "#;
 
         assert!(super::patch_explanation_quality_failure(response, None).is_none());
+    }
+
+    #[test]
+    fn prepare_submit_says_when_it_was_handed_an_opportunity_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite3")).unwrap();
+        let finding_id = store
+            .record_finding(&FindingInput {
+                kind: "crash".to_string(),
+                title: "Crash in sshpass".to_string(),
+                severity: "high".to_string(),
+                fingerprint: "sshpass-crash".to_string(),
+                summary: "sshpass segfaults on -e without the variable".to_string(),
+                details: json!({}),
+                artifact: None,
+                repo_root: None,
+                ecosystem: Some("debian".to_string()),
+            })
+            .unwrap();
+        let opportunity = store.get_opportunity_by_finding(finding_id).unwrap();
+
+        let error = super::prepare_submission(&store, opportunity.id)
+            .expect_err("an opportunity id is not a proposal id");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("is an opportunity, not a proposal"),
+            "unhelpful error: {message}"
+        );
+        assert!(message.contains(&format!("propose-fix {}", opportunity.id)));
     }
 
     #[test]

@@ -1347,6 +1347,39 @@ impl Store {
         self.get_proposal(proposal_id)
     }
 
+    /// Every proposal for an opportunity, newest first, for telling an operator
+    /// who passed the wrong id which ids actually exist.
+    pub fn list_proposals_for_opportunity(
+        &self,
+        opportunity_id: i64,
+    ) -> Result<Vec<ProposalRecord>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, opportunity_id, engine, state, bundle_path, output_path, created_at, updated_at
+            FROM proposals
+            WHERE opportunity_id = ?1
+            ORDER BY id DESC
+            ",
+        )?;
+        let rows = stmt.query_map([opportunity_id], |row| {
+            Ok(ProposalRecord {
+                id: row.get(0)?,
+                opportunity_id: row.get(1)?,
+                engine: row.get(2)?,
+                state: row.get(3)?,
+                bundle_path: PathBuf::from(row.get::<_, String>(4)?),
+                output_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })?;
+        let mut proposals = Vec::new();
+        for row in rows {
+            proposals.push(row?);
+        }
+        Ok(proposals)
+    }
+
     pub fn list_running_codex_proposals_for_opportunity(
         &self,
         opportunity_id: i64,
