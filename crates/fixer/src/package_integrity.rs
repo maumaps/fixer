@@ -61,7 +61,14 @@ pub fn diverged_evidence_files(evidence: &Value) -> Vec<DivergedFile> {
     let mut checked: Vec<(PathBuf, &'static str)> =
         artifacts.iter().cloned().map(|p| (p, "artifact")).collect();
     for module in evidence_stack_modules(evidence) {
-        if let Some((_, path)) = resolve_module_path(&module, &artifacts) {
+        // Some collectors record the module as a full path, some as the bare
+        // soname the loader printed; a path needs no lookup.
+        let path = if module.starts_with('/') {
+            Some(PathBuf::from(&module))
+        } else {
+            resolve_module_path(&module, &artifacts).map(|(_, path)| path)
+        };
+        if let Some(path) = path {
             if !checked.iter().any(|(known, _)| known == &path) {
                 checked.push((path, "stack module"));
             }
@@ -134,9 +141,11 @@ fn frame_module(frame: &str) -> Option<&str> {
         return None;
     }
     let module = frame[open + 1..close].trim();
-    // `n/a [postgres]` is a frame without a symbol, still a real module name;
-    // an empty or path-shaped bracket is not what this collector writes.
-    if module.is_empty() || module.contains('/') {
+    // `n/a [postgres]` is a frame without a symbol, still a real module; the
+    // crash collectors write either a bare soname or the loader's full path,
+    // and `/usr/lib/x86_64-linux-gnu/libgvc.so.7.0.6` is how the graphviz
+    // crashes on this host name theirs.
+    if module.is_empty() {
         return None;
     }
     Some(module)
@@ -309,6 +318,24 @@ mod tests {
         assert_eq!(
             evidence_stack_modules(&evidence),
             vec!["postgis-3.so".to_string(), "postgres".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_stack_frame_that_carries_the_full_module_path_is_kept() {
+        let evidence = json!({
+            "artifact_path": "/usr/bin/dot",
+            "details": {
+                "primary_stack": [
+                    "strdup_and_subst_obj [/usr/lib/x86_64-linux-gnu/libgvc.so.7.0.6]",
+                    "n/a [/usr/lib/x86_64-linux-gnu/libgvc.so.7.0.6]"
+                ]
+            }
+        });
+
+        assert_eq!(
+            evidence_stack_modules(&evidence),
+            vec!["/usr/lib/x86_64-linux-gnu/libgvc.so.7.0.6".to_string()]
         );
     }
 
