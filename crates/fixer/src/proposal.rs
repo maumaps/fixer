@@ -3966,18 +3966,14 @@ fn evidence_confidence_quality_failure(
         return Some("Security-sensitive source patches touching authentication, authorization, credentials, cryptography, sandboxing, permissions, or timing/throttling behavior must not be marked pull-request-ready from observed-only or inferred evidence. Reproduce the behavior and include security-impact analysis, or publish a no-patch diagnosis/report for human review.".to_string());
     }
     if confidence == "reproduced" {
-        let reproduced_markers = [
-            "reproduc",
-            "ran the failing command",
-            "failing test",
-            "before/after",
-        ];
-        if !reproduced_markers
-            .iter()
-            .any(|marker| issue_lower.contains(marker))
-        {
-            return Some("`## Evidence Confidence` says `reproduced`, but `## Issue Connection` does not say what failure was reproduced. Either name the exact reproduced command/test or lower confidence to `observed`/`inferred`.".to_string());
-        }
+        // What backs a `reproduced` claim is a named reproducer with its result,
+        // and `## Validation` is where a command and its before/after belong. The
+        // guard used to demand the word in `## Issue Connection` as well, which
+        // failed write-ups that had done the work: a gpt-5.6-luna sshpass patch
+        // listed the crashing command, both exit statuses and a negative control,
+        // and was rejected for narrating the crash without repeating "reproduced".
+        // The Issue Connection still has to name the symptom -- that is checked
+        // below for every patch, reproduced or not.
         if !validation_names_reproduction(&validation_lower) {
             return Some("`## Evidence Confidence` says `reproduced`, but `## Validation` does not name the concrete reproduction command/test and result. Add the reproducer evidence there or lower confidence to `observed`/`inferred`.".to_string());
         }
@@ -11370,6 +11366,41 @@ src/server.c
 
 ## Validation
 Reproduced with `strace -f -e openat,read ./src/redis-server /tmp/redis.conf` before and after the patch: before showed repeated `/proc/self/stat` opens at the cron cadence; after the patch showed the slower cadence. Ran `make`.
+"#;
+
+        assert!(super::patch_explanation_quality_failure(response, None).is_none());
+    }
+
+    #[test]
+    fn patch_explanation_quality_guard_accepts_a_reproducer_named_only_in_validation() {
+        // Verbatim shape of the gpt-5.6-luna sshpass write-up that the guard
+        // failed on 2026-09-19. Its Validation names the crashing command, the
+        // before and after behaviour and a negative control; its Issue Connection
+        // narrates the crash without using the word "reproduced".
+        let response = r#"Subject: Avoid dereferencing a missing -e password variable
+
+## Commit Message
+
+When `-e` names an unset environment variable, report the invalid argument and skip password copying. This prevents `strdup(NULL)` while preserving environment scrubbing for valid passwords.
+
+## Evidence Confidence
+
+reproduced
+
+## Issue Connection
+
+Fixer's collected crash showed `sshpass` terminating in `strlen` called by `strdup`; the missing-variable path in `parse_options()` passed `NULL` to `hide_password()`. The patch moves `hide_password()` and `unsetenv()` into the successful `getenv()` branch. The expected effect is an ordinary exit status 1 for an unset password variable instead of a segmentation fault, with valid credentials still copied and scrubbed.
+
+## Git Add Paths
+
+main.c
+
+## Validation
+
+- `./configure && make` - passed from the workspace root.
+- `env -u SSHPASS ./sshpass -e true` - reproduced the original crash before the patch; after the patch, reported the missing variable and exited 1 without a segfault.
+- `SSHPASS=secret ./sshpass -e true` - exited 0.
+- `git diff --check` - passed.
 "#;
 
         assert!(super::patch_explanation_quality_failure(response, None).is_none());

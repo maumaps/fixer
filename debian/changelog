@@ -1,3 +1,15 @@
+fixer (0.250.0-1) unstable; urgency=medium
+
+  * Do not patch distribution source for a file the machine rebuilt itself.
+    A PostGIS crash on this host pointed at a locally built postgis-3.so; the
+    workspace would have come from apt-get source, and Codex would have patched
+    code that never ran. The check follows the recorded stack, so the module
+    that crashed is verified, not just the executable that hosted it.
+  * Stop failing a reproduced patch whose reproducer is named in Validation,
+    where the prompt asks for it, rather than also in Issue Connection.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Sat, 19 Sep 2026 21:05:00 +0400
+
 fixer (0.249.0-1) unstable; urgency=medium
 
   * Accept the word the authoring prompt asks for. The prompt requires an
