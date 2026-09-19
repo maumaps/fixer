@@ -2,6 +2,7 @@ use crate::adapters::inspect_repo;
 use crate::config::FixerConfig;
 use crate::models::{InstalledPackageMetadata, OpportunityRecord, PreparedWorkspace};
 use crate::native_provenance::native_executable_source_hint;
+use crate::package_integrity::distribution_source_refusal;
 use crate::util::{
     command_exists, command_output_in_dir_with_timeout, command_output_os_with_timeout,
     command_output_with_timeout, command_status_in_dir_with_timeout, command_status_with_timeout,
@@ -123,6 +124,15 @@ pub fn ensure_workspace_for_opportunity(
                 .acquisition_note
                 .unwrap_or_else(|| "Using retained local artifact repository.".to_string()),
         });
+    }
+
+    // Everything above resolves the workspace from the build that actually ran:
+    // a repository attached to the opportunity, the executable's own provenance,
+    // a retained local checkout. Everything below assumes the installed files are
+    // the distribution's -- so before patching distribution source, check that
+    // they still are.
+    if let Some(reason) = distribution_source_refusal(&opportunity.evidence) {
+        return Err(anyhow!("opportunity {}: {reason}", opportunity.id));
     }
 
     let package_name = package_name_from_opportunity(opportunity);
