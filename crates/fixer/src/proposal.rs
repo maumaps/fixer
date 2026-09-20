@@ -3612,7 +3612,7 @@ fn summarize_failure_log(log: &str) -> String {
 }
 
 fn codex_subagent_prompt_hint() -> &'static str {
-    "\n\nCodex subagent/fan-out expectation: for any non-trivial investigation, do not keep all checking in the lead context. Proactively spawn bounded leaf subagents for independent source inspection, duplicate/upstream search, implementation sanity checks, and verification while the lead owns integration. Use the newest available mini model for read-only scouts, and use `gpt-5.3-codex-spark` aggressively for tiny coding, test, and verification leaves even when the lead model is `gpt-5.5`. Pass model names explicitly when spawning. Keep subagents as leaves: tell them not to spawn their own agents, not to run recursive `codex review`, not to perform public/external/destructive actions, and not to duplicate the same live-state operation. Merge their evidence into the final patch/report instead of merely saying a subagent looked."
+    "\n\nCodex subagent/fan-out expectation: for any non-trivial investigation, do not keep all checking in the lead context. Proactively spawn bounded leaf subagents for independent source inspection, duplicate/upstream search, implementation sanity checks, and verification while the lead owns integration. Use the newest available mini model for read-only scouts, and use `gpt-5.3-codex-spark` aggressively for tiny coding, test, and verification leaves even when the lead model is `gpt-5.6-luna`. Pass model names explicitly when spawning. Keep subagents as leaves: tell them not to spawn their own agents, not to run recursive `codex review`, not to perform public/external/destructive actions, and not to duplicate the same live-state operation. Merge their evidence into the final patch/report instead of merely saying a subagent looked."
 }
 
 fn build_prompt(
@@ -9079,11 +9079,77 @@ mod tests {
     fn default_codex_policy_keeps_spark_as_prompted_leaf_not_stage_fallback() {
         let config = FixerConfig::default();
 
-        assert_eq!(config.patch.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(config.patch.model.as_deref(), Some("gpt-5.6-luna"));
         assert_eq!(config.patch.spark_model.as_deref(), None);
         assert!(!config.patch.spark_fallback_on_rate_limit);
         assert!(super::codex_subagent_prompt_hint().contains("gpt-5.3-codex-spark"));
         assert!(super::codex_subagent_prompt_hint().contains("leaf subagents"));
+    }
+
+    #[test]
+    fn default_primary_model_reaches_codex_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_codex = dir.path().join("fake-codex.sh");
+        let args_log = dir.path().join("codex-args.log");
+        let repo_root = dir.path().join("workspace");
+        let prompt_path = dir.path().join("prompt.md");
+        let output_path = dir.path().join("output.txt");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        std::fs::write(
+            &fake_codex,
+            format!(
+                r#"#!/bin/sh
+args_log='{args_log}'
+out=''
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+  printf '%s\n' 'Usage: codex exec [OPTIONS]'
+  exit 0
+fi
+printf '%s\n' "$*" >> "$args_log"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+printf '%s\n' 'stage output' > "$out"
+exit 0
+"#,
+                args_log = args_log.display(),
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_codex).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_codex, perms).unwrap();
+        }
+
+        let mut config = FixerConfig::default();
+        config.patch.codex_command = fake_codex.display().to_string();
+        config.patch.codex_timeout_seconds = 0;
+        let stage = super::run_codex_stage(
+            &config,
+            &repo_root,
+            &prompt_path,
+            &output_path,
+            "Patch Pass",
+            "please patch",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(stage.success);
+        assert_eq!(stage.selected_model.as_deref(), Some("gpt-5.6-luna"));
+        let args = std::fs::read_to_string(args_log).unwrap();
+        assert!(args.contains("exec"));
+        assert!(args.contains("-m gpt-5.6-luna"));
+        assert!(!args.contains("gpt-5.5"));
     }
 
     #[test]
@@ -10768,7 +10834,7 @@ exit 0
         for prompt in [&patch_prompt, &plan_prompt] {
             assert!(prompt.contains("Proactively spawn bounded leaf subagents"));
             assert!(prompt.contains("gpt-5.3-codex-spark"));
-            assert!(prompt.contains("even when the lead model is `gpt-5.5`"));
+            assert!(prompt.contains("even when the lead model is `gpt-5.6-luna`"));
             assert!(prompt.contains("not to perform public/external/destructive actions"));
         }
     }

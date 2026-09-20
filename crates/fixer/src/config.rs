@@ -549,7 +549,7 @@ fn default_codex_memory_max() -> Option<String> {
 }
 
 fn default_patch_model() -> Option<String> {
-    Some("gpt-5.5".to_string())
+    Some("gpt-5.6-luna".to_string())
 }
 
 fn default_spark_model() -> Option<String> {

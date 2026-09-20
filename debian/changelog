@@ -1,3 +1,10 @@
+fixer (0.253.0-1) unstable; urgency=medium
+
+  * Start the normal Fixer Codex repair path on gpt-5.6-luna while preserving
+    the existing review, lease, and rate-limit behavior.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Mon, 21 Sep 2026 00:52:34 +0400
+
 fixer (0.252.0-1) unstable; urgency=medium
 
   * Stop sending a worker the whole evidence board to pick one issue from. A
