@@ -14,7 +14,14 @@ pub struct GcOptions {
     pub include_sources: bool,
     pub retention_days: Option<u64>,
     pub protected_paths: Vec<PathBuf>,
+    /// Perf capture files that open proposals or checkpoints still reference.
+    pub protected_perf_paths: Vec<PathBuf>,
+    /// Only reclaim perf captures (the cheap pass the daemon loop runs itself).
+    pub perf_only: bool,
 }
+
+/// A perf capture younger than this may still be written by `perf record`.
+const PERF_IN_PROGRESS_GRACE_SECONDS: i64 = 10 * 60;
 
 #[derive(Debug, Clone)]
 pub struct GcOutcome {
@@ -48,29 +55,37 @@ pub fn collect_gc_candidates(config: &FixerConfig, options: &GcOptions) -> Resul
         .unwrap_or(config.service.hotspot_investigation_retention_days);
     let mut entries = Vec::new();
 
-    entries.extend(collect_proposal_candidates(
-        &config.service.state_dir.join("proposals"),
+    if !options.perf_only {
+        entries.extend(collect_proposal_candidates(
+            &config.service.state_dir.join("proposals"),
+            options
+                .retention_days
+                .unwrap_or(config.service.proposal_bundle_retention_days),
+            config.service.proposal_bundle_keep_per_opportunity,
+            &options
+                .protected_paths
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        )?);
+        entries.extend(collect_aged_directory_candidates(
+            &config.service.state_dir.join("investigations"),
+            retention_days,
+            GcEntryKind::Investigation,
+            "investigation artifact older than retention window",
+        )?);
+    }
+    entries.extend(collect_perf_candidates(
+        &config.service.state_dir.join("perf"),
         options
             .retention_days
-            .unwrap_or(config.service.proposal_bundle_retention_days),
-        config.service.proposal_bundle_keep_per_opportunity,
+            .unwrap_or(config.service.perf_retention_days),
+        config.service.perf_max_bytes,
         &options
-            .protected_paths
+            .protected_perf_paths
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>(),
-    )?);
-    entries.extend(collect_aged_directory_candidates(
-        &config.service.state_dir.join("investigations"),
-        retention_days,
-        GcEntryKind::Investigation,
-        "investigation artifact older than retention window",
-    )?);
-    entries.extend(collect_aged_file_candidates(
-        &config.service.state_dir.join("perf"),
-        retention_days,
-        GcEntryKind::PerfSample,
-        "perf sample older than retention window",
     )?);
 
     if options.include_sources {
@@ -198,28 +213,56 @@ fn collect_aged_directory_candidates(
     Ok(candidates)
 }
 
-fn collect_aged_file_candidates(
+/// Perf captures are write-once and large. Remove the ones past the retention
+/// window, then the oldest remaining ones until the directory fits `max_bytes`.
+/// Files that live work references, and files young enough to still be written
+/// by `perf record`, are never candidates.
+fn collect_perf_candidates(
     root: &Path,
     retention_days: u64,
-    kind: GcEntryKind,
-    reason: &str,
+    max_bytes: u64,
+    protected: &BTreeSet<PathBuf>,
 ) -> Result<Vec<GcEntry>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
     let cutoff = cutoff_for_retention(retention_days);
-    let mut candidates = Vec::new();
+    let in_progress_after = Utc::now() - ChronoDuration::seconds(PERF_IN_PROGRESS_GRACE_SECONDS);
+    let mut files = Vec::new();
+    let mut total: u64 = 0;
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file() || modified_at(&path)? >= cutoff {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() {
             continue;
         }
+        total = total.saturating_add(metadata.len());
+        let modified = DateTime::<Utc>::from(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+        if modified >= in_progress_after || protected.contains(&path) {
+            continue;
+        }
+        files.push((modified, metadata.len(), path));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.2.cmp(&right.2)));
+
+    let mut candidates = Vec::new();
+    for (modified, bytes, path) in files {
+        let reason = if modified < cutoff {
+            "perf sample older than retention window"
+        } else if total > max_bytes {
+            "perf directory exceeds size cap"
+        } else {
+            continue;
+        };
+        total = total.saturating_sub(bytes);
         candidates.push(GcEntry {
-            bytes: path_size(&path)?,
             path,
-            kind,
+            kind: GcEntryKind::PerfSample,
             reason: reason.to_string(),
+            bytes,
             removed: false,
         });
     }
@@ -310,13 +353,15 @@ fn remove_gc_path(path: &Path) -> Result<()> {
 mod tests {
     use super::{
         GcEntryKind, GcOptions, apply_gc_candidates, collect_gc_candidates,
-        collect_proposal_candidates,
+        collect_perf_candidates, collect_proposal_candidates,
     };
     use crate::config::FixerConfig;
     use std::collections::BTreeSet;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use std::thread;
     use std::time::Duration;
+    use std::time::SystemTime;
     use tempfile::tempdir;
 
     #[test]
@@ -347,7 +392,7 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         fs::create_dir_all(dir.path().join("proposals/7-b")).unwrap();
         fs::create_dir_all(dir.path().join("perf")).unwrap();
-        fs::write(dir.path().join("perf/sample.data"), vec![0_u8; 16]).unwrap();
+        perf_file(&dir.path().join("perf"), "sample.data", 16, 30);
 
         let mut candidates = collect_gc_candidates(
             &config,
@@ -428,5 +473,117 @@ mod tests {
                 .any(|entry| entry.path == protected_bundle)
         );
         assert!(candidates.iter().any(|entry| entry.path == orphan_bundle));
+    }
+
+    fn perf_file(dir: &Path, name: &str, bytes: usize, age_days: u64) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, vec![0_u8; bytes]).unwrap();
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(age_days * 24 * 60 * 60))
+            .unwrap();
+        path
+    }
+
+    fn removed_names(candidates: &[super::GcEntry]) -> BTreeSet<String> {
+        candidates
+            .iter()
+            .map(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn perf_gc_ages_out_old_captures_only() {
+        let dir = tempdir().unwrap();
+        perf_file(dir.path(), "old.data", 10, 30);
+        perf_file(dir.path(), "recent.data", 10, 1);
+
+        let candidates =
+            collect_perf_candidates(dir.path(), 7, u64::MAX, &BTreeSet::new()).unwrap();
+
+        assert_eq!(
+            removed_names(&candidates),
+            BTreeSet::from(["old.data".to_string()])
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|entry| entry.kind == GcEntryKind::PerfSample)
+        );
+    }
+
+    #[test]
+    fn perf_gc_size_cap_removes_oldest_first() {
+        let dir = tempdir().unwrap();
+        perf_file(dir.path(), "a-oldest.data", 100, 3);
+        perf_file(dir.path(), "b-middle.data", 100, 2);
+        perf_file(dir.path(), "c-newest.data", 100, 1);
+
+        let candidates = collect_perf_candidates(dir.path(), 7, 150, &BTreeSet::new()).unwrap();
+
+        assert_eq!(
+            removed_names(&candidates),
+            BTreeSet::from(["a-oldest.data".to_string(), "b-middle.data".to_string()])
+        );
+    }
+
+    #[test]
+    fn perf_gc_keeps_referenced_captures_even_when_old_or_over_cap() {
+        let dir = tempdir().unwrap();
+        let referenced = perf_file(dir.path(), "referenced.data", 100, 30);
+        perf_file(dir.path(), "stale.data", 100, 30);
+        let protected = BTreeSet::from([referenced.clone()]);
+
+        let candidates = collect_perf_candidates(dir.path(), 7, 10, &protected).unwrap();
+
+        assert_eq!(
+            removed_names(&candidates),
+            BTreeSet::from(["stale.data".to_string()])
+        );
+    }
+
+    #[test]
+    fn perf_gc_never_removes_a_capture_still_being_written() {
+        let dir = tempdir().unwrap();
+        // Written just now: even with retention 0 and a zero cap it must stay.
+        fs::write(dir.path().join("writing.data"), vec![0_u8; 100]).unwrap();
+
+        let candidates = collect_perf_candidates(dir.path(), 0, 0, &BTreeSet::new()).unwrap();
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn perf_only_gc_leaves_other_artifact_kinds_alone() {
+        let dir = tempdir().unwrap();
+        let mut config = FixerConfig::default();
+        config.service.state_dir = dir.path().to_path_buf();
+        config.service.perf_retention_days = 7;
+        fs::create_dir_all(dir.path().join("perf")).unwrap();
+        perf_file(&dir.path().join("perf"), "old.data", 10, 30);
+        fs::create_dir_all(dir.path().join("proposals/7-a")).unwrap();
+        fs::create_dir_all(dir.path().join("proposals/7-b")).unwrap();
+        fs::create_dir_all(dir.path().join("proposals/7-c")).unwrap();
+
+        let mut candidates = collect_gc_candidates(
+            &config,
+            &GcOptions {
+                perf_only: true,
+                ..GcOptions::default()
+            },
+        )
+        .unwrap();
+        apply_gc_candidates(&mut candidates, false).unwrap();
+
+        assert!(!dir.path().join("perf/old.data").exists());
+        assert!(dir.path().join("proposals/7-a").exists());
+        assert!(dir.path().join("proposals/7-b").exists());
+        assert!(dir.path().join("proposals/7-c").exists());
     }
 }
