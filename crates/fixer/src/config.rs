@@ -41,6 +41,10 @@ pub struct ServiceConfig {
     pub collect_bpftrace: bool,
     #[serde(default = "default_perf_duration")]
     pub perf_duration_seconds: u64,
+    #[serde(default = "default_perf_retention_days")]
+    pub perf_retention_days: u64,
+    #[serde(default = "default_perf_max_bytes")]
+    pub perf_max_bytes: u64,
     #[serde(default = "default_true")]
     pub auto_investigate_hotspots: bool,
     #[serde(default = "default_true")]
@@ -256,6 +260,8 @@ impl Default for ServiceConfig {
             collect_perf: false,
             collect_bpftrace: false,
             perf_duration_seconds: default_perf_duration(),
+            perf_retention_days: default_perf_retention_days(),
+            perf_max_bytes: default_perf_max_bytes(),
             auto_investigate_hotspots: true,
             auto_investigate_stuck_processes: true,
             hotspot_investigation_cooldown_seconds: default_hotspot_investigation_cooldown(),
@@ -442,6 +448,14 @@ fn default_poll_interval() -> u64 {
 
 fn default_perf_duration() -> u64 {
     3
+}
+
+fn default_perf_retention_days() -> u64 {
+    7
+}
+
+fn default_perf_max_bytes() -> u64 {
+    5 * 1024 * 1024 * 1024
 }
 
 fn default_coredump_limit() -> usize {

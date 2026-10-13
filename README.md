@@ -128,6 +128,12 @@ Use `--retention-days 0` when you want an immediate local cache purge, and
 `--include-sources` only when it is acceptable to delete regenerable source
 checkouts under the Fixer state directory.
 
+The daemon also prunes the perf capture directory by itself once an hour:
+captures older than `perf_retention_days` (default 7) are removed, then the
+oldest remaining ones until the directory is under `perf_max_bytes` (default
+5 GiB). Captures referenced by a running or unpublished-ready proposal, and
+files still being written, are never removed.
+
 To run the server locally:
 
 ```bash

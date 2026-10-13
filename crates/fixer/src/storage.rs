@@ -1449,6 +1449,42 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Perf capture files that live work still points at: findings whose
+    /// opportunity has a running proposal or a ready one that is not yet
+    /// published, plus profiles held in local state (investigation checkpoints).
+    pub fn list_live_perf_data_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut raw_documents = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT f.details_json
+            FROM findings f
+            JOIN opportunities o ON o.finding_id = f.id
+            JOIN proposals p ON p.opportunity_id = o.id
+            LEFT JOIN proposal_publications pp ON pp.proposal_id = p.id
+            WHERE f.details_json LIKE '%perf_data%'
+              AND (p.state = 'running' OR (p.state = 'ready' AND pp.proposal_id IS NULL))
+            ",
+        )?;
+        for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            raw_documents.push(row?);
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value_json FROM local_state WHERE value_json LIKE '%perf_data%'")?;
+        for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            raw_documents.push(row?);
+        }
+        let mut paths = Vec::new();
+        for raw in raw_documents {
+            if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                collect_perf_data_values(&value, &mut paths);
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     pub fn list_latest_ready_codex_proposals(
         &self,
         limit: usize,
@@ -2157,6 +2193,25 @@ fn map_opportunity_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpportunityR
     })
 }
 
+fn collect_perf_data_values(value: &Value, out: &mut Vec<PathBuf>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                match (key.as_str(), child) {
+                    ("perf_data", Value::String(path)) => out.push(PathBuf::from(path)),
+                    _ => collect_perf_data_values(child, out),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_perf_data_values(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BUSY_TIMEOUT, Connection, Duration, Store};
@@ -2228,6 +2283,58 @@ mod tests {
         let status = store.status().unwrap();
         assert_eq!(status.findings, 1);
         assert_eq!(status.opportunities, 1);
+    }
+
+    #[test]
+    fn live_perf_paths_follow_unfinished_proposals_and_local_state() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fixer.sqlite")).unwrap();
+        let mut opportunity_for = |tag: &str, perf: &str| {
+            let finding_id = store
+                .record_finding(&FindingInput {
+                    kind: "hotspot".to_string(),
+                    title: format!("hotspot {tag}"),
+                    severity: "medium".to_string(),
+                    fingerprint: format!("fp-{tag}"),
+                    summary: "summary".to_string(),
+                    details: json!({"perf_data": perf}),
+                    artifact: None,
+                    repo_root: None,
+                    ecosystem: None,
+                })
+                .unwrap();
+            store.get_opportunity_by_finding(finding_id).unwrap().id
+        };
+        let running = opportunity_for("running", "/p/running.data");
+        let ready = opportunity_for("ready", "/p/ready.data");
+        let failed = opportunity_for("failed", "/p/failed.data");
+        let _unrelated = opportunity_for("none", "/p/none.data");
+        store
+            .create_proposal(running, "codex", "running", Path::new("/b/1"), None)
+            .unwrap();
+        store
+            .create_proposal(ready, "codex", "ready", Path::new("/b/2"), None)
+            .unwrap();
+        store
+            .create_proposal(failed, "codex", "failed", Path::new("/b/3"), None)
+            .unwrap();
+        store
+            .set_local_state(
+                "checkpoint",
+                &json!({"profile": {"perf_data": "/p/ckpt.data"}}),
+            )
+            .unwrap();
+
+        let live = store.list_live_perf_data_paths().unwrap();
+
+        assert_eq!(
+            live,
+            vec![
+                PathBuf::from("/p/ckpt.data"),
+                PathBuf::from("/p/ready.data"),
+                PathBuf::from("/p/running.data"),
+            ]
+        );
     }
 
     #[test]

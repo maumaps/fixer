@@ -25,6 +25,8 @@ use std::time::Duration;
 
 const COMPLAINT_RELATED_CANDIDATE_LIMIT: usize = 50_000;
 
+const PERF_PRUNE_INTERVAL_SECONDS: u64 = 3600;
+
 pub struct App {
     pub config: FixerConfig,
     pub store: Store,
@@ -156,6 +158,24 @@ impl App {
 
     fn run_cycle(&self) -> Result<()> {
         let report = self.collect_once()?;
+        if self.should_run_network_task("last_perf_prune_at", PERF_PRUNE_INTERVAL_SECONDS) {
+            match self.prune_perf_captures() {
+                Ok(outcome) => {
+                    self.store
+                        .set_local_state("last_perf_prune_at", &Utc::now().to_rfc3339())?;
+                    if !outcome.entries.is_empty() {
+                        tracing::info!(
+                            removed = outcome.entries.len(),
+                            bytes_reclaimed = outcome.bytes_reclaimed,
+                            "pruned perf captures"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = format!("{error:#}"), "perf prune failed")
+                }
+            }
+        }
         tracing::info!(
             capabilities = report.capabilities_seen,
             artifacts = report.artifacts_seen,
@@ -164,10 +184,8 @@ impl App {
         );
         let participation = self.participation()?;
         if participation.state.mode.can_submit()
-            && self.should_run_network_task(
-                "last_sync_at",
-                self.config.network.sync_interval_seconds,
-            )
+            && self
+                .should_run_network_task("last_sync_at", self.config.network.sync_interval_seconds)
         {
             match self.sync() {
                 Ok(outcome) => {
@@ -398,6 +416,7 @@ impl App {
 
         let mut options = options;
         options.protected_paths = self.store.list_unpublished_ready_proposal_bundle_paths()?;
+        options.protected_perf_paths = self.store.list_live_perf_data_paths()?;
         let mut entries = gc::collect_gc_candidates(&self.config, &options)?;
         let bytes_reclaimed = gc::apply_gc_candidates(&mut entries, options.dry_run)?;
         Ok(GcOutcome {
@@ -406,6 +425,16 @@ impl App {
             sync_warning,
             entries,
             bytes_reclaimed,
+        })
+    }
+
+    /// Bound the perf capture directory without touching the network or other
+    /// artifact kinds; cheap enough to run from the collection loop.
+    pub fn prune_perf_captures(&self) -> Result<GcOutcome> {
+        self.gc(GcOptions {
+            skip_sync: true,
+            perf_only: true,
+            ..GcOptions::default()
         })
     }
 

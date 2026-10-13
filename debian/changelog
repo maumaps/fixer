@@ -1,3 +1,17 @@
+fixer (0.254.0-1) unstable; urgency=medium
+
+  * Bound the perf capture directory. Every popular-binary profile wrote a
+    `perf record` file that nothing ever removed; on the live host that was
+    80 GB in 22k files on a 96%-full root filesystem. The collection loop now
+    prunes /var/lib/fixer/perf hourly: captures older than `perf_retention_days`
+    (default 7) go first, then the oldest remaining ones until the directory
+    fits `perf_max_bytes` (default 5 GiB). A capture that a running or
+    unpublished-ready proposal, or a saved investigation checkpoint, still
+    points at is kept, and so is any file young enough to still be written.
+    `fixer gc` applies the same rule.
+
+ -- Darafei Praliaskouski <me@komzpa.net>  Tue, 13 Oct 2026 04:30:00 +0400
+
 fixer (0.253.0-1) unstable; urgency=medium
 
   * Start the normal Fixer Codex repair path on gpt-5.6-luna while preserving
