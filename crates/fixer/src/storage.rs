@@ -170,6 +170,12 @@ impl Store {
                 updated_at TEXT NOT NULL
             );
 
+            -- Without this every `p.opportunity_id = o.id` probe (warning
+            -- pruning, ready-proposal checks) scanned all of proposals once per
+            -- findings row: minutes of pread64 per cycle on a 300k-finding board.
+            CREATE INDEX IF NOT EXISTS idx_proposals_opportunity_id
+                ON proposals(opportunity_id);
+
             CREATE TABLE IF NOT EXISTS synced_issue_links (
                 local_opportunity_id INTEGER PRIMARY KEY REFERENCES opportunities(id),
                 remote_issue_id TEXT NOT NULL,
